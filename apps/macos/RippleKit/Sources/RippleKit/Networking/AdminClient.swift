@@ -88,6 +88,15 @@ public struct AdminClient: Sendable {
         do { return try JSONValue(data: data) } catch { throw AdminError.decoding("\(error)") }
     }
 
+    /// A call whose non-2xx answers carry a document the caller needs, e.g. the mod-settings 409
+    /// whose body is the current snapshot to rebase on. Throws only for transport failures and
+    /// missing routes; every HTTP status comes back with its parsed body (nil when empty or not JSON).
+    public func exchange(_ method: String, _ path: String, json body: JSONValue? = nil, timeout: TimeInterval = writeTimeout) async throws -> (status: Int, document: JSONValue?) {
+        let answer = try await transport(method, path, query: [], body: body?.data(), timeout: timeout)
+        if answer.isSuccess, answer.isHTML { throw AdminError.routeMissing(path: path) }
+        return (answer.status, answer.data.isEmpty ? nil : try? JSONValue(data: answer.data))
+    }
+
     // MARK: Plumbing
 
     func request(_ method: String, _ path: String, query: [URLQueryItem], body: Data?, timeout: TimeInterval) -> URLRequest {
@@ -105,7 +114,19 @@ public struct AdminClient: Sendable {
         return request
     }
 
-    private func perform(_ method: String, _ path: String, query: [URLQueryItem], body: Data?, timeout: TimeInterval, expectJSON: Bool = true) async throws -> Data {
+    /// One HTTP answer, before any status interpretation.
+    private struct Answer {
+        let status: Int
+        let contentType: String
+        let data: Data
+
+        var isSuccess: Bool { (200..<300).contains(status) }
+        var isJSON: Bool { contentType.contains("json") }
+        /// An HTML page where JSON was expected: an older router's dashboard fallback.
+        var isHTML: Bool { !data.isEmpty && !isJSON && contentType.contains("html") }
+    }
+
+    private func transport(_ method: String, _ path: String, query: [URLQueryItem], body: Data?, timeout: TimeInterval) async throws -> Answer {
         let request = request(method, path, query: query, body: body, timeout: timeout)
         let data: Data
         let response: URLResponse
@@ -115,17 +136,19 @@ public struct AdminClient: Sendable {
             throw AdminError.offline
         }
         let http = response as? HTTPURLResponse
-        let status = http?.statusCode ?? 0
-        let contentType = http?.value(forHTTPHeaderField: "Content-Type")?.lowercased() ?? ""
-        let isJSON = contentType.contains("json")
-        guard (200..<300).contains(status) else {
-            throw AdminError.http(status: status, message: isJSON ? Self.errorMessage(in: data) : nil)
+        return Answer(status: http?.statusCode ?? 0,
+                      contentType: http?.value(forHTTPHeaderField: "Content-Type")?.lowercased() ?? "",
+                      data: data)
+    }
+
+    private func perform(_ method: String, _ path: String, query: [URLQueryItem], body: Data?, timeout: TimeInterval, expectJSON: Bool = true) async throws -> Data {
+        let answer = try await transport(method, path, query: query, body: body, timeout: timeout)
+        guard answer.isSuccess else {
+            throw AdminError.http(status: answer.status, message: answer.isJSON ? Self.errorMessage(in: answer.data) : nil)
         }
         // 204 and empty bodies are fine for writes; an HTML page in place of JSON is not.
-        if expectJSON, !data.isEmpty, !isJSON, contentType.contains("html") {
-            throw AdminError.routeMissing(path: path)
-        }
-        return data
+        if expectJSON, answer.isHTML { throw AdminError.routeMissing(path: path) }
+        return answer.data
     }
 
     private func decode<T: Decodable>(_ type: T.Type, from data: Data, path: String) throws -> T {
