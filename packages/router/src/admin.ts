@@ -668,7 +668,10 @@ async function modOptions(deps: AdminDeps, scores: ModelScoreCatalog): Promise<M
       usable = p.auth === "antigravity" ? (google[name] ?? []).some(a => a.state === "ready")
         : !!(p.apiKey || process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY);
     } else if (p.type === "anthropic") {
-      usable = p.auth === "api-key" ? !!(p.apiKey || process.env.ANTHROPIC_API_KEY) : claudeAuthStore(deps).describeSource() !== null;
+      // Stored accounts serve the turn when Claude Code's own login is not seen; the pool refreshes a
+      // due token before each turn, so only an account that must sign in again is out.
+      usable = p.auth === "api-key" ? !!(p.apiKey || process.env.ANTHROPIC_API_KEY)
+        : claudeAuthStore(deps).describeSource() !== null || listClaudeAccounts(homeDir()).some(a => !a.needsReauth);
     }
     if (credentials[name]) usable = usable && credentials[name]!.some(c => c.state === "ready");
     const exhausted = health[name];
