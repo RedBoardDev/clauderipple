@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- **macOS uses the native menu-bar app (`apps/macos`) instead of the Electron tray.** The CLI
+  opens `com.clauderipple.mac`; if it is not installed, it points to `apps/macos/build.sh install`.
+  Windows keeps the Electron tray, including its login item and router-down recovery.
+
 ## 0.11.1 — 2026-10-20
 
 ### Fixed

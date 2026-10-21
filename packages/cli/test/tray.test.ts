@@ -6,7 +6,34 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { earlyExit, trayEnv } from "../src/tray.ts";
+import { earlyExit, installTrayRuntime, NATIVE_APP_INSTALL_HINT, openNativeApp, startTray, trayEnv } from "../src/tray.ts";
+
+test("macOS opens the native bundle by id and reports its absence without fetching a runtime", () => {
+  const calls: [string, string[]][] = [];
+  const result = openNativeApp((file, args) => {
+    calls.push([file, args]);
+    return { status: 0 };
+  });
+  assert.deepEqual(calls, [["/usr/bin/open", ["-b", "com.clauderipple.mac"]]]);
+  assert.equal(result.ok, true);
+  for (const status of [1, null]) {
+    assert.deepEqual(openNativeApp(() => ({ status })), { ok: false, message: NATIVE_APP_INSTALL_HINT });
+  }
+  assert.deepEqual(openNativeApp(() => { throw new Error("unavailable"); }), { ok: false, message: NATIVE_APP_INSTALL_HINT });
+});
+
+test("macOS tray start and runtime-install both delegate to the native app, including foreground starts", async () => {
+  let calls = 0;
+  const result = { ok: true, message: "fake native app opened" };
+  const options = { platform: "darwin" as const, openApp: () => { calls++; return result; } };
+  assert.deepEqual(await startTray(options), result);
+  assert.deepEqual(await startTray({ ...options, detached: false }), result);
+  assert.deepEqual(installTrayRuntime(options), result);
+  assert.equal(calls, 3);
+  const missing = { ok: false, message: NATIVE_APP_INSTALL_HINT };
+  assert.deepEqual(await startTray({ ...options, openApp: () => missing }), missing);
+  assert.deepEqual(installTrayRuntime({ ...options, openApp: () => missing }), missing);
+});
 
 // Issue #50: a tray that died at launch still reported "✓ tray started".
 test("a tray process that exits at once is reported with its output; one that stays up is started", async () => {
