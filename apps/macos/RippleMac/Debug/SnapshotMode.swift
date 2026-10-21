@@ -40,6 +40,8 @@ enum SnapshotMode {
             let panel = PanelView(app: app).environment(store).tint(Theme.accent)
             await write(panel, width: Metrics.panelWidth, height: nil, appearance: appearance, material: .popover,
                         to: request.directory.appending(path: "panel\(suffix)-\(name).png"))
+            await write(IconSheet(), width: IconSheet.width, height: nil, appearance: appearance, material: .menu,
+                        to: request.directory.appending(path: "menubar-icons-\(name).png"))
             for pane in request.panes {
                 SettingsNavigation.shared.pane = pane
                 let root = SettingsRoot(app: app).environment(store).tint(Theme.accent)
@@ -48,6 +50,38 @@ enum SnapshotMode {
             }
         }
         NSApplication.shared.terminate(nil)
+    }
+
+    /// Every icon state at menu-bar size and magnified, tinted the way the status item tints a
+    /// template image.
+    private struct IconSheet: View {
+        static let width: CGFloat = 640
+        private static let magnified: CGFloat = 3
+        private static let states: [(String, MenuBarGauge)] = [
+            ("full", MenuBarGauge(mood: .ok, fill: 1)),
+            ("half", MenuBarGauge(mood: .ok, fill: 0.5)),
+            ("low", MenuBarGauge(mood: .ok, fill: 0.15)),
+            ("stale", MenuBarGauge(mood: .ok, fill: 0.6, isStale: true)),
+            ("blocked", MenuBarGauge(mood: .blocked, fill: 0.4)),
+            ("down", MenuBarGauge(mood: .down, fill: 0)),
+            ("idle", MenuBarGauge(mood: .idle, fill: 1)),
+        ]
+
+        var body: some View {
+            HStack(alignment: .bottom, spacing: 18) {
+                ForEach(Self.states, id: \.0) { name, gauge in
+                    let image = MenuBarIcon.image(for: gauge)
+                    VStack(spacing: 6) {
+                        Image(nsImage: image).renderingMode(.template).foregroundStyle(.primary)
+                        Image(nsImage: image).renderingMode(.template).resizable().interpolation(.high)
+                            .frame(width: image.size.width * Self.magnified, height: image.size.height * Self.magnified)
+                            .foregroundStyle(.primary)
+                        Text(name).font(.caption).foregroundStyle(.secondary)
+                    }
+                }
+            }
+            .padding(16)
+        }
     }
 
     private static func write(_ view: some View, width: CGFloat, height: CGFloat?, appearance: NSAppearance.Name,

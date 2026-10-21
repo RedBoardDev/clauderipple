@@ -12,7 +12,8 @@ struct RoutingContextField: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: Metrics.labelGap) {
-            TextField(placeholder, text: $text)
+            TextField("Context window", text: $text, prompt: Text(placeholder))
+                .labelsHidden()
                 .accessibilityLabel("Context window")
                 .textFieldStyle(.roundedBorder)
                 .focused($focused)

@@ -31,6 +31,11 @@ struct ActivityPane: View {
     }
 
     private var selectedProvider: String? { provider.isEmpty ? nil : provider }
+    /// The router's ISO 8601 timestamp in the user's own date format; the raw text if it does not parse.
+    private static func historyStart(_ iso: String) -> String {
+        (try? Date(iso, strategy: .iso8601))?.formatted(date: .abbreviated, time: .shortened) ?? iso
+    }
+
     private var providerNames: [String] {
         var names = Set(summary.value?.summary.providers.keys.map { $0 } ?? [])
         if !provider.isEmpty { names.insert(provider) }
@@ -44,6 +49,7 @@ struct ActivityPane: View {
                 Text("Router log").tag(true)
             }
             .pickerStyle(.segmented)
+            .labelsHidden()
             .padding(Metrics.inset)
 
             if showRouterLog {
@@ -94,7 +100,7 @@ struct ActivityPane: View {
                 Section {
                     FormNote(activity.note)
                     if let earliest = activity.summary.earliest {
-                        LabeledContent("History starts", value: earliest)
+                        LabeledContent("History starts", value: Self.historyStart(earliest))
                             .textSelection(.enabled)
                     }
                     if activity.periodAvailable {
