@@ -4,18 +4,16 @@
 // the remote with Claude's asterisk and its signal arcs), so both apps read as one product.
 // Run: npm --workspace @clauderipple/app run icons
 //
-//   assets/tray*Template{,@2x}.png   macOS menu bar, 22pt template images (black + alpha; macOS tints them)
 //   assets/trayWin*{,@2x}.png        Windows tray, 32/64px, coloured (Windows does not tint)
-//   assets/icon.png                  1024 app icon on the macOS grid (Linux .desktop, window icon)
-//   assets/icon.icns                 the same, every iconset size (the `clauderipple app --install` launcher)
+//   assets/icon.png                  1024 app icon on the existing grid (Linux .desktop, window icon)
 //   assets/icon.ico                  Windows grid, 16–256 (window icon, Start Menu / Desktop shortcut)
-//   build/icon.icns, build/icon.png  what electron-builder reads (mac.icon; win.icon, Windows grid); not committed
+//   build/icon.png                   Windows-grid render; not committed
+// macOS uses apps/macos instead; no template tray icons or .icns are generated here.
 //
 // assets/ is committed and shipped in the npm package (scripts/build-npm.mjs), so publishing needs
-// neither a browser nor iconutil. Rendering is headless Chrome screenshotting the SVGs (CHROME= to
-// point at another Chromium; Chrome, Chromium and Edge are looked for). With no browser the
-// committed renders are copied into build/ and nothing is redrawn. The .icns needs macOS iconutil;
-// elsewhere the committed one is kept.
+// no browser. Rendering is headless Chrome screenshotting the SVGs (CHROME= to point at another
+// Chromium; Chrome, Chromium and Edge are looked for). With no browser the committed PNG is
+// copied into build/ and nothing is redrawn; the committed Windows .ico stays available.
 //
 // Tray states (menu bar and Windows alike): the remote as a one-colour glyph, drawn in the icon's
 // own coordinates (the asterisk and the dots are cut out of a solid pill):
@@ -24,7 +22,7 @@
 //   down   : switched off: a hollow pill, a dash for the asterisk, no arcs
 //   direct : no arcs (nothing goes through the router) and an arrow badge: Claude goes straight out
 // Windows does not tint its tray, so it carries the state in colour as well.
-import { execFile, execFileSync } from "node:child_process";
+import { execFile } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -56,7 +54,7 @@ function findBrowser(): string | null {
 
 const browser = findBrowser();
 if (!browser) {
-  for (const file of ["icon.png", "icon.icns"]) {
+  for (const file of ["icon.png"]) {
     const from = path.join(assets, file);
     if (!fs.existsSync(from)) throw new Error(`no Chrome/Chromium/Edge to render icons with (set CHROME=) and no committed assets/${file} to fall back on`);
     fs.copyFileSync(from, path.join(build, file));
@@ -132,14 +130,6 @@ function trayMark(state: State): string {
 }
 const traySvg = (body: string, color: string) => `<svg xmlns="http://www.w3.org/2000/svg" viewBox="${TRAY_VIEW}" style="color:${color}">${body}</svg>`;
 
-// macOS menu bar: 22pt template images.
-const MAC_NAME: Record<State, string> = { ok: "trayTemplate", warn: "trayWarnTemplate", down: "trayDownTemplate", direct: "trayDirectTemplate" };
-for (const s of STATES) {
-  const svg = traySvg(trayMark(s), "#000");
-  queue(img(svg, 22), 22, path.join(assets, `${MAC_NAME[s]}.png`));
-  queue(img(svg, 44), 44, path.join(assets, `${MAC_NAME[s]}@2x.png`));
-}
-
 // Windows tray: coloured, since Windows does not tint. ok is the icon's own orange; the alarms keep
 // tones that hold on both a light and a dark taskbar.
 const WIN_NAME: Record<State, string> = { ok: "trayWin", warn: "trayWinWarn", down: "trayWinDown", direct: "trayWinDirect" };
@@ -193,21 +183,13 @@ function winIcon(size: number): string {
   return `<div style="width:${size}px;height:${size}px;display:flex;align-items:center;justify-content:center">${img(tile(t), t)}</div>`;
 }
 
-const iconset = path.join(tmp, "icon.iconset");
-fs.mkdirSync(iconset);
-for (const base of [16, 32, 128, 256, 512]) {
-  queue(macIcon(base), base, path.join(iconset, `icon_${base}x${base}.png`));
-  queue(macIcon(base * 2), base * 2, path.join(iconset, `icon_${base}x${base}@2x.png`));
-}
+// Preserve the shared window/Linux icon's appearance without generating a macOS iconset.
+queue(macIcon(1024), 1024, path.join(assets, "icon.png"));
 const ICO_SIZES = [16, 24, 32, 48, 64, 128, 256];
 for (const s of ICO_SIZES) queue(winIcon(s), s, path.join(tmp, `ico-${s}.png`));
 queue(winIcon(1024), 1024, path.join(build, "icon.png"));
 
 await drain();
-
-fs.copyFileSync(path.join(iconset, "icon_512x512@2x.png"), path.join(assets, "icon.png"));
-if (process.platform === "darwin") execFileSync("iconutil", ["-c", "icns", iconset, "-o", path.join(assets, "icon.icns")]);
-else console.log("not macOS: kept the committed assets/icon.icns (iconutil is macOS-only)");
 
 /** PNG-compressed .ico (Windows Vista and later read PNG entries). */
 function ico(pngs: { size: number; data: Buffer }[]): Buffer {
@@ -230,8 +212,5 @@ function ico(pngs: { size: number; data: Buffer }[]): Buffer {
 }
 fs.writeFileSync(path.join(assets, "icon.ico"), ico(ICO_SIZES.map((size) => ({ size, data: fs.readFileSync(path.join(tmp, `ico-${size}.png`)) }))));
 
-// electron-builder: mac.icon is build/icon.icns; win.icon is build/icon.png (rendered above on the
-// Windows grid; electron-builder makes its .ico from it).
-fs.copyFileSync(path.join(assets, "icon.icns"), path.join(build, "icon.icns"));
 fs.rmSync(tmp, { recursive: true, force: true });
-console.log(`icons written to ${assets} (tray, icon.png/.icns/.ico) and ${build} (icon.icns, icon.png)`);
+console.log(`icons written to ${assets} (Windows tray, icon.png/.ico) and ${build} (icon.png)`);

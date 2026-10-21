@@ -2,7 +2,7 @@
   "name": "@clauderipple/app",
   "version": "0.11.1",
   "private": true,
-  "description": "ClaudeRipple menu-bar app (macOS). Hosts the local GUI served by the router and shows chain health in the tray.",
+  "description": "ClaudeRipple Electron tray for Windows and Linux. Hosts the dashboard even when the router is down and shows chain health.",
   "license": "GPL-3.0-only",
   "author": "pbj",
   "main": "dist/main.js",
@@ -11,8 +11,6 @@
     "test": "node --disable-warning=MODULE_TYPELESS_PACKAGE_JSON --test test/*.test.ts",
     "start": "npm run build && electron .",
     "icons": "node scripts/make-icons.mts",
-    "dist": "npm run icons && npm run build && CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder --mac --dir -c.directories.output=release-dev",
-    "release": "npm run icons && npm run build && electron-builder --mac --arm64 --x64",
     "dist:win": "npm run icons && npm run build && electron-builder --win --dir -c.directories.output=release-dev",
     "release:win": "npm run icons && npm run build && electron-builder --win"
   },
@@ -26,23 +24,6 @@
     "electronVersion": "38.8.6",
     "directories": {
       "output": "release"
-    },
-    "mac": {
-      "category": "public.app-category.developer-tools",
-      "hardenedRuntime": true,
-      "gatekeeperAssess": false,
-      "entitlements": "build/entitlements.mac.plist",
-      "entitlementsInherit": "build/entitlements.mac.plist",
-      "notarize": true,
-      "target": [
-        "dmg",
-        "zip"
-      ],
-      "artifactName": "${productName}-${version}-${arch}.${ext}",
-      "icon": "build/icon.icns",
-      "extendInfo": {
-        "LSUIElement": true
-      }
     },
     "files": [
       "dist/**",

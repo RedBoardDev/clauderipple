@@ -1,5 +1,6 @@
 // The menu-bar / tray app, started from the CLI.
 //
+// macOS opens the separately installed native app; the other platforms retain the Electron tray.
 // Installed from npm there is no application bundle to double-click. Electron supplies the tray,
 // and npm fetches the binary already built for this platform — but it is 270MB, which is not
 // something to hand every person who only wants the router. So it is not a dependency: the tray
@@ -45,6 +46,21 @@ export function electronPath(): string | null {
 
 export type TrayStart = { ok: boolean; message: string };
 
+export const NATIVE_APP_INSTALL_HINT = "Install the menu-bar app: apps/macos/build.sh install";
+type NativeAppOptions = { platform?: NodeJS.Platform; openApp?: () => TrayStart };
+
+/** Launch Services locates the native app by identity, without starting or probing the router. */
+export function openNativeApp(run: (file: string, args: string[]) => { status: number | null } = (file, args) => spawnSync(file, args, { stdio: "ignore" })): TrayStart {
+  try {
+    const result = run("/usr/bin/open", ["-b", "com.clauderipple.mac"]);
+    return result.status === 0
+      ? { ok: true, message: "Native menu-bar app opened" }
+      : { ok: false, message: NATIVE_APP_INSTALL_HINT };
+  } catch {
+    return { ok: false, message: NATIVE_APP_INSTALL_HINT };
+  }
+}
+
 /**
  * Our environment without ELECTRON_RUN_AS_NODE, so Electron starts as the tray rather than as a
  * plain Node process. The variable has to be removed, not emptied: macOS Electron reads an empty
@@ -63,7 +79,8 @@ export function trayEnv(env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv
  * process, which is what a command typed in a terminal wants; the supervisor uses the foreground
  * form instead.
  */
-export async function startTray(options: { detached?: boolean } = {}): Promise<TrayStart> {
+export async function startTray(options: NativeAppOptions & { detached?: boolean } = {}): Promise<TrayStart> {
+  if ((options.platform ?? process.platform) === "darwin") return (options.openApp ?? openNativeApp)();
   const current = runtime();
   // Started by hand (the app icon, `clauderipple tray`), the window opens; started by the logon
   // supervisor in the foreground, it stays in the tray. The login item launches Electron directly.
@@ -138,7 +155,8 @@ function npmCli(): string | null {
 }
 
 /** Fetches Electron into this installation so the tray can run. Prints npm's own progress. */
-export function installTrayRuntime(): TrayStart {
+export function installTrayRuntime(options: NativeAppOptions = {}): TrayStart {
+  if ((options.platform ?? process.platform) === "darwin") return (options.openApp ?? openNativeApp)();
   if (electronPath()) return { ok: true, message: "✓ Electron is already installed" };
   const cli = npmCli();
   if (!cli) return { ok: false, message: `found no npm next to ${process.execPath}; install Electron yourself: npm install electron` };

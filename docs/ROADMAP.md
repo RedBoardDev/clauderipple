@@ -40,9 +40,11 @@ OpenAI-only providers (Grok, Mistral, Groq, Ollama…). M5 = Windows.
 - The router serves a local GUI (`packages/ui`) and an admin API on
   127.0.0.1:(port+1): slot mapping (which picker entry → which provider model),
   providers, chain health, request log, quota, about.
-- `packages/app`: Electron menu-bar shell that hosts that GUI in a window and
-  shows health in the tray (ok / attention / down), with restart, login, logs.
-- Ships the installer inside; the CLI remains for headless use.
+- macOS: the native menu-bar app in `apps/macos` (`com.clauderipple.mac`) replaces
+  the Electron shell. Install with `apps/macos/build.sh install`; the CLI opens it by bundle id.
+- Windows keeps `packages/app`: the Electron tray hosts the dashboard even with
+  the router down, with repair, direct connection, a login item and outage notifications.
+- The CLI remains for headless use; macOS Electron build/release targets are retired.
 
 ## Later
 
