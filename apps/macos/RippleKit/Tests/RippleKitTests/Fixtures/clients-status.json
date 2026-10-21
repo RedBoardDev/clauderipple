@@ -1,0 +1,11 @@
+{
+  "version": "0.9.5",
+  "picker": {"enabled": true, "last": {"at": "2026-01-02T03:04:05.000Z", "injected": 2, "surfaces": [{"id": "code", "models": ["alpha-model"]}]}},
+  "statusMod": false,
+  "pickerModels": ["Alpha", "Beta"],
+  "providers": {
+    "alpha": {"type": "chatgpt", "reachable": true, "usable": true, "webSearch": true},
+    "beta": {"type": "openai-compatible", "reachable": true, "usable": true, "webSearchModels": ["beta-search"]},
+    "pool": {"type": "anthropic", "reachable": true, "usable": true, "webSearch": true}
+  }
+}
