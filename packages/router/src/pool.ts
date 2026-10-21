@@ -118,6 +118,8 @@ export type CredentialReport = {
   /** Seconds until this credential is usable again; absent when it is ready or quarantined. */
   cooldownSeconds?: number;
   failures: number;
+  /** Last account to serve a successful upstream response, not merely a usable credential. */
+  active: boolean;
 };
 
 /**
@@ -127,6 +129,7 @@ export type CredentialReport = {
  */
 export class CredentialPool {
   private readonly health = new Map<string, Health>();
+  private readonly active = new Map<string, string>();
   /** conversation → durable owner id (or runtime id when there is no owner), preserving its cache across token refreshes. */
   private readonly sticky = new Map<string, { provider: string; ownerId: string; at: number }>();
   private readonly now: () => number;
@@ -203,12 +206,16 @@ export class CredentialPool {
    * 429 does not mean the rate limit went away — clearing it here would send the next turn straight
    * back into the limit. The cooldown expires on its own soon enough.
    */
-  succeed(provider: string, id: string): void {
+  succeed(provider: string, id: string, ownerId = id): void {
+    this.active.set(provider, ownerId);
     const h = this.healthOf(provider, id);
     if (h.cooldownUntil <= this.now()) h.cooldownUntil = 0;
     h.quarantined = false;
     h.failures = 0;
   }
+
+  /** Durable owner of the last success, even when its credential has since expired. */
+  activeOwner(provider: string): string | null { return this.active.get(provider) ?? null; }
 
   /** Operator action from the dashboard: give a parked credential another chance now. */
   clear(provider: string, id?: string): void {
@@ -228,6 +235,7 @@ export class CredentialPool {
         state: h.quarantined ? "quarantined" : cooling ? "cooling" : "ready",
         ...(cooling ? { cooldownSeconds: Math.ceil((h.cooldownUntil - now) / 1000) } : {}),
         failures: h.failures,
+        active: this.active.get(provider) === (c.ownerId ?? c.id),
       };
     });
   }

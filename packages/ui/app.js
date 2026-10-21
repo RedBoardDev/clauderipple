@@ -265,9 +265,98 @@ async function loadCatalogs() {
 
 // ---- Status -------------------------------------------------------------------------
 
+let limitsSnapshot = null;
+let limitsFailed = false;
+async function refreshLimits() {
+  try { limitsSnapshot = await api("/api/limits"); limitsFailed = false; }
+  catch { limitsFailed = true; }
+  renderLimits();
+}
+
+function limitsReset(window, weekly, now) {
+  if (!window || !Number.isFinite(window.resetAt)) return t("limits.resetUnknown");
+  const reset = new Date(window.resetAt);
+  if (weekly) return t("limits.resetsAt", { time: reset.toLocaleString(undefined, { weekday: "short", hour: "2-digit", minute: "2-digit", hour12: false }) });
+  const minutes = Math.max(0, Math.ceil((window.resetAt - now) / 60_000));
+  return t("limits.resetsIn", { hours: Math.floor(minutes / 60), minutes: minutes % 60 });
+}
+
+function limitsWindowRow(label, window, pace, weekly, now) {
+  const known = window && Number.isFinite(window.usedPercent);
+  const percent = known ? `${Math.round(window.usedPercent * 10) / 10}%` : t("limits.unknown");
+  const reset = limitsReset(window, weekly, now);
+  const track = el("div", {
+    class: `limits-track${known ? "" : " unknown"}`, role: "progressbar", tabindex: "0",
+    "aria-label": label, "aria-valuemin": "0", "aria-valuemax": "100",
+    ...(known ? { "aria-valuenow": Math.max(0, Math.min(100, window.usedPercent)) } : {}),
+    "aria-valuetext": `${percent} · ${reset}`, title: `${label} · ${percent} · ${reset}`,
+  });
+  if (known) {
+    const fill = el("span", { class: "limits-fill", "aria-hidden": "true" });
+    fill.style.width = `${Math.max(0, Math.min(100, window.usedPercent))}%`;
+    track.appendChild(fill);
+  }
+  const hasPace = known && pace && Number.isFinite(pace.expectedPercent) && Number.isFinite(pace.paceDelta);
+  if (hasPace) {
+    const tick = el("span", { class: "limits-pace-tick", "aria-hidden": "true" });
+    tick.style.left = `${Math.max(0, Math.min(100, pace.expectedPercent))}%`;
+    track.appendChild(tick);
+  }
+  const paceText = hasPace ? t(pace.paceDelta > 0 ? "limits.ahead" : pace.paceDelta < 0 ? "limits.behind" : "limits.onPace", { points: Math.round(Math.abs(pace.paceDelta) * 10) / 10 }) : null;
+  if (paceText) track.title += ` · ${paceText}`;
+  return el("div", { class: "limits-window" }, [
+    el("div", { class: "limits-window-head" }, [el("span", { text: label }), el("span", { text: percent })]),
+    track,
+    el("div", { class: "limits-window-foot" }, [el("span", { text: reset }), paceText ? el("span", { class: "limits-pace-label", text: paceText }) : null]),
+  ]);
+}
+
+function limitsAccountRow(account, now) {
+  const badges = [];
+  if (account.active) badges.push(badge("first", t("limits.active")));
+  if (account.preferred) badges.push(badge("", t("limits.preferred")));
+  const health = account.health || {};
+  if (Number.isFinite(health.pausedUntil) && health.pausedUntil > now) {
+    badges.push(badge("warn", t("limits.pausedUntil", { time: new Date(health.pausedUntil).toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit", hour12: false }) })));
+  } else if (health.state === "paused") badges.push(badge("warn", t("limits.paused")));
+  else if (health.state === "needs-login") badges.push(badge("bad", t("limits.needsLogin")));
+  if (account.stale || limitsFailed) badges.push(badge("warn", t("limits.stale")));
+  const windows = account.usageWindows || {};
+  return el("div", { class: "limits-account", "data-account-id": account.id }, [
+    el("div", { class: "limits-account-head" }, [
+      el("strong", { text: account.label || account.id }),
+      el("div", { class: "limits-badges" }, badges),
+    ]),
+    limitsWindowRow(t("limits.fiveHour"), windows.fiveHour, null, false, now),
+    limitsWindowRow(t("limits.weekly"), windows.weekly, account.weeklyPace, true, now),
+    el("div", { class: "limits-fetched", text: Number.isFinite(account.fetchedAt) ? t("limits.fetchedAt", { time: new Date(account.fetchedAt).toLocaleTimeString() }) : t("limits.notFetched") }),
+  ]);
+}
+
+function renderLimits() {
+  let card = $("#health-limits");
+  if (!card) {
+    card = section(t("limits.title"), []);
+    card.id = "health-limits";
+    const providers = $("#health-providers").closest(".section");
+    providers.before(card);
+  }
+  const groups = ((limitsSnapshot && limitsSnapshot.providers) || []).filter((provider) => provider.type === "anthropic" || provider.type === "chatgpt");
+  const now = Date.now();
+  $(".group", card).replaceChildren(
+    ...(limitsFailed ? [hint(t("limits.fetchFailed"))] : []),
+    ...groups.map((provider) => el("div", { class: "limits-provider" }, [
+      el("h3", { class: "limits-provider-title", text: `${provider.type === "anthropic" ? "Claude" : "ChatGPT"} · ${provider.provider}` }),
+      ...provider.accounts.map((account) => limitsAccountRow(account, now)),
+    ])),
+    ...(!groups.length && !limitsFailed ? [hint(t("limits.empty"))] : []),
+  );
+}
+
 async function refreshHealth() {
   try {
-    status = await api("/api/status");
+    const [nextStatus] = await Promise.all([api("/api/status"), refreshLimits()]);
+    status = nextStatus;
   } catch (error) {
     $("#health-desktop").replaceChildren(cell(t("health.connection"), badge("bad", t("health.disconnected"))));
     // Inside the app a router that does not answer is a state with a way out, not an error.
@@ -743,9 +832,8 @@ function renderHealthProviders() {
     const quota = quotaLine(name);
     if (quota) lines.push(el("span", { class: "cell-sub", text: quota }));
     // Claude subscription accounts, one line each: the current login and every account added here.
-    // Before the config has loaded the rows come from the status, which names the sign-in source
-    // rather than the auth mode.
-    if (provider.type === "anthropic" && (provider.auth === "claude-code" || (live && live.authSource))) {
+    // Status owns these snapshots even before Providers loads the config or observed auth expires.
+    if (provider.type === "anthropic" && status && status.claude && status.claude.accounts && status.claude.accounts.length) {
       const usage = ((status && status.claude && status.claude.accounts) || [])
         .map((account) => ({ account, text: chatgptQuotaText(account.quota) }))
         .filter(({ text }) => text)

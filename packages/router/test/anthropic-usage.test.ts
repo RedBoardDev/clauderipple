@@ -80,6 +80,71 @@ test("each account is asked once per interval with its own headers, and a failur
   assert.deepEqual(Object.keys(kept).sort(), ["acct", "current"], "a failed lookup keeps the last good numbers");
 });
 
+test("refresh bypasses TTL, shares in-flight work, and retries only the failed owner once after 15s", async () => {
+  let now = 1_000_000;
+  const calls: Record<string, number> = {};
+  let fail = false;
+  let release: (() => void) | undefined;
+  let gate: Promise<void> = Promise.resolve();
+  const usage = new ClaudeUsage({ credentials: async () => ["current", "other"].map((id) => ({ id, headers: { owner: id } })) }, {
+    upstream: () => "api.anthropic.com", now: () => now,
+    fetch: async (_url, init) => {
+      const owner = (init.headers as Record<string, string>).owner!;
+      calls[owner] = (calls[owner] ?? 0) + 1;
+      await gate;
+      return fail && owner === "other" ? new Response("no", { status: 503 }) : Response.json(BODY);
+    },
+  });
+  const first = await usage.snapshot();
+  assert.equal(first.other?.at, now);
+  await usage.snapshot();
+  assert.deepEqual(calls, { current: 1, other: 1 });
+  fail = true;
+  gate = new Promise<void>((resolve) => { release = resolve; });
+  const forced = usage.snapshot(true);
+  assert.equal(usage.snapshot(true), forced, "forced requests join one lookup");
+  assert.equal(usage.snapshot(), forced, "ordinary polls join it too");
+  release!();
+  const failed = await forced;
+  assert.equal(failed.other?.stale, true);
+  assert.equal(failed.other?.at, first.other?.at, "a failure never changes the successful-fetch timestamp");
+  now += 14_999;
+  await usage.snapshot();
+  assert.deepEqual(calls, { current: 2, other: 2 });
+  now += 1;
+  await usage.snapshot();
+  assert.deepEqual(calls, { current: 2, other: 3 }, "only the failed owner is retried");
+  now += 15_000;
+  await usage.snapshot();
+  assert.equal(calls.other, 3, "a second failure returns to the full TTL rather than looping");
+  fail = false;
+  now += 300_000;
+  const recovered = await usage.snapshot();
+  assert.equal(recovered.other?.stale, undefined);
+  assert.equal(recovered.other?.at, now);
+});
+
+test("a credential-source failure also keeps stale data and gets one short retry", async () => {
+  let now = 0;
+  let fail = false;
+  let calls = 0;
+  const usage = new ClaudeUsage({ credentials: async () => {
+    calls++;
+    if (fail) throw new Error("unavailable");
+    return [{ id: "current", headers: {} }];
+  } }, { upstream: () => "api.anthropic.com", now: () => now, fetch: async () => Response.json(BODY) });
+  await usage.snapshot();
+  fail = true;
+  now = 300_000;
+  assert.equal((await usage.snapshot()).current?.stale, true);
+  now += 15_000;
+  await usage.snapshot();
+  assert.equal(calls, 3);
+  now += 15_000;
+  await usage.snapshot();
+  assert.equal(calls, 3);
+});
+
 test("a removed account drops out of the snapshot", async () => {
   let now = 0;
   let owners = ["current", "gone"];

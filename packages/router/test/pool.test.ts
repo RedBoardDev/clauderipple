@@ -95,6 +95,25 @@ test("a token refresh keeps the conversation on its durable account without inhe
   assert.equal(pool.pick("p", [other, fresh], "conv")?.id, fresh.id, "the fresh generation does not inherit the old generation's quarantine");
 });
 
+test("active is the last successful durable owner, not the next ready credential", () => {
+  const pool = new CredentialPool();
+  const a = { id: "a:old", ownerId: "a", headers: {} };
+  const b = { id: "b:gen", ownerId: "b", headers: {} };
+  pool.pick("claude", [a, b]);
+  assert.equal(pool.activeOwner("claude"), null);
+  assert.ok(pool.report("claude", [a, b]).every((r) => !r.active));
+  pool.succeed("claude", b.id, b.ownerId);
+  pool.penalise("claude", a.id, 400);
+  assert.deepEqual(pool.report("claude", [a, b]).map((r) => r.active), [false, true]);
+  pool.succeed("claude", a.id, a.ownerId);
+  const fresh = { ...a, id: "a:new" };
+  assert.deepEqual(pool.report("claude", [fresh, b]).map((r) => r.active), [true, false]);
+  pool.penalise("claude", fresh.id, 401);
+  pool.report("claude", [b]);
+  assert.equal(pool.activeOwner("claude"), "a", "expired/rejected accounts retain their last-success marker");
+  assert.equal(pool.activeOwner("other"), null);
+});
+
 test("a failure moves the conversation on, and the parked credential is skipped", () => {
   const c = clock();
   const pool = new CredentialPool({ now: c.now });

@@ -1391,7 +1391,12 @@ export class Proxy {
         if (status >= 400) {
           this.pool.penalise(penalised.provider, penalised.id, status, retryAfterMs(upRes.headers), errBody);
           if (status === 401 && cfg.providers[penalised.provider]?.type === "anthropic") this.claudeAccounts.reject(penalised.id);
-        } else this.pool.succeed(penalised.provider, penalised.id);
+        } else if (status >= 200 && status < 300) this.pool.succeed(penalised.provider, penalised.id, chosen?.ownerId);
+      } else if (!route && isApiHost && status >= 200 && status < 300) {
+        // Native passthrough uses the caller's current Claude login, not a selected pool account.
+        for (const [name, provider] of Object.entries(cfg.providers)) {
+          if (provider.type === "anthropic" && provider.auth === "claude-code") this.pool.succeed(name, "current");
+        }
       }
 
       // Nothing has been written to the client yet, so a refused credential can still be replaced
@@ -1721,12 +1726,19 @@ export class Proxy {
     return [{ id: "default", headers }];
   }
 
+  /** Last successful Claude owner per provider, independent of current credential availability. */
+  claudeActiveAccounts(): Record<string, string | null> {
+    return Object.fromEntries(Object.entries(this.deps.config().providers)
+      .filter(([, p]) => p.type === "anthropic" && p.auth === "claude-code")
+      .map(([name]) => [name, this.pool.activeOwner(name)]));
+  }
+
   /** Health of every credential the config declares, for the dashboard. */
   credentialHealth(): Record<string, ReturnType<CredentialPool["report"]>> {
     const cfg = this.deps.config();
     const out: Record<string, ReturnType<CredentialPool["report"]>> = {};
     for (const [name, provider] of Object.entries(cfg.providers)) {
-      const creds = provider.type === "anthropic" && provider.accountPool
+      const creds = provider.type === "anthropic" && provider.auth === "claude-code"
         ? this.claudeAccounts.peekCredentials()
         : this.credentialsOf(name, provider);
       if (creds.length === 0 || (creds.length === 1 && creds[0]!.id === "default")) continue; // nothing to report about a pool of one

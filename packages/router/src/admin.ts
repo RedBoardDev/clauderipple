@@ -76,6 +76,8 @@ import { GROK_DEFAULT_URL, GROK_EFFORT_LEVELS, GROK_FALLBACK_MODELS, grokModelsF
 import { GROK_WARNING, grokHeaders } from "./providers/grok/index.ts";
 import type { TunnelStatus } from "./remote-tunnel.ts";
 import { parsePowerChange, persistPowerChange, type PowerApi } from "./power.ts";
+import { buildLimitsAccount, type LimitsAccount, type LimitsWindow } from "./limits.ts";
+export type { LimitsAccount, LimitsWindow } from "./limits.ts";
 
 const MAX_BODY = 1024 * 1024;
 /** `/api/image` carries reference images inline, so it gets more room than a config save. */
@@ -145,7 +147,7 @@ export type AdminDeps = {
    * Optional: per-credential cooldowns and quarantines, for providers that declare a pool. Ids and
    * labels only — never a header value.
    */
-  credentials?: () => Record<string, { id: string; label?: string; state: string; cooldownSeconds?: number; failures: number }[]>;
+  credentials?: () => Record<string, { id: string; label?: string; state: string; cooldownSeconds?: number; failures: number; active?: boolean }[]>;
   /** Optional: picker-mode state and the last bootstrap injection. */
   picker?: () => { enabled: boolean; hosts: string[]; last: unknown };
   /** Optional: observed CLI credentials held by the live proxy, never serialized directly. */
@@ -178,7 +180,9 @@ export type AdminDeps = {
    * Usage of each Claude subscription account, keyed by owner id ("current" for the Claude Code
    * login, otherwise the account id `/api/claude-accounts` lists). Absent in tests.
    */
-  claudeUsage?: () => Promise<Record<string, Record<string, unknown>>>;
+  claudeUsage?: (force?: boolean) => Promise<Record<string, Record<string, unknown>>>;
+  /** Last successful owner per Claude provider, including owners whose login has since expired. */
+  claudeActive?: () => Record<string, string | null>;
   /** The Claude models the signed-in account can use (`GET /v1/models`); null until one answer. Absent in tests. */
   claudeModels?: () => Promise<ClaudeModel[] | null>;
   /** An OpenCode Go provider's usage windows, for the status bar's limits row (`/api/limits`). Absent in tests. */
@@ -229,9 +233,6 @@ async function claudeAccountUsage(deps: AdminDeps): Promise<{ id: string; label:
 // saved with `limits: false` opts out. Read in the provider's config order; the mod keeps Claude
 // first and otherwise follows this order.
 
-/** One window the limits row reads. `reset_at` is epoch seconds, as the other readers use. */
-export type LimitsWindow = { kind: "five_hour" | "seven_day" | "scoped" | "window"; label?: string; used_percent: number; window_minutes?: number; reset_at?: number };
-export type LimitsAccount = { account: number; windows: LimitsWindow[]; at: number };
 export type LimitsProvider = { provider: string; type: string; title: string; accounts: LimitsAccount[] };
 
 /** A `{used_percent, window_minutes, reset_at}` snapshot window as `/api/limits` reads it, or null. */
@@ -271,38 +272,39 @@ function claudeLimitWindows(quota: Record<string, unknown>): LimitsWindow[] {
   return out;
 }
 
-/** The Claude Code login's plan windows as one account (the row shows Claude as a single group). */
-async function anthropicLimitAccounts(deps: AdminDeps): Promise<LimitsAccount[]> {
-  let usage: Record<string, Record<string, unknown>>;
-  try {
-    usage = (await deps.claudeUsage?.()) ?? {};
-  } catch {
-    return [];
-  }
-  const quota = usage.current ?? Object.values(usage)[0];
-  if (!quota) return [];
-  const windows = claudeLimitWindows(quota);
-  if (!windows.length) return [];
-  const at = typeof quota.at === "number" ? quota.at : Date.now();
-  return [{ account: 0, windows, at }];
+/** All Claude accounts, including those awaiting their first quota snapshot or a new sign-in. */
+async function anthropicLimitAccounts(deps: AdminDeps, name: string, refresh: boolean): Promise<LimitsAccount[]> {
+  const usage: Record<string, Record<string, unknown>> = await deps.claudeUsage?.(refresh).catch(() => ({})) ?? {};
+  const reports = deps.credentials?.()[name] ?? [];
+  const stored = listClaudeAccounts(homeDir());
+  const active = deps.claudeActive?.()[name];
+  // The live proxy reports the current login even before its first usage fetch succeeds. Reuse that
+  // metadata rather than rediscovering local credentials on every limits poll.
+  const hasCurrent = active === "current" || !!usage.current || reports.some((r) => r.id === "current");
+  const accounts = [
+    ...(hasCurrent ? [{ id: "current", label: "Current Claude login", preferred: !stored.some((a) => a.preferred), needsReauth: false, expiresAt: Infinity }] : []),
+    ...stored,
+  ];
+  const now = Date.now();
+  return accounts.map((account, index) => {
+    const report = reports.find((r) => r.id === account.id);
+    const state = account.needsReauth ? "needs-login" : report?.state ?? (account.id === "current" || account.expiresAt <= now ? "needs-login" : "ready");
+    const quota = usage[account.id];
+    return buildLimitsAccount({
+      id: account.id, label: account.label, preferred: account.preferred, active: active !== undefined ? account.id === active : report?.active === true,
+      health: { state, ...(report?.cooldownSeconds ? { pausedUntil: now + report.cooldownSeconds * 1000 } : {}) },
+    }, index, quota ? claudeLimitWindows(quota) : [], quota, now, 5 * 60_000);
+  });
 }
 
-/** Every ChatGPT account's windows, paused and needs-login accounts left out and unnumbered. */
+/** ChatGPT has no stored preference: the first account in rotation is the default for new turns. */
 function chatgptLimitAccounts(accounts: ChatGptAccountStatus[]): LimitsAccount[] {
-  const kept = accounts.filter((a) => a.state !== "paused" && a.state !== "needs-login");
-  const out: LimitsAccount[] = [];
-  kept.forEach((account, index) => {
-    const quota = account.quota;
-    if (!quota || typeof quota.at !== "number") return;
-    const limits = quota.rate_limits as { primary?: unknown; secondary?: unknown } | undefined;
-    const windows: LimitsWindow[] = [];
-    for (const w of [limits?.primary, limits?.secondary]) {
-      const win = limitWindowFrom(w);
-      if (win) windows.push({ kind: windowKind(win.window_minutes), used_percent: win.used_percent, ...(win.window_minutes !== undefined ? { window_minutes: win.window_minutes } : {}), ...(win.reset_at !== undefined ? { reset_at: win.reset_at } : {}) });
-    }
-    if (windows.length) out.push({ account: index, windows, at: quota.at });
-  });
-  return out;
+  const preferred = accounts.find((a) => a.state === "ready");
+  const now = Date.now();
+  return accounts.map((account, index) => buildLimitsAccount({
+    id: account.id, label: account.email || account.label, preferred: account.id === preferred?.id, active: account.active,
+    health: { state: account.state, ...(account.cooldownSeconds ? { pausedUntil: now + account.cooldownSeconds * 1000 } : {}) },
+  }, index, account.quota ? claudeLimitWindows(account.quota) : [], account.quota, now, 10 * 60_000));
 }
 
 /** Every Antigravity account's windows (Gemini's own plus the third-party ones), paused left out. */
@@ -329,14 +331,15 @@ async function googleLimitAccounts(deps: AdminDeps, name: string): Promise<Limit
 }
 
 /** Every provider whose quota can be read, in one shape, for `GET /api/limits`. */
-async function buildLimits(deps: AdminDeps): Promise<{ providers: LimitsProvider[] }> {
+async function buildLimits(deps: AdminDeps, refresh = false): Promise<{ providers: LimitsProvider[] }> {
   const providers: LimitsProvider[] = [];
-  const chatgpt = deps.chatgpt?.();
-  const accounts = chatgpt?.accounts?.() ?? {};
+  // Limits is a standalone reader: do not rely on a Status request to refresh ChatGPT first.
+  const chatgpt = await chatgptStatus(deps, { refresh });
+  const accounts = chatgpt.accounts;
   for (const [name, p] of Object.entries(deps.config().providers)) {
     if (p.limits === false) continue;
     if (p.type === "anthropic" && p.auth === "claude-code") {
-      const rows = await anthropicLimitAccounts(deps);
+      const rows = await anthropicLimitAccounts(deps, name, refresh);
       if (rows.length) providers.push({ provider: name, type: "anthropic", title: "Claude", accounts: rows });
     } else if (p.type === "chatgpt") {
       const rows = chatgptLimitAccounts(accounts[name] ?? []);
@@ -1953,7 +1956,8 @@ export function startAdmin(deps: AdminDeps): Promise<{ port: number; close(): vo
       }
       // One shape for every provider whose quota can be read, for the status bar's limits row.
       if (pathname === "/api/limits" && method === "GET") {
-        sendJson(res, 200, await buildLimits(deps));
+        const refresh = new URL(url, "http://127.0.0.1").searchParams.get("refresh") === "1";
+        sendJson(res, 200, await buildLimits(deps, refresh));
         return;
       }
       if (pathname === "/api/mod-settings" && method === "GET") {
