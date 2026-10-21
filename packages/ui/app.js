@@ -281,7 +281,7 @@ function limitsReset(window, weekly, now) {
   return t("limits.resetsIn", { hours: Math.floor(minutes / 60), minutes: minutes % 60 });
 }
 
-function limitsWindowRow(label, window, pace, weekly, now) {
+function limitsWindowRow(label, window, weekly, now) {
   const known = window && Number.isFinite(window.usedPercent);
   const percent = known ? `${Math.round(window.usedPercent * 10) / 10}%` : t("limits.unknown");
   const reset = limitsReset(window, weekly, now);
@@ -296,18 +296,10 @@ function limitsWindowRow(label, window, pace, weekly, now) {
     fill.style.width = `${Math.max(0, Math.min(100, window.usedPercent))}%`;
     track.appendChild(fill);
   }
-  const hasPace = known && pace && Number.isFinite(pace.expectedPercent) && Number.isFinite(pace.paceDelta);
-  if (hasPace) {
-    const tick = el("span", { class: "limits-pace-tick", "aria-hidden": "true" });
-    tick.style.left = `${Math.max(0, Math.min(100, pace.expectedPercent))}%`;
-    track.appendChild(tick);
-  }
-  const paceText = hasPace ? t(pace.paceDelta > 0 ? "limits.ahead" : pace.paceDelta < 0 ? "limits.behind" : "limits.onPace", { points: Math.round(Math.abs(pace.paceDelta) * 10) / 10 }) : null;
-  if (paceText) track.title += ` · ${paceText}`;
   return el("div", { class: "limits-window" }, [
     el("div", { class: "limits-window-head" }, [el("span", { text: label }), el("span", { text: percent })]),
     track,
-    el("div", { class: "limits-window-foot" }, [el("span", { text: reset }), paceText ? el("span", { class: "limits-pace-label", text: paceText }) : null]),
+    el("div", { class: "limits-window-foot" }, [el("span", { text: reset })]),
   ]);
 }
 
@@ -329,8 +321,8 @@ function limitsAccountRow(account, now) {
       el("div", { class: "limits-badges" }, [...badges, el("span", { class: "limits-fetched", text: fetched })]),
     ]),
     el("div", { class: "limits-windows" }, [
-      limitsWindowRow(t("limits.fiveHour"), windows.fiveHour, null, false, now),
-      limitsWindowRow(t("limits.weekly"), windows.weekly, account.weeklyPace, true, now),
+      limitsWindowRow(t("limits.fiveHour"), windows.fiveHour, false, now),
+      limitsWindowRow(t("limits.weekly"), windows.weekly, true, now),
     ]),
   ]);
 }

@@ -412,7 +412,7 @@ label.check input { margin-top: 2px; }
 .provider-status .cell-text strong { font-weight: 500; }
 .provider-status .account-usage { display: grid; gap: 1px; }
 
-/* One scale (0–100%) for both windows; the tick marks expected weekly consumption, not a limit. */
+/* One scale (0–100%) for both windows. */
 .provider-block { position: relative; }
 .group > * + .provider-block::before { content: ""; position: absolute; top: 0; left: 16px; right: 0; height: 1px; background: var(--separator); }
 .provider-limits { padding: 0 16px 14px; }
@@ -433,13 +433,10 @@ label.check input { margin-top: 2px; }
 .limits-track.unknown { background: repeating-linear-gradient(135deg, var(--fill) 0 4px, transparent 4px 8px); }
 .limits-account .limits-track { background: var(--fill-press); }
 .limits-account .limits-track.unknown { background: repeating-linear-gradient(135deg, var(--fill-press) 0 4px, transparent 4px 8px); }
-.limits-pace-tick { position: absolute; top: -3px; height: 14px; width: 2px; transform: translateX(-1px); background: var(--label); box-shadow: none; }
-.limits-pace-label::before { content: ""; display: inline-block; height: 9px; border-left: 2px solid var(--label); margin-right: 5px; }
 .limits-fetched { color: var(--label-2); font-size: var(--fs-cap); }
 @media (forced-colors: active) {
   .limits-track { border: 1px solid CanvasText; }
   .limits-fill { background: Highlight; forced-color-adjust: none; }
-  .limits-pace-tick { background: CanvasText; forced-color-adjust: none; }
 }
 
 /* ---- Model mapping ------------------------------------------------------------------- */

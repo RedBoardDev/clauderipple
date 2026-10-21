@@ -44,7 +44,7 @@ function limitsUi(api: (path: string) => Promise<unknown>) {
     ${limits}; ${providers}; return { refreshLimits, limitsAccountRow, limitsWindowRow };`) as (...args: unknown[]) => {
     refreshLimits(): Promise<void>;
     limitsAccountRow(account: unknown, now: number): Element;
-    limitsWindowRow(label: string, window: unknown, pace: unknown, weekly: boolean, now: number): Element;
+    limitsWindowRow(label: string, window: unknown, weekly: boolean, now: number): Element;
   };
   const ui = build(api, el, t, (selector: string) => selector === "#health-providers" ? box : null,
     (kind: string, label: string) => el("span", { class: `badge ${kind}`, text: label }), (label: string) => el("p", { text: label }));
@@ -79,8 +79,7 @@ test("Providers carries each subscription account's limits and marks retained fi
   assert.match(text(ui.card), /Paused until/);
   assert.match(text(ui.card), /Unknown/);
   assert.match(text(ui.card), /125%/);
-  assert.match(text(ui.card), /ahead by 75 pts/);
-  assert.equal(findAll(ui.card, hasClass("limits-pace-tick")).length, 1);
+  assert.doesNotMatch(text(ui.card), /ahead by|behind by|on pace/, "no weekly pace for now");
   assert.equal(findAll(ui.card, (n) => n.tag === "img").length, 0, "labels remain text, never HTML");
   assert.match(text(ui.card), /<img src=x/);
   fail = true;
@@ -89,21 +88,19 @@ test("Providers carries each subscription account's limits and marks retained fi
   assert.equal(findAll(ui.card, (n) => n.attrs.text === "Stale").length, 3);
 });
 
-test("window bars expose the true percentage, named reset times and pace without guessing missing data", () => {
+test("window bars expose the true percentage, named reset times without guessing missing data", () => {
   const ui = limitsUi(async () => ({}));
   const now = Date.parse("2026-10-21T12:00:00Z");
-  const five = ui.limitsWindowRow("5 hours", { usedPercent: 23, resetAt: now + 134 * 60_000 }, null, false, now);
+  const five = ui.limitsWindowRow("5 hours", { usedPercent: 23, resetAt: now + 134 * 60_000 }, false, now);
   assert.match(text(five), /resets in 2h 14m/);
-  const weekly = ui.limitsWindowRow("Weekly", { usedPercent: 125, resetAt: now + 86400_000 }, { expectedPercent: 50, paceDelta: 75 }, true, now);
+  const weekly = ui.limitsWindowRow("Weekly", { usedPercent: 125, resetAt: now + 86400_000 }, true, now);
   const bar = findAll(weekly, (node) => node.attrs.role === "progressbar")[0]!;
   assert.equal(bar.attrs["aria-valuenow"], 100);
   assert.match(String(bar.attrs["aria-valuetext"]), /125%/);
   assert.equal(findAll(weekly, hasClass("limits-fill"))[0]?.style.width, "100%");
-  assert.equal(findAll(weekly, hasClass("limits-pace-tick"))[0]?.style.left, "50%");
   assert.match(text(weekly), /resets /);
-  const missing = ui.limitsWindowRow("Weekly", { usedPercent: 5 }, null, true, now);
+  const missing = ui.limitsWindowRow("Weekly", { usedPercent: 5 }, true, now);
   assert.match(text(missing), /Reset time unknown/);
-  assert.equal(findAll(missing, hasClass("limits-pace-tick")).length, 0);
 });
 
 test("Status shows Claude usage after reload without config or a fresh observed sign-in source", () => {

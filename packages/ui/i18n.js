@@ -2499,7 +2499,6 @@ Object.assign(I18N.en, {
   "limits.pausedUntil": "Paused until {time}", "limits.paused": "Paused", "limits.needsLogin": "Needs login", "limits.stale": "Stale",
   "limits.fiveHour": "5 hours", "limits.weekly": "Weekly", "limits.unknown": "Unknown", "limits.resetUnknown": "Reset time unknown",
   "limits.resetsIn": "resets in {hours}h {minutes}m", "limits.resetsAt": "resets {time}",
-  "limits.ahead": "ahead by {points} pts", "limits.behind": "behind by {points} pts", "limits.onPace": "on pace",
   "limits.fetchedAt": "Updated {time}", "limits.notFetched": "No usage snapshot yet",
 });
 for (const locale of Object.values(I18N)) {
