@@ -301,10 +301,16 @@ async function anthropicLimitAccounts(deps: AdminDeps, name: string, refresh: bo
 function chatgptLimitAccounts(accounts: ChatGptAccountStatus[]): LimitsAccount[] {
   const preferred = accounts.find((a) => a.state === "ready");
   const now = Date.now();
-  return accounts.map((account, index) => buildLimitsAccount({
-    id: account.id, label: account.email || account.label, preferred: account.id === preferred?.id, active: account.active,
-    health: { state: account.state, ...(account.cooldownSeconds ? { pausedUntil: now + account.cooldownSeconds * 1000 } : {}) },
-  }, index, account.quota ? claudeLimitWindows(account.quota) : [], account.quota, now, 10 * 60_000));
+  return accounts.map((account, index) => {
+    // The quota map keeps an account's last figures forever: a paused or signed-out account would
+    // show them frozen (and at 0% after its reset) in the mod band and the phone, which read only
+    // `windows`. Such an account is listed with its state and no windows.
+    const live = account.state !== "paused" && account.state !== "needs-login";
+    return buildLimitsAccount({
+      id: account.id, label: account.email || account.label, preferred: account.id === preferred?.id, active: account.active,
+      health: { state: account.state, ...(account.cooldownSeconds ? { pausedUntil: now + account.cooldownSeconds * 1000 } : {}) },
+    }, index, live && account.quota ? claudeLimitWindows(account.quota) : [], live ? account.quota : undefined, now, 10 * 60_000);
+  });
 }
 
 /** Every Antigravity account's windows (Gemini's own plus the third-party ones), paused left out. */

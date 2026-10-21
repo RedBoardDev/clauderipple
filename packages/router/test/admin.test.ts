@@ -2566,7 +2566,8 @@ test("GET /api/limits assembles every readable provider and honours limits:false
       accounts: () => ({
         chatgpt: [
           { id: "a", label: "A", paused: false, state: "ready", quota: { at: now, rate_limits: { primary: { used_percent: 23, window_minutes: 10080, reset_at: future }, secondary: null } }, active: true },
-          { id: "b", label: "B", paused: true, state: "paused", quota: null, active: false },
+          // A paused account keeps its last figures in the quota map; they must not reach `windows`.
+          { id: "b", label: "B", paused: true, state: "paused", quota: { at: now, rate_limits: { primary: { used_percent: 97, window_minutes: 10080, reset_at: future }, secondary: null } }, active: false },
         ] as never,
         quiet: [{ id: "c", label: "C", paused: false, state: "ready", quota: { at: now, rate_limits: { primary: { used_percent: 5, window_minutes: 10080 } } }, active: false }] as never,
       }),

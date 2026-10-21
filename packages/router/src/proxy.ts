@@ -1392,8 +1392,10 @@ export class Proxy {
           this.pool.penalise(penalised.provider, penalised.id, status, retryAfterMs(upRes.headers), errBody);
           if (status === 401 && cfg.providers[penalised.provider]?.type === "anthropic") this.claudeAccounts.reject(penalised.id);
         } else if (status >= 200 && status < 300) this.pool.succeed(penalised.provider, penalised.id, chosen?.ownerId);
-      } else if (!route && isApiHost && status >= 200 && status < 300) {
+      } else if (!route && isApiHost && pathname === "/v1/messages" && status >= 200 && status < 300) {
         // Native passthrough uses the caller's current Claude login, not a selected pool account.
+        // Model answers only: telemetry and token counts on the same host would mark it active
+        // while the conversation runs on an added account.
         for (const [name, provider] of Object.entries(cfg.providers)) {
           if (provider.type === "anthropic" && provider.auth === "claude-code") this.pool.succeed(name, "current");
         }
