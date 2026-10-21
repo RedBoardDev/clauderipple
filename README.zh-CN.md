@@ -158,7 +158,7 @@ Claude Code 的系统提示词和工具描述是为 Claude 编写的，所以其
 | 需格式转换的供应商的提示缓存 | 实测 **94–99 %** | 未测量 | 未测量 | 不定 | 不适用 |
 | 任务面板中以真实模型名标注子代理 | ✅ | ❌ | ❌ | ❌ | ❌ |
 | 图形化设置界面，无需终端 | ✅ | ✅ | ❌ | ❌ | ❌ |
-| 经签名和公证、自带运行时的应用 | ✅ | ✅ | ❌ | ❌ | – |
+| macOS 原生菜单栏应用；Windows 为 Electron 托盘 | ✅ | - | ❌ | ❌ | - |
 
 ¹ opencodex 的 README 在演示中展示过 Claude Desktop，但无论在代码仓库还是文档站点上，都没有公布相应的配置步骤（2026-09-16 核实）。当时接入桌面应用的唯一公开途径就是官方网关设置——即最后一列。
 
@@ -182,7 +182,7 @@ Claude Code 的系统提示词和工具描述是为 Claude 编写的，所以其
 - **用 ChatGPT 订阅生成图片。** `clauderipple image "<prompt>"`，支持参考图和透明背景。子代理会被告知用法，因此 GPT 或 DeepSeek worker 无需图像工具也能生成图片并查看结果。
 - **合上笔记本，Claude 照样干活。** 在 macOS 和 Windows 上，Claude 工作期间（以及结束后 10 分钟内）笔记本合盖也不睡眠，所以你从手机发起的任务能做完。Wi-Fi 断了网，它会转到手机热点（iPhone 或 Android），之后再回到已知的 Wi-Fi。该功能默认关闭，需要在控制面板的“笔记本管理”中打开；见[合盖与手机热点](#合盖与手机热点)。
 - **按需精简 worker。** 打开一个开关，生成的子代理就只获得 worker 会用到的工具，而不是会话中的所有 MCP 服务器和插件：某个 worker 的首个请求因此从 33k token 降到了 9k token。
-- **为不想碰终端的人而设计。** 供应商预设支持一键连接测试和模型发现，下拉式模型映射，自动保存，韩语和英语界面。菜单栏应用自带运行时，首次启动时自动完成设置。经过签名和公证。
+- **为不想碰终端的人而设计。** 供应商预设支持一键连接测试和模型发现，下拉式模型映射，自动保存，韩语和英语界面。macOS 上是 `apps/macos` 中的原生菜单栏应用，Windows 上是自带运行时、首次启动时自动完成设置的 Electron 托盘。
 
 <p align="center">
   <img src="docs/media/mapping.png" width="880" alt="模型映射：每个 Claude 模型名由哪个模型作答，以及各模型的推理强度">
@@ -257,21 +257,22 @@ clauderipple ui
 
 **供应商** → 添加 ChatGPT 或粘贴 API 密钥 → **模型映射**。
 
-**菜单栏 / 托盘应用**是可选的。它显示路由服务的状态，点一下就能打开控制面板：
+**菜单栏 / 托盘应用**是可选的。在 macOS 上，[`apps/macos`](apps/macos) 中的原生菜单栏应用取代了 Electron 托盘。从源码检出安装时，运行 `apps/macos/build.sh install`（`/Applications/ClaudeRipple.app`，bundle id 为 `com.clauderipple.mac`）。然后这样打开：
 
 ```sh
 clauderipple tray
 ```
 
-它基于 Electron，体积约 270MB，因此默认不安装。`clauderipple tray --install` 会下载一次；除此之外的一切不需要它也能正常工作。
+在 macOS 上，`tray`、`tray --install`、`tray --ensure` 和 `app --install` 都会打开原生应用；若尚未安装，CLI 会打印安装命令。该应用自行管理登录项，即使路由服务已停止，也能通过 CLI 提供恢复功能。
+Windows 继续使用 Electron 托盘、其登录项和故障通知。在 Windows 和 Linux 上，`clauderipple tray --install` 会下载一次 Electron（约 270MB）；除此之外的一切不需要它也能正常工作。
 
-**更新。** 有新版本时，托盘应用会提示（**检查更新…**），也可以运行：
+**更新。** Windows 托盘提供**检查更新…**，在任何平台上也都可以使用 CLI：
 
 ```sh
 clauderipple update
 ```
 
-它会按你当初的安装方式更新——再次运行安装脚本，或通过 npm——然后以新版本重启路由服务。托盘应用的 Electron 会在更新后保留。
+它会按你当初的安装方式更新——再次运行安装脚本，或通过 npm——然后以新版本重启路由服务。Windows / Linux 托盘应用的 Electron 会在更新后保留；macOS 原生应用则需从 `apps/macos` 单独构建和安装。
 
 可选：若要在 Desktop 模型选择器中显示真实名称，请依次进入 **客户端 → Claude Desktop → 模型选择器 → 开启**，然后退出并重新打开 Claude Desktop。为了仅为你的用户信任本地证书，macOS 会要求输入登录密码，Windows 会显示带有证书指纹的确认对话框；Linux 则直接将其添加到你的 NSS 数据库，不做询问。ClaudeRipple 永远看不到任何密码，所有平台都不需要管理员权限。
 
