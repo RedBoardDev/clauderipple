@@ -65,11 +65,14 @@ test("Providers carries each subscription account's limits and marks retained fi
   });
   await ui.refreshLimits();
   assert.deepEqual(paths, ["/api/limits"]);
-  const rows = findAll(ui.card, hasClass("cell"));
-  assert.equal(rows.length, 3, "one row per provider, no separate Limits card");
+  const rows = ui.card.children;
+  assert.equal(rows.length, 3, "one entry per provider, no separate Limits card");
+  assert.ok(hasClass("provider-block")(rows[0]!) && hasClass("provider-block")(rows[1]!));
   assert.equal(findAll(rows[0]!, hasClass("limits-account")).length, 2);
   assert.equal(findAll(rows[1]!, hasClass("limits-account")).length, 1);
+  assert.equal(findAll(rows[0]!.children[0]!, hasClass("limits-account")).length, 0, "the clickable row holds only the name and state");
   assert.doesNotMatch(text(rows[0]!), /text quota|text pool/, "gauges replace the text lines");
+  assert.ok(hasClass("cell")(rows[2]!));
   assert.match(text(rows[2]!), /text quota other/, "a provider without limits keeps its text lines");
   assert.match(text(ui.card), /Active/);
   assert.match(text(ui.card), /Preferred/);

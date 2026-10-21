@@ -322,14 +322,16 @@ function limitsAccountRow(account, now) {
   else if (health.state === "needs-login") badges.push(badge("bad", t("limits.needsLogin")));
   if (account.stale || limitsFailed) badges.push(badge("warn", t("limits.stale")));
   const windows = account.usageWindows || {};
+  const fetched = Number.isFinite(account.fetchedAt) ? t("limits.fetchedAt", { time: new Date(account.fetchedAt).toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" }) }) : t("limits.notFetched");
   return el("div", { class: "limits-account", "data-account-id": account.id }, [
     el("div", { class: "limits-account-head" }, [
       el("strong", { text: account.label || account.id }),
-      el("div", { class: "limits-badges" }, badges),
+      el("div", { class: "limits-badges" }, [...badges, el("span", { class: "limits-fetched", text: fetched })]),
     ]),
-    limitsWindowRow(t("limits.fiveHour"), windows.fiveHour, null, false, now),
-    limitsWindowRow(t("limits.weekly"), windows.weekly, account.weeklyPace, true, now),
-    el("div", { class: "limits-fetched", text: Number.isFinite(account.fetchedAt) ? t("limits.fetchedAt", { time: new Date(account.fetchedAt).toLocaleTimeString() }) : t("limits.notFetched") }),
+    el("div", { class: "limits-windows" }, [
+      limitsWindowRow(t("limits.fiveHour"), windows.fiveHour, null, false, now),
+      limitsWindowRow(t("limits.weekly"), windows.weekly, account.weeklyPace, true, now),
+    ]),
   ]);
 }
 
@@ -820,7 +822,6 @@ function renderHealthProviders() {
     const live = status && status.providers && status.providers[name];
     const lines = [];
     const limits = providerLimits(name);
-    if (limits) lines.push(el("div", { class: "provider-limits" }, limits.accounts.map((account) => limitsAccountRow(account, Date.now()))));
     // Without `/api/limits` figures (an older router, a failed read) the text lines stand in for them.
     const quota = limits ? null : quotaLine(name);
     if (quota) lines.push(el("span", { class: "cell-sub", text: quota }));
@@ -844,10 +845,13 @@ function renderHealthProviders() {
     // The row opens the provider's own page; a button inside it keeps its own click.
     const row = cell(el("span", { class: "cell-label", text: name }), [providerState(name, provider), chevronIcon()], lines, "provider-status link");
     row.tabIndex = 0;
-    const open = (event) => { if (!event.target.closest("button, a, .provider-limits")) openProvider(name, provider); };
+    const open = (event) => { if (!event.target.closest("button, a")) openProvider(name, provider); };
     row.addEventListener("click", open);
     row.addEventListener("keydown", (event) => { if (event.key === "Enter" && event.target === row) open(event); });
-    return row;
+    // The gauges sit under the row at full width; only the row (name and state) opens the provider.
+    if (!limits) return row;
+    const now = Date.now();
+    return el("div", { class: "provider-block" }, [row, el("div", { class: "provider-limits" }, limits.accounts.map((account) => limitsAccountRow(account, now)))]);
   }));
 }
 
