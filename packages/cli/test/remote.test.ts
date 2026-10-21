@@ -77,6 +77,7 @@ test("remote add: ssh argv, CA, settings merge with a one-time backup, agents, c
   });
   assert.ok(f.out.some((l) => l.includes("deep-y.md") && l.includes("not ours")));
   assert.deepEqual(configuredHosts(f.configFile), [{ host: "me@box", port: 18799 }]);
+  assert.equal(fs.statSync(f.configFile).mode & 0o777, 0o600, "config.json carries provider keys");
   assert.ok(!fs.readdirSync(f.remote(".claude")).some((n) => n.includes("clauderipple-tmp")), "no temp files left");
 
   // Again, after the remote settings changed by hand: the backup is not replaced.

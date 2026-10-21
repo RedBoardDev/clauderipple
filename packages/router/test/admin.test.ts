@@ -557,7 +557,7 @@ test("HEAD answers a read-only route with its headers and no body", async () => 
     assert.equal(headCss.headers.get("content-length"), getCss.headers.get("content-length"), "the length of the body a GET would have sent");
     // The body is the part a HEAD must not carry, and `fetch` never exposes one — read the wire.
     const wire = await new Promise<string>((done, fail) => {
-      const sock = net.connect(port, "127.0.0.1", () => sock.write("HEAD /style.css HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n"));
+      const sock = net.connect(port, "127.0.0.1", () => sock.write(`HEAD /style.css HTTP/1.1\r\nHost: 127.0.0.1:${port}\r\nConnection: close\r\n\r\n`));
       let text = "";
       sock.on("data", (chunk: Buffer) => { text += chunk.toString("latin1"); });
       sock.on("close", () => done(text));
@@ -749,6 +749,15 @@ test("PUT /api/config accepts a valid config and saves it atomically", async () 
     const dir = fs.readdirSync(path.dirname(configFile));
     assert.ok(!dir.some((f) => f.includes(".tmp-")));
     setCfg(next);
+  });
+});
+
+test("PUT /api/config leaves config.json readable by its owner only, even one that was not", async () => {
+  await withAdmin(makeCfg(), async ({ port, configFile }) => {
+    fs.chmodSync(configFile, 0o644);
+    const res = await fetch(`${base()}:${port}/api/config`, { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify(makeCfg()) });
+    assert.equal(res.status, 200);
+    assert.equal(fs.statSync(configFile).mode & 0o777, 0o600);
   });
 });
 
@@ -1402,10 +1411,46 @@ test("the Origin guard covers the other state-changing endpoints too", async () 
       const res = await fetch(`${base()}:${port}${p}`, { method: "POST", headers: { origin: "http://evil.example" } });
       assert.equal(res.status, 403, `${p} must refuse a cross-site POST`);
     }
-    // Reading is not gated: a cross-site page cannot see the response anyway.
+    // A read is not gated on Origin (a cross-site page cannot see the response); the Host and
+    // sec-fetch-site guard below is what turns a browser read away.
     const get = await fetch(`${base()}:${port}/api/status`, { headers: { origin: "http://evil.example" } });
     assert.equal(get.status, 200);
   });
+});
+
+/** A request with exactly these headers: fetch sets Host itself and cannot be told otherwise. */
+function rawRequest(port: number, method: string, pathname: string, headers: Record<string, string>): Promise<number | undefined> {
+  return new Promise((resolve, reject) => {
+    const req = http.request({ host: "127.0.0.1", port, method, path: pathname, headers }, (res) => {
+      res.resume();
+      res.on("end", () => resolve(res.statusCode));
+    });
+    req.on("error", reject);
+    req.end();
+  });
+}
+
+test("every admin route refuses a rebound Host and a cross-site browser request, reads included", async () => {
+  let called = 0;
+  await withAdmin(
+    makeCfg(),
+    async ({ port }) => {
+      for (const host of ["evil.example", `evil.example:${port}`, "127.0.0.1:1", `127.0.0.2:${port}`]) {
+        assert.equal(await rawRequest(port, "GET", "/api/config", { host }), 403, `Host ${host} must be refused`);
+      }
+      assert.equal(await rawRequest(port, "GET", "/api/config", { host: `127.0.0.1:${port}`, "sec-fetch-site": "cross-site" }), 403);
+      assert.equal(await rawRequest(port, "POST", "/api/shutdown", { host: `evil.example:${port}` }), 403);
+      assert.equal(called, 0);
+      for (const host of [`127.0.0.1:${port}`, `localhost:${port}`, `[::1]:${port}`]) {
+        assert.equal(await rawRequest(port, "GET", "/api/config", { host }), 200, `Host ${host} must be allowed`);
+      }
+      assert.equal(await rawRequest(port, "GET", "/api/config", { host: `127.0.0.1:${port}`, "sec-fetch-site": "same-origin" }), 200);
+      // The tray's ripple://app/ proxy (protocol.ts): Host 127.0.0.1:<port>, no Origin, a write.
+      assert.equal(await rawRequest(port, "POST", "/api/shutdown", { host: `127.0.0.1:${port}`, accept: "*/*" }), 202);
+      assert.equal(called, 1);
+    },
+    { shutdown: () => void called++ },
+  );
 });
 
 test("GET /api/claude-models de-duplicates surfaces and drops our own injected ids", async () => {

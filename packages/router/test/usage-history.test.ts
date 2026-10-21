@@ -187,6 +187,20 @@ test("a restart replays requests.jsonl.1 when a long request straddled the rotat
   });
 });
 
+test("usage-hourly.jsonl is readable by its owner only, even one written before that rule", () => {
+  withDir((dir) => {
+    const file = path.join(dir, "requests.jsonl");
+    const history = path.join(dir, "usage-hourly.jsonl");
+    fs.writeFileSync(history, "", { mode: 0o644 });
+    const log = new RequestLog(file);
+    log.add(record("h11", "2026-10-20T11:05:00.000Z", { usage: usage(10, 0, 0) }));
+    // A record in the next hour closes hour 11, which appends it.
+    log.add(record("h12", "2026-10-20T12:05:00.000Z", { usage: usage(1, 0, 0) }));
+    assert.ok(fs.readFileSync(history, "utf8").length > 0);
+    assert.equal(fs.statSync(history).mode & 0o777, 0o600);
+  });
+});
+
 test("malformed usage-history lines are skipped and good ones still count", () => {
   withDir((dir) => {
     const file = path.join(dir, "requests.jsonl");

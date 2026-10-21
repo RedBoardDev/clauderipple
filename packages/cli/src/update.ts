@@ -11,6 +11,11 @@
 //   * A packaged app or a source checkout is not updated from here.
 // Either way `install` runs afterwards from the new files; it restarts a router still running
 // the old version, which re-running the installer never did before.
+//
+// This copy is a fork: the published package and install script are upstream's, and installing
+// them would replace the fork's code with theirs. So the update source defaults to the fork's own
+// checkout, which `update` does not drive (it explains the steps instead), and the registry is not
+// asked. CLAUDERIPPLE_UPDATE_SOURCE=upstream restores the published flow.
 
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";
@@ -20,6 +25,23 @@ import { windowsPowerShellEnv } from "./windows-powershell.ts";
 import type { Runtime } from "./runtime.ts";
 
 export const PACKAGE = "clauderipple";
+
+export type UpdateSource = "fork" | "upstream";
+
+/** Where updates come from: the fork's checkout unless CLAUDERIPPLE_UPDATE_SOURCE=upstream says otherwise. */
+export function updateSource(env: NodeJS.ProcessEnv = process.env): UpdateSource {
+  return env.CLAUDERIPPLE_UPDATE_SOURCE === "upstream" ? "upstream" : "fork";
+}
+
+/** How a fork install is updated, from its checkout (CLAUDE.md). */
+export const FORK_UPDATE_STEPS = [
+  "This ClaudeRipple is a fork; `clauderipple update` does not install the published (upstream) version over it.",
+  "Update it from the fork's checkout:",
+  "  git pull && npm pack",
+  "  npm install --prefix ~/.clauderipple/lib ./clauderipple-<version>.tgz",
+  "  clauderipple restart",
+  "To follow the published releases instead, run with CLAUDERIPPLE_UPDATE_SOURCE=upstream.",
+].join("\n");
 const SCRIPT_BASE = "https://raw.githubusercontent.com/PBJ-2/clauderipple/main/scripts";
 
 export type InstallKind =

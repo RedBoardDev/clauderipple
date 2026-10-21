@@ -73,7 +73,7 @@ test("the osascript call is one admin do-shell-script with the script escaped", 
 });
 
 test("Insomnia cleanup: agent out, plist and app to the Trash, app quit, keychain item deleted — in that order", () => {
-  const steps = insomniaCleanupSteps({ uid: 501, home: "/Users/pbj", exists: () => true });
+  const steps = insomniaCleanupSteps({ uid: 501, home: "/Users/pbj", exists: () => true, insomniaApp: true });
   assert.deepEqual(steps.map((s) => (s.kind === "run" ? [s.file, ...s.args].join(" ") : `trash ${s.path}`)), [
     "/bin/launchctl bootout gui/501/com.insomnia.backstop",
     "trash /Users/pbj/Library/LaunchAgents/com.insomnia.backstop.plist",
@@ -81,12 +81,18 @@ test("Insomnia cleanup: agent out, plist and app to the Trash, app quit, keychai
     "trash /Users/pbj/Applications/Insomnia.app",
     "/usr/bin/security delete-generic-password -s insomnia-hotspot",
   ]);
-  assert.equal(insomniaCleanupSteps({ uid: 501, home: "/Users/pbj", exists: () => false }).filter((s) => s.kind === "trash").length, 0);
+  assert.equal(insomniaCleanupSteps({ uid: 501, home: "/Users/pbj", exists: () => false, insomniaApp: false }).filter((s) => s.kind === "trash").length, 0);
+});
+
+test("Insomnia cleanup leaves another app named Insomnia running and in place", () => {
+  const steps = insomniaCleanupSteps({ uid: 501, home: "/Users/pbj", exists: () => true, insomniaApp: false });
+  assert.ok(!steps.some((s) => s.kind === "run" && s.file === "/usr/bin/killall"));
+  assert.ok(!steps.some((s) => s.kind === "trash" && s.path.endsWith("Insomnia.app")));
 });
 
 // ---- Orchestration with a fake Mac --------------------------------------------------------------
 
-function deps(o: { platform?: NodeJS.Platform; insomnia?: boolean; osascript?: RunResult; trashCli?: boolean } = {}) {
+function deps(o: { platform?: NodeJS.Platform; insomnia?: boolean; appId?: string; osascript?: RunResult; trashCli?: boolean } = {}) {
   const calls: { file: string; args: string[] }[] = [];
   const printed: string[] = [];
   const trashed: string[] = [];
@@ -100,6 +106,7 @@ function deps(o: { platform?: NodeJS.Platform; insomnia?: boolean; osascript?: R
       calls.push({ file, args });
       if (file === "/usr/sbin/networksetup") return { code: 0, stdout: PORTS, stderr: "" };
       if (file === "/usr/bin/osascript") return o.osascript ?? { code: 0, stdout: "", stderr: "" };
+      if (file === "/usr/bin/plutil") return { code: 0, stdout: `${o.appId ?? "com.kgarg.insomnia"}\n`, stderr: "" };
       if (file === "/usr/bin/trash") return o.trashCli === false ? { code: -1, stdout: "", stderr: "ENOENT" } : { code: 0, stdout: "", stderr: "" };
       return { code: 0, stdout: "", stderr: "" };
     },
@@ -135,6 +142,7 @@ test("setup: one privileged call with the rule's own hash, a sudo -n check, then
   assert.deepEqual(t.removed, [temp], "the temp file is removed");
   const sudoCheck = files.indexOf("/usr/bin/sudo");
   assert.deepEqual(t.calls[sudoCheck]!.args, ["-n", "-l", "/usr/bin/pmset", "-a", "disablesleep", "1"]);
+  assert.ok(files.indexOf("/usr/bin/plutil") < files.indexOf("/usr/bin/osascript"), "the app is identified before the dialog");
   const after = files.slice(sudoCheck + 1);
   assert.deepEqual(after, ["/bin/launchctl", "/usr/bin/trash", "/usr/bin/killall", "/usr/bin/trash", "/usr/bin/security"]);
 });
@@ -147,6 +155,16 @@ test("setup without Insomnia touches nothing of it; /usr/bin/trash missing falls
   const u = deps({ insomnia: true, trashCli: false });
   assert.equal((await awakeSetup({}, u.d)).ok, true);
   assert.deepEqual(u.trashed, ["/Users/u/Library/LaunchAgents/com.insomnia.backstop.plist", "/Users/u/Applications/Insomnia.app"]);
+});
+
+test("setup with another app at ~/Applications/Insomnia.app neither quits nor trashes it, and says so", async () => {
+  const t = deps({ insomnia: true, appId: "com.insomnia.app" });
+  assert.equal((await awakeSetup({}, t.d)).ok, true);
+  assert.ok(!t.calls.some((c) => c.file === "/usr/bin/killall"));
+  assert.ok(!t.calls.some((c) => c.file === "/usr/bin/trash" && c.args[0] === "/Users/u/Applications/Insomnia.app"));
+  assert.ok(t.printed.some((l) => l.includes("left /Users/u/Applications/Insomnia.app alone") && l.includes("com.insomnia.app")));
+  // Insomnia's own leftovers (its sudoers rule, its backstop agent) are still cleared.
+  assert.ok(t.calls.some((c) => c.file === "/bin/launchctl"));
 });
 
 test("setup refuses before any prompt: another OS, a bad hotspot name; a cancelled dialog changes nothing", async () => {

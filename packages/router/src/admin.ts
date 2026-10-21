@@ -990,7 +990,8 @@ function sendJson(res: http.ServerResponse, status: number, body: unknown): void
 function writeConfigFile(configFile: string, config: Config): void {
   const tmp = `${configFile}.tmp-${process.pid}-${Date.now()}`;
   fs.mkdirSync(path.dirname(configFile), { recursive: true });
-  fs.writeFileSync(tmp, JSON.stringify(config, null, 2) + "\n");
+  // Owner-only: the config carries provider keys. The rename replaces the old file's mode too.
+  fs.writeFileSync(tmp, JSON.stringify(config, null, 2) + "\n", { mode: 0o600 });
   fs.renameSync(tmp, configFile);
 }
 
@@ -1806,8 +1807,23 @@ export function startAdmin(deps: AdminDeps): Promise<{ port: number; close(): vo
   function crossSitePost(req: http.IncomingMessage): boolean {
     const origin = req.headers.origin;
     if (!origin) return false;
-    const allowed = new Set([`http://127.0.0.1:${boundPort}`, `http://localhost:${boundPort}`]);
-    return !allowed.has(origin);
+    return !origin.startsWith("http://") || !loopbackHosts().has(origin.slice("http://".length));
+  }
+
+  /** `host:port` of this server as a client on this machine names it. */
+  function loopbackHosts(): Set<string> {
+    return new Set([`127.0.0.1:${boundPort}`, `localhost:${boundPort}`, `[::1]:${boundPort}`]);
+  }
+
+  /**
+   * Reads need a guard too: GET /api/config returns provider keys. A page on another site cannot
+   * read the response, but DNS rebinding makes it same-origin to the browser — its Host is then
+   * the attacker's name, never one of ours. `sec-fetch-site` turns away the plain cross-site
+   * request in browsers that send it. The CLI, the tray (protocol.ts sets Host to 127.0.0.1), the
+   * mod and the phone host all connect to 127.0.0.1 and send neither.
+   */
+  function foreignRequest(req: http.IncomingMessage): boolean {
+    return req.headers["sec-fetch-site"] === "cross-site" || !loopbackHosts().has(req.headers.host ?? "");
   }
 
   async function handle(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
@@ -1819,16 +1835,15 @@ export function startAdmin(deps: AdminDeps): Promise<{ port: number; close(): vo
     const method = req.method === "HEAD" ? "GET" : (req.method ?? "GET");
     const pathname = url.split("?")[0] ?? "/";
     try {
-      if (method !== "GET" && crossSitePost(req)) {
-        deps.log.warn(`admin: refused ${method} ${pathname} from origin ${String(req.headers.origin)}`);
+      if (foreignRequest(req) || (method !== "GET" && crossSitePost(req))) {
+        deps.log.warn(`admin: refused ${method} ${pathname} from host ${String(req.headers.host)}, origin ${String(req.headers.origin)}`);
         sendJson(res, 403, { error: "cross-site request refused" });
         return;
       }
       if (pathname.startsWith("/api/phone/")) {
         res.setHeader("cache-control", "no-store");
-        // Pairing is a credential read: guard GETs too, including DNS-rebinding Host values.
-        if (crossSitePost(req) || req.headers["sec-fetch-site"] === "cross-site" ||
-          !new Set([`127.0.0.1:${boundPort}`, `localhost:${boundPort}`]).has(req.headers.host ?? "")) {
+        // Pairing is a credential read: a foreign Origin is refused on GETs too.
+        if (crossSitePost(req)) {
           sendJson(res, 403, { error: "same-origin phone control required" });
           return;
         }

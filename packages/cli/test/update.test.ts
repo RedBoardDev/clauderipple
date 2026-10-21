@@ -1,6 +1,10 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { installKind, isNewer } from "../src/update.ts";
+import { spawnSync } from "node:child_process";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { installKind, isNewer, updateSource } from "../src/update.ts";
 
 test("versions compare by number, not as text", () => {
   assert.equal(isNewer("0.6.0", "0.5.1"), true);
@@ -25,4 +29,32 @@ test("an install is recognised by where its files are", () => {
   const win = { packaged: false, cli: "C:\\Users\\me\\.clauderipple\\node_modules\\clauderipple\\dist\\cli\\src\\index.js", repo: "C:\\Users\\me\\.clauderipple\\node_modules\\clauderipple" };
   assert.deepEqual(installKind(win, { platform: "win32", env: {}, home: "C:\\Users\\ME" }), { kind: "script", prefix: "C:\\Users\\me\\.clauderipple" });
   assert.equal(installKind({ ...win, repo: "C:\\Users\\me\\AppData\\Roaming\\npm\\node_modules\\clauderipple" }, { platform: "win32", env: {}, home: "C:\\Users\\me" }).kind, "npm");
+});
+
+// The fork must not be replaced by the published package: upstream only when asked for.
+test("updates come from the fork unless upstream is asked for", () => {
+  assert.equal(updateSource({}), "fork");
+  assert.equal(updateSource({ CLAUDERIPPLE_UPDATE_SOURCE: "fork" }), "fork");
+  assert.equal(updateSource({ CLAUDERIPPLE_UPDATE_SOURCE: "npm" }), "fork");
+  assert.equal(updateSource({ CLAUDERIPPLE_UPDATE_SOURCE: "upstream" }), "upstream");
+});
+
+test("update on a fork installs nothing and says how; the check never offers one", () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "cr-update-"));
+  const env: NodeJS.ProcessEnv = { ...process.env, CLAUDERIPPLE_HOME: home, CLAUDE_SETTINGS_PATH: path.join(home, "settings.json") };
+  delete env.CLAUDERIPPLE_UPDATE_SOURCE;
+  delete env.NODE_OPTIONS;
+  const cli = path.resolve(import.meta.dirname, "../src/index.ts");
+  try {
+    const update = spawnSync(process.execPath, [cli, "update"], { env, encoding: "utf8", timeout: 30_000 });
+    assert.equal(update.status, 1);
+    assert.match(update.stdout, /npm install --prefix ~\/\.clauderipple\/lib .*\.tgz\n\s*clauderipple restart/);
+    // The tray and the dashboard offer an update only when this says newer.
+    const check = spawnSync(process.execPath, [cli, "update", "--check", "--json"], { env, encoding: "utf8", timeout: 30_000 });
+    assert.equal(check.status, 0);
+    const result = JSON.parse(check.stdout.trim().split("\n").pop()!) as Record<string, unknown>;
+    assert.deepEqual([result.latest, result.newer, result.kind], [null, false, "fork"]);
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
 });
