@@ -1,0 +1,6 @@
+{"providers":[
+  {"provider":"claude","type":"anthropic","accounts":[
+    {"account":0,"windows":[{"kind":"five_hour","label":"5h","used_percent":20,"window_minutes":300,"reset_at":1800003600},
+                            {"kind":"weekly","label":"week","used_percent":35,"window_minutes":10080,"reset_at":1800345600}],"at":1799999910000}
+  ]}
+]}

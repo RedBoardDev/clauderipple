@@ -1,0 +1,10 @@
+{"version":"0.9.5","providers":{"claude":{"type":"anthropic","reachable":true,"usable":true}},
+ "chatgpt":{"accounts":{"chatgpt-subscription":[
+   {"id":"own-1","label":"","email":"me@example.com","planType":"prolite","expiresAt":1800100000000,"needsReauth":false,"paused":false,
+    "source":"own","state":"ready","active":true,
+    "quota":{"rate_limits":{"primary":{"used_percent":88,"window_minutes":10080,"reset_at":1800432000},"secondary":null},"at":1799999900000}},
+   {"id":"codex","label":"Codex","expiresAt":1800100000000,"needsReauth":false,"paused":false,"source":"codex",
+    "state":"cooling","cooldownSeconds":600,"quota":null,"active":false},
+   {"id":"own-2","label":"Later","expiresAt":1800100000000,"needsReauth":false,"paused":false,"source":"own","state":"warming-up","active":false}
+ ]}},
+ "credentials":{"claude":[{"id":"0b5c6a1e-0000-4000-8000-000000000001","state":"cooling","cooldownSeconds":120}]}}

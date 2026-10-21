@@ -59,6 +59,24 @@ public enum Format {
         return date.formatted(style)
     }
 
+    /// "5h 14% · Week 10%" for an account row; a full window adds when it reopens, the only time the
+    /// reset matters. Nil while the usage is unknown.
+    public static func quotaLine(_ quota: Quota?, now: Date = Date()) -> String? {
+        guard let quota else { return nil }
+        let parts = [("5h", quota.fiveHour), ("Week", quota.weekly)].compactMap { name, window -> String? in
+            guard let window else { return nil }
+            var text = "\(name) \(percent(window.usedPercent))"
+            if window.usedPercent >= fullPercent, let reset = window.resetDate(observedAt: quota.fetchedAt) {
+                text += ", reopens in \(countdown(to: reset, now: now))"
+            }
+            return text
+        }
+        return parts.isEmpty ? nil : parts.joined(separator: " · ")
+    }
+
+    /// A window at or past this is spent.
+    private static let fullPercent: Double = 100
+
     /// Compact token count: 950, 12.4k, 3.1M.
     public static func tokens(_ n: Double) -> String {
         if n < 1000 { return "\(Int(n))" }

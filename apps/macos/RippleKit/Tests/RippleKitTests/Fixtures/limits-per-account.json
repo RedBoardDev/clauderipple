@@ -1,0 +1,20 @@
+{"providers":[
+  {"provider":"claude","type":"anthropic","title":"Claude","accounts":[
+    {"account":0,"windows":[],"at":1799999910000,"id":"acct-a","label":"Work","preferred":false,"active":true,
+     "health":{"state":"ready","pausedUntil":null},
+     "usageWindows":{"fiveHour":{"usedPercent":100,"windowMinutes":300,"resetAt":1800003600000},
+                     "weekly":{"usedPercent":40,"windowMinutes":10080,"resetAt":1800345600000}},
+     "unknown":false,"stale":false,"fetchedAt":1799999910000,"weeklyPace":{"expectedPercent":42.9,"paceDelta":-2.9}},
+    {"account":1,"windows":[],"at":1799990000000,"id":"acct-b","label":"Personal","preferred":true,"active":false,
+     "health":{"state":"cooling","pausedUntil":1800000600000},
+     "usageWindows":{"fiveHour":{"usedPercent":10,"windowMinutes":300,"resetAt":1800010800000},
+                     "weekly":{"usedPercent":5,"windowMinutes":10080,"resetAt":1800518400000}},
+     "stale":true,"fetchedAt":1799990000000}
+  ]},
+  {"provider":"chatgpt-subscription","type":"chatgpt","accounts":[
+    {"account":0,"windows":[{"kind":"weekly","used_percent":52,"window_minutes":10080,"reset_at":1800432000}],"at":1799999910000,
+     "id":"pro-1","label":"Pro","active":true,
+     "usageWindows":{"weekly":{"usedPercent":52,"windowMinutes":10080,"resetAt":1800432000000}}}
+  ]},
+  {"provider":"gemini","type":"google","accounts":[{"account":0,"windows":[],"at":0,"id":"g-1"}]}
+]}

@@ -50,6 +50,12 @@ public extension AdminClient {
         try await send("POST", "/api/claude-oauth/cancel")
     }
 
+    /// Removes every Claude account added to the router (CLI `claude-logout`). The current Claude
+    /// Code / Claude Desktop login is not touched.
+    func removeAllClaudeAccounts() async throws -> CLIResult {
+        try await send("POST", "/api/claude-logout")
+    }
+
     // MARK: ChatGPT accounts
 
     func chatgptAccounts(provider: String? = nil) async throws -> ChatGptAccountsResponse {
