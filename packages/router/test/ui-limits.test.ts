@@ -33,20 +33,25 @@ const findAll = (node: Element, predicate: (node: Element) => boolean): Element[
 const hasClass = (name: string) => (node: Element) => String(node.attrs.class ?? "").split(" ").includes(name);
 
 function limitsUi(api: (path: string) => Promise<unknown>) {
-  const group = el("div", { class: "group" });
-  const card = el("section", {}, [group]);
-  const code = source.slice(source.indexOf("let limitsSnapshot = null;"), source.indexOf("async function refreshHealth()"));
-  const build = new Function("api", "el", "t", "$", "badge", "hint", `${code}; return { refreshLimits, limitsAccountRow, limitsWindowRow };`) as (...args: unknown[]) => {
+  const box = el("div", { id: "health-providers" });
+  const limits = source.slice(source.indexOf("let limitsSnapshot = null;"), source.indexOf("async function refreshHealth()"));
+  const providers = source.slice(source.indexOf("function renderHealthProviders()"), source.indexOf("let statusModBusy"));
+  const build = new Function("api", "el", "t", "$", "badge", "hint", `
+    const currentConfig = { providers: { claude: { type: "anthropic" }, gpt: { type: "chatgpt" }, other: { type: "openai-compatible" } } }, status = { providers: {} };
+    const quotaLine = (name) => "text quota " + name, credentialLine = (name) => el("span", { text: "text pool " + name });
+    const providerState = () => null, chevronIcon = () => null, openProvider = () => {}, chatgptLoginButton = () => null, chatgptLoginMessage = "";
+    const cell = (label, value, lines) => el("div", { class: "cell" }, [label, ...lines.filter(Boolean).map((line) => typeof line === "string" ? el("span", { text: line }) : line)]);
+    ${limits}; ${providers}; return { refreshLimits, limitsAccountRow, limitsWindowRow };`) as (...args: unknown[]) => {
     refreshLimits(): Promise<void>;
     limitsAccountRow(account: unknown, now: number): Element;
     limitsWindowRow(label: string, window: unknown, pace: unknown, weekly: boolean, now: number): Element;
   };
-  const ui = build(api, el, t, (selector: string) => selector === "#health-limits" ? card : group,
+  const ui = build(api, el, t, (selector: string) => selector === "#health-providers" ? box : null,
     (kind: string, label: string) => el("span", { class: `badge ${kind}`, text: label }), (label: string) => el("p", { text: label }));
-  return { ...ui, card };
+  return { ...ui, card: box };
 }
 
-test("Limits loads its own endpoint, renders all accounts and marks retained figures stale on failure", async () => {
+test("Providers carries each subscription account's limits and marks retained figures stale on failure", async () => {
   const now = Date.now();
   const current = buildLimitsAccount({ id: "current", label: "Current Claude login", active: true, preferred: false, health: { state: "ready" } }, 0,
     [{ kind: "seven_day", used_percent: 125, window_minutes: 10080, reset_at: (now + 3.5 * 86400_000) / 1000 }, { kind: "five_hour", used_percent: 23, window_minutes: 300, reset_at: (now + 134 * 60_000) / 1000 }], { at: now }, now, 300_000);
@@ -60,9 +65,12 @@ test("Limits loads its own endpoint, renders all accounts and marks retained fig
   });
   await ui.refreshLimits();
   assert.deepEqual(paths, ["/api/limits"]);
-  assert.equal(findAll(ui.card, hasClass("limits-account")).length, 3);
-  assert.match(text(ui.card), /Claude · claude/);
-  assert.match(text(ui.card), /ChatGPT · gpt/);
+  const rows = findAll(ui.card, hasClass("cell"));
+  assert.equal(rows.length, 3, "one row per provider, no separate Limits card");
+  assert.equal(findAll(rows[0]!, hasClass("limits-account")).length, 2);
+  assert.equal(findAll(rows[1]!, hasClass("limits-account")).length, 1);
+  assert.doesNotMatch(text(rows[0]!), /text quota|text pool/, "gauges replace the text lines");
+  assert.match(text(rows[2]!), /text quota other/, "a provider without limits keeps its text lines");
   assert.match(text(ui.card), /Active/);
   assert.match(text(ui.card), /Preferred/);
   assert.match(text(ui.card), /Paused until/);
@@ -74,7 +82,6 @@ test("Limits loads its own endpoint, renders all accounts and marks retained fig
   assert.match(text(ui.card), /<img src=x/);
   fail = true;
   await ui.refreshLimits();
-  assert.match(text(ui.card), /Could not refresh limits/);
   assert.match(text(ui.card), /125%/, "last figures remain visible");
   assert.equal(findAll(ui.card, (n) => n.attrs.text === "Stale").length, 3);
 });
@@ -101,7 +108,7 @@ test("Status shows Claude usage after reload without config or a fresh observed 
   const code = source.slice(source.indexOf("function renderHealthProviders()"), source.indexOf("let statusModBusy"));
   const render = new Function("box", "el", `
     const currentConfig = null, status = {providers: {claude: {type: 'anthropic', authSource: null}}, claude: {accounts: [{id: 'current', label: 'Current', quota: {}}]}};
-    const $ = () => box, hint = () => null, t = key => key, quotaLine = () => null, credentialLine = () => null;
+    const $ = () => box, hint = () => null, t = key => key, quotaLine = () => null, credentialLine = () => null, providerLimits = () => null;
     const chatgptQuotaText = () => '5h 23%', claudeAccountLabel = account => account.label;
     const providerState = () => null, chevronIcon = () => null, cell = (label, value, lines) => el('div', {}, [label, ...lines]);
     ${code}; renderHealthProviders();

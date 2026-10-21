@@ -333,24 +333,14 @@ function limitsAccountRow(account, now) {
   ]);
 }
 
+/** The limits entry `/api/limits` gives one provider, when it reads that provider's accounts. */
+function providerLimits(name) {
+  const entry = ((limitsSnapshot && limitsSnapshot.providers) || []).find((provider) => provider.provider === name);
+  return entry && (entry.type === "anthropic" || entry.type === "chatgpt") && entry.accounts.length ? entry : null;
+}
+/** Limits live in the Providers card: each subscription provider's row carries its accounts' gauges. */
 function renderLimits() {
-  let card = $("#health-limits");
-  if (!card) {
-    card = section(t("limits.title"), []);
-    card.id = "health-limits";
-    const providers = $("#health-providers").closest(".section");
-    providers.before(card);
-  }
-  const groups = ((limitsSnapshot && limitsSnapshot.providers) || []).filter((provider) => provider.type === "anthropic" || provider.type === "chatgpt");
-  const now = Date.now();
-  $(".group", card).replaceChildren(
-    ...(limitsFailed ? [hint(t("limits.fetchFailed"))] : []),
-    ...groups.map((provider) => el("div", { class: "limits-provider" }, [
-      el("h3", { class: "limits-provider-title", text: `${provider.type === "anthropic" ? "Claude" : "ChatGPT"} · ${provider.provider}` }),
-      ...provider.accounts.map((account) => limitsAccountRow(account, now)),
-    ])),
-    ...(!groups.length && !limitsFailed ? [hint(t("limits.empty"))] : []),
-  );
+  if ($("#health-providers")) renderHealthProviders();
 }
 
 async function refreshHealth() {
@@ -829,18 +819,21 @@ function renderHealthProviders() {
   box.replaceChildren(...providers.map(([name, provider]) => {
     const live = status && status.providers && status.providers[name];
     const lines = [];
-    const quota = quotaLine(name);
+    const limits = providerLimits(name);
+    if (limits) lines.push(el("div", { class: "provider-limits" }, limits.accounts.map((account) => limitsAccountRow(account, Date.now()))));
+    // Without `/api/limits` figures (an older router, a failed read) the text lines stand in for them.
+    const quota = limits ? null : quotaLine(name);
     if (quota) lines.push(el("span", { class: "cell-sub", text: quota }));
     // Claude subscription accounts, one line each: the current login and every account added here.
     // Status owns these snapshots even before Providers loads the config or observed auth expires.
-    if (provider.type === "anthropic" && status && status.claude && status.claude.accounts && status.claude.accounts.length) {
+    if (!limits && provider.type === "anthropic" && status && status.claude && status.claude.accounts && status.claude.accounts.length) {
       const usage = ((status && status.claude && status.claude.accounts) || [])
         .map((account) => ({ account, text: chatgptQuotaText(account.quota) }))
         .filter(({ text }) => text)
         .map(({ account, text }) => el("div", { text: `${claudeAccountLabel(account)} · ${text}` }));
       if (usage.length) lines.push(el("div", { class: "cell-sub account-usage" }, usage));
     }
-    const pool = credentialLine(name);
+    const pool = limits ? null : credentialLine(name);
     if (pool) lines.push(pool);
     if (live && live.needsLogin && provider.type === "chatgpt") {
       lines.push(el("div", { class: "cell-actions" }, [
@@ -851,7 +844,7 @@ function renderHealthProviders() {
     // The row opens the provider's own page; a button inside it keeps its own click.
     const row = cell(el("span", { class: "cell-label", text: name }), [providerState(name, provider), chevronIcon()], lines, "provider-status link");
     row.tabIndex = 0;
-    const open = (event) => { if (!event.target.closest("button, a")) openProvider(name, provider); };
+    const open = (event) => { if (!event.target.closest("button, a, .provider-limits")) openProvider(name, provider); };
     row.addEventListener("click", open);
     row.addEventListener("keydown", (event) => { if (event.key === "Enter" && event.target === row) open(event); });
     return row;

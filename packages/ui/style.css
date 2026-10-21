@@ -413,9 +413,9 @@ label.check input { margin-top: 2px; }
 .provider-status .account-usage { display: grid; gap: 1px; }
 
 /* One scale (0–100%) for both windows; the tick marks expected weekly consumption, not a limit. */
-.limits-provider + .limits-provider { border-top: 1px solid var(--separator); }
-.limits-provider-title { padding: 14px 16px 0; font-size: var(--fs-sub); color: var(--label-2); font-weight: 600; }
-.limits-account { padding: 14px 16px; min-width: 0; }
+.provider-limits { margin-top: 4px; cursor: default; }
+.limits-account { padding: 12px 0; min-width: 0; }
+.limits-account:last-child { padding-bottom: 2px; }
 .limits-account + .limits-account { border-top: 1px solid var(--separator); }
 .limits-account-head { display: flex; justify-content: space-between; align-items: baseline; gap: 8px 16px; flex-wrap: wrap; }
 .limits-account-head strong { font-size: var(--fs-sub); font-weight: 600; overflow-wrap: anywhere; min-width: 0; }
