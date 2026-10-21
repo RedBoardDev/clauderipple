@@ -106,3 +106,24 @@ final class EndpointTests: XCTestCase {
                        "http://127.0.0.1:5555")
     }
 }
+
+final class AdminExchangeTests: XCTestCase {
+    // WHY: PUT /api/mod-settings answers a stale revision with 409 and the current snapshot as the
+    // body. The caller rebases on that body, so a non-2xx answer must not lose it.
+    func testExchangeKeepsTheBodyOfAConflict() async throws {
+        let client = MockRouter.client { _ in .json(#"{"settings":{"bias":1},"revision":7,"stored":true}"#, status: 409) }
+        let answer = try await client.exchange("PUT", "/api/mod-settings", json: .object([("schemaVersion", .int(1))]))
+        XCTAssertEqual(answer.status, 409)
+        XCTAssertEqual(answer.document?["revision"]?.intValue, 7)
+    }
+
+    func testExchangeStillDetectsAMissingRoute() async {
+        let client = MockRouter.client { _ in .dashboardPage }
+        do {
+            _ = try await client.exchange("PUT", "/api/mod-settings")
+            XCTFail("expected routeMissing")
+        } catch {
+            XCTAssertEqual(error as? AdminError, .routeMissing(path: "/api/mod-settings"))
+        }
+    }
+}
