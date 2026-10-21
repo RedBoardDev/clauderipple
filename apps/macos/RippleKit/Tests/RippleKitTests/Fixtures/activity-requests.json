@@ -1,0 +1,7 @@
+{
+  "requests": [
+    { "id": "example-old", "at": "2026-10-20T10:00:00Z", "ms": 160, "status": 200, "ok": true, "kind": "messages", "source": "example-source@high", "target": "example-large", "provider": "sample-a", "stream": true, "usage": { "input": 10, "cached": 80, "output": 20 } },
+    { "id": "example-new", "at": "2026-10-20T11:00:00.123Z", "ms": 250, "status": "draining", "ok": false, "kind": "image", "source": "example-source", "target": "example-image", "provider": "sample-b", "effort": "medium", "requestedTier": "priority", "servedTier": "default", "stopReason": "end_turn", "usage": { "input": 20, "cached": 70, "cacheWrite": 10, "output": 30 }, "refusal": "drain", "purpose": "web-search", "note": "Example retry", "session": "example-session", "resent": true, "upstreamCalled": false, "upstreamRequestId": "example-upstream", "messageId": "example-message" },
+    { "id": "example-minimal", "status": null, "usage": { "output": 1 } }
+  ]
+}
