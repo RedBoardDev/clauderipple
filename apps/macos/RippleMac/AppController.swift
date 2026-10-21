@@ -15,12 +15,29 @@ final class AppController {
     /// must not raise a notification.
     static let downNotifyAfter: TimeInterval = 20
     static let notificationsKey = "notifyRouterDown"
+    static let loginItemInitializedKey = "loginItemInitialized"
 
     init() {
         store = RouterStore()
         UserDefaults.standard.register(defaults: [Self.notificationsKey: true])
         store.start()
         watchConnection()
+        if let snapshot = SnapshotMode.request() {
+            Task { await SnapshotMode.run(snapshot, app: self) }
+        } else {
+            Self.enableLoginItemOnFirstLaunch()
+        }
+    }
+
+    /// The app must be running before Claude Desktop is, or a dead router shows nothing but a proxy
+    /// error (ARCHITECTURE §5): so it starts at login unless the user turned that off. Done once, and
+    /// only for the installed copy — registering a build folder would start that copy at login.
+    private static func enableLoginItemOnFirstLaunch() {
+        let defaults = UserDefaults.standard
+        guard !defaults.bool(forKey: loginItemInitializedKey),
+              Bundle.main.bundleURL.path.hasPrefix("/Applications/") else { return }
+        defaults.set(true, forKey: loginItemInitializedKey)
+        if !LaunchAtLogin.isEnabled { LaunchAtLogin.set(true) }
     }
 
     /// Checks the outage rule every few seconds. Polling rather than observing: the rule is about

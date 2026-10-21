@@ -27,7 +27,8 @@ struct DrainHint: View {
             Spacer(minLength: 4)
             if let target = advice.useNow, target.kind == .claude, !target.isPreferred {
                 Button(applying ? "…" : "Use first") { apply(target) }
-                    .buttonStyle(.glass)
+                    .buttonStyle(.borderedProminent)
+                    .buttonBorderShape(.capsule)
                     .controlSize(.small)
                     .disabled(applying)
                     .help("Make \(target.label) the account new Claude conversations start on")

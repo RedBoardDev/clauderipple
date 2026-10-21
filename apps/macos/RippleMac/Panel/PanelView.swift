@@ -101,7 +101,7 @@ private struct RouterDownCard: View {
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
             Button("Open recovery") { SettingsRoot.open(with: openWindow, pane: .overview) }
-                .buttonStyle(.glassProminent)
+                .buttonStyle(.borderedProminent)
                 .controlSize(.small)
         }
         .padding(12)

@@ -65,6 +65,23 @@ public final class RouterStore {
         self.client = client
     }
 
+    /// A store frozen on given data, for previews, `--demo` and snapshot rendering. It never polls.
+    public init(preview accounts: [AccountUsage], status: RouterStatus?, today: RequestSummary? = nil,
+                power: PowerStatus? = nil, claudeRotation: Bool? = nil, updated: Date = Date()) {
+        client = AdminClient(baseURL: URL(string: "http://127.0.0.1:1")!)
+        self.accounts = accounts
+        self.status = status
+        self.today = today
+        self.power = power
+        powerAvailable = power != nil
+        self.claudeRotation = claudeRotation
+        connection = status == nil ? .offline : .online
+        downSince = status == nil ? updated : nil
+        lastUpdated = updated
+        limitsSource = .perAccount
+        recompute()
+    }
+
     // MARK: Lifecycle
 
     public func start() {

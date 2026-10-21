@@ -67,10 +67,11 @@ struct PanelHeader: View {
                 if refreshing { ProgressView().controlSize(.mini) }
             }
             .frame(width: 26, height: 26)
+            .background(.quaternary, in: Circle())
             .contentShape(Circle())
         }
-        .buttonStyle(.glass)
-        .buttonBorderShape(.circle)
+        .buttonStyle(.borderless)
+        .foregroundStyle(.secondary)
         .keyboardShortcut("r", modifiers: .command)
         .help(store.lastUpdated.map { "Updated \(Format.age(of: $0)). Refresh now (⌘R)" } ?? "Refresh now (⌘R)")
         .accessibilityLabel("Refresh")
