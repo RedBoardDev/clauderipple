@@ -43,6 +43,18 @@ there is one (needed for notifications), otherwise unsigned.
 
 `CLAUDERIPPLE_APP_ADMIN_URL` points the app at a stand-in router instead of the real one.
 
+### Visual checks without screen recording
+
+```sh
+ClaudeRipple.app/Contents/MacOS/ClaudeRipple --snapshot <dir> [--demo] [--panes overview,accounts,…]
+```
+
+renders the panel, the menu-bar icon states and the given settings panes in light and dark to PNGs,
+then quits. `--demo` uses made-up accounts (`DemoData`) and never polls. Without it the panes read
+the live router (GETs only; nothing is saved unless a control is changed). Set `CLAUDERIPPLE_HOME`
+to an empty folder so the Overview pane cannot run the CLI. Offscreen windows are never key, so
+selection highlights, glass and prominent buttons draw in their inactive colours.
+
 ## Talking to the router
 
 - The admin API's boundary is loopback + Host / Fetch-Metadata / Origin checks; there is no token.
