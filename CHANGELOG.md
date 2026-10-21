@@ -5,7 +5,7 @@
 ### Added
 
 - **A native macOS menu-bar app (`apps/macos`, SwiftUI).** The panel shows every Claude and ChatGPT
-  account's 5-hour and weekly limits with reset times, weekly pace and Active / Preferred / Paused
+  account's 5-hour and weekly limits with reset times and Active / Preferred / Paused
   badges, suggests which account to drain first, and toggles keep-awake. The icon's ring is the
   weekly room left on the tightest serving account. A settings window covers accounts (sign-in,
   rotation, use first, pause, rename, remove), model mapping, workers and effort, clients,

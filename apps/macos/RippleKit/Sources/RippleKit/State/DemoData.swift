@@ -13,8 +13,7 @@ public enum DemoData {
         func row(_ kind: ProviderKind, _ provider: String, _ id: String, _ label: String, plan: String?, active: Bool = false,
                  preferred: Bool = false, health: AccountHealth = .ready, fiveHour: UsageWindowState?, weekly: UsageWindowState?) -> AccountUsage {
             AccountUsage(kind: kind, provider: provider, accountId: id, label: label, plan: plan, isActive: active,
-                         isPreferred: preferred, health: health, fiveHour: fiveHour, weekly: weekly,
-                         pace: Pace.compute(for: weekly, now: now), fetchedAt: now.addingTimeInterval(-90))
+                         isPreferred: preferred, health: health, fiveHour: fiveHour, weekly: weekly, fetchedAt: now.addingTimeInterval(-90))
         }
         return [
             row(.claude, "claude", "demo-work", "Work", plan: "max", active: true,

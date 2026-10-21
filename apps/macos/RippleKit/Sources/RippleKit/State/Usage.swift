@@ -42,56 +42,6 @@ public struct UsageWindowState: Sendable, Equatable {
     public static let exhaustedAt: Double = 99.5
 }
 
-/// Weekly consumption against the even pace that would land exactly on 100% at reset.
-public struct Pace: Sendable, Equatable {
-    /// Where usage would be now at an even pace, 0…100.
-    public let expectedPercent: Double
-    /// Actual minus expected, in percentage points. Positive = ahead (burning faster than the week allows).
-    public let delta: Double
-
-    public init(expectedPercent: Double, delta: Double) {
-        self.expectedPercent = expectedPercent
-        self.delta = delta
-    }
-
-    public enum Verdict: Sendable, Equatable { case onPace, ahead, reserve }
-
-    /// Within this many points either side reads as on pace: the provider's percent is an integer
-    /// and the clock moves, so a ±1–2 wobble is noise rather than news.
-    public static let onPaceBand: Double = 3
-
-    public var verdict: Verdict {
-        if abs(delta) < Self.onPaceBand { return .onPace }
-        return delta > 0 ? .ahead : .reserve
-    }
-
-    /// Even-pace position for a window of `length` ending at `resetsAt`. Elapsed time is clamped,
-    /// usage is not (credits can exceed 100%). Same formula as the router's `weeklyPace`.
-    public static func compute(for window: UsageWindowState?, now: Date) -> Pace? {
-        guard let window, let reset = window.resetsAt, window.length > 0 else { return nil }
-        let start = reset.addingTimeInterval(-window.length)
-        let elapsed = min(1, max(0, now.timeIntervalSince(start) / window.length))
-        let expected = elapsed * 100
-        return Pace(expectedPercent: expected, delta: window.usedPercent - expected)
-    }
-
-    /// When the window would hit 100% at the average rate so far, if that comes before its reset.
-    /// Nil means it lasts until reset (or there is not enough history to say).
-    public static func projectedExhaustion(for window: UsageWindowState?, now: Date) -> Date? {
-        guard let window, let reset = window.resetsAt, window.length > 0, window.usedPercent > 0 else { return nil }
-        if window.isExhausted { return now }
-        let start = reset.addingTimeInterval(-window.length)
-        let elapsed = now.timeIntervalSince(start)
-        // Under 2% of the window gone (≈3h of a week), the average rate says nothing yet.
-        guard elapsed > window.length * minimumElapsedShare else { return nil }
-        let rate = window.usedPercent / elapsed
-        let runsOut = now.addingTimeInterval((100 - window.usedPercent) / rate)
-        return runsOut < reset ? runsOut : nil
-    }
-
-    static let minimumElapsedShare = 0.02
-}
-
 public enum AccountHealth: Sendable, Equatable {
     case ready
     /// Cooling down after a rate-limit or error answer.
@@ -127,13 +77,12 @@ public struct AccountUsage: Sendable, Equatable, Identifiable {
     public let health: AccountHealth
     public let fiveHour: UsageWindowState?
     public let weekly: UsageWindowState?
-    public let pace: Pace?
     public let fetchedAt: Date?
     public let isStale: Bool
 
     public init(kind: ProviderKind, provider: String, accountId: String, label: String, plan: String? = nil,
                 isActive: Bool = false, isPreferred: Bool = false, health: AccountHealth = .ready,
-                fiveHour: UsageWindowState? = nil, weekly: UsageWindowState? = nil, pace: Pace? = nil,
+                fiveHour: UsageWindowState? = nil, weekly: UsageWindowState? = nil,
                 fetchedAt: Date? = nil, isStale: Bool = false) {
         self.kind = kind
         self.provider = provider
@@ -145,7 +94,6 @@ public struct AccountUsage: Sendable, Equatable, Identifiable {
         self.health = health
         self.fiveHour = fiveHour
         self.weekly = weekly
-        self.pace = pace
         self.fetchedAt = fetchedAt
         self.isStale = isStale
     }
@@ -187,13 +135,11 @@ public enum UsageBuilder {
             w.map { UsageWindowState(usedPercent: $0.usedPercent, windowMinutes: $0.windowMinutes, resetsAt: $0.resetAt.map(date(ms:))) }
         }
         let weekly = state(a.usageWindows?.weekly)
-        let pace = a.weeklyPace.map { Pace(expectedPercent: $0.expectedPercent, delta: $0.paceDelta) }
-            ?? Pace.compute(for: weekly, now: now)
         return AccountUsage(
             kind: kind, provider: provider, accountId: a.id ?? String(a.account), label: a.label ?? "Account \(a.account + 1)",
             isActive: a.active ?? false, isPreferred: a.preferred ?? false,
             health: AccountHealth(routerState: a.health?.state, pausedUntil: a.health?.pausedUntil.map(date(ms:))),
-            fiveHour: state(a.usageWindows?.fiveHour), weekly: weekly, pace: pace,
+            fiveHour: state(a.usageWindows?.fiveHour), weekly: weekly,
             fetchedAt: a.fetchedAt.map(date(ms:)), isStale: a.stale ?? false)
     }
 
@@ -245,7 +191,7 @@ public enum UsageBuilder {
         let stale = quota?.stale == true || fetched.map { now.timeIntervalSince($0) >= kind.staleAfter } ?? true
         return AccountUsage(kind: kind, provider: provider, accountId: id, label: label, plan: plan,
                             isActive: active, isPreferred: preferred, health: health,
-                            fiveHour: fiveHour, weekly: weekly, pace: Pace.compute(for: weekly, now: now),
+                            fiveHour: fiveHour, weekly: weekly,
                             fetchedAt: fetched, isStale: stale)
     }
 

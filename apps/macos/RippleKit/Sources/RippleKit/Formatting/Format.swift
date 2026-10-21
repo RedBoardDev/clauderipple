@@ -44,13 +44,6 @@ public enum Format {
         "\(Int(min(100, max(0, value)).rounded()))%"
     }
 
-    /// Signed percentage points for a pace delta: "+12 pts", "−4 pts", "on pace".
-    public static func paceDelta(_ delta: Double) -> String {
-        let rounded = Int(delta.rounded())
-        if rounded == 0 { return "on pace" }
-        return rounded > 0 ? "+\(rounded) pts" : "−\(-rounded) pts"
-    }
-
     /// Absolute reset time for tooltips: "Thu 14:05", or "14:05" when it is today.
     public static func resetTime(_ date: Date, now: Date = Date(), calendar: Calendar = .current) -> String {
         let style: Date.FormatStyle = calendar.isDate(date, inSameDayAs: now)

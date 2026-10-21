@@ -2,7 +2,7 @@
 
 SwiftUI menu-bar client for the local router's admin API (`http://127.0.0.1:8791`). It replaces the
 Electron tray and most of the web dashboard: the panel shows every Claude and ChatGPT account's
-5-hour and weekly limits with reset times and weekly pace; the settings window covers accounts,
+5-hour and weekly limits with reset times; the settings window covers accounts,
 model mapping, workers and effort, clients, activity, laptop, general and about.
 
 What stays on the web dashboard: adding or editing providers (API keys, probes, capability
@@ -21,7 +21,7 @@ apps/macos/
     Sources/RippleKit/
       Networking/    Endpoint (port discovery), AdminClient, API.swift + API+<Pane>.swift
       Models/        wire types (Decodable), JSONValue (order-preserving JSON for config writes)
-      State/         RouterStore (polling), Usage (normalized accounts, pace), DrainAdvisor, MenuBarGauge
+      State/         RouterStore (polling), Usage (normalized accounts), DrainAdvisor, MenuBarGauge
       Formatting/    countdowns, ages, percents
       UI/            Theme tokens, UsageBar, AccountCard, badges, mascot geometry, menu-bar icon, PaneKit
     Tests/RippleKitTests/   unit tests; Fixtures/*.json (made-up values only); Support/MockRouter
@@ -62,8 +62,7 @@ selection highlights, glass and prominent buttons draw in their inactive colours
 - Older routers answer unknown routes with their dashboard page (HTTP 200, `text/html`).
   `AdminClient` turns that into `AdminError.routeMissing`, which panes use for capability detection.
 - Limits: per-account `/api/limits` when the router has it, else `/api/claude-accounts` plus
-  `/api/status` (ChatGPT accounts and the Claude pool's credential states). Pace is computed
-  client-side when the router does not send it.
+  `/api/status` (ChatGPT accounts and the Claude pool's credential states).
 - Config edits go through `AdminClient.updateConfig`: re-read the whole config, change it, write it
   back. `JSONValue` keeps key order (provider order is routing order) and number literals.
   The config carries credentials: keep it in memory, never log it or put it in a fixture.

@@ -1,6 +1,6 @@
 import SwiftUI
 
-/// One account in the panel: name, badges, plan, then a row per usage window and the weekly pace.
+/// One account in the panel: name, badges, plan, then a row per usage window.
 public struct AccountCard: View {
     let account: AccountUsage
     let now: Date
@@ -16,11 +16,10 @@ public struct AccountCard: View {
             if account.hasWindows {
                 VStack(alignment: .leading, spacing: 5) {
                     if let fiveHour = account.fiveHour {
-                        WindowRow(title: "5h", window: fiveHour, expected: nil, dimmed: account.isStale, now: now)
+                        WindowRow(title: "5h", window: fiveHour, dimmed: account.isStale, now: now)
                     }
                     if let weekly = account.weekly {
-                        WindowRow(title: "Week", window: weekly, expected: account.pace?.expectedPercent, dimmed: account.isStale, now: now)
-                        PaceLine(account: account, now: now)
+                        WindowRow(title: "Week", window: weekly, dimmed: account.isStale, now: now)
                     }
                 }
             } else {
@@ -74,7 +73,6 @@ public struct AccountCard: View {
 struct WindowRow: View {
     let title: String
     let window: UsageWindowState
-    let expected: Double?
     let dimmed: Bool
     let now: Date
 
@@ -89,7 +87,7 @@ struct WindowRow: View {
                 .font(.system(size: 11))
                 .foregroundStyle(.secondary)
                 .frame(width: Self.titleWidth, alignment: .leading)
-            UsageBar(usedPercent: window.usedPercent, expectedPercent: expected, dimmed: dimmed)
+            UsageBar(usedPercent: window.usedPercent, dimmed: dimmed)
             Text(Format.percent(window.usedPercent))
                 .font(.data(12, weight: .semibold))
                 .foregroundStyle(window.isExhausted ? AnyShapeStyle(Theme.bad) : AnyShapeStyle(.primary))
@@ -109,52 +107,5 @@ struct WindowRow: View {
         .accessibilityElement(children: .ignore)
         .accessibilityLabel("\(title == "5h" ? "Five-hour" : "Weekly") window, \(Format.percent(window.usedPercent)) used"
             + (window.resetsAt.map { ", resets in \(Format.countdown(to: $0, now: now))" } ?? ""))
-    }
-}
-
-/// "+8 pts ahead of pace · runs out in 2d 4h", under the weekly bar.
-struct PaceLine: View {
-    let account: AccountUsage
-    let now: Date
-
-    var body: some View {
-        if let pace = account.pace {
-            let runsOut = Pace.projectedExhaustion(for: account.weekly, now: now)
-            HStack(spacing: 4) {
-                Image(systemName: symbol(pace.verdict))
-                    .font(.system(size: 9, weight: .bold))
-                Text(text(pace, runsOut: runsOut))
-            }
-            .font(.system(size: 11))
-            .foregroundStyle(color(pace.verdict, runsOut: runsOut))
-            .padding(.leading, WindowRow.titleWidth + 8)
-            .help("Even pace would have used \(Int(pace.expectedPercent.rounded()))% of the week by now (the tick on the bar).")
-        }
-    }
-
-    private func text(_ pace: Pace, runsOut: Date?) -> String {
-        switch pace.verdict {
-        case .onPace: return "On pace"
-        case .reserve: return "\(Format.paceDelta(pace.delta)) · in reserve"
-        case .ahead:
-            if let runsOut { return "\(Format.paceDelta(pace.delta)) · runs out in \(Format.countdown(to: runsOut, now: now))" }
-            return "\(Format.paceDelta(pace.delta)) ahead of pace"
-        }
-    }
-
-    private func symbol(_ verdict: Pace.Verdict) -> String {
-        switch verdict {
-        case .onPace: "equal"
-        case .ahead: "arrow.up.right"
-        case .reserve: "arrow.down.right"
-        }
-    }
-
-    private func color(_ verdict: Pace.Verdict, runsOut: Date?) -> AnyShapeStyle {
-        switch verdict {
-        case .onPace: AnyShapeStyle(.secondary)
-        case .reserve: AnyShapeStyle(Theme.ok)
-        case .ahead: runsOut != nil ? AnyShapeStyle(Theme.bad) : AnyShapeStyle(Theme.warn)
-        }
     }
 }

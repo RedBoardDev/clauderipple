@@ -4,7 +4,7 @@ import Foundation
 /// - legacy: anonymous accounts (`account` index + `windows` array, `reset_at` in epoch seconds);
 /// - per-account (feature/limits-view): every Claude and ChatGPT account adds `id`, `label`,
 ///   `preferred`, `active`, `health`, `usageWindows` (epoch-ms `resetAt`), `stale`, `fetchedAt`
-///   and `weeklyPace`. All additive members are optional.
+///   and `weeklyPace` (not shown by the app, so not decoded). All additive members are optional.
 public struct LimitsResponse: Decodable, Sendable {
     public let providers: [LimitsProvider]
 }
@@ -51,11 +51,6 @@ public struct LimitsAccount: Decodable, Sendable {
         public let pausedUntil: Double?
     }
 
-    public struct WeeklyPace: Decodable, Sendable, Equatable {
-        public let expectedPercent: Double
-        public let paceDelta: Double
-    }
-
     public let account: Int
     public let windows: [LegacyWindow]
     /// Epoch milliseconds; 0 when unknown.
@@ -69,10 +64,9 @@ public struct LimitsAccount: Decodable, Sendable {
     public let unknown: Bool?
     public let stale: Bool?
     public let fetchedAt: Double?
-    public let weeklyPace: WeeklyPace?
 
     enum CodingKeys: String, CodingKey {
-        case account, windows, at, id, label, preferred, active, health, usageWindows, unknown, stale, fetchedAt, weeklyPace
+        case account, windows, at, id, label, preferred, active, health, usageWindows, unknown, stale, fetchedAt
     }
 
     public init(from decoder: Decoder) throws {
@@ -89,7 +83,6 @@ public struct LimitsAccount: Decodable, Sendable {
         unknown = try c.decodeIfPresent(Bool.self, forKey: .unknown)
         stale = try c.decodeIfPresent(Bool.self, forKey: .stale)
         fetchedAt = try c.decodeIfPresent(Double.self, forKey: .fetchedAt)
-        weeklyPace = try? c.decodeIfPresent(WeeklyPace.self, forKey: .weeklyPace)
     }
 
     /// Whether this is a per-account entry (the newer contract) rather than an anonymous legacy row.

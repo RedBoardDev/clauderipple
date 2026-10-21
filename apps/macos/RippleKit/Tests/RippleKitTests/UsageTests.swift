@@ -7,9 +7,8 @@ private let hour: TimeInterval = 3600
 private let day: TimeInterval = 86_400
 
 final class UsageBuilderTests: XCTestCase {
-    // WHY: the per-account /api/limits is what newer routers serve. Resets are epoch ms, the
-    // router's own weekly pace wins over a local one, and providers without subscription limits
-    // (google) are not account rows.
+    // WHY: the per-account /api/limits is what newer routers serve. Resets are epoch ms and
+    // providers without subscription limits (google) are not account rows.
     func testPerAccountLimitsBecomeRows() throws {
         let response = try JSONDecoder().decode(LimitsResponse.self, from: fixture("limits-per-account"))
         let rows = try XCTUnwrap(UsageBuilder.fromLimits(response, now: now))
@@ -20,16 +19,11 @@ final class UsageBuilderTests: XCTestCase {
         XCTAssertTrue(work.isActive)
         XCTAssertTrue(work.isBlocked, "a spent 5-hour window blocks even with week to spare")
         XCTAssertEqual(work.weekly?.resetsAt, Date(timeIntervalSince1970: 1_800_345_600))
-        XCTAssertEqual(work.pace?.delta, -2.9)
-        XCTAssertEqual(work.pace?.verdict, .onPace)
 
         let personal = rows[1]
         XCTAssertTrue(personal.isPreferred)
         XCTAssertEqual(personal.health, .cooling(until: Date(timeIntervalSince1970: 1_800_000_600)))
         XCTAssertTrue(personal.isStale)
-        // No router pace: computed locally. Week resets in 6 days, so 1/7 of it has gone.
-        XCTAssertEqual(try XCTUnwrap(personal.pace?.expectedPercent), 100.0 / 7, accuracy: 0.01)
-        XCTAssertEqual(personal.pace?.verdict, .reserve)
 
         let pro = rows[2]
         XCTAssertEqual(pro.kind, .chatgpt)
@@ -78,40 +72,6 @@ final class UsageBuilderTests: XCTestCase {
 
         XCTAssertEqual(rows[4].health, .cooling(until: now.addingTimeInterval(600)))
         XCTAssertEqual(rows[5].health, .other("unknown"), "an unknown router state is kept, not read as ready")
-    }
-}
-
-final class PaceTests: XCTestCase {
-    private func week(used: Double, resetsIn: TimeInterval) -> UsageWindowState {
-        UsageWindowState(usedPercent: used, windowMinutes: Quota.weeklyMinutes, resetsAt: now.addingTimeInterval(resetsIn))
-    }
-
-    func testPaceIsUsageMinusElapsedShare() throws {
-        let pace = try XCTUnwrap(Pace.compute(for: week(used: 60, resetsIn: 3.5 * day), now: now))
-        XCTAssertEqual(pace.expectedPercent, 50, accuracy: 0.001)
-        XCTAssertEqual(pace.delta, 10, accuracy: 0.001)
-        XCTAssertEqual(pace.verdict, .ahead)
-    }
-
-    // WHY: percents are integers and the clock moves; under 3 points either side is noise.
-    func testOnPaceBand() {
-        XCTAssertEqual(Pace(expectedPercent: 50, delta: 2.9).verdict, .onPace)
-        XCTAssertEqual(Pace(expectedPercent: 50, delta: -2.9).verdict, .onPace)
-        XCTAssertEqual(Pace(expectedPercent: 50, delta: -3).verdict, .reserve)
-    }
-
-    func testNoResetNoPace() {
-        XCTAssertNil(Pace.compute(for: UsageWindowState(usedPercent: 10, windowMinutes: Quota.weeklyMinutes, resetsAt: nil), now: now))
-    }
-
-    func testProjectedExhaustion() {
-        // 50% after one day: at that rate the rest goes in one more day, well before the reset.
-        XCTAssertEqual(Pace.projectedExhaustion(for: week(used: 50, resetsIn: 6 * day), now: now), now.addingTimeInterval(day))
-        // 10% after half the week lasts until the reset.
-        XCTAssertNil(Pace.projectedExhaustion(for: week(used: 10, resetsIn: 3.5 * day), now: now))
-        // Under 2% of the week gone, the average rate says nothing yet.
-        XCTAssertNil(Pace.projectedExhaustion(for: week(used: 5, resetsIn: 7 * day - hour), now: now))
-        XCTAssertEqual(Pace.projectedExhaustion(for: week(used: 100, resetsIn: day), now: now), now)
     }
 }
 
