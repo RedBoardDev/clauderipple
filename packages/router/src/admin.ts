@@ -286,7 +286,7 @@ async function anthropicLimitAccounts(deps: AdminDeps, name: string, refresh: bo
     ...stored,
   ];
   const now = Date.now();
-  return accounts.map((account, index) => {
+  const listed = accounts.map((account, index) => {
     const report = reports.find((r) => r.id === account.id);
     const state = account.needsReauth ? "needs-login" : report?.state ?? (account.id === "current" || account.expiresAt <= now ? "needs-login" : "ready");
     const quota = usage[account.id];
@@ -295,6 +295,11 @@ async function anthropicLimitAccounts(deps: AdminDeps, name: string, refresh: bo
       health: { state, ...(report?.cooldownSeconds ? { pausedUntil: now + report.cooldownSeconds * 1000 } : {}) },
     }, index, quota ? claudeLimitWindows(quota) : [], quota, now, 5 * 60_000);
   });
+  // The mod's status bar reads the legacy `windows` and shows Claude as one group: only the account
+  // serving turns (else the preferred one, else the first with figures) keeps them. Every account's
+  // figures stay in `usageWindows` for the Status page.
+  const shown = listed.find((a) => a.active && a.windows.length) ?? listed.find((a) => a.preferred && a.windows.length) ?? listed.find((a) => a.windows.length);
+  return listed.map((a) => a === shown ? a : { ...a, windows: [] });
 }
 
 /** ChatGPT has no stored preference: the first account in rotation is the default for new turns. */

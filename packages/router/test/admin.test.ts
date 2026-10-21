@@ -2544,6 +2544,25 @@ test("limits lists every Claude and ChatGPT account with identity, activity, pre
   });
 });
 
+test("GET /api/limits gives the mod's legacy windows to the serving Claude account only", async () => {
+  const now = Date.now();
+  const quota = (five: number) => ({ at: now, rate_limits: { primary: { used_percent: five, window_minutes: 300, reset_at: (now + 3600_000) / 1000 } } });
+  let active = "current";
+  await withAdmin(makeCfg({ providers: { claude: { type: "anthropic", auth: "claude-code" } } }), async ({ port, home }) => {
+    const stored = saveClaudeOAuthAccount(home, { accessToken: "legacy-access", refreshToken: "legacy-refresh", expiresAt: now + 3600_000, accountId: "legacy-account", email: "legacy@example.test" });
+    const read = async () => ((await (await fetch(`${base()}:${port}/api/limits`)).json()) as { providers: LimitsProvider[] }).providers[0]!.accounts;
+    const first = await read();
+    assert.deepEqual(first.map((a) => a.windows.length > 0), [true, false]);
+    assert.deepEqual(first.map((a) => a.usageWindows?.fiveHour?.usedPercent), [3, 22], "the Status page still sees every account");
+    active = stored.id;
+    assert.deepEqual((await read()).map((a) => a.windows.length > 0), [false, true]);
+  }, {
+    claudeUsage: async () => ({ current: quota(3), [listClaudeAccounts(process.env.CLAUDERIPPLE_HOME!)[0]!.id]: quota(22) }),
+    claudeActive: () => ({ claude: active }),
+    credentials: () => ({ claude: [{ id: "current", state: "ready", failures: 0 }] }),
+  });
+});
+
 test("GET /api/limits assembles every readable provider and honours limits:false", async () => {
   const now = Date.now();
   const future = Math.floor((now + 3_600_000) / 1000);
