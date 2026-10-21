@@ -8,12 +8,13 @@ import path from "node:path";
 import { DEFAULTS, type Config, type ProviderModel } from "../src/config.ts";
 import { Logger } from "../src/log.ts";
 import { backfillContextWindows, effortLevelsForModel, googleHealth, measureUnsettledModels, parseUpdateCheck, startAdmin, type AdminDeps } from "../src/admin.ts";
-import type { ImageRequest } from "../src/providers/chatgpt/index.ts";
+import type { ChatGptAccountStatus, ImageRequest } from "../src/providers/chatgpt/index.ts";
+import type { LimitsProvider } from "../src/admin.ts";
 import type { GoogleAccountStatus } from "../src/providers/google/index.ts";
 import { RequestLog } from "../src/requestlog.ts";
 import { PRESETS } from "../src/presets.ts";
 import { saveClaudeAuthFile, saveClaudeOAuthFile } from "../src/providers/anthropic-token-file.ts";
-import { listClaudeAccounts, readClaudeAccountsFile, saveClaudeOAuthAccount } from "../src/providers/anthropic-accounts.ts";
+import { listClaudeAccounts, readClaudeAccountsFile, saveClaudeOAuthAccount, setPreferredClaudeAccount } from "../src/providers/anthropic-accounts.ts";
 import { ObservedClaudeCodeAuth } from "../src/providers/anthropic-observed.ts";
 import type { ModOptions } from "../src/admin.ts";
 import type { ModSettingsSnapshot } from "../src/mod-settings.ts";
@@ -45,6 +46,7 @@ async function withAdmin(
     google?: NonNullable<AdminDeps["google"]>;
     opencodeUsage?: NonNullable<AdminDeps["opencodeUsage"]>;
     claudeUsage?: NonNullable<AdminDeps["claudeUsage"]>;
+    claudeActive?: NonNullable<AdminDeps["claudeActive"]>;
     googleOAuthFetch?: (url: string, init?: RequestInit) => Promise<Response>;
     googleOAuthPort?: number;
   } = {},
@@ -2415,6 +2417,76 @@ test("POST /api/providers/probe[grok] without a session says to sign in and call
   assert.equal(called, false);
 });
 
+test("limits lists every Claude and ChatGPT account with identity, activity, preference and named windows", async () => {
+  const now = Date.now();
+  const week = 7 * 24 * 60 * 60_000;
+  const quota = { at: now, rate_limits: {
+    primary: { used_percent: 125, window_minutes: 10080, reset_at: (now + week / 2) / 1000 },
+    secondary: { used_percent: 15, window_minutes: 300, reset_at: (now + 3600_000) / 1000 },
+  } };
+  const flags: boolean[] = [];
+  let active = "current";
+  let currentAvailable = true;
+  let refreshes = 0;
+  let fetched = false;
+  const accounts: ChatGptAccountStatus[] = [
+    { id: "gpt-work", label: "Work", email: "work@example.test", source: "own", expiresAt: now + 3600_000, needsReauth: false, paused: false, state: "cooling", cooldownSeconds: 60, active: true, quota },
+    { id: "gpt-personal", label: "Personal", source: "own", expiresAt: now + 3600_000, needsReauth: false, paused: false, state: "ready", active: false, quota: null },
+  ];
+  await withAdmin(makeCfg({ providers: { claude: { type: "anthropic", auth: "claude-code" }, gpt: { type: "chatgpt" } } }), async ({ port, home }) => {
+    const stored = saveClaudeOAuthAccount(home, { accessToken: "test-access", refreshToken: "test-refresh", expiresAt: now - 1, accountId: "other-test-account", email: "other@example.test" });
+    setPreferredClaudeAccount(home, stored.id);
+    const body = await (await fetch(`${base()}:${port}/api/limits`)).json() as { providers: LimitsProvider[] };
+    const [claude, gpt] = body.providers;
+    assert.equal(refreshes, 1, "Limits refreshes ChatGPT itself without a Status visit");
+    assert.deepEqual(claude?.accounts.map((a) => a.id), ["current", stored.id]);
+    const [current, other] = claude!.accounts;
+    assert.equal(current?.label, "Current Claude login");
+    assert.equal(current?.active, true);
+    assert.equal(current?.preferred, false);
+    assert.equal(current?.health?.state, "ready");
+    assert.equal(current?.usageWindows?.fiveHour?.usedPercent, 15);
+    assert.equal(current?.usageWindows?.weekly?.usedPercent, 125);
+    assert.equal(current?.usageWindows?.weekly?.resetAt, Math.round((now + week / 2) / 1000) * 1000);
+    assert.ok(Math.abs(current!.weeklyPace!.expectedPercent - 50) < 0.01);
+    assert.ok(Math.abs(current!.weeklyPace!.paceDelta - 75) < 0.01);
+    assert.equal(current?.stale, false);
+    assert.equal(current?.fetchedAt, now);
+    assert.equal(other?.label, "other@example.test");
+    assert.equal(other?.preferred, true);
+    assert.equal(other?.active, false);
+    assert.equal(other?.health?.state, "needs-login");
+    assert.equal(other?.unknown, true);
+    assert.equal(other?.stale, true);
+    assert.equal(other?.fetchedAt, null);
+    assert.deepEqual(other?.windows, []);
+    assert.deepEqual(other?.usageWindows, {});
+    assert.deepEqual(gpt?.accounts.map((a) => [a.id, a.label, a.preferred, a.active]), [
+      ["gpt-work", "work@example.test", false, true], ["gpt-personal", "Personal", true, false],
+    ]);
+    assert.equal(gpt?.accounts[0]?.health?.state, "paused-until");
+    assert.ok(gpt!.accounts[0]!.health!.pausedUntil! >= now + 60_000);
+    assert.equal(gpt?.accounts[1]?.unknown, true);
+    assert.deepEqual(flags, [false]);
+    active = stored.id;
+    const forced = await (await fetch(`${base()}:${port}/api/limits?refresh=1`)).json() as { providers: LimitsProvider[] };
+    assert.deepEqual(flags, [false, true]);
+    assert.equal(refreshes, 2);
+    assert.equal(forced.providers[0]?.accounts[1]?.active, true, "last-success tracking survives an expired credential");
+    assert.equal(forced.providers[0]?.accounts[0]?.active, false);
+    currentAvailable = false;
+    active = "current";
+    const signedOut = await (await fetch(`${base()}:${port}/api/limits`)).json() as { providers: LimitsProvider[] };
+    assert.equal(signedOut.providers[0]?.accounts[0]?.active, true, "last success survives a sign-out");
+    assert.equal(signedOut.providers[0]?.accounts[0]?.health?.state, "needs-login", "cached usage cannot make an unavailable login ready");
+  }, {
+    claudeUsage: async (force) => { flags.push(force === true); return { current: quota }; },
+    claudeActive: () => ({ claude: active }),
+    credentials: () => ({ claude: currentAvailable ? [{ id: "current", state: "ready", failures: 0 }] : [] }),
+    chatgpt: () => ({ quota: { gpt: fetched ? quota : null }, auth: {}, accounts: () => ({ gpt: accounts }), refresh: async () => { refreshes++; fetched = true; return quota; } }),
+  });
+});
+
 test("GET /api/limits assembles every readable provider and honours limits:false", async () => {
   const now = Date.now();
   const future = Math.floor((now + 3_600_000) / 1000);
@@ -2434,8 +2506,9 @@ test("GET /api/limits assembles every readable provider and honours limits:false
     assert.deepEqual(body.providers.map((p) => p.title), ["Claude", "GPT", "Gemini", "Go"]);
     assert.equal(body.providers[0]!.type, "anthropic");
     assert.deepEqual(body.providers[0]!.accounts[0]!.windows.map((w) => `${w.kind}${w.label ? ":" + w.label : ""}`), ["five_hour", "seven_day", "scoped:Fable"]);
-    // The paused ChatGPT account takes no number; the ready one is account 0.
-    assert.deepEqual(body.providers[1]!.accounts.map((a) => a.account), [0]);
+    // The ready account retains its index; the paused account is now visible too, with no windows.
+    assert.deepEqual(body.providers[1]!.accounts.map((a) => a.account), [0, 1]);
+    assert.deepEqual(body.providers[1]!.accounts[1]!.windows, []);
     assert.equal(body.providers[2]!.type, "google");
     assert.equal(body.providers[3]!.type, "opencode-go");
   }, {
