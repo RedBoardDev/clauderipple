@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { closeSync, ftruncateSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, writeFileSync } from "node:fs";
+import { closeSync, ftruncateSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, truncateSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { readJson, writeFileAtomic } from "./fsutil.ts";
 import { FRAME_CAP, INLINE_CAP } from "./protocol.ts";
@@ -111,8 +111,7 @@ export class EventLog {
   private scan(name: string, last: boolean): void {
     const file = join(this.dir, name);
     const data = readFileSync(file);
-    const segment: Segment = { fd: openSync(file, "a+", 0o600), bytes: data.length, number: Number(name.slice(7, -6)) };
-    this.segments.push(segment);
+    const entries: { event: SessionEvent; offset: number; length: number }[] = [];
     let offset = 0;
     while (offset < data.length) {
       const end = data.indexOf(10, offset);
@@ -127,16 +126,17 @@ export class EventLog {
         if (!last || end !== data.length - 1) throw error;
         break;
       }
-      if (event === null || event.seq !== this.lastSeq + 1 || typeof event.at !== "number" || typeof event.kind !== "string") {
+      if (event === null || event.seq !== this.lastSeq + entries.length + 1 || typeof event.at !== "number" || typeof event.kind !== "string") {
         throw new Error(`Invalid event at ${name}:${offset}`);
       }
-      this.index(event, segment, offset, end + 1 - offset);
+      entries.push({ event, offset, length: end + 1 - offset });
       offset = end + 1;
     }
-    if (offset !== data.length) {
-      ftruncateSync(segment.fd, offset);
-      segment.bytes = offset;
-    }
+    // Windows cannot truncate through an append-only handle, so repair before opening that handle.
+    if (offset !== data.length) truncateSync(file, offset);
+    const segment: Segment = { fd: openSync(file, "a+", 0o600), bytes: offset, number: Number(name.slice(7, -6)) };
+    this.segments.push(segment);
+    for (const entry of entries) this.index(entry.event, segment, entry.offset, entry.length);
   }
 
   private index(event: SessionEvent, segment: Segment, offset: number, length: number): void {

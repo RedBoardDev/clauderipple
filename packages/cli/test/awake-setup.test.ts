@@ -9,6 +9,7 @@ import {
   type SetupDeps,
 } from "../src/awake-setup.ts";
 import { readJournal, type RunResult } from "../../router/src/awake.ts";
+import { needsPosixPaths, posixPaths } from "../../../test/capabilities.ts";
 
 const PORTS = "Hardware Port: Ethernet Adapter (en3)\nDevice: en3\n\nHardware Port: Wi-Fi\nDevice: en0\nEthernet Address: c0:c7:db:32:f6:de\n";
 
@@ -74,13 +75,15 @@ test("the osascript call is one admin do-shell-script with the script escaped", 
 
 test("Insomnia cleanup: agent out, plist and app to the Trash, app quit, keychain item deleted — in that order", () => {
   const steps = insomniaCleanupSteps({ uid: 501, home: "/Users/pbj", exists: () => true, insomniaApp: true });
-  assert.deepEqual(steps.map((s) => (s.kind === "run" ? [s.file, ...s.args].join(" ") : `trash ${s.path}`)), [
-    "/bin/launchctl bootout gui/501/com.insomnia.backstop",
-    "trash /Users/pbj/Library/LaunchAgents/com.insomnia.backstop.plist",
-    "/usr/bin/killall -TERM Insomnia",
-    "trash /Users/pbj/Applications/Insomnia.app",
-    "/usr/bin/security delete-generic-password -s insomnia-hotspot",
-  ]);
+  if (posixPaths) {
+    assert.deepEqual(steps.map((s) => (s.kind === "run" ? [s.file, ...s.args].join(" ") : `trash ${s.path}`)), [
+      "/bin/launchctl bootout gui/501/com.insomnia.backstop",
+      "trash /Users/pbj/Library/LaunchAgents/com.insomnia.backstop.plist",
+      "/usr/bin/killall -TERM Insomnia",
+      "trash /Users/pbj/Applications/Insomnia.app",
+      "/usr/bin/security delete-generic-password -s insomnia-hotspot",
+    ]);
+  }
   assert.equal(insomniaCleanupSteps({ uid: 501, home: "/Users/pbj", exists: () => false, insomniaApp: false }).filter((s) => s.kind === "trash").length, 0);
 });
 
@@ -127,7 +130,7 @@ function deps(o: { platform?: NodeJS.Platform; insomnia?: boolean; appId?: strin
   return { d, calls, printed, trashed, temps, removed, rippleHome };
 }
 
-test("setup: one privileged call with the rule's own hash, a sudo -n check, then Insomnia's unprivileged leftovers", async () => {
+test("setup: one privileged call with the rule's own hash, a sudo -n check, then Insomnia's unprivileged leftovers", { skip: needsPosixPaths }, async () => {
   const t = deps({ insomnia: true });
   const r = await awakeSetup({ ssid: "PBJ" }, t.d);
   assert.equal(r.ok, true, r.detail);
@@ -152,9 +155,11 @@ test("setup without Insomnia touches nothing of it; /usr/bin/trash missing falls
   assert.equal((await awakeSetup({}, t.d)).ok, true);
   assert.ok(!t.calls.some((c) => c.file === "/bin/launchctl" || c.file === "/usr/bin/security"));
   assert.ok(!t.calls.find((c) => c.file === "/usr/bin/osascript")!.args[1]!.includes("insomnia"));
-  const u = deps({ insomnia: true, trashCli: false });
-  assert.equal((await awakeSetup({}, u.d)).ok, true);
-  assert.deepEqual(u.trashed, ["/Users/u/Library/LaunchAgents/com.insomnia.backstop.plist", "/Users/u/Applications/Insomnia.app"]);
+  if (posixPaths) {
+    const u = deps({ insomnia: true, trashCli: false });
+    assert.equal((await awakeSetup({}, u.d)).ok, true);
+    assert.deepEqual(u.trashed, ["/Users/u/Library/LaunchAgents/com.insomnia.backstop.plist", "/Users/u/Applications/Insomnia.app"]);
+  }
 });
 
 test("setup with another app at ~/Applications/Insomnia.app neither quits nor trashes it, and says so", async () => {

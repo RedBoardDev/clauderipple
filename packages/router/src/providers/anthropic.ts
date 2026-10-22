@@ -19,6 +19,10 @@ const CACHE_MS = 60_000;
 
 export type ClaudeCodeCredentials = { accessToken: string; expiresAt: number };
 export type CredentialReader = () => string | null;
+export type ClaudeCodeCredentialReaders = {
+  keychain: CredentialReader;
+  credentialsFile: CredentialReader;
+};
 /** Source labels are deliberately metadata only: no token value reaches an admin response. */
 export type ClaudeCodeAuthSource = "observed" | "env" | "keychain" | "credentials-file" | "token-file";
 export type ClaudeCodeAuth =
@@ -29,6 +33,8 @@ export type ClaudeCodeAuthOptions = {
   home?: string;
   env?: NodeJS.ProcessEnv;
   now?: () => number;
+  /** Test seam for Claude Code's OS-owned credential sources. */
+  credentialReaders?: ClaudeCodeCredentialReaders;
   /** Test seam for the OAuth refresh. */
   fetch?: FetchLike;
   log?: (line: string) => void;
@@ -56,9 +62,12 @@ export function readClaudeCodeCredentialsFile(): string | null {
 }
 
 /** Keychain first on macOS, then Claude Code's credential-file fallback. */
-export function readClaudeCodeCredentials(): string | null {
-  const keychain = readClaudeCodeKeychain();
-  return parseClaudeCodeCredentials(keychain) ? keychain : readClaudeCodeCredentialsFile();
+export function readClaudeCodeCredentials(readers: ClaudeCodeCredentialReaders = {
+  keychain: readClaudeCodeKeychain,
+  credentialsFile: readClaudeCodeCredentialsFile,
+}): string | null {
+  const keychain = readers.keychain();
+  return parseClaudeCodeCredentials(keychain) ? keychain : readers.credentialsFile();
 }
 
 export function parseClaudeCodeCredentials(raw: string | null): ClaudeCodeCredentials | null {
@@ -103,6 +112,7 @@ export class ClaudeCodeCredentialStore {
  */
 export class ClaudeCodeAuthStore {
   private readonly credentials: ClaudeCodeCredentialStore;
+  private readonly credentialReaders: ClaudeCodeCredentialReaders;
   private readonly observed: ObservedClaudeCodeAuth | undefined;
   private readonly home: string;
   private readonly env: NodeJS.ProcessEnv;
@@ -111,8 +121,12 @@ export class ClaudeCodeAuthStore {
   private readonly log: (line: string) => void;
   private refreshing: Promise<void> | null = null;
 
-  constructor(credentials = new ClaudeCodeCredentialStore(), options: ClaudeCodeAuthOptions = {}) {
-    this.credentials = credentials;
+  constructor(credentials: ClaudeCodeCredentialStore | undefined = undefined, options: ClaudeCodeAuthOptions = {}) {
+    this.credentialReaders = options.credentialReaders ?? {
+      keychain: readClaudeCodeKeychain,
+      credentialsFile: readClaudeCodeCredentialsFile,
+    };
+    this.credentials = credentials ?? new ClaudeCodeCredentialStore(() => readClaudeCodeCredentials(this.credentialReaders));
     this.observed = options.observed;
     this.home = options.home ?? (process.env.CLAUDERIPPLE_HOME?.trim() || path.join(os.homedir(), ".clauderipple"));
     this.env = options.env ?? process.env;
@@ -172,9 +186,9 @@ export class ClaudeCodeAuthStore {
   describeSource(): ClaudeCodeAuthSource | null {
     if (this.observed?.getFresh(this.now())) return "observed";
     if (this.env.CLAUDE_CODE_OAUTH_TOKEN?.trim()) return "env";
-    const keychain = parseClaudeCodeCredentials(readClaudeCodeKeychain());
+    const keychain = parseClaudeCodeCredentials(this.credentialReaders.keychain());
     if (keychain && this.now() < keychain.expiresAt) return "keychain";
-    const credentialsFile = parseClaudeCodeCredentials(readClaudeCodeCredentialsFile());
+    const credentialsFile = parseClaudeCodeCredentials(this.credentialReaders.credentialsFile());
     if (credentialsFile && this.now() < credentialsFile.expiresAt) return "credentials-file";
     return readClaudeAuthFile(this.home) ? "token-file" : null;
   }

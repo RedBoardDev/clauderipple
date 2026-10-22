@@ -8,7 +8,7 @@ import { rungOf } from './ladder'
 import { debugText, langFrom, t } from './i18n'
 import type { Lang } from './i18n'
 import { EFFORT_JUDGE_SYSTEM, finalEffort, isCacheSafeModel, isShortFollowUp, jevEffortRequest, jevFailure, jevUsage, jevWorkerRequest, judgeContext, parseEffortVerdict, parseJevEffort, parseJevKey, parseJevWorker, shouldJudge } from './judge'
-import { AUTO_DESCRIPTION, WORKER_JUDGE_SYSTEM, agentProvider, candidateUsable, chatgptUsable, claudeCandidates, ladderOptionsFrom, ladderPick, parseWorkerVerdict, readMarker, routerModelOptions, spawnModel, spawnTitle, takesOver, TIER_MARKERS, tierOf, workerJudgeInput, zenJev } from './workers'
+import { AUTO_DESCRIPTION, WORKER_JUDGE_SYSTEM, agentProvider, candidateUsable, chatgptUsable, claudeCandidates, domainVerdict, ladderOptionsFrom, ladderPick, parseWorkerVerdict, readMarker, routerModelOptions, spawnModel, spawnTitle, takesOver, TIER_MARKERS, tierOf, workerJudgeInput, workerRule, zenJev } from './workers'
 import { MARKER, agentModel, fixSpawn } from './worker'
 import { activeModeOf, chatgptProviders, claudeWindow, eagerNote, gptLimitsFrom, modeKey, modeOver, quotaWindows, resetProvider, routingSettings } from './modes'
 import type { QuotaWindow } from './modes'
@@ -642,7 +642,9 @@ async function judge($: EngineInterface, s: Settings, input: JudgeInput | { desc
       const response = await Promise.race([
         $.http.fetch(source === 'zen' ? 'https://opencode.ai/zen/v1/systemone' : 'https://api.typesafe.ai/v1/systemone', { method: 'POST', headers: { 'content-type': 'application/json', authorization: source === 'zen' ? key : `Bearer ${key}` }, body: JSON.stringify({ ...body, model }) })
           .catch(() => 'network' as const),
-        $.clock.sleep(3000).then(() => null),
+        // Jev answers in about 2.1–2.4 s even with a full context (measured 2026-10-22), so 3 s timed
+        // out whenever OpenCode slowed down — and the Haiku fallback then cost more than waiting.
+        $.clock.sleep(5000).then(() => null),
       ])
       // A dropped connection or a slow answer is often one bad moment, not a broken judge.
       if (!response || response === 'network') {
@@ -722,6 +724,8 @@ async function requestPick($: EngineInterface, e: AgentSpawnInput, s: Settings):
   let rawVerdict: WorkerVerdict | null = null
   let judgeError: string | undefined
   let target: TierTarget | undefined
+  const mode = activeModeOf(s)
+  const routing = routingSettings(s)
   if (explicit) {
     // Agent names and their file-model ids are both valid explicit routing notes.
     const name = files.has(explicit.name) ? explicit.name : [...files].find(([, f]) => agentModel(f)?.replace(/@[^@]*$/, '').toLowerCase() === explicit.name)?.[0]
@@ -729,12 +733,21 @@ async function requestPick($: EngineInterface, e: AgentSpawnInput, s: Settings):
     verdict = { domain: 'general', level: 'standard', effort: effortOf(explicit.level) ?? 'high', why: t(language, 'toasts.explicitMarker') }
     by = 'marker'
   } else if (tier) {
-    // The main chat named the tier. The judge still rates the same brief, unawaited, so the log
-    // can later say which of the two was right (see shadowJudge).
+    // A marker owns the tier. Only a set with domain ladders needs the shadow judge's domain
+    // before dispatch; otherwise leave the existing unawaited path (and latency) unchanged.
     const named = TIER_MARKERS[tier]!
     verdict = { domain: 'general', ...named, effort: RUNG_EFFORT[rungOf(named)], why: t(language, 'toasts.sessionTier', { tier }) }
     by = 'session'
-    void shadowJudge($, s, id, { description: e.description, prompt: e.prompt })
+    const shadow = shadowJudge($, s, id, { description: e.description, prompt: e.prompt })
+    if (routing.domainRules?.ui || routing.domainRules?.backend) {
+      const judged = await shadow
+      if (judged?.verdict && 'domain' in judged.verdict) {
+        rawVerdict = judged.verdict
+        verdict.domain = judged.verdict.domain
+      }
+      ms = judged?.ms ?? 0
+      judgeError = judged?.error
+    }
   } else {
     const judged = await judge($, s, { description: e.description, prompt: e.prompt }, true)
     if (judged.verdict && 'domain' in judged.verdict) { rawVerdict = judged.verdict; verdict = judged.verdict; by = judged.by }
@@ -749,12 +762,15 @@ async function requestPick($: EngineInterface, e: AgentSpawnInput, s: Settings):
   const providers = options && options.until > now ? Object.fromEntries(Object.entries(options.providers ?? {}).filter(([, p]) => p.exhaustedUntil === undefined || p.exhaustedUntil > now)) : {}
   const explicitCandidate = target ? pinnedCandidates.find(c => c.target.agent === target!.agent) ?? (target.agent === 'general-purpose' ? { target, model: target.model ?? 'sonnet', provider: (await read($, routerModels)).find(m => m.value.toLowerCase() === target!.model)?.provider ?? 'anthropic' } : undefined) : undefined
   if (explicitCandidate && s.providers[explicitCandidate.provider] === false) return { deny: t(language, 'workers.disabled', { provider: explicitCandidate.provider }) }
-  // An active mode moves the tiers; an explicit marker still names its own model.
-  const mode = activeModeOf(s)
-  const routing = routingSettings(s)
-  const resolved = explicitCandidate && candidateUsable(explicitCandidate, s, usable, providers)
+  // An active mode replaces the whole set; an explicit marker still names its own model. Design under
+  // the ui ladder takes the heavy level even past a tier marker: the main chat tiers by difficulty,
+  // and a design task is "standard" by that measure while its result depends on the model's taste.
+  const { rule, ladder } = workerRule(verdict.domain, routing)
+  const explicitUsable = !!explicitCandidate && candidateUsable(explicitCandidate, s, usable, providers)
+  const domained: ReturnType<typeof domainVerdict> = explicitUsable ? { verdict } : domainVerdict(verdict, rule)
+  const resolved = explicitUsable
     ? { target: target!, effort: verdict.effort }
-    : ladderPick(verdict, routing.rules.general, routing, pinnedCandidates, usable, language, routing.allow, providers, routing.allowKnown)
+    : ladderPick(domained.verdict, ladder, routing, pinnedCandidates, usable, language, routing.allow, providers, routing.allowKnown)
   const selected = resolved.target
   if (!selected) return { deny: t(language, 'workers.none') }
   const fallbackReason = resolved.fallbackReason
@@ -762,10 +778,10 @@ async function requestPick($: EngineInterface, e: AgentSpawnInput, s: Settings):
   const model = spawnModel(selected, verdict.effort, files.has(selected.agent) ? agentModel(files.get(selected.agent)!) : undefined)
   let prompt = e.prompt
   if (marker) prompt = prompt.replace(MARKER, '').replace(/^\s*\n/, '')
-  const value: WorkerPick = { ...verdict, ...resolved, target: selected, by, ms, id, ...(fallbackReason ? { fallbackReason } : {}) }
+  const value: WorkerPick = { ...verdict, ...resolved, rule, target: selected, by, ms, id, ...(fallbackReason ? { fallbackReason } : {}) }
   // The verdict behind a pick is otherwise only in the agents panel; one debug line per pick keeps
   // it checkable: what the judge said, the rung it landed on and what ran.
-  const entry = { task: e.description.slice(0, 200), domain: value.domain, level: value.level, kind: value.kind ?? 'do', sure: value.sure, rung: value.rung, position: value.position, skipped: value.skipped, target: value.target, model: model ?? null, effort: value.effort, by, ...(mode ? { mode: mode.name } : {}), ...(fallbackReason ? { fallbackReason } : {}) }
+  const entry = { task: e.description.slice(0, 200), domain: value.domain, level: value.level, kind: value.kind ?? 'do', sure: value.sure, rule: value.rule, ...(domained.raised ? { raised: domained.raised } : {}), rung: value.rung, position: value.position, skipped: value.skipped, target: value.target, model: model ?? null, effort: value.effort, by, ...(mode ? { mode: mode.name } : {}), ...(fallbackReason ? { fallbackReason } : {}) }
   await $.ui.log('ClaudeRipple worker pick: ' + JSON.stringify(entry), { to: 'debug' })
   // The brief itself is never logged (it can hold anything); its length is. To re-judge a pick,
   // its brief is in the session's own transcript under the same description.
@@ -779,15 +795,16 @@ async function requestPick($: EngineInterface, e: AgentSpawnInput, s: Settings):
 
 /**
  * What the judge would have said of a brief the main chat already tiered: logged beside the pick
- * (same `id`), never awaited by the spawn, never acted on. Together with each pick's outcome it is
- * what decides later whether the judge stays.
+ * (same `id`). With domain ladders the spawn awaits this same result for its domain only; without
+ * them it never waits or acts on it. The marker's tier always stands.
  */
-async function shadowJudge($: EngineInterface, s: Settings, id: string, input: { description: string; prompt: string }): Promise<void> {
+async function shadowJudge($: EngineInterface, s: Settings, id: string, input: { description: string; prompt: string }): Promise<Judged | undefined> {
   try {
     const judged = await judge($, s, input, true)
     const verdict = judged.verdict && 'domain' in judged.verdict ? judged.verdict : null
     await persistWorkerPick($, { type: 'shadow', pick: id, at: new Date(await $.clock.now()).toISOString(), verdict, rung: verdict ? rungOf(verdict) : null, judge: judged.by, ms: judged.ms, ...(judged.error ? { error: judged.error } : {}) })
-  } catch (error) { await report($, 'shadow judge', error) }
+    return judged
+  } catch (error) { await report($, 'shadow judge', error); return undefined }
 }
 
 async function toggleAuto($: EngineInterface): Promise<void> {
@@ -1077,21 +1094,24 @@ async function fallbackLimits($: EngineInterface): Promise<LimitItem[]> {
  * predates the endpoint (404) the older per-provider routes answer instead, so the row shows before
  * the router is restarted. A failure keeps the last good row rather than blanking it, and the state
  * is written only when it moved: a redraw that shows nothing new is wasted (each answer is drawn
- * afresh).
+ * afresh). Only a good read holds off the next minute, and only while there is a row: a failed read
+ * stamped the minute too, and a session whose first read failed (the router restarting) showed no
+ * limits row for that minute (2026-10-22).
  */
 let limitsAt = 0
 async function refreshLimits($: EngineInterface): Promise<void> {
   if (!(await currentSettings($)).extras.includes('limits')) return
   const now = await $.clock.now()
-  if (now - limitsAt < 60_000) return
-  limitsAt = now
+  if (now - limitsAt < 60_000 && await read($, limits) !== null) return
   try {
     const admin = await adminUrl($)
     const response = await $.http.fetch(`${admin}/api/limits`)
     let items: LimitItem[] | null = null
     if (response.ok) items = routerLimitItems(JSON.parse(response.text), now)
     else if (response.status === 404) items = await fallbackLimits($)
-    if (items && !same(items, await read($, limits))) await update($, limits, () => items)
+    if (!items) return
+    limitsAt = now
+    if (!same(items, await read($, limits))) await update($, limits, () => items)
   } catch (error) { await report($, 'limits', error) }
 }
 async function refreshUsage($: EngineInterface): Promise<void> {

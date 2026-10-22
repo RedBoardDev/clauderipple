@@ -85,6 +85,25 @@ export function installKind(rt: Pick<Runtime, "packaged" | "cli" | "repo">, opts
   return same(prefix, scriptPrefix(opts.env, opts.home)) ? { kind: "script", prefix } : { kind: "npm", prefix };
 }
 
+/**
+ * npm puts a clauderipple.ps1 next to clauderipple.cmd, and PowerShell picks it first — but the
+ * default execution policy runs no .ps1, so `clauderipple` failed with PSSecurityException (#38 for
+ * a script install, #62 for `npm install -g`). Without it PowerShell falls through to the .cmd,
+ * which runs under any policy. Every npm install writes it again, so `install`, which every update
+ * ends with, removes it. Returns the file removed.
+ */
+export function dropPowerShellShim(kind: InstallKind, platform: NodeJS.Platform = process.platform): string | null {
+  if (platform !== "win32" || (kind.kind !== "npm" && kind.kind !== "script")) return null;
+  const ps1 = path.join(kind.prefix, `${PACKAGE}.ps1`);
+  if (!fs.existsSync(path.join(kind.prefix, `${PACKAGE}.cmd`)) || !fs.existsSync(ps1)) return null;
+  try {
+    fs.rmSync(ps1);
+    return ps1;
+  } catch {
+    return null;
+  }
+}
+
 /** The version npm would install now. */
 export async function latestVersion(fetchImpl: typeof fetch = fetch): Promise<string> {
   const res = await fetchImpl(`https://registry.npmjs.org/${PACKAGE}/latest`, { signal: AbortSignal.timeout(10_000), headers: { accept: "application/json" } });

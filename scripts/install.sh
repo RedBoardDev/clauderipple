@@ -12,6 +12,7 @@
 #   CLAUDERIPPLE_PREFIX    where to install            (default: $HOME/.clauderipple)
 #   CLAUDERIPPLE_PACKAGE   what to install             (default: clauderipple, from npm)
 #   CLAUDERIPPLE_NO_SETUP  1 = install only, no setup  (default: run `clauderipple install`)
+#   CLAUDERIPPLE_NO_TRAY   1 = do not add the menu-bar app (macOS; Electron is ~270MB)
 set -eu
 
 PREFIX="${CLAUDERIPPLE_PREFIX:-$HOME/.clauderipple}"
@@ -161,5 +162,23 @@ fi
 
 say ""
 "$BIN/clauderipple" install
+
+# --- the menu-bar app ---------------------------------------------------------------------------
+# Part of the default install on macOS: it carries the dashboard that opens with the router down
+# (repair, switch to Claude's own connection), which is the entry point a non-terminal user needs.
+# Linux keeps it opt-in. Electron is ~270MB, so CLAUDERIPPLE_NO_TRAY=1 skips it.
+
+say ""
+if [ "$(uname -s)" = "Darwin" ] && [ "${CLAUDERIPPLE_NO_TRAY:-}" != "1" ]; then
+  say "Adding the menu-bar app (Electron, about 270MB, fetched once)…"
+  if "$BIN/clauderipple" tray --install; then
+    "$BIN/clauderipple" app --install || say "The menu-bar app's launcher was not added; try again with: clauderipple app --install"
+    "$BIN/clauderipple" tray || true
+  else
+    say ""
+    say "The router is installed; the menu-bar app was not. Add it later with: clauderipple tray --install"
+  fi
+fi
+
 say ""
 say "Open the dashboard with: clauderipple ui"

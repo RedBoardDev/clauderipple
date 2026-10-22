@@ -71,6 +71,18 @@ gave 18 (light 1, standard 43, max 0).
   (`shadowJudge`), only into the log.
 - No marker: the judge decides, as before.
 
+**Added 2026-10-22: the description also names the explicit-model marker.** A session that wanted
+Opus for a server review, where the backend ladder's hard rung is Sol, started seven `claude -p
+--model claude-opus-5-5` processes from Bash: they ran, but outside the agents panel and the pick
+log. `[[ripple: opus@high]]` on `ripple:auto` already did this (`requestPick`'s `explicit` branch:
+no judge, no ladder, no mode, `by: "marker"`; measured 2026-10-22, `opus@low` ran on
+`claude-opus-5-5` at effort low and was logged), but nothing told the main chat. The description
+now does, and says not to start a model another way. It also carries what any delegator wants and
+had kept in a personal CLAUDE.md: what a brief states, checking the report did what was asked, and
+continuing a worker only within 5 minutes (after an 8-minute wait, three resumes rewrote 300k,
+338k and 377k uncached tokens, 2026-09-28). Leftover files are the worker body's rule already
+(`router/src/agents.ts`).
+
 **The pick log decides whether the judge stays.** `~/.clauderipple/logs/worker-picks.jsonl`,
 3,000 lines, three line types joined by the pick's `id`:
 
@@ -152,6 +164,54 @@ individual workers are edited on the dashboard. Existing effort/judge/cache cont
   name, delegation and end survive. Existing saved lists remain independent of later Base edits.
 - Field overrides and "더 세밀하게" rules are dropped; the card shows a one-time line saying so.
 - Auto (experimental, AA floors) is removed; `ripple:auto` uses the judge + tiers above.
+
+## Optional domain ladders (2026-10-21)
+
+Each worker set (Base or a saved mode) may store `domainRules: { ui?: Rule; backend?: Rule }`
+next to its general ladder, never inside `settings.rules`. `design` and `frontend` verdicts use
+`ui`; `backend` uses `backend`; other domains use general. An absent override uses **that set's**
+general ladder. An active mode replaces both general and domain rules completely: a missing mode
+override never inherits Base's. New modes deep-copy Base's general and optional domain ladders;
+existing modes gain no overrides on load. Normalization keeps only valid optional ladders and
+reuses ordered-step validation, then folds them into two levels (below). Retired per-field
+pin/Auto rules remain retired.
+
+A tier marker still owns the rung. **Only when the effective set has a domain override** does the
+spawn await its existing shadow judge, taking only its domain and reusing the same result for the
+shadow log. This conditional wait is necessary because the domain determines which ladder to
+consult; the judge cannot replace the marker's level/kind/confidence or promote its rung. Judge
+failure/timeout uses general. Without domain overrides, the shadow judge remains unawaited and
+does not affect dispatch or its latency. Explicit model markers keep their existing priority.
+Every `WorkerPick` and pick log records `rule: 'ui' | 'backend' | 'general'` beside the rung.
+Availability, ticked models, provider policy and within-ladder fallback are unchanged.
+
+The dashboard adds `전체 | 프론트엔드·디자인 | 백엔드` above the worker rows in every set tab.
+An optional domain has a `따로 정하기` switch: off shows that it follows general; on deep-copies
+that set's current general rungs and opens the same ordered-list editor. Turning it off deletes
+the override. The router fills empty rungs in existing Base and mode domain ladders using the
+same `fillLadder` as general, without creating absent overrides. All six UI languages cover the
+controls. The shared model checklist stays on Base.
+
+**A domain ladder has two levels, not four (2026-10-21).** The stored shape keeps the four rungs,
+so `ladderPick` and `rungOf` are untouched, but the two pairs are equal: `light` and `standard`
+hold one list, `hard` and `plan` another. Normalization folds every domain ladder (`ui`,
+`backend`, in Base and in each saved mode) with `twoLevelRungs`: the upper rung of each pair wins
+— `standard`'s list for the light pair, `plan`'s for the heavy one — and an empty upper rung
+falls back to the lower. The general ladder is **not** folded: it keeps four distinct rungs.
+
+Why: in practice a domain does not have four different tiers. The four general rungs are four
+models of the same ladder, and a domain ladder with four lists mostly sent trivial CSS edits to
+the design model — the mistake the domain ladder itself was meant to prevent. Two levels keep the
+choice the user actually makes ("this domain's cheap work" vs "this domain's hard work"), while
+the router still climbs rung by rung inside a level.
+
+**Design always takes the heavy level (2026-10-21).** Under the `ui` ladder a `design` verdict on the light or standard rung is raised to the hard rung (`domainVerdict` in `workers.ts`, logged as `raised: 'design'` beside `rule`); This holds past a tier marker too, the one exception to the marker owning the rung: the main chat tiers by difficulty, and by that measure design is `standard`. `frontend`, the `backend` ladder, the general ladder and explicit model markers keep their rung. Why: a store-screenshot redesign was judged `design`/`standard` and ran on the light pair; the main chat stopped it and resent it as `hard` (pick log, 2026-10-21). Visual design depends on the model's taste, not on difficulty.
+
+The dashboard shows the two levels instead of four rows: `가벼운 작업` edits the light pair
+(the same list is written to `light` and `standard`), `무거운 작업` edits the heavy pair (`hard`
+and `plan`). Each row shows the pair's upper rung. Switching `따로 정하기` on copies the set's
+general rungs folded the same way (light pair ← `general.standard`, heavy pair ← `general.plan`).
+The router fills a domain ladder and folds it again, so the pairs stay equal after the fill.
 
 ## Acceptance
 

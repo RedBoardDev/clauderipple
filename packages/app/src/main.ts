@@ -13,9 +13,10 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { reopenClaude } from "./claude-desktop";
+import { claudeStartedAt, reopenClaude } from "./claude-desktop";
+import { readUpdateSeen, rememberUpdate, updateNotice, type RouterUpdate, type UpdateSeen } from "./update-model";
 import { handleScheme, ORIGIN, registerScheme } from "./protocol";
-import { parseJsonOutput, repairDetails, shouldNotifyDown, tailLines, trayState, type Action, type ActionResult, type AppState, type Busy, type DirectOutput, type Doctor, type RepairOutput } from "./status-model";
+import { parseJsonOutput, repairDetails, restartStillOwed, shouldNotifyDown, tailLines, trayState, type Action, type ActionResult, type AppState, type Busy, type DirectOutput, type Doctor, type RepairOutput } from "./status-model";
 import { mainWindow, openWindow, sendToWindow, windowVisible, type Bounds } from "./window";
 
 type QuotaWindow = { used_percent?: number; window_minutes?: number };
@@ -23,6 +24,7 @@ type Quota = { rate_limits?: { primary?: QuotaWindow | null; secondary?: QuotaWi
 
 type Status = {
   version: string;
+  autoUpdate?: RouterUpdate;
   /** Reported from 0.1.2 on; an older router leaves it out. */
   runtime?: { node: string; router: string | null; startedAt: string };
   /** Reported from 0.1.2 on: whether requests can actually go through, and what is in the way. */
@@ -126,6 +128,8 @@ const STRINGS = {
     updateNow: "Update",
     later: "Later",
     updating: (v: string) => `Updating to ClaudeRipple ${v}…`,
+    autoUpdated: (v: string) => `Updated to ClaudeRipple ${v}`,
+    autoAvailable: (v: string) => `New version ${v} — click to update`,
     updateDone: (v: string) => `Updated to ClaudeRipple ${v}`,
     updateFailed: "The update did not finish",
     updateCheckFailed: "Could not check for updates",
@@ -210,6 +214,8 @@ const STRINGS = {
     updateNow: "업데이트",
     later: "나중에",
     updating: (v: string) => `ClaudeRipple ${v} 업데이트 중…`,
+    autoUpdated: (v: string) => `ClaudeRipple ${v}로 업데이트됨`,
+    autoAvailable: (v: string) => `새 버전 ${v} — 클릭해서 업데이트`,
     updateDone: (v: string) => `ClaudeRipple ${v} 업데이트 완료`,
     updateFailed: "업데이트를 완료하지 못했습니다",
     updateCheckFailed: "업데이트 정보를 확인하지 못했습니다",
@@ -294,6 +300,8 @@ const STRINGS = {
     updateNow: "更新",
     later: "稍后",
     updating: (v: string) => `正在更新到 ClaudeRipple ${v}…`,
+    autoUpdated: (v: string) => `已更新到 ClaudeRipple ${v}`,
+    autoAvailable: (v: string) => `新版本 ${v} — 点击更新`,
     updateDone: (v: string) => `已更新到 ClaudeRipple ${v}`,
     updateFailed: "更新未完成",
     updateCheckFailed: "无法检查更新",
@@ -378,6 +386,8 @@ const STRINGS = {
     updateNow: "アップデート",
     later: "後で",
     updating: (v: string) => `ClaudeRipple ${v} にアップデート中…`,
+    autoUpdated: (v: string) => `ClaudeRipple ${v} にアップデートしました`,
+    autoAvailable: (v: string) => `新バージョン ${v} — クリックして更新`,
     updateDone: (v: string) => `ClaudeRipple ${v} にアップデートしました`,
     updateFailed: "アップデートが完了しませんでした",
     updateCheckFailed: "アップデートを確認できませんでした",
@@ -462,6 +472,8 @@ const STRINGS = {
     updateNow: "Actualizar",
     later: "Más tarde",
     updating: (v: string) => `Actualizando a ClaudeRipple ${v}…`,
+    autoUpdated: (v: string) => `Actualizado a ClaudeRipple ${v}`,
+    autoAvailable: (v: string) => `Nueva versión ${v} — haz clic para actualizar`,
     updateDone: (v: string) => `Actualizado a ClaudeRipple ${v}`,
     updateFailed: "La actualización no se completó",
     updateCheckFailed: "No se pudo comprobar si hay actualizaciones",
@@ -546,6 +558,8 @@ const STRINGS = {
     updateNow: "Atualizar",
     later: "Depois",
     updating: (v: string) => `Atualizando para o ClaudeRipple ${v}…`,
+    autoUpdated: (v: string) => `Atualizado para o ClaudeRipple ${v}`,
+    autoAvailable: (v: string) => `Nova versão ${v} — clique para atualizar`,
     updateDone: (v: string) => `Atualizado para o ClaudeRipple ${v}`,
     updateFailed: "A atualização não foi concluída",
     updateCheckFailed: "Não foi possível verificar atualizações",
@@ -664,6 +678,7 @@ async function poll(): Promise<void> {
     downSince = null;
     downNotified = false;
     answered = true;
+    void handleRouterUpdate(last).catch((error: unknown) => console.error(`update notification: ${error}`));
     void reconcileRouter(last);
   } catch (e) {
     last = null;
@@ -674,7 +689,7 @@ async function poll(): Promise<void> {
     // the outage the notification is for. Neither is the direct mode, where the router being off
     // is the point — so doctor is asked first, and once per outage. With the window on screen the
     // user is already looking at the same news.
-    if (shouldNotifyDown({ downForMs: Date.now() - downSince, graceMs: DOWN_NOTIFY_AFTER_MS, alreadyNotified: downNotified, updating, busy: !!rec.busy || windowVisible(), mode: rec.doctor?.mode ?? null })) {
+    if (shouldNotifyDown({ downForMs: Date.now() - downSince, graceMs: DOWN_NOTIFY_AFTER_MS, alreadyNotified: downNotified, updating: updating || Date.now() < routerUpdateUntil, busy: !!rec.busy || windowVisible(), mode: rec.doctor?.mode ?? null })) {
       downNotified = true;
       void refreshDoctor().then(() => {
         if (!last && rec.doctor?.mode !== "direct") notifyDown();
@@ -683,6 +698,11 @@ async function poll(): Promise<void> {
   }
   // Up or down changed: what doctor said about the rest (direct, mixed) may have changed with it.
   if (before !== null && before !== answered && !rec.busy) void refreshDoctor();
+  // Claude quit or reopened by hand has applied the change as surely as the button would.
+  if (rec.restartClaude && !rec.busy && Date.now() - restartCheckedAt >= RESTART_CHECK_MS) {
+    restartCheckedAt = Date.now();
+    if (!restartStillOwed(restartOwedSince, await claudeStartedAt())) rec.restartClaude = false;
+  }
   render();
 }
 
@@ -902,6 +922,11 @@ const rec: { doctor: Doctor | null; doctorFailed: boolean; busy: Busy; result: A
   result: null,
   restartClaude: false,
 };
+/** When the connection last changed in a way Claude only picks up on its next start. */
+let restartOwedSince = 0;
+let restartCheckedAt = 0;
+/** How often a pending "reopen Claude" step asks whether Claude was reopened some other way. */
+const RESTART_CHECK_MS = 15_000;
 let doctorRun: Promise<void> | null = null;
 
 /** One `doctor` at a time; callers that arrive while one runs share it. */
@@ -1038,7 +1063,11 @@ async function runAction(action: "repair" | "direct-on" | "direct-off", args: st
       ? repairDetails(out, r.output)
       : [out?.detail ?? "", ...(ok ? [] : tailLines(out ? "" : r.output, 8))].filter(Boolean);
   rec.result = { action, ok, timedOut: r.timedOut, details, at: Date.now() };
-  if (ok && out?.restartClaude) rec.restartClaude = true;
+  if (ok && out?.restartClaude) {
+    // A Claude that is not running picks the change up when it next starts: nothing to ask for.
+    restartOwedSince = Date.now();
+    rec.restartClaude = restartStillOwed(restartOwedSince - 1, await claudeStartedAt());
+  }
   if (out?.doctor) {
     rec.doctor = out.doctor;
     rec.doctorFailed = false;
@@ -1082,6 +1111,66 @@ type UpdateCheck = { current: string; latest: string | null; newer: boolean; kin
 let availableUpdate: UpdateCheck | null = null;
 let updating = false;
 const UPDATE_CHECK_MS = 12 * 60 * 60 * 1000;
+let routerUpdateUntil = 0;
+let updateNotification: Notification | null = null;
+let updateSeen: UpdateSeen | undefined;
+const updateSeenFile = path.join(home, "update-notifications.json");
+
+function loadUpdateSeen(): UpdateSeen {
+  try { return readUpdateSeen(JSON.parse(fs.readFileSync(updateSeenFile, "utf8"))); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") console.error(`update notification state: ${error}`);
+    return { updated: [], available: [] };
+  }
+}
+
+async function relaunchTray(): Promise<void> {
+  app.releaseSingleInstanceLock();
+  const result = await runCliResult(["tray"]);
+  if (!result.ok) {
+    // Keep a functioning tray if its replacement could not start.
+    if (!app.requestSingleInstanceLock()) app.quit();
+    throw new Error(result.output || "could not relaunch tray");
+  }
+  app.quit();
+}
+
+async function handleRouterUpdate(status: Status): Promise<void> {
+  if (status.autoUpdate?.running) routerUpdateUntil = Date.now() + 10 * 60_000;
+  else routerUpdateUntil = 0;
+  if (updating) return;
+  updateSeen ??= loadUpdateSeen();
+  const notice = updateNotice(status.version, app.getVersion(), status.autoUpdate, updateSeen);
+  if (!notice) return;
+  // Memory dedup is immediate; disk dedup must succeed before a relaunch to avoid restart loops.
+  updateSeen = rememberUpdate(updateSeen, notice);
+  fs.mkdirSync(home, { recursive: true });
+  const tmp = `${updateSeenFile}.${process.pid}.tmp`;
+  try {
+    fs.writeFileSync(tmp, JSON.stringify(updateSeen) + "\n", { mode: 0o600 });
+    fs.renameSync(tmp, updateSeenFile);
+  } finally {
+    try { fs.unlinkSync(tmp); } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+  }
+  if (notice.kind === "available") {
+    const check: UpdateCheck = { current: status.version, latest: notice.version, newer: true, kind: status.autoUpdate?.kind ?? "unknown" };
+    availableUpdate = check;
+    if (Notification.isSupported()) {
+      updateNotification = new Notification({ title: "ClaudeRipple", body: L.autoAvailable(notice.version), icon: notifyIcon() });
+      updateNotification.on("click", () => { void offerUpdate(check).catch((error: unknown) => console.error(`offer update: ${error}`)); });
+      updateNotification.show();
+    }
+    return;
+  }
+  if (Notification.isSupported()) {
+    updateNotification = new Notification({ title: "ClaudeRipple", body: L.autoUpdated(notice.version), icon: notifyIcon() });
+    updateNotification.show();
+  }
+  if (notice.relaunch) {
+    updating = true;
+    try { await relaunchTray(); } finally { updating = false; }
+  }
+}
 
 async function checkForUpdate(): Promise<UpdateCheck | null> {
   const r = await runCliResult(["update", "--check", "--json"]);
@@ -1124,6 +1213,17 @@ async function offerUpdate(check: UpdateCheck): Promise<void> {
   render();
   const version = check.latest ?? "";
   if (Notification.isSupported()) new Notification({ title: "ClaudeRipple", body: L.updating(version), icon: notifyIcon() }).show();
+  if (last?.autoUpdate) {
+    // Share the router's coordinator with its scheduler instead of racing a second installer.
+    try {
+      const response = await fetch(`${adminUrl()}api/update`, { method: "POST", signal: AbortSignal.timeout(35_000) });
+      if (!response.ok) throw new Error(await response.text());
+      routerUpdateUntil = Date.now() + 10 * 60_000;
+    } catch (error) {
+      await dialog.showMessageBox({ type: "warning", message: L.updateFailed, detail: String(error) });
+    } finally { updating = false; render(); }
+    return; // /api/status will confirm completion, notify and relaunch this tray.
+  }
   const r = await runCliResult(["update"]);
   updating = false;
   if (!r.ok) {
@@ -1133,11 +1233,8 @@ async function offerUpdate(check: UpdateCheck): Promise<void> {
   }
   availableUpdate = null;
   if (Notification.isSupported()) new Notification({ title: "ClaudeRipple", body: L.updateDone(version), icon: notifyIcon() }).show();
-  // A new tray from the new files, then this one goes. The lock is let go first, or the new tray
-  // would see this one and leave.
-  app.releaseSingleInstanceLock();
-  await runCliResult(["tray"]);
-  app.quit();
+  // A new tray from the new files, then this one goes.
+  await relaunchTray();
 }
 
 // Offer setup only when there is no working installation at all. A developer who runs the router

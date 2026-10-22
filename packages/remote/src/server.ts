@@ -8,7 +8,7 @@ import path from "node:path";
 import { WebSocketServer } from "ws";
 import { tokenMatches } from "./config.ts";
 import type { Phone } from "./local-control.ts";
-import { browse, makeFolder, recentFolders } from "./folders.ts";
+import { browse, macConsent, makeFolder, recentFolders } from "./folders.ts";
 import type { RecentSource } from "./folders.ts";
 import { gitInfo } from "./worktree.ts";
 import { ATTACHMENT_CAP, FRAME_CAP, PING_MS, STALE_MS } from "./protocol.ts";
@@ -475,7 +475,7 @@ export class HostServer {
       }
       case "browse": return browse(op.path, op.hidden ?? false);
       case "mkdir": return { path: await makeFolder(op.parent, op.name) };
-      case "git": return gitInfo(op.path);
+      case "git": return macConsent(op.path, () => gitInfo(op.path));
       case "commands": return s.commands(op.session);
       case "blob": {
         if (!s.has(op.session)) throw new Error("no such session");

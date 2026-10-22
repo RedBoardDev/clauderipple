@@ -26,7 +26,7 @@ import { ProviderHealth, providerExhaustion, UpstreamHealth } from "./health.ts"
 import type { HoldGate } from "./hold.ts";
 import { BOOTSTRAP_PATH, injectBootstrap } from "./bootstrap.ts";
 import { THREAD_UNSUPPORTED, effortOf, isAutoModeClassifier, resolve, rewriteBody, stripThreadFields, threadDecision, unroutableReason, type Resolved } from "./routing.ts";
-import { defaultAgentDir, withAgentAliases } from "./agents.ts";
+import { defaultAgentDir, imageLine, withAgentAliases } from "./agents.ts";
 import { forwardCompatibleHeader, resolveCompatibleCaps, sanitizeForCompatible } from "./compat.ts";
 import { applyIdentityToAnthropicBody } from "./identity.ts";
 import { anthropicServerToolBackend, webPluginBackend, webSearchBlocks, webSearchErrorBlocks, webSearchMessage, webSearchQuery, webSearchSse, type WebSearchQuery } from "./websearch.ts";
@@ -40,13 +40,15 @@ import { OpenCodeUsage, isOpenCodeGo, type OpenCodeWindow } from "./providers/op
 import { GrokAdapter } from "./providers/grok/index.ts";
 import type { GrokWindow } from "./providers/grok/usage.ts";
 import { conversationKey, type AnthropicRequest } from "./providers/chatgpt/translate.ts";
-import { providerFor, searchProviderFor, terminateHosts } from "./config.ts";
+import { adminPort, providerFor, searchProviderFor, terminateHosts } from "./config.ts";
 import type { CertStore } from "./certs.ts";
 import { chatPickerModels, injectPickerModels, isBootstrapPath } from "./picker.ts";
-import { effortLevelsForModel } from "./admin.ts";
+import { effortLevels, effortLevelsForModel } from "./admin.ts";
+import { isWebFetchRequest } from "./webfetch.ts";
 import { ResponseUsageTap, requestId, type RequestLog, type RequestRecord, type RequestUsage } from "./requestlog.ts";
 import { credentialHeaderValues, redactErrorText, redactHeaders } from "./redact.ts";
 import type { ObservedClaudeCodeAuth } from "./providers/anthropic-observed.ts";
+import type { ClaudeCodeCredentialReaders } from "./providers/anthropic.ts";
 import { ClaudeAccountAuthPool } from "./providers/anthropic-account-pool.ts";
 import { ClaudeModelCatalog } from "./providers/anthropic-models.ts";
 import { ClaudeUsage } from "./providers/anthropic-usage.ts";
@@ -202,6 +204,8 @@ export type ProxyDeps = {
   requests: RequestLog;
   /** Process-memory only; captures a real passthrough Claude Code OAuth header set. */
   observedClaudeCodeAuth?: ObservedClaudeCodeAuth;
+  /** Test seam for Claude Code's keychain and credential-file readers. */
+  claudeCodeCredentialReaders?: ClaudeCodeCredentialReaders;
   /** Where agent definitions are read from. Defaults to `~/.claude/agents`; tests inject a tmp dir. */
   agentDir?: string;
   /** TLS dialer for absolute-form proxy requests. Production uses node:tls; integration tests inject a local CA. */
@@ -479,6 +483,7 @@ export class Proxy {
       home: deps.home,
       log: deps.log,
       ...(deps.observedClaudeCodeAuth ? { observed: deps.observedClaudeCodeAuth } : {}),
+      ...(deps.claudeCodeCredentialReaders ? { credentialReaders: deps.claudeCodeCredentialReaders } : {}),
     });
     this.claudeUsage = new ClaudeUsage(this.claudeAccounts, {
       upstream: () => this.deps.config().upstream,
@@ -737,6 +742,13 @@ export class Proxy {
     };
     const session = req.headers["x-claude-code-session-id"];
     if (typeof session === "string" && /^[\w-]{1,128}$/.test(session)) record.session = session;
+    // Claude Code names the agent a request was made inside, and only a subagent's request carries
+    // the name (CLI 2.1.304: `...Y?.agentId&&{"x-claude-code-agent-id":…}`). This one bit is what
+    // tells the main session from a subagent's turns, so it is recorded for every provider and read
+    // by the ChatGPT adapter to choose its tier.
+    const agentId = req.headers["x-claude-code-agent-id"];
+    const subagent = typeof agentId === "string" && agentId.length > 0;
+    if (subagent) record.subagent = true;
     let observedUsage: RequestUsage | undefined;
     let observedStopReason: string | undefined;
     // Set once a Google turn came back unwritten (a prompt refusal or no model capacity), which allows
@@ -839,716 +851,769 @@ export class Proxy {
       // returns nothing is worse than one that costs what it always cost.
     }
 
-    const resolved = json ? resolve(model, json, cfg) : null;
-
-    // A non-Claude model this router cannot route is refused here, by name, instead of being
-    // forwarded to Anthropic. `PASS` on such a request answers 404 from Anthropic and looks like
-    // "the model vanished" (2026-09-20: an agent file named `deepseek` resolved, through a missing
-    // alias, to a model no provider declared — thirty of them came back 404). A native `claude-*`
-    // id is deliberately unrouted and must keep passing through (§5).
-    if (!resolved && isApiHost && isMessages && json && typeof model === "string" && !model.startsWith("claude-")) {
-      const reason = unroutableReason(model, json, cfg);
-      if (reason) {
-        const payload = JSON.stringify({ type: "error", error: { type: "invalid_request_error", message: `ClaudeRipple: ${reason}` } });
-        res.writeHead(400, { "content-type": "application/json", "content-length": String(Buffer.byteLength(payload)) }).end(payload);
-        tag = `REFUSE ${model}`;
-        record = { ...record, provider: "refused" };
-        finish("400", payload.length, `ClaudeRipple: ${reason}`, true, { ...(!searchAttempted ? { upstreamCalled: false as const } : {}), refusal: "unroutable" });
-        return;
+    const webFetch = !!(cfg.webSearch && json && pathname === "/v1/messages" && isWebFetchRequest(json));
+    let fetchRoute: Resolved | null = null;
+    if (webFetch) record.purpose = "web-fetch";
+    if (webFetch && cfg.webSearch) {
+      const settings = cfg.webSearch;
+      if (this.targetUsable(settings, cfg)) {
+        const ladder = effortLevels(cfg).providers[settings.provider];
+        const levels = ladder?.models?.[settings.model] ?? ladder?.default ?? [];
+        fetchRoute = { ...settings, effort: levels.includes("low") ? "low" : undefined, tag: `${String(model)}->${settings.model} (web fetch)` };
+      } else {
+        unwrittenFallbackNote = `web fetch via ${settings.provider} unavailable; original destination fallback`;
+        log.warn(`web fetch via ${settings.provider}: provider unusable; leaving the request alone`);
       }
     }
-    // A slot with fallbacks picks its provider before anything is sent, so a primary that is rate
-    // limited for the next hour is skipped rather than rediscovered once per request. A distinct
-    // prompt refusal can also select one fallback below, but only before any response is written.
-    let route = resolved ? this.chooseTarget(resolved, cfg, log) : null;
-    /** The request before any target rewrote it, kept only when a Google target may hand the turn back. */
-    let pristine: typeof json | undefined;
-    const source = typeof model === "string" ? model : "-";
-    record = {
-      ...record,
-      source,
-      target: source,
-      stream: json?.stream === true,
-    };
-    const requestedEffort = effortOf(json ?? {});
-    if (requestedEffort) record.effort = requestedEffort;
-
-    // Only a real, un-routed Claude Code Messages request may refresh this RAM-only source.
-    // Do not inspect it elsewhere: it must never enter logs, RequestLog, picker diagnostics, or admin data.
-    if (isApiHost && pathname === "/v1/messages" && !route) this.deps.observedClaudeCodeAuth?.observe(req.rawHeaders);
-
-    // A `WebSearch` side request routed to a provider that cannot run the server tool must not be
-    // sent. The tool is dropped on every translated path, which leaves "you are an assistant for
-    // performing a web search tool use / perform a web search for the query: …" with no tool
-    // attached — and a model told to search with nothing to search with narrates a tool call
-    // instead. OpenCode Go's DeepSeek answered exactly that, in its own markup, as HTTP 200
-    // (measured 2026-09-18), and the session reported the search tool as unresponsive.
-    //
-    // Say so in the shape the CLI prints. A search that fails visibly can be retried by a human;
-    // one that returns prose shaped like an answer cannot.
-    if (search && route && json && !this.canRunServerTools(route.provider, cfg)) {
-      // A ChatGPT provider has a search of its own — the backend `webSearch` names — so a search
-      // routed there is served by it, not refused. Requiring `webSearch` as well refused every
-      // search of a `smallFast` slot pointed at Luna while the Clients screen called that provider
-      // searchable (2026-10-07: 41 searches failed with nothing on screen to say why). A configured
-      // backend on this same provider has already had its try above.
-      // The same holds for a plan that searches on another of its endpoints (`anthropicSearch`).
-      const own = (cfg.providers[route.provider]?.type === "chatgpt" || searchProviderFor(cfg.providers[route.provider], route.model) !== undefined) &&
-        cfg.webSearch?.provider !== route.provider;
-      if (own && (await this.serveWebSearch(res, json, search, { provider: route.provider, model: route.model }, record, finish, markSearchAttempted))) return;
-      const blocks = webSearchErrorBlocks(search, "unavailable");
-      const model = typeof json.model === "string" ? json.model : "unknown";
-      const wantStream = json.stream === true;
-      const payload = wantStream ? webSearchSse(model, blocks, 0) : JSON.stringify(webSearchMessage(model, blocks, 0));
-      res.writeHead(200, wantStream
-        ? { "content-type": "text/event-stream", "cache-control": "no-cache", connection: "keep-alive" }
-        : { "content-type": "application/json" }).end(payload);
-      log.warn(`web search: ${route.provider} cannot run server tools and no webSearch backend is configured; refused rather than answered with invented results`);
-      record = { ...record, target: route.model, provider: route.provider, purpose: "web-search" };
-      finish("200", Buffer.byteLength(payload), `web search refused: ${route.provider} runs no server tools`, false, { ...(!searchAttempted ? { upstreamCalled: false as const } : {}), refusal: "web-search-unsupported" });
-      return;
-    }
-
-    let compatCaps: ReturnType<typeof resolveCompatibleCaps> | undefined;
-    let compatChanges: string[] = [];
-    /** The credential this attempt is using, and so the one a failure is charged to. */
-    let chosen: Credential | null = null;
-    let penalised: { provider: string; id: string } | null = null;
-    let target: { protocol: "http:" | "https:"; host: string; port: number; agent: http.Agent | https.Agent; extraHeaders: Record<string, string>; basePath?: string; dropClientAuth?: boolean; dropHeaders?: Set<string>; dropHeaderPrefixes?: string[] };
-    // Re-enter only for the one unwritten Google turn (prompt refusal or no model capacity). Each target sees the original
-    // request, not the primary's rewritten effort, stripped thread, or translated body.
-    for (;;) {
-      if (pristine) json = structuredClone(pristine);
-      if (route && json) {
-        record = { ...record, target: route.model, provider: route.provider };
-        delete record.effort;
-        const configured = cfg.providers[route.provider];
-        if (!configured) {
-          finish("500", 0, `unknown provider ${route.provider}`, true, { ...(!searchAttempted ? { upstreamCalled: false as const } : {}), refusal: "unknown-provider" });
-          res.writeHead(500, { "content-type": "application/json" }).end(JSON.stringify({ error: { type: "clauderipple_config", message: `unknown provider ${route.provider}` } }));
+    const originalBody = body;
+    const originalJson = fetchRoute ? structuredClone(json) : null;
+    const originalRecord = { ...record };
+    const response = res;
+    const complete = finish;
+    // Every provider still uses the ordinary path below. Only this opt-in side request may
+    // withhold an error response and retry the original destination, before the first byte.
+    const run = async (fetchTarget: Resolved | null): Promise<void> => {
+      let attemptDone = false;
+      const res = fetchTarget ? deferErrorResponse(response, () => attemptDone) : response;
+      const finish: typeof complete = (status, bytes, note, failed, extra) => {
+        if (attemptDone) return;
+        if (fetchTarget && !response.headersSent && !response.destroyed && !req.aborted && (Number(status) >= 400 || !Number.isFinite(Number(status)) || Number(status) <= 0)) {
+          attemptDone = true;
+          // A later local refusal must not claim that no upstream was called on this request.
+          searchAttempted ||= extra?.upstreamCalled !== false;
+          log.warn(`web fetch via ${fetchTarget.provider}: ${note ?? status}; falling back to original destination`);
+          body = originalBody;
+          json = structuredClone(originalJson);
+          record = { ...originalRecord, purpose: "web-fetch" };
+          unwrittenFallbackNote = `web fetch via ${fetchTarget.provider} failed; original destination fallback`;
+          void run(null).catch((error: Error) => {
+            complete("502", 0, `web fetch fallback error: ${error.message}`);
+            if (!response.headersSent) response.writeHead(502).end();
+            else response.destroy();
+          });
           return;
         }
-        // A model may speak another wire than the rest of its provider: one subscription serving
-        // several protocols is one provider, and this is where the model's own shape is folded in so
-        // the branches below pick the adapter it actually needs.
-        const provider = providerFor(configured, route.model);
-        // Only the Google adapter can return a turn unwritten, so only it pays for the copy.
-        if (!pristine && provider.type === "google") pristine = structuredClone(json);
-        rewriteBody(json, route, cfg.effortClamp);
-        if (provider.type === "chatgpt") {
-          const td = threadDecision(json);
-          if (td === "refuse") {
-            const out = JSON.stringify(THREAD_UNSUPPORTED);
-            res.writeHead(400, { "content-type": "application/json", "content-length": String(Buffer.byteLength(out)) }).end(out);
-            finish("400", out.length, "thread continue refused → CLI resends stateless", false, { resent: true, ...(!searchAttempted ? { upstreamCalled: false as const } : {}), refusal: "thread-continue" });
-            return;
-          }
-          if (td === "strip") stripThreadFields(json);
-          const routeEffort = effortOf(json);
-          if (routeEffort) record.effort = routeEffort;
-          tag = `CHATGPT ${route.tag} effort=${routeEffort ?? "-"}`;
-          try {
-            // The adapter reports each account's outcome to the shared pool itself, so a slot pointing
-            // here fails over once every account is out (chooseTarget asks the adapter).
-            const o = await this.chatgpt(route.provider, provider).handle(req, res, path, json as unknown as AnthropicRequest, route.model, effortOf(json));
-            if (!path.startsWith("/v1/messages/count_tokens")) this.providerHealth.observe(route.provider, o.status, o.exhaustion);
-            finish(String(o.status), o.bytes, o.note, o.status >= 400, { ...o, ...(searchAttempted ? { upstreamCalled: undefined } : {}) });
-          } catch (e) {
-            finish("-", 0, `chatgpt error ${(e as NodeJS.ErrnoException).code ?? ""} ${(e as Error).message}`);
-            if (!res.headersSent) res.writeHead(502, { "content-type": "application/json" }).end(JSON.stringify({ type: "error", error: { type: "api_error", message: (e as Error).message } }));
-            else res.destroy();
-          }
+        if (!fetchTarget) { complete(status, bytes, note, failed, extra); return; }
+        complete(status, bytes, [`web fetch via ${fetchTarget.provider}`, note].filter(Boolean).join("; "), failed ?? (!!note || Number(status) >= 400), extra);
+      };
+      if (fetchTarget && json) {
+        record.purpose = "web-fetch";
+        const output = { ...(json.output_config as Record<string, unknown> | undefined) };
+        delete output.effort;
+        json.output_config = output;
+      }
+      const resolved = fetchTarget ?? (json ? resolve(model, json, cfg) : null);
+
+      // A non-Claude model this router cannot route is refused here, by name, instead of being
+      // forwarded to Anthropic. `PASS` on such a request answers 404 from Anthropic and looks like
+      // "the model vanished" (2026-09-20: an agent file named `deepseek` resolved, through a missing
+      // alias, to a model no provider declared — thirty of them came back 404). A native `claude-*`
+      // id is deliberately unrouted and must keep passing through (§5).
+      if (!resolved && isApiHost && isMessages && json && typeof model === "string" && !model.startsWith("claude-")) {
+        const reason = unroutableReason(model, json, cfg);
+        if (reason) {
+          const payload = JSON.stringify({ type: "error", error: { type: "invalid_request_error", message: `ClaudeRipple: ${reason}` } });
+          res.writeHead(400, { "content-type": "application/json", "content-length": String(Buffer.byteLength(payload)) }).end(payload);
+          tag = `REFUSE ${model}`;
+          record = { ...record, provider: "refused" };
+          finish("400", payload.length, `ClaudeRipple: ${reason}`, true, { ...(!searchAttempted ? { upstreamCalled: false as const } : {}), refusal: "unroutable" });
           return;
         }
-        if (provider.type === "openai-compatible") {
-          const td = threadDecision(json);
-          if (td === "refuse") {
-            const out = JSON.stringify(THREAD_UNSUPPORTED);
-            res.writeHead(400, { "content-type": "application/json", "content-length": String(Buffer.byteLength(out)) }).end(out);
-            finish("400", out.length, "thread continue refused → CLI resends stateless", false, { resent: true, ...(!searchAttempted ? { upstreamCalled: false as const } : {}), refusal: "thread-continue" });
+      }
+      // A slot with fallbacks picks its provider before anything is sent, so a primary that is rate
+      // limited for the next hour is skipped rather than rediscovered once per request. A distinct
+      // prompt refusal can also select one fallback below, but only before any response is written.
+      let route = resolved ? this.chooseTarget(resolved, cfg, log) : null;
+      /** The request before any target rewrote it, kept only when a Google target may hand the turn back. */
+      let pristine: typeof json | undefined;
+      const source = typeof model === "string" ? model : "-";
+      record = {
+        ...record,
+        source,
+        target: source,
+        stream: json?.stream === true,
+      };
+      const requestedEffort = effortOf(json ?? {});
+      if (requestedEffort) record.effort = requestedEffort;
+
+      // Only a real, un-routed Claude Code Messages request may refresh this RAM-only source.
+      // Do not inspect it elsewhere: it must never enter logs, RequestLog, picker diagnostics, or admin data.
+      if (isApiHost && pathname === "/v1/messages" && !route) this.deps.observedClaudeCodeAuth?.observe(req.rawHeaders);
+
+      // A `WebSearch` side request routed to a provider that cannot run the server tool must not be
+      // sent. The tool is dropped on every translated path, which leaves "you are an assistant for
+      // performing a web search tool use / perform a web search for the query: …" with no tool
+      // attached — and a model told to search with nothing to search with narrates a tool call
+      // instead. OpenCode Go's DeepSeek answered exactly that, in its own markup, as HTTP 200
+      // (measured 2026-09-18), and the session reported the search tool as unresponsive.
+      //
+      // Say so in the shape the CLI prints. A search that fails visibly can be retried by a human;
+      // one that returns prose shaped like an answer cannot.
+      if (search && route && json && !this.canRunServerTools(route.provider, cfg)) {
+        // A ChatGPT provider has a search of its own — the backend `webSearch` names — so a search
+        // routed there is served by it, not refused. Requiring `webSearch` as well refused every
+        // search of a `smallFast` slot pointed at Luna while the Clients screen called that provider
+        // searchable (2026-10-07: 41 searches failed with nothing on screen to say why). A configured
+        // backend on this same provider has already had its try above.
+        // The same holds for a plan that searches on another of its endpoints (`anthropicSearch`).
+        const own = (cfg.providers[route.provider]?.type === "chatgpt" || searchProviderFor(cfg.providers[route.provider], route.model) !== undefined) &&
+          cfg.webSearch?.provider !== route.provider;
+        if (own && (await this.serveWebSearch(res, json, search, { provider: route.provider, model: route.model }, record, finish, markSearchAttempted))) return;
+        const blocks = webSearchErrorBlocks(search, "unavailable");
+        const model = typeof json.model === "string" ? json.model : "unknown";
+        const wantStream = json.stream === true;
+        const payload = wantStream ? webSearchSse(model, blocks, 0) : JSON.stringify(webSearchMessage(model, blocks, 0));
+        res.writeHead(200, wantStream
+          ? { "content-type": "text/event-stream", "cache-control": "no-cache", connection: "keep-alive" }
+          : { "content-type": "application/json" }).end(payload);
+        log.warn(`web search: ${route.provider} cannot run server tools and no webSearch backend is configured; refused rather than answered with invented results`);
+        record = { ...record, target: route.model, provider: route.provider, purpose: "web-search" };
+        finish("200", Buffer.byteLength(payload), `web search refused: ${route.provider} runs no server tools`, false, { ...(!searchAttempted ? { upstreamCalled: false as const } : {}), refusal: "web-search-unsupported" });
+        return;
+      }
+
+      let compatCaps: ReturnType<typeof resolveCompatibleCaps> | undefined;
+      let compatChanges: string[] = [];
+      /** The credential this attempt is using, and so the one a failure is charged to. */
+      let chosen: Credential | null = null;
+      let penalised: { provider: string; id: string } | null = null;
+      let target: { protocol: "http:" | "https:"; host: string; port: number; agent: http.Agent | https.Agent; extraHeaders: Record<string, string>; basePath?: string; dropClientAuth?: boolean; dropHeaders?: Set<string>; dropHeaderPrefixes?: string[] };
+      // Re-enter only for the one unwritten Google turn (prompt refusal or no model capacity). Each target sees the original
+      // request, not the primary's rewritten effort, stripped thread, or translated body.
+      for (;;) {
+        if (pristine) json = structuredClone(pristine);
+        if (route && json) {
+          record = { ...record, target: route.model, provider: route.provider };
+          delete record.effort;
+          const configured = cfg.providers[route.provider];
+          if (!configured) {
+            finish("500", 0, `unknown provider ${route.provider}`, true, { ...(!searchAttempted ? { upstreamCalled: false as const } : {}), refusal: "unknown-provider" });
+            res.writeHead(500, { "content-type": "application/json" }).end(JSON.stringify({ error: { type: "clauderipple_config", message: `unknown provider ${route.provider}` } }));
             return;
           }
-          if (td === "strip") stripThreadFields(json);
-          const routeEffort = effortOf(json);
-          if (routeEffort) record.effort = routeEffort;
-          tag = `OPENAI ${route.tag} wire=${provider.wire ?? "chat"} effort=${routeEffort ?? "-"}`;
-          try {
-            const o = await this.openai(route.provider, provider).handle(req, res, path, json as unknown as AnthropicRequest, route.model, routeEffort);
-            this.recordOutcome(route.provider, o.status);
-            if (!path.startsWith("/v1/messages/count_tokens")) this.providerHealth.observe(route.provider, o.status, o.exhaustion);
-            finish(String(o.status), o.bytes, o.note, o.status >= 400, { ...o, ...(searchAttempted ? { upstreamCalled: undefined } : {}) });
-          } catch (e) {
-            this.recordOutcome(route.provider, 0);
-            finish("-", 0, `openai error ${(e as NodeJS.ErrnoException).code ?? ""} ${(e as Error).message}`);
-            if (!res.headersSent) res.writeHead(502, { "content-type": "application/json" }).end(JSON.stringify({ type: "error", error: { type: "api_error", message: (e as Error).message } }));
-            else res.destroy();
-          }
-          return;
-        }
-        if (provider.type === "google") {
-          // Google holds no server-side thread either, so a `continue` is refused as it is for the
-          // other translated providers; the CLI resends the turn with the full history.
-          const td = threadDecision(json);
-          if (td === "refuse") {
-            const out = JSON.stringify(THREAD_UNSUPPORTED);
-            res.writeHead(400, { "content-type": "application/json", "content-length": String(Buffer.byteLength(out)) }).end(out);
-            finish("400", out.length, "thread continue refused → CLI resends stateless", false, { resent: true, ...(!searchAttempted ? { upstreamCalled: false as const } : {}), refusal: "thread-continue" });
-            return;
-          }
-          if (td === "strip") stripThreadFields(json);
-          const routeEffort = effortOf(json);
-          if (routeEffort) record.effort = routeEffort;
-          tag = `GOOGLE ${route.tag} effort=${routeEffort ?? "-"}`;
-          try {
-            const o = await this.google(route.provider, provider).handle(req, res, path, json as unknown as AnthropicRequest, route.model, routeEffort);
-            if (o.kind === "prompt-incompatible" || o.kind === "model-capacity") {
-              const why = o.kind === "prompt-incompatible" ? "prompt" : "capacity";
-              const alreadyRetried = unwrittenSeen;
-              unwrittenSeen = true;
-              if (res.destroyed || res.writableEnded || res.headersSent) {
-                finish("0", 0, `client closed before ${why} fallback`, true);
-                if (!res.destroyed && !res.writableEnded) res.destroy();
-                return;
-              }
-              const fallback = !alreadyRetried && resolved
-                ? this.unwrittenFallback(resolved, route, cfg, why) : null;
-              if (fallback) {
-                unwrittenFallbackNote = `${o.note}; fallback ${route.provider}/${route.model} → ${fallback.provider}/${fallback.model}`;
-                log.info(`FAILOVER ${unwrittenFallbackNote}`);
-                route = fallback;
-                continue;
-              }
-              // Neither is about the account or the provider (a refusal is request-specific, missing
-              // capacity is the model's on Google's side): neither cool nor mark success.
-              res.writeHead(o.status, { "content-type": "application/json" }).end(o.errorBody);
-              finish(String(o.status), Buffer.byteLength(o.errorBody), o.note, true, o.kind === "prompt-incompatible" ? { refusal: "prompt-incompatible" } : undefined);
+          // A model may speak another wire than the rest of its provider: one subscription serving
+          // several protocols is one provider, and this is where the model's own shape is folded in so
+          // the branches below pick the adapter it actually needs.
+          const provider = providerFor(configured, route.model);
+          // Only the Google adapter can return a turn unwritten, so only it pays for the copy.
+          if (!pristine && provider.type === "google") pristine = structuredClone(json);
+          rewriteBody(json, route, cfg.effortClamp);
+          if (provider.type === "chatgpt") {
+            const td = threadDecision(json);
+            if (td === "refuse") {
+              const out = JSON.stringify(THREAD_UNSUPPORTED);
+              res.writeHead(400, { "content-type": "application/json", "content-length": String(Buffer.byteLength(out)) }).end(out);
+              finish("400", out.length, "thread continue refused → CLI resends stateless", false, { resent: true, ...(!searchAttempted ? { upstreamCalled: false as const } : {}), refusal: "thread-continue" });
               return;
             }
-            this.recordOutcome(route.provider, o.status);
-            if (!path.startsWith("/v1/messages/count_tokens")) this.providerHealth.observe(route.provider, o.status, o.exhaustion);
-            finish(String(o.status), o.bytes, o.note, o.status >= 400, { ...o, ...(searchAttempted ? { upstreamCalled: undefined } : {}) });
-          } catch (e) {
-            this.recordOutcome(route.provider, 0);
-            finish("-", 0, `google error ${(e as NodeJS.ErrnoException).code ?? ""} ${(e as Error).message}`);
-            if (!res.headersSent) res.writeHead(502, { "content-type": "application/json" }).end(JSON.stringify({ type: "error", error: { type: "api_error", message: (e as Error).message } }));
-            else res.destroy();
+            if (td === "strip") stripThreadFields(json);
+            const routeEffort = effortOf(json);
+            if (routeEffort) record.effort = routeEffort;
+            tag = `CHATGPT ${route.tag} effort=${routeEffort ?? "-"}`;
+            try {
+              // The adapter reports each account's outcome to the shared pool itself, so a slot pointing
+              // here fails over once every account is out (chooseTarget asks the adapter).
+              const o = await this.chatgpt(route.provider, provider).handle(req, res, path, json as unknown as AnthropicRequest, route.model, effortOf(json), { subagent, imageHint: imageLine(adminPort(cfg)) });
+              if (!path.startsWith("/v1/messages/count_tokens")) this.providerHealth.observe(route.provider, o.status, o.exhaustion);
+              finish(String(o.status), o.bytes, o.note, o.status >= 400, { ...o, ...(searchAttempted ? { upstreamCalled: undefined } : {}) });
+            } catch (e) {
+              finish("-", 0, `chatgpt error ${(e as NodeJS.ErrnoException).code ?? ""} ${(e as Error).message}`);
+              if (!res.headersSent) res.writeHead(502, { "content-type": "application/json" }).end(JSON.stringify({ type: "error", error: { type: "api_error", message: (e as Error).message } }));
+              else res.destroy();
+            }
+            return;
           }
-          return;
-        }
-        if (provider.type === "grok") {
-          // The chat proxy keeps no server-side thread, so a `continue` is refused like on the other
-          // translated providers and the CLI resends the turn with the full history.
-          const td = threadDecision(json);
-          if (td === "refuse") {
+          if (provider.type === "openai-compatible") {
+            const td = threadDecision(json);
+            if (td === "refuse") {
+              const out = JSON.stringify(THREAD_UNSUPPORTED);
+              res.writeHead(400, { "content-type": "application/json", "content-length": String(Buffer.byteLength(out)) }).end(out);
+              finish("400", out.length, "thread continue refused → CLI resends stateless", false, { resent: true, ...(!searchAttempted ? { upstreamCalled: false as const } : {}), refusal: "thread-continue" });
+              return;
+            }
+            if (td === "strip") stripThreadFields(json);
+            const routeEffort = effortOf(json);
+            if (routeEffort) record.effort = routeEffort;
+            tag = `OPENAI ${route.tag} wire=${provider.wire ?? "chat"} effort=${routeEffort ?? "-"}`;
+            try {
+              const o = await this.openai(route.provider, provider).handle(req, res, path, json as unknown as AnthropicRequest, route.model, routeEffort);
+              this.recordOutcome(route.provider, o.status);
+              if (!path.startsWith("/v1/messages/count_tokens")) this.providerHealth.observe(route.provider, o.status, o.exhaustion);
+              finish(String(o.status), o.bytes, o.note, o.status >= 400, { ...o, ...(searchAttempted ? { upstreamCalled: undefined } : {}) });
+            } catch (e) {
+              this.recordOutcome(route.provider, 0);
+              finish("-", 0, `openai error ${(e as NodeJS.ErrnoException).code ?? ""} ${(e as Error).message}`);
+              if (!res.headersSent) res.writeHead(502, { "content-type": "application/json" }).end(JSON.stringify({ type: "error", error: { type: "api_error", message: (e as Error).message } }));
+              else res.destroy();
+            }
+            return;
+          }
+          if (provider.type === "google") {
+            // Google holds no server-side thread either, so a `continue` is refused as it is for the
+            // other translated providers; the CLI resends the turn with the full history.
+            const td = threadDecision(json);
+            if (td === "refuse") {
+              const out = JSON.stringify(THREAD_UNSUPPORTED);
+              res.writeHead(400, { "content-type": "application/json", "content-length": String(Buffer.byteLength(out)) }).end(out);
+              finish("400", out.length, "thread continue refused → CLI resends stateless", false, { resent: true, ...(!searchAttempted ? { upstreamCalled: false as const } : {}), refusal: "thread-continue" });
+              return;
+            }
+            if (td === "strip") stripThreadFields(json);
+            const routeEffort = effortOf(json);
+            if (routeEffort) record.effort = routeEffort;
+            tag = `GOOGLE ${route.tag} effort=${routeEffort ?? "-"}`;
+            try {
+              const o = await this.google(route.provider, provider).handle(req, res, path, json as unknown as AnthropicRequest, route.model, routeEffort);
+              if (o.kind === "prompt-incompatible" || o.kind === "model-capacity") {
+                const why = o.kind === "prompt-incompatible" ? "prompt" : "capacity";
+                const alreadyRetried = unwrittenSeen;
+                unwrittenSeen = true;
+                if (res.destroyed || res.writableEnded || res.headersSent) {
+                  finish("0", 0, `client closed before ${why} fallback`, true);
+                  if (!res.destroyed && !res.writableEnded) res.destroy();
+                  return;
+                }
+                const fallback = !alreadyRetried && resolved
+                  ? this.unwrittenFallback(resolved, route, cfg, why) : null;
+                if (fallback) {
+                  unwrittenFallbackNote = `${o.note}; fallback ${route.provider}/${route.model} → ${fallback.provider}/${fallback.model}`;
+                  log.info(`FAILOVER ${unwrittenFallbackNote}`);
+                  route = fallback;
+                  continue;
+                }
+                // Neither is about the account or the provider (a refusal is request-specific, missing
+                // capacity is the model's on Google's side): neither cool nor mark success.
+                res.writeHead(o.status, { "content-type": "application/json" }).end(o.errorBody);
+                finish(String(o.status), Buffer.byteLength(o.errorBody), o.note, true, o.kind === "prompt-incompatible" ? { refusal: "prompt-incompatible" } : undefined);
+                return;
+              }
+              this.recordOutcome(route.provider, o.status);
+              if (!path.startsWith("/v1/messages/count_tokens")) this.providerHealth.observe(route.provider, o.status, o.exhaustion);
+              finish(String(o.status), o.bytes, o.note, o.status >= 400, { ...o, ...(searchAttempted ? { upstreamCalled: undefined } : {}) });
+            } catch (e) {
+              this.recordOutcome(route.provider, 0);
+              finish("-", 0, `google error ${(e as NodeJS.ErrnoException).code ?? ""} ${(e as Error).message}`);
+              if (!res.headersSent) res.writeHead(502, { "content-type": "application/json" }).end(JSON.stringify({ type: "error", error: { type: "api_error", message: (e as Error).message } }));
+              else res.destroy();
+            }
+            return;
+          }
+          if (provider.type === "grok") {
+            // The chat proxy keeps no server-side thread, so a `continue` is refused like on the other
+            // translated providers and the CLI resends the turn with the full history.
+            const td = threadDecision(json);
+            if (td === "refuse") {
+              const out = JSON.stringify(THREAD_UNSUPPORTED);
+              res.writeHead(400, { "content-type": "application/json", "content-length": String(Buffer.byteLength(out)) }).end(out);
+              finish("400", out.length, "thread continue refused → CLI resends stateless", false, { resent: true });
+              return;
+            }
+            if (td === "strip") stripThreadFields(json);
+            record = { ...record, target: route.model, provider: route.provider };
+            const routeEffort = effortOf(json);
+            if (routeEffort) record.effort = routeEffort;
+            tag = `GROK ${route.tag} effort=${routeEffort ?? "-"}`;
+            try {
+              const o = await this.grok(route.provider, provider).handle(req, res, path, json as unknown as AnthropicRequest, route.model, routeEffort);
+              this.recordOutcome(route.provider, o.status);
+              finish(String(o.status), o.bytes, o.note, o.status >= 400, { ...(o.usage ? { usage: o.usage } : {}), ...(o.stopReason ? { stopReason: o.stopReason } : {}) });
+            } catch (e) {
+              this.recordOutcome(route.provider, 0);
+              finish("-", 0, `grok error ${(e as NodeJS.ErrnoException).code ?? ""} ${(e as Error).message}`);
+              if (!res.headersSent) res.writeHead(502, { "content-type": "application/json" }).end(JSON.stringify({ type: "error", error: { type: "api_error", message: (e as Error).message } }));
+              else res.destroy();
+            }
+            return;
+          }
+          if (provider.type === "anthropic") {
+            if (!provider.accountPool || provider.auth !== "claude-code") {
+              finish("400", 0, "native Anthropic provider is available through OpenAI ingress only", false);
+              res.writeHead(400, { "content-type": "application/json" }).end(JSON.stringify({ error: { type: "invalid_request_error", message: "native Anthropic provider is available through OpenAI ingress only" } }));
+              return;
+            }
+            // Native Messages need no translation. Only authentication changes, so server-side threads,
+            // prompt caching, beta features and the client's exact tool contract remain first-party.
+            const credentials = await this.claudeAccounts.credentials();
+            if (credentials.length === 0) {
+              const out = JSON.stringify({ type: "error", error: { type: "authentication_error", message: "ClaudeRipple: no usable Claude account; sign in or reauthenticate an account" } });
+              res.writeHead(401, { "content-type": "application/json", "content-length": String(Buffer.byteLength(out)) }).end(out);
+              finish("401", out.length, "no usable Claude account", true, { ...(!searchAttempted ? { upstreamCalled: false as const } : {}), refusal: "no-account" });
+              return;
+            }
+            dropForeignThinking(json);
+            body = Buffer.from(JSON.stringify(json));
+            chosen = this.pool.pick(route.provider, credentials, conversationKey(json as AnthropicRequest));
+            const using = chosen ?? credentials[0]!;
+            chosen = using;
+            penalised = { provider: route.provider, id: using.id };
+            target = {
+              protocol: "https:",
+              host: cfg.upstream,
+              port: this.deps.upstreamPort ?? 443,
+              agent: this.deps.upstreamAgent ?? this.agentFor(route.provider, "https:"),
+              extraHeaders: withClientBetas(using.headers, req.headers["anthropic-beta"]),
+              dropClientAuth: true,
+              dropHeaders: new Set(credentials.flatMap((credential) => Object.keys(credential.headers).map((name) => name.toLowerCase()))),
+              dropHeaderPrefixes: ["anthropic-client-", "x-stainless-"],
+            };
+            const routeEffort = effortOf(json);
+            if (routeEffort) record.effort = routeEffort;
+            tag = `CLAUDE ${route.tag} account=${using.ownerId?.slice(0, 8) ?? "current"}`;
+          } else {
+          // An Anthropic-shaped endpoint keeps no server-side thread either, so a `continue` is refused
+          // here as it is for the translated providers. sanitizeForCompatible used to strip the field
+          // and forward the rest, which is only the delta: DeepSeek (via Bailian) received two orphan
+          // tool_results with no task and answered that none had been given (measured 2026-09-24, CLI
+          // 2.1.280). Refused, the CLI resends the turn with the full history.
+          if (threadDecision(json) === "refuse") {
             const out = JSON.stringify(THREAD_UNSUPPORTED);
             res.writeHead(400, { "content-type": "application/json", "content-length": String(Buffer.byteLength(out)) }).end(out);
-            finish("400", out.length, "thread continue refused → CLI resends stateless", false, { resent: true });
+            finish("400", out.length, "thread continue refused → CLI resends stateless", false, { resent: true, ...(!searchAttempted ? { upstreamCalled: false as const } : {}), refusal: "thread-continue" });
             return;
           }
-          if (td === "strip") stripThreadFields(json);
-          record = { ...record, target: route.model, provider: route.provider };
-          const routeEffort = effortOf(json);
-          if (routeEffort) record.effort = routeEffort;
-          tag = `GROK ${route.tag} effort=${routeEffort ?? "-"}`;
-          try {
-            const o = await this.grok(route.provider, provider).handle(req, res, path, json as unknown as AnthropicRequest, route.model, routeEffort);
-            this.recordOutcome(route.provider, o.status);
-            finish(String(o.status), o.bytes, o.note, o.status >= 400, { ...(o.usage ? { usage: o.usage } : {}), ...(o.stopReason ? { stopReason: o.stopReason } : {}) });
-          } catch (e) {
-            this.recordOutcome(route.provider, 0);
-            finish("-", 0, `grok error ${(e as NodeJS.ErrnoException).code ?? ""} ${(e as Error).message}`);
-            if (!res.headersSent) res.writeHead(502, { "content-type": "application/json" }).end(JSON.stringify({ type: "error", error: { type: "api_error", message: (e as Error).message } }));
-            else res.destroy();
-          }
-          return;
-        }
-        if (provider.type === "anthropic") {
-          if (!provider.accountPool || provider.auth !== "claude-code") {
-            finish("400", 0, "native Anthropic provider is available through OpenAI ingress only", false);
-            res.writeHead(400, { "content-type": "application/json" }).end(JSON.stringify({ error: { type: "invalid_request_error", message: "native Anthropic provider is available through OpenAI ingress only" } }));
-            return;
-          }
-          // Native Messages need no translation. Only authentication changes, so server-side threads,
-          // prompt caching, beta features and the client's exact tool contract remain first-party.
-          const credentials = await this.claudeAccounts.credentials();
-          if (credentials.length === 0) {
-            const out = JSON.stringify({ type: "error", error: { type: "authentication_error", message: "ClaudeRipple: no usable Claude account; sign in or reauthenticate an account" } });
-            res.writeHead(401, { "content-type": "application/json", "content-length": String(Buffer.byteLength(out)) }).end(out);
-            finish("401", out.length, "no usable Claude account", true, { ...(!searchAttempted ? { upstreamCalled: false as const } : {}), refusal: "no-account" });
-            return;
-          }
-          dropForeignThinking(json);
+          const preset = provider.preset ? PRESETS.find((entry) => entry.id === provider.preset) : undefined;
+          const routeModel = route.model;
+          const modelEffortLevels = provider.models?.find((entry) => entry.id === routeModel)?.effortLevels;
+          compatCaps = resolveCompatibleCaps(
+            preset ? { effortLevels: preset.effortLevels, thinking: preset.thinking, ...(preset.serverTools ? { serverTools: true } : {}) } : undefined,
+            modelEffortLevels === undefined ? provider.caps : { ...provider.caps, effortLevels: modelEffortLevels },
+          );
+          const sanitized = sanitizeForCompatible(json, compatCaps);
+          json = sanitized.json;
+          compatChanges = sanitized.changes;
+          // The upstream would otherwise read Claude Code's own system prompt and answer that it is
+          // Claude. After sanitizing, so the effort named is the one the provider actually receives.
+          applyIdentityToAnthropicBody(json, {
+            model: route.model,
+            effort: effortOf(json),
+            identity: provider.identity,
+            instructionsAppend: provider.instructionsAppend,
+          });
           body = Buffer.from(JSON.stringify(json));
+          const u = new URL(provider.url);
+          const protocol = u.protocol === "https:" ? "https:" : "http:";
+          // Which credential answers this turn. The conversation keeps the one it is on while that one
+          // is healthy, because moving it moves the prompt cache with it. Every credential cooling or
+          // quarantined leaves `chosen` null, and the request goes out on the configured headers so the
+          // provider — not us — gets to say no.
+          const credentials = this.credentialsOf(route.provider, provider);
+          // The same key the prompt cache is keyed on. `metadata.user_id` alone is one value for every
+          // conversation a user has, so using it raw would drag all of them onto one credential at once
+          // — the opposite of what stickiness is for (see conversationKey and ARCHITECTURE §4).
           chosen = this.pool.pick(route.provider, credentials, conversationKey(json as AnthropicRequest));
+          // Nothing usable means every credential is cooling, and the turn still has to go somewhere:
+          // the first one, so the request carries real credentials rather than none, and so the answer
+          // is charged to the credential that actually produced it.
           const using = chosen ?? credentials[0]!;
           chosen = using;
           penalised = { provider: route.provider, id: using.id };
           target = {
-            protocol: "https:",
-            host: cfg.upstream,
-            port: this.deps.upstreamPort ?? 443,
-            agent: this.deps.upstreamAgent ?? this.agentFor(route.provider, "https:"),
-            extraHeaders: withClientBetas(using.headers, req.headers["anthropic-beta"]),
+            protocol,
+            host: u.hostname,
+            port: Number(u.port) || (protocol === "https:" ? 443 : 80),
+            agent: this.agentFor(route.provider, protocol),
+            // The credential wins over the session header: they are different names in practice, but a
+            // vendor that reused one would mean the request going out unauthenticated.
+            extraHeaders: provider.sessionHeader
+              ? { [provider.sessionHeader]: conversationKey(json as AnthropicRequest), ...using.headers }
+              : using.headers,
             dropClientAuth: true,
-            dropHeaders: new Set(credentials.flatMap((credential) => Object.keys(credential.headers).map((name) => name.toLowerCase()))),
-            dropHeaderPrefixes: ["anthropic-client-", "x-stainless-"],
+            // Providers mount their Anthropic-compatible API under a path (DeepSeek /anthropic, OpenRouter /api,
+            // Qwen /apps/anthropic): the CLI's /v1/messages is appended to it. Dropping it sent requests to the
+            // vendor's website, which answered 200 with HTML (measured 2026-09-13 with OpenRouter).
+            basePath: u.pathname.replace(/\/+$/, ""),
           };
           const routeEffort = effortOf(json);
           if (routeEffort) record.effort = routeEffort;
-          tag = `CLAUDE ${route.tag} account=${using.ownerId?.slice(0, 8) ?? "current"}`;
+          tag = `${route.provider.toUpperCase()} ${route.tag} effort=${routeEffort ?? "-"}`;
+          }
+        } else if (isApiHost) {
+          target = { protocol: "https:", host: cfg.upstream, port: this.deps.upstreamPort ?? 443, agent: this.deps.upstreamAgent ?? this.upstreamAgent, extraHeaders: {} };
+          tag = `PASS ${typeof model === "string" ? model : "-"}`;
+          // Passthrough stays byte-exact unless another model's thinking would get the turn refused.
+          if (json && dropForeignThinking(json) > 0) body = Buffer.from(JSON.stringify(json));
         } else {
-        // An Anthropic-shaped endpoint keeps no server-side thread either, so a `continue` is refused
-        // here as it is for the translated providers. sanitizeForCompatible used to strip the field
-        // and forward the rest, which is only the delta: DeepSeek (via Bailian) received two orphan
-        // tool_results with no task and answered that none had been given (measured 2026-09-24, CLI
-        // 2.1.280). Refused, the CLI resends the turn with the full history.
-        if (threadDecision(json) === "refuse") {
-          const out = JSON.stringify(THREAD_UNSUPPORTED);
-          res.writeHead(400, { "content-type": "application/json", "content-length": String(Buffer.byteLength(out)) }).end(out);
-          finish("400", out.length, "thread continue refused → CLI resends stateless", false, { resent: true, ...(!searchAttempted ? { upstreamCalled: false as const } : {}), refusal: "thread-continue" });
+          target = { protocol: "https:", host: reqHost, port: 443, agent: this.agentFor(`host:${reqHost}`, "https:"), extraHeaders: {} };
+          tag = `WEB ${reqHost}`;
+        }
+        break;
+      }
+
+      if (json && typeof json.service_tier === "string") record.requestedTier = json.service_tier;
+
+      // Two kinds of response editing: the CLI bootstrap (api host) and the claude.ai bootstrap (picker mode).
+      const isCliBootstrap = isApiHost && !route && path.startsWith(BOOTSTRAP_PATH);
+      const isPickerBootstrap = !isApiHost && !!cfg.picker?.enabled && method === "GET" && isBootstrapPath(path);
+      const isBootstrap = isCliBootstrap || isPickerBootstrap;
+      const headers: string[] = [];
+      const raw = req.rawHeaders;
+      for (let i = 0; i < raw.length; i += 2) {
+        const k = raw[i]!;
+        const lk = k.toLowerCase();
+        if (HOP_BY_HOP.has(lk)) continue;
+        // Bootstrap responses are edited: keep the client's accept-encoding as-is (some edges misbehave without it)
+        // and decompress whatever comes back before editing.
+        if (lk in target.extraHeaders || target.dropHeaders?.has(lk) || target.dropHeaderPrefixes?.some((prefix) => lk.startsWith(prefix))) continue;
+        if (target.dropClientAuth && CLIENT_AUTH.has(lk)) continue;
+        // Anthropic beta flags opt into features most compatible providers have not implemented.
+        if (compatCaps && !forwardCompatibleHeader(lk, compatCaps)) {
+          compatChanges.push("anthropic-beta");
+          continue;
+        }
+        // Picker bootstrap: never let the renderer revalidate against a cached (unedited) copy.
+        if (isPickerBootstrap && (lk === "if-none-match" || lk === "if-modified-since")) continue;
+        headers.push(k, raw[i + 1]!);
+      }
+      for (const [k, v] of Object.entries(target.extraHeaders)) headers.push(k, v);
+      if (route && compatChanges.length > 0) log.info(`COMPAT ${route.provider}: ${compatChanges.join(", ")}`);
+      headers.push("host", target.protocol === "https:" && target.port === 443 ? target.host : `${target.host}:${target.port}`);
+      // No content-length on body-less GET/HEAD: some edges reject it; Chromium never sends it.
+      if (body.length > 0 || (method !== "GET" && method !== "HEAD")) headers.push("content-length", String(body.length));
+      if (isPickerBootstrap) {
+        const shown: string[] = [];
+        for (const [rawName, value] of Array.from({ length: headers.length / 2 }, (_, i) => [headers[i * 2]!, headers[i * 2 + 1]!] as [string, string])) {
+          const safe = redactHeaders({ [rawName]: value })[rawName];
+          shown.push(safe === "[REDACTED]" ? `${rawName.toLowerCase()}=<${value.length}B>` : `${rawName.toLowerCase()}=${value}`);
+        }
+        log.info(`PICKER request ${method} ${path.slice(0, 80)} headers: ${shown.join(" | ")}`);
+      }
+      // Keep every credential this turn sends. A retry can use an opaque token that does not match a
+      // known token shape; retaining its actual value is what keeps a reflected refusal out of logs.
+      const errorSecrets = new Set(credentialHeaderValues(Array.from({ length: headers.length / 2 }, (_, i) => [headers[i * 2]!, headers[i * 2 + 1]!] as [string, string])));
+      // Every retry is rebuilt from the first attempt's header list. Keep the union of identity header
+      // names already used so a current-session fingerprint cannot reappear on a third account.
+      let usedCredentialHeaders = { ...(chosen?.headers ?? {}) };
+
+      const lib = target.protocol === "https:" ? https : http;
+      /**
+       * The attempt in flight. A routed turn may make more than one: when a credential is refused and
+       * nothing has reached the client yet, the next credential takes over inside the same turn, so
+       * the client is answered on its first ask instead of having to retry. `send` below replaces
+       * this; everything that reaches for the upstream reaches for it through here.
+       */
+      let upReq!: http.ClientRequest;
+      /** Credentials already spent on this turn, so a retry cannot pick one of them again. */
+      const tried = new Set<string>(penalised ? [penalised.id] : []);
+      /** The headers of the attempt in flight, so a stale-socket resend repeats exactly that attempt. */
+      let lastAttemptHeaders: string[] = headers;
+      let staleRetries = 0;
+      const send = (attemptHeaders: string[]): void => {
+        lastAttemptHeaders = attemptHeaders;
+        upReq = lib.request({
+          protocol: target.protocol,
+          host: target.host,
+          port: target.port,
+          method,
+          path: target.basePath ? target.basePath + path : path,
+          headers: attemptHeaders,
+          agent: target.agent,
+          ...(target.protocol === "https:" ? { servername: target.host } : {}),
+        });
+        upReq.on("error", onUpstreamError);
+        upReq.on("response", onUpstreamResponse);
+        upReq.end(body);
+      };
+
+      /**
+       * The next credential to try inside this turn, or null to answer with what the provider said.
+       * Only for a routed request whose provider has one we have not already spent — a failure that
+       * is the request's own fault is not retried at all (see `classify`).
+       */
+      const nextCredential = (status: number, body = ""): Credential | null => {
+        if (!route || !penalised || res.headersSent) return null;
+        if (!classify(status, undefined, body).retryable) return null;
+        const owner = cfg.providers[route.provider];
+        if (!owner) return null;
+        // The model's own shape again: its credential pool is the provider's, but an auth convention
+        // this model overrides has to be the one the retry actually sends.
+        const provider = providerFor(owner, route.model);
+        const native = provider.type === "anthropic" && provider.accountPool;
+        const available = native ? this.claudeAccounts.peekCredentials() : this.credentialsOf(route.provider, provider);
+        const rest = available.filter((c) => !tried.has(c.id));
+        if (rest.length === 0) return null;
+        const next = this.pool.pick(route.provider, rest, conversationKey(json as AnthropicRequest));
+        return next && native ? { ...next, headers: withClientBetas(next.headers, req.headers["anthropic-beta"]) } : next;
+      };
+
+      // Destroying the upstream makes it emit ECONNRESET (measured, Node 24.15), which is
+      // indistinguishable from the provider dropping us unless we remember that we did it. Without
+      // this flag every cancelled turn charged the credential a failure and moved the conversation
+      // off it, which costs the prompt cache — for a turn the user cancelled on purpose.
+      let clientAborted = false;
+      // Set when a 403 body was read ahead of the forward, so the forward knows to write that body
+      // instead of the stream it came from.
+      let headFilled = false;
+      // The 403 body exactly as it arrived. It is what the client is given: the judgement below
+      // reads a decoded copy, but a compressed body cannot survive a round trip through a UTF-8
+      // string — invalid sequences become U+FFFD and never come back. Returning that while
+      // `content-encoding` still stands is `ERR_CONTENT_DECODING_FAILED` in the app (2026-09-22).
+      let errRaw: Buffer = Buffer.alloc(0);
+      // Set when the body was longer than the read cap, so its bytes are no longer a whole
+      // compressed stream and only the decoded head can be forwarded.
+      let errTruncated = false;
+      const abortUpstream = (): void => {
+        clientAborted = true;
+        if (upReq && !upReq.destroyed) upReq.destroy();
+      };
+      req.on("aborted", abortUpstream);
+      res.on("close", () => {
+        if (!finished) {
+          abortUpstream();
+          finish("-", 0, "client closed");
+        }
+      });
+
+      const onUpstreamError = (e: Error): void => {
+        // A kept-alive socket the upstream had already closed: the reset arrives before any response,
+        // so the request never reached it. claude.ai did this 259 times in four days of picker mode
+        // (2026-10-03..06), each one a 502 on an app request such as `current_user_access`. Send an
+        // idempotent request again on a fresh attempt instead of failing it; a POST is never resent,
+        // since a reset cannot prove the upstream did not act on it.
+        const code = (e as NodeJS.ErrnoException).code;
+        if (upReq.reusedSocket && (code === "ECONNRESET" || code === "EPIPE") && IDEMPOTENT.has(method) && !clientAborted && !res.headersSent && staleRetries < 2) {
+          staleRetries++;
+          log.info(`STALE ${reqHost}: kept-alive socket was closed (${code}); resending ${method} ${path.slice(0, 60)}`);
+          send(lastAttemptHeaders);
           return;
         }
-        const preset = provider.preset ? PRESETS.find((entry) => entry.id === provider.preset) : undefined;
-        const routeModel = route.model;
-        const modelEffortLevels = provider.models?.find((entry) => entry.id === routeModel)?.effortLevels;
-        compatCaps = resolveCompatibleCaps(
-          preset ? { effortLevels: preset.effortLevels, thinking: preset.thinking, ...(preset.serverTools ? { serverTools: true } : {}) } : undefined,
-          modelEffortLevels === undefined ? provider.caps : { ...provider.caps, effortLevels: modelEffortLevels },
-        );
-        const sanitized = sanitizeForCompatible(json, compatCaps);
-        json = sanitized.json;
-        compatChanges = sanitized.changes;
-        // The upstream would otherwise read Claude Code's own system prompt and answer that it is
-        // Claude. After sanitizing, so the effort named is the one the provider actually receives.
-        applyIdentityToAnthropicBody(json, {
-          model: route.model,
-          effort: effortOf(json),
-          identity: provider.identity,
-          instructionsAppend: provider.instructionsAppend,
-        });
-        body = Buffer.from(JSON.stringify(json));
-        const u = new URL(provider.url);
-        const protocol = u.protocol === "https:" ? "https:" : "http:";
-        // Which credential answers this turn. The conversation keeps the one it is on while that one
-        // is healthy, because moving it moves the prompt cache with it. Every credential cooling or
-        // quarantined leaves `chosen` null, and the request goes out on the configured headers so the
-        // provider — not us — gets to say no.
-        const credentials = this.credentialsOf(route.provider, provider);
-        // The same key the prompt cache is keyed on. `metadata.user_id` alone is one value for every
-        // conversation a user has, so using it raw would drag all of them onto one credential at once
-        // — the opposite of what stickiness is for (see conversationKey and ARCHITECTURE §4).
-        chosen = this.pool.pick(route.provider, credentials, conversationKey(json as AnthropicRequest));
-        // Nothing usable means every credential is cooling, and the turn still has to go somewhere:
-        // the first one, so the request carries real credentials rather than none, and so the answer
-        // is charged to the credential that actually produced it.
-        const using = chosen ?? credentials[0]!;
-        chosen = using;
-        penalised = { provider: route.provider, id: using.id };
-        target = {
-          protocol,
-          host: u.hostname,
-          port: Number(u.port) || (protocol === "https:" ? 443 : 80),
-          agent: this.agentFor(route.provider, protocol),
-          // The credential wins over the session header: they are different names in practice, but a
-          // vendor that reused one would mean the request going out unauthenticated.
-          extraHeaders: provider.sessionHeader
-            ? { [provider.sessionHeader]: conversationKey(json as AnthropicRequest), ...using.headers }
-            : using.headers,
-          dropClientAuth: true,
-          // Providers mount their Anthropic-compatible API under a path (DeepSeek /anthropic, OpenRouter /api,
-          // Qwen /apps/anthropic): the CLI's /v1/messages is appended to it. Dropping it sent requests to the
-          // vendor's website, which answered 200 with HTML (measured 2026-09-13 with OpenRouter).
-          basePath: u.pathname.replace(/\/+$/, ""),
-        };
-        const routeEffort = effortOf(json);
-        if (routeEffort) record.effort = routeEffort;
-        tag = `${route.provider.toUpperCase()} ${route.tag} effort=${routeEffort ?? "-"}`;
-        }
-      } else if (isApiHost) {
-        target = { protocol: "https:", host: cfg.upstream, port: this.deps.upstreamPort ?? 443, agent: this.deps.upstreamAgent ?? this.upstreamAgent, extraHeaders: {} };
-        tag = `PASS ${typeof model === "string" ? model : "-"}`;
-        // Passthrough stays byte-exact unless another model's thinking would get the turn refused.
-        if (json && dropForeignThinking(json) > 0) body = Buffer.from(JSON.stringify(json));
-      } else {
-        target = { protocol: "https:", host: reqHost, port: 443, agent: this.agentFor(`host:${reqHost}`, "https:"), extraHeaders: {} };
-        tag = `WEB ${reqHost}`;
-      }
-      break;
-    }
-
-    if (json && typeof json.service_tier === "string") record.requestedTier = json.service_tier;
-
-    // Two kinds of response editing: the CLI bootstrap (api host) and the claude.ai bootstrap (picker mode).
-    const isCliBootstrap = isApiHost && !route && path.startsWith(BOOTSTRAP_PATH);
-    const isPickerBootstrap = !isApiHost && !!cfg.picker?.enabled && method === "GET" && isBootstrapPath(path);
-    const isBootstrap = isCliBootstrap || isPickerBootstrap;
-    const headers: string[] = [];
-    const raw = req.rawHeaders;
-    for (let i = 0; i < raw.length; i += 2) {
-      const k = raw[i]!;
-      const lk = k.toLowerCase();
-      if (HOP_BY_HOP.has(lk)) continue;
-      // Bootstrap responses are edited: keep the client's accept-encoding as-is (some edges misbehave without it)
-      // and decompress whatever comes back before editing.
-      if (lk in target.extraHeaders || target.dropHeaders?.has(lk) || target.dropHeaderPrefixes?.some((prefix) => lk.startsWith(prefix))) continue;
-      if (target.dropClientAuth && CLIENT_AUTH.has(lk)) continue;
-      // Anthropic beta flags opt into features most compatible providers have not implemented.
-      if (compatCaps && !forwardCompatibleHeader(lk, compatCaps)) {
-        compatChanges.push("anthropic-beta");
-        continue;
-      }
-      // Picker bootstrap: never let the renderer revalidate against a cached (unedited) copy.
-      if (isPickerBootstrap && (lk === "if-none-match" || lk === "if-modified-since")) continue;
-      headers.push(k, raw[i + 1]!);
-    }
-    for (const [k, v] of Object.entries(target.extraHeaders)) headers.push(k, v);
-    if (route && compatChanges.length > 0) log.info(`COMPAT ${route.provider}: ${compatChanges.join(", ")}`);
-    headers.push("host", target.protocol === "https:" && target.port === 443 ? target.host : `${target.host}:${target.port}`);
-    // No content-length on body-less GET/HEAD: some edges reject it; Chromium never sends it.
-    if (body.length > 0 || (method !== "GET" && method !== "HEAD")) headers.push("content-length", String(body.length));
-    if (isPickerBootstrap) {
-      const shown: string[] = [];
-      for (const [rawName, value] of Array.from({ length: headers.length / 2 }, (_, i) => [headers[i * 2]!, headers[i * 2 + 1]!] as [string, string])) {
-        const safe = redactHeaders({ [rawName]: value })[rawName];
-        shown.push(safe === "[REDACTED]" ? `${rawName.toLowerCase()}=<${value.length}B>` : `${rawName.toLowerCase()}=${value}`);
-      }
-      log.info(`PICKER request ${method} ${path.slice(0, 80)} headers: ${shown.join(" | ")}`);
-    }
-    // Keep every credential this turn sends. A retry can use an opaque token that does not match a
-    // known token shape; retaining its actual value is what keeps a reflected refusal out of logs.
-    const errorSecrets = new Set(credentialHeaderValues(Array.from({ length: headers.length / 2 }, (_, i) => [headers[i * 2]!, headers[i * 2 + 1]!] as [string, string])));
-    // Every retry is rebuilt from the first attempt's header list. Keep the union of identity header
-    // names already used so a current-session fingerprint cannot reappear on a third account.
-    let usedCredentialHeaders = { ...(chosen?.headers ?? {}) };
-
-    const lib = target.protocol === "https:" ? https : http;
-    /**
-     * The attempt in flight. A routed turn may make more than one: when a credential is refused and
-     * nothing has reached the client yet, the next credential takes over inside the same turn, so
-     * the client is answered on its first ask instead of having to retry. `send` below replaces
-     * this; everything that reaches for the upstream reaches for it through here.
-     */
-    let upReq!: http.ClientRequest;
-    /** Credentials already spent on this turn, so a retry cannot pick one of them again. */
-    const tried = new Set<string>(penalised ? [penalised.id] : []);
-    /** The headers of the attempt in flight, so a stale-socket resend repeats exactly that attempt. */
-    let lastAttemptHeaders: string[] = headers;
-    let staleRetries = 0;
-    const send = (attemptHeaders: string[]): void => {
-      lastAttemptHeaders = attemptHeaders;
-      upReq = lib.request({
-        protocol: target.protocol,
-        host: target.host,
-        port: target.port,
-        method,
-        path: target.basePath ? target.basePath + path : path,
-        headers: attemptHeaders,
-        agent: target.agent,
-        ...(target.protocol === "https:" ? { servername: target.host } : {}),
-      });
-      upReq.on("error", onUpstreamError);
-      upReq.on("response", onUpstreamResponse);
-      upReq.end(body);
-    };
-
-    /**
-     * The next credential to try inside this turn, or null to answer with what the provider said.
-     * Only for a routed request whose provider has one we have not already spent — a failure that
-     * is the request's own fault is not retried at all (see `classify`).
-     */
-    const nextCredential = (status: number, body = ""): Credential | null => {
-      if (!route || !penalised || res.headersSent) return null;
-      if (!classify(status, undefined, body).retryable) return null;
-      const owner = cfg.providers[route.provider];
-      if (!owner) return null;
-      // The model's own shape again: its credential pool is the provider's, but an auth convention
-      // this model overrides has to be the one the retry actually sends.
-      const provider = providerFor(owner, route.model);
-      const native = provider.type === "anthropic" && provider.accountPool;
-      const available = native ? this.claudeAccounts.peekCredentials() : this.credentialsOf(route.provider, provider);
-      const rest = available.filter((c) => !tried.has(c.id));
-      if (rest.length === 0) return null;
-      const next = this.pool.pick(route.provider, rest, conversationKey(json as AnthropicRequest));
-      return next && native ? { ...next, headers: withClientBetas(next.headers, req.headers["anthropic-beta"]) } : next;
-    };
-
-    // Destroying the upstream makes it emit ECONNRESET (measured, Node 24.15), which is
-    // indistinguishable from the provider dropping us unless we remember that we did it. Without
-    // this flag every cancelled turn charged the credential a failure and moved the conversation
-    // off it, which costs the prompt cache — for a turn the user cancelled on purpose.
-    let clientAborted = false;
-    // Set when a 403 body was read ahead of the forward, so the forward knows to write that body
-    // instead of the stream it came from.
-    let headFilled = false;
-    // The 403 body exactly as it arrived. It is what the client is given: the judgement below
-    // reads a decoded copy, but a compressed body cannot survive a round trip through a UTF-8
-    // string — invalid sequences become U+FFFD and never come back. Returning that while
-    // `content-encoding` still stands is `ERR_CONTENT_DECODING_FAILED` in the app (2026-09-22).
-    let errRaw: Buffer = Buffer.alloc(0);
-    // Set when the body was longer than the read cap, so its bytes are no longer a whole
-    // compressed stream and only the decoded head can be forwarded.
-    let errTruncated = false;
-    const abortUpstream = (): void => {
-      clientAborted = true;
-      if (upReq && !upReq.destroyed) upReq.destroy();
-    };
-    req.on("aborted", abortUpstream);
-    res.on("close", () => {
-      if (!finished) {
-        abortUpstream();
-        finish("-", 0, "client closed");
-      }
-    });
-
-    const onUpstreamError = (e: Error): void => {
-      // A kept-alive socket the upstream had already closed: the reset arrives before any response,
-      // so the request never reached it. claude.ai did this 259 times in four days of picker mode
-      // (2026-10-03..06), each one a 502 on an app request such as `current_user_access`. Send an
-      // idempotent request again on a fresh attempt instead of failing it; a POST is never resent,
-      // since a reset cannot prove the upstream did not act on it.
-      const code = (e as NodeJS.ErrnoException).code;
-      if (upReq.reusedSocket && (code === "ECONNRESET" || code === "EPIPE") && IDEMPOTENT.has(method) && !clientAborted && !res.headersSent && staleRetries < 2) {
-        staleRetries++;
-        log.info(`STALE ${reqHost}: kept-alive socket was closed (${code}); resending ${method} ${path.slice(0, 60)}`);
-        send(lastAttemptHeaders);
-        return;
-      }
-      if (target.host === cfg.upstream) this.deps.health.failure(e);
-      // Nothing reached the provider, so this says nothing about the credential — but it does say
-      // the route is unusable for a moment, and a pool with somewhere else to go should use it.
-      // Our own abort is not the provider's fault and must not be charged to it.
-      if (penalised && !clientAborted) this.pool.penalise(penalised.provider, penalised.id, 0);
-      finish("-", 0, `upstream error ${(e as NodeJS.ErrnoException).code ?? ""} ${(e as Error).message}`);
-      if (!res.headersSent) {
-        res.writeHead(502, { "content-type": "application/json", connection: "close" });
-        res.end(JSON.stringify({ error: { type: "clauderipple_upstream", message: `${target.host}: ${(e as Error).message}` } }));
-      } else {
-        res.destroy();
-      }
-    };
-
-    const onUpstreamResponse = (upRes: http.IncomingMessage): void => {
-      if (target.host === cfg.upstream) this.deps.health.success();
-      const status = upRes.statusCode ?? 0;
-      // A 403 is the one status whose meaning is in its body. A relay reporting a broken upstream
-      // must not be charged to the credential — that is what made one working key answer every turn
-      // with an authentication error for a minute (2026-09-21). Every other status is judged from
-      // the status alone, and its body is left for the forward below, untouched.
-      if (status === 403) {
-        bufferBody(upRes, ERROR_HEAD_MAX).then((whole) => onUpstreamJudged(upRes, status, whole)).catch((e: Error) => {
-          log.warn(`upstream ${status}: could not read the body: ${e.message}`);
-          finish(String(status), 0, `upstream ${status}: body read failed`);
+        if (target.host === cfg.upstream) this.deps.health.failure(e);
+        // Nothing reached the provider, so this says nothing about the credential — but it does say
+        // the route is unusable for a moment, and a pool with somewhere else to go should use it.
+        // Our own abort is not the provider's fault and must not be charged to it.
+        if (penalised && !clientAborted) this.pool.penalise(penalised.provider, penalised.id, 0);
+        finish("-", 0, `upstream error ${(e as NodeJS.ErrnoException).code ?? ""} ${(e as Error).message}`);
+        if (!res.headersSent) {
+          res.writeHead(502, { "content-type": "application/json", connection: "close" });
+          res.end(JSON.stringify({ error: { type: "clauderipple_upstream", message: `${target.host}: ${(e as Error).message}` } }));
+        } else {
           res.destroy();
-        });
-        return;
-      }
-      onUpstreamJudged(upRes, status, "");
-    };
-
-    /**
-     * The whole of a small body, read before anything is decided or written.
-     *
-     * A 403's meaning is in its body and cannot be judged before it arrives, so the bytes are read
-     * and handed back as the head: `unshift` after a stream has ended throws, and reading a head and
-     * forwarding the rest mid-flow is where a body can be lost to a pause nothing resumes. A 403 is
-     * a refusal, so its body is small.
-     *
-     * What is returned is the body **decoded for reading**, because the judgement is about what the
-     * body says. The bytes themselves are kept in `errRaw` for the client: a compressed body is
-     * arbitrary binary, and text is a one-way door for it.
-     *
-     * Past `max` there is nothing worth identifying, so the rest is dropped — but the stream is
-     * never destroyed. Tearing the connection down over a body size would turn a refusal the user
-     * can read into a socket error, which is a worse bug than the one this handles; an unbounded
-     * relay answer instead reaches the forward above the cap and is reported there.
-     */
-    const bufferBody = (stream: http.IncomingMessage, max: number): Promise<string> => new Promise((resolveBody) => {
-      const chunks: Buffer[] = [];
-      let size = 0;
-      stream.on("data", (c: Buffer) => {
-        const room = max - size;
-        if (room <= 0) { errTruncated = true; stream.resume(); return; }
-        if (c.length > room) errTruncated = true;
-        chunks.push(c.subarray(0, room));
-        size += Math.min(c.length, room);
-      });
-      const handOver = (): void => {
-        errRaw = Buffer.concat(chunks, size);
-        headFilled = true;
-        resolveBody(decodeBodyToText(errRaw, stream.headers["content-encoding"]));
-      };
-      stream.once("end", handOver);
-      // A dropped or failed stream still hands over what arrived; the caller's own upstream error
-      // path is already attached, and duplicating it here would race it for the same response.
-      stream.once("error", handOver);
-    });
-
-    const onUpstreamJudged = (upRes: http.IncomingMessage, status: number, errBody: string): void => {
-      // Charge the answer to the credential that produced it. A rate limit parks this one until its
-      // stated reset so the next request takes another; an answer clears whatever it was carrying.
-      // A 400 is our own request and is charged to nobody (see `classify`).
-      if (penalised) {
-        if (status >= 400) {
-          this.pool.penalise(penalised.provider, penalised.id, status, retryAfterMs(upRes.headers), errBody);
-          if (status === 401 && cfg.providers[penalised.provider]?.type === "anthropic") this.claudeAccounts.reject(penalised.id);
-        } else if (status >= 200 && status < 300) this.pool.succeed(penalised.provider, penalised.id, chosen?.ownerId);
-      } else if (!route && isApiHost && pathname === "/v1/messages" && status >= 200 && status < 300) {
-        // Native passthrough uses the caller's current Claude login, not a selected pool account.
-        // Model answers only: telemetry and token counts on the same host would mark it active
-        // while the conversation runs on an added account.
-        for (const [name, provider] of Object.entries(cfg.providers)) {
-          if (provider.type === "anthropic" && provider.auth === "claude-code") this.pool.succeed(name, "current");
         }
-      }
+      };
 
-      // Nothing has been written to the client yet, so a refused credential can still be replaced
-      // and the client answered on its first ask. Only here: once the answer starts flowing the
-      // turn is committed, because replacing a half-sent stream splices two answers together.
-      const retry = status >= 400 ? nextCredential(status, errBody) : null;
-      if (retry) {
-        const previousId = retry.ownerId ? penalised!.id.split(":", 1)[0]! : penalised!.id;
-        log.info(`RETRY ${route!.provider}: ${previousId} answered ${status}, trying ${retry.ownerId ?? retry.id}`);
-        tried.add(retry.id);
-        usedCredentialHeaders = { ...usedCredentialHeaders, ...(chosen?.headers ?? {}), ...retry.headers };
-        chosen = retry;
-        penalised = { provider: route!.provider, id: retry.id };
-        for (const secret of credentialHeaderValues(Object.entries(retry.headers))) errorSecrets.add(secret);
-        upRes.resume();
-        upRes.destroy();
-        // Remove every identity header used by any earlier attempt. The baseline is the first request,
-        // so removing only the immediately previous account would resurrect first-attempt fingerprints.
-        send(withCredential(headers, retry.headers, usedCredentialHeaders));
-        return;
-      }
+      const onUpstreamResponse = (upRes: http.IncomingMessage): void => {
+        if (target.host === cfg.upstream) this.deps.health.success();
+        const status = upRes.statusCode ?? 0;
+        // A 403 is the one status whose meaning is in its body. A relay reporting a broken upstream
+        // must not be charged to the credential — that is what made one working key answer every turn
+        // with an authentication error for a minute (2026-09-21). Every other status is judged from
+        // the status alone, and its body is left for the forward below, untouched.
+        if (status === 403) {
+          bufferBody(upRes, ERROR_HEAD_MAX).then((whole) => onUpstreamJudged(upRes, status, whole)).catch((e: Error) => {
+            log.warn(`upstream ${status}: could not read the body: ${e.message}`);
+            finish(String(status), 0, `upstream ${status}: body read failed`);
+            res.destroy();
+          });
+          return;
+        }
+        onUpstreamJudged(upRes, status, "");
+      };
 
-      const native = isApiHost && (!route || cfg.providers[route.provider]?.type === "anthropic");
-      if (native && typeof upRes.headers["request-id"] === "string") record.upstreamRequestId = upRes.headers["request-id"];
-      const outHeaders: string[] = [];
-      const r = upRes.rawHeaders;
-      for (let i = 0; i < r.length; i += 2) {
-        const lk = r[i]!.toLowerCase();
-        if (lk === "connection" || lk === "keep-alive" || lk === "transfer-encoding") continue;
-        if (isBootstrap && (lk === "content-length" || lk === "content-encoding")) continue;
-        if (isPickerBootstrap && (lk === "etag" || lk === "last-modified")) continue;
-        // A truncated 403 is forwarded decoded (its bytes are no longer a whole compressed
-        // stream), so neither the upstream's encoding nor its length describes what is sent.
-        if (errTruncated && (lk === "content-length" || lk === "content-encoding")) continue;
-        outHeaders.push(r[i]!, r[i + 1]!);
-      }
-      let bytes = 0;
-      if (isBootstrap) {
+      /**
+       * The whole of a small body, read before anything is decided or written.
+       *
+       * A 403's meaning is in its body and cannot be judged before it arrives, so the bytes are read
+       * and handed back as the head: `unshift` after a stream has ended throws, and reading a head and
+       * forwarding the rest mid-flow is where a body can be lost to a pause nothing resumes. A 403 is
+       * a refusal, so its body is small.
+       *
+       * What is returned is the body **decoded for reading**, because the judgement is about what the
+       * body says. The bytes themselves are kept in `errRaw` for the client: a compressed body is
+       * arbitrary binary, and text is a one-way door for it.
+       *
+       * Past `max` there is nothing worth identifying, so the rest is dropped — but the stream is
+       * never destroyed. Tearing the connection down over a body size would turn a refusal the user
+       * can read into a socket error, which is a worse bug than the one this handles; an unbounded
+       * relay answer instead reaches the forward above the cap and is reported there.
+       */
+      const bufferBody = (stream: http.IncomingMessage, max: number): Promise<string> => new Promise((resolveBody) => {
         const chunks: Buffer[] = [];
-        upRes.on("data", (c: Buffer) => chunks.push(c));
-        upRes.on("end", () => {
-          let out: Buffer = Buffer.concat(chunks);
-          const enc = String(upRes.headers["content-encoding"] ?? "").toLowerCase();
-          try {
-            if (enc === "gzip" || enc === "x-gzip") out = zlib.gunzipSync(out);
-            else if (enc === "deflate") out = zlib.inflateSync(out);
-            else if (enc === "br") out = zlib.brotliDecompressSync(out);
-            else if (enc === "zstd" && typeof (zlib as unknown as { zstdDecompressSync?: unknown }).zstdDecompressSync === "function")
-              out = (zlib as unknown as { zstdDecompressSync: (b: Buffer) => Buffer }).zstdDecompressSync(out);
-          } catch (e) {
-            log.warn(`bootstrap decode (${enc}) failed: ${(e as Error).message}`);
+        let size = 0;
+        stream.on("data", (c: Buffer) => {
+          const room = max - size;
+          if (room <= 0) { errTruncated = true; stream.resume(); return; }
+          if (c.length > room) errTruncated = true;
+          chunks.push(c.subarray(0, room));
+          size += Math.min(c.length, room);
+        });
+        const handOver = (): void => {
+          errRaw = Buffer.concat(chunks, size);
+          headFilled = true;
+          resolveBody(decodeBodyToText(errRaw, stream.headers["content-encoding"]));
+        };
+        stream.once("end", handOver);
+        // A dropped or failed stream still hands over what arrived; the caller's own upstream error
+        // path is already attached, and duplicating it here would race it for the same response.
+        stream.once("error", handOver);
+      });
+
+      const onUpstreamJudged = (upRes: http.IncomingMessage, status: number, errBody: string): void => {
+        // Charge the answer to the credential that produced it. A rate limit parks this one until its
+        // stated reset so the next request takes another; an answer clears whatever it was carrying.
+        // A 400 is our own request and is charged to nobody (see `classify`).
+        if (penalised) {
+          if (status >= 400) {
+            this.pool.penalise(penalised.provider, penalised.id, status, retryAfterMs(upRes.headers), errBody);
+            if (status === 401 && cfg.providers[penalised.provider]?.type === "anthropic") this.claudeAccounts.reject(penalised.id);
+          } else if (status >= 200 && status < 300) this.pool.succeed(penalised.provider, penalised.id, chosen?.ownerId);
+        } else if (!route && isApiHost && pathname === "/v1/messages" && status >= 200 && status < 300) {
+          // Native passthrough uses the caller's current Claude login, not a selected pool account.
+          // Model answers only: telemetry and token counts on the same host would mark it active
+          // while the conversation runs on an added account.
+          for (const [name, provider] of Object.entries(cfg.providers)) {
+            if (provider.type === "anthropic" && provider.auth === "claude-code") this.pool.succeed(name, "current");
           }
-          if (status === 200 && isCliBootstrap) {
+        }
+
+        // Nothing has been written to the client yet, so a refused credential can still be replaced
+        // and the client answered on its first ask. Only here: once the answer starts flowing the
+        // turn is committed, because replacing a half-sent stream splices two answers together.
+        const retry = status >= 400 ? nextCredential(status, errBody) : null;
+        if (retry) {
+          const previousId = retry.ownerId ? penalised!.id.split(":", 1)[0]! : penalised!.id;
+          log.info(`RETRY ${route!.provider}: ${previousId} answered ${status}, trying ${retry.ownerId ?? retry.id}`);
+          tried.add(retry.id);
+          usedCredentialHeaders = { ...usedCredentialHeaders, ...(chosen?.headers ?? {}), ...retry.headers };
+          chosen = retry;
+          penalised = { provider: route!.provider, id: retry.id };
+          for (const secret of credentialHeaderValues(Object.entries(retry.headers))) errorSecrets.add(secret);
+          upRes.resume();
+          upRes.destroy();
+          // Remove every identity header used by any earlier attempt. The baseline is the first request,
+          // so removing only the immediately previous account would resurrect first-attempt fingerprints.
+          send(withCredential(headers, retry.headers, usedCredentialHeaders));
+          return;
+        }
+
+        const native = isApiHost && (!route || cfg.providers[route.provider]?.type === "anthropic");
+        if (native && typeof upRes.headers["request-id"] === "string") record.upstreamRequestId = upRes.headers["request-id"];
+        const outHeaders: string[] = [];
+        const r = upRes.rawHeaders;
+        for (let i = 0; i < r.length; i += 2) {
+          const lk = r[i]!.toLowerCase();
+          if (lk === "connection" || lk === "keep-alive" || lk === "transfer-encoding") continue;
+          if (isBootstrap && (lk === "content-length" || lk === "content-encoding")) continue;
+          if (isPickerBootstrap && (lk === "etag" || lk === "last-modified")) continue;
+          // A truncated 403 is forwarded decoded (its bytes are no longer a whole compressed
+          // stream), so neither the upstream's encoding nor its length describes what is sent.
+          if (errTruncated && (lk === "content-length" || lk === "content-encoding")) continue;
+          outHeaders.push(r[i]!, r[i + 1]!);
+        }
+        let bytes = 0;
+        if (isBootstrap) {
+          const chunks: Buffer[] = [];
+          upRes.on("data", (c: Buffer) => chunks.push(c));
+          upRes.on("end", () => {
+            let out: Buffer = Buffer.concat(chunks);
+            const enc = String(upRes.headers["content-encoding"] ?? "").toLowerCase();
             try {
-              out = injectBootstrap(out, cfg);
+              if (enc === "gzip" || enc === "x-gzip") out = zlib.gunzipSync(out);
+              else if (enc === "deflate") out = zlib.inflateSync(out);
+              else if (enc === "br") out = zlib.brotliDecompressSync(out);
+              else if (enc === "zstd" && typeof (zlib as unknown as { zstdDecompressSync?: unknown }).zstdDecompressSync === "function")
+                out = (zlib as unknown as { zstdDecompressSync: (b: Buffer) => Buffer }).zstdDecompressSync(out);
             } catch (e) {
-              log.warn(`bootstrap inject failed: ${(e as Error).message}`);
+              log.warn(`bootstrap decode (${enc}) failed: ${(e as Error).message}`);
             }
-          } else if (isPickerBootstrap && status !== 200 && status !== 304) {
-            log.warn(`PICKER bootstrap upstream ${status}; headers: ${JSON.stringify(redactHeaders(upRes.headers))}; body: ${redactErrorText(out.toString("utf8"), [...errorSecrets], 300)}`);
-          } else if (status === 200 && isPickerBootstrap) {
-            try {
-              const j = JSON.parse(out.toString("utf8")) as Record<string, unknown>;
-              const r = injectPickerModels(j, chatPickerModels(cfg), cfg.cli.autoCompactWindow, (model) => effortLevelsForModel(cfg, model));
-              if (r.surfaces.length > 0) {
-                this.lastPickerInjection = { at: new Date().toISOString(), ...r };
-                out = Buffer.from(JSON.stringify(j));
-                log.info(`PICKER injected ${r.injected} model(s); surfaces: ${r.surfaces.map((s) => `${s.id}[${s.models.length}]`).join(" ")}`);
-              } else {
-                log.info(`PICKER bootstrap had no model_selector_config (${path.slice(0, 60)})`);
+            if (status === 200 && isCliBootstrap) {
+              try {
+                out = injectBootstrap(out, cfg);
+              } catch (e) {
+                log.warn(`bootstrap inject failed: ${(e as Error).message}`);
               }
-            } catch (e) {
-              log.warn(`picker inject failed: ${(e as Error).message}`);
+            } else if (isPickerBootstrap && status !== 200 && status !== 304) {
+              log.warn(`PICKER bootstrap upstream ${status}; headers: ${JSON.stringify(redactHeaders(upRes.headers))}; body: ${redactErrorText(out.toString("utf8"), [...errorSecrets], 300)}`);
+            } else if (status === 200 && isPickerBootstrap) {
+              try {
+                const j = JSON.parse(out.toString("utf8")) as Record<string, unknown>;
+                const r = injectPickerModels(j, chatPickerModels(cfg), cfg.cli.autoCompactWindow, (model) => effortLevelsForModel(cfg, model));
+                if (r.surfaces.length > 0) {
+                  this.lastPickerInjection = { at: new Date().toISOString(), ...r };
+                  out = Buffer.from(JSON.stringify(j));
+                  log.info(`PICKER injected ${r.injected} model(s); surfaces: ${r.surfaces.map((s) => `${s.id}[${s.models.length}]`).join(" ")}`);
+                } else {
+                  log.info(`PICKER bootstrap had no model_selector_config (${path.slice(0, 60)})`);
+                }
+              } catch (e) {
+                log.warn(`picker inject failed: ${(e as Error).message}`);
+              }
             }
+            outHeaders.push("content-length", String(out.length));
+            res.writeHead(status, outHeaders);
+            res.end(out);
+            finish(String(status), out.length);
+          });
+          upRes.on("error", (e) => {
+            finish(String(status), bytes, `upstream stream error ${(e as Error).message}`);
+            res.destroy();
+          });
+          return;
+        }
+        res.writeHead(status, outHeaders);
+        // This observer is deliberately side-band: it sees the exact chunks after they are written
+        // to the client, retains only a 64 KiB line/object fragment, and never changes backpressure.
+        const tap = new ResponseUsageTap(
+          typeof upRes.headers["content-type"] === "string" ? upRes.headers["content-type"] : undefined,
+          typeof upRes.headers["content-encoding"] === "string" ? upRes.headers["content-encoding"] : undefined,
+        );
+        // An error body is the only thing that says why the provider refused; keep its head for the
+        // log and the Logs page. A DeepSeek 401 went unexplained for a day because only the status
+        // code was recorded (2026-09-15).
+        const errorHead: Buffer[] = [];
+        let errorHeadBytes = 0;
+        // The 403 body was read to judge it, so it is written here instead of read again from a
+        // stream that has already ended. The bytes go back exactly as they arrived, so a compressed
+        // body still matches the `content-encoding` and `content-length` the upstream stated; only a
+        // truncated one is sent decoded, and both headers were dropped above for it.
+        if (headFilled) {
+          const body = errTruncated ? Buffer.from(errBody, "utf8") : errRaw;
+          bytes = body.length;
+          res.end(body);
+          finish(String(status), bytes, `upstream ${status}: ${redactErrorText(errBody, [...errorSecrets], 300)}`);
+          return;
+        }
+        upRes.on("data", (c: Buffer) => {
+          bytes += c.length;
+          const writable = res.write(c);
+          tap.feed(c);
+          if (status >= 400 && errorHeadBytes < ERROR_HEAD_MAX) {
+            const remaining = ERROR_HEAD_MAX - errorHeadBytes;
+            errorHead.push(c.subarray(0, remaining));
+            errorHeadBytes += Math.min(c.length, remaining);
           }
-          outHeaders.push("content-length", String(out.length));
-          res.writeHead(status, outHeaders);
-          res.end(out);
-          finish(String(status), out.length);
+          if (!writable) upRes.pause();
+        });
+        res.on("drain", () => upRes.resume());
+        upRes.on("end", () => {
+          const observed = tap.finish();
+          observedUsage = observed.usage;
+          observedStopReason = observed.stopReason;
+          if (!native && observed.messageId !== undefined) record.messageId = observed.messageId;
+          if (observed.servedTier !== undefined) record.servedTier = observed.servedTier;
+          res.end();
+          const errorBody = status >= 400 ? decodeBodyToText(Buffer.concat(errorHead), upRes.headers["content-encoding"]) : "";
+          if (route && path.startsWith("/v1/messages") && !path.startsWith("/v1/messages/count_tokens")) {
+            this.providerHealth.observe(route.provider, status, providerExhaustion(status, errorBody, retryAfterMs(upRes.headers)));
+          }
+          const note = status >= 400 ? `upstream ${status}: ${errorSnippet(Buffer.concat(errorHead), upRes.headers["content-encoding"], [...errorSecrets], upRes.headers["content-type"])}` : undefined;
+          // Anthropic forgets a conversation's server-side thread after a few idle minutes, and the CLI
+          // answers the 404 by replaying the whole conversation, which hits the prompt cache. From CLI
+          // 2.1.288 this is about half the turns after five idle minutes (2026-10-07: 105 of 217, none
+          // of 69 before), so it is recorded as resent rather than failed.
+          if (status === 404 && note && /thread_not_found|No thread state was found/.test(note)) {
+            finish(String(status), bytes, note, false, { resent: true });
+            return;
+          }
+          finish(String(status), bytes, note);
         });
         upRes.on("error", (e) => {
           finish(String(status), bytes, `upstream stream error ${(e as Error).message}`);
           res.destroy();
         });
-        return;
-      }
-      res.writeHead(status, outHeaders);
-      // This observer is deliberately side-band: it sees the exact chunks after they are written
-      // to the client, retains only a 64 KiB line/object fragment, and never changes backpressure.
-      const tap = new ResponseUsageTap(
-        typeof upRes.headers["content-type"] === "string" ? upRes.headers["content-type"] : undefined,
-        typeof upRes.headers["content-encoding"] === "string" ? upRes.headers["content-encoding"] : undefined,
-      );
-      // An error body is the only thing that says why the provider refused; keep its head for the
-      // log and the Logs page. A DeepSeek 401 went unexplained for a day because only the status
-      // code was recorded (2026-09-15).
-      const errorHead: Buffer[] = [];
-      let errorHeadBytes = 0;
-      // The 403 body was read to judge it, so it is written here instead of read again from a
-      // stream that has already ended. The bytes go back exactly as they arrived, so a compressed
-      // body still matches the `content-encoding` and `content-length` the upstream stated; only a
-      // truncated one is sent decoded, and both headers were dropped above for it.
-      if (headFilled) {
-        const body = errTruncated ? Buffer.from(errBody, "utf8") : errRaw;
-        bytes = body.length;
-        res.end(body);
-        finish(String(status), bytes, `upstream ${status}: ${redactErrorText(errBody, [...errorSecrets], 300)}`);
-        return;
-      }
-      upRes.on("data", (c: Buffer) => {
-        bytes += c.length;
-        const writable = res.write(c);
-        tap.feed(c);
-        if (status >= 400 && errorHeadBytes < ERROR_HEAD_MAX) {
-          const remaining = ERROR_HEAD_MAX - errorHeadBytes;
-          errorHead.push(c.subarray(0, remaining));
-          errorHeadBytes += Math.min(c.length, remaining);
-        }
-        if (!writable) upRes.pause();
-      });
-      res.on("drain", () => upRes.resume());
-      upRes.on("end", () => {
-        const observed = tap.finish();
-        observedUsage = observed.usage;
-        observedStopReason = observed.stopReason;
-        if (!native && observed.messageId !== undefined) record.messageId = observed.messageId;
-        if (observed.servedTier !== undefined) record.servedTier = observed.servedTier;
-        res.end();
-        const errorBody = status >= 400 ? decodeBodyToText(Buffer.concat(errorHead), upRes.headers["content-encoding"]) : "";
-        if (route && path.startsWith("/v1/messages") && !path.startsWith("/v1/messages/count_tokens")) {
-          this.providerHealth.observe(route.provider, status, providerExhaustion(status, errorBody, retryAfterMs(upRes.headers)));
-        }
-        const note = status >= 400 ? `upstream ${status}: ${errorSnippet(Buffer.concat(errorHead), upRes.headers["content-encoding"], [...errorSecrets], upRes.headers["content-type"])}` : undefined;
-        // Anthropic forgets a conversation's server-side thread after a few idle minutes, and the CLI
-        // answers the 404 by replaying the whole conversation, which hits the prompt cache. From CLI
-        // 2.1.288 this is about half the turns after five idle minutes (2026-10-07: 105 of 217, none
-        // of 69 before), so it is recorded as resent rather than failed.
-        if (status === 404 && note && /thread_not_found|No thread state was found/.test(note)) {
-          finish(String(status), bytes, note, false, { resent: true });
-          return;
-        }
-        finish(String(status), bytes, note);
-      });
-      upRes.on("error", (e) => {
-        finish(String(status), bytes, `upstream stream error ${(e as Error).message}`);
-        res.destroy();
-      });
-    };
+      };
 
-    send(headers);
+      send(headers);
+    };
+    await run(fetchRoute);
   }
 
   /**
@@ -1761,6 +1826,31 @@ export class Proxy {
     }
     return a;
   }
+}
+
+/**
+ * Let the ordinary adapters prepare their usual errors without committing one to the client.
+ * Successful responses stream directly, with real backpressure; no body is buffered. Once a
+ * success header is sent this becomes a transparent response, including mid-stream failures.
+ */
+function deferErrorResponse(response: http.ServerResponse, discarded: () => boolean): http.ServerResponse {
+  let error = false;
+  const guarded = new globalThis.Proxy(response, {
+    get(target, key) {
+      if (key === "writeHead") return (...args: unknown[]) => {
+        if (discarded()) return guarded;
+        error = typeof args[0] === "number" && args[0] >= 400 && !target.headersSent;
+        return error ? guarded : Reflect.apply(target.writeHead, target, args);
+      };
+      if (key === "write" || key === "end" || key === "flushHeaders" || key === "destroy") return (...args: unknown[]) => {
+        if (discarded() || error || (key === "destroy" && !target.headersSent)) return guarded;
+        return Reflect.apply(target[key], target, args);
+      };
+      const value: unknown = Reflect.get(target, key, target);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+  return guarded;
 }
 
 function readBody(req: http.IncomingMessage): Promise<Buffer> {

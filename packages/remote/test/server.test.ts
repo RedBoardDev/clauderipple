@@ -215,10 +215,13 @@ test("desktop polling runs on its own timer with no phone connected, so completi
   assert.ok(calls > baseline, "no phone connected: the desktop poll still runs on its timer");
   assert.ok(f.sessions.list().some(s => s.id === id && s.state === "running"), "a Mac turn is detected with no clients");
   const peer = await f.auth();
+  // A connected observer reports visibility, which intentionally restores the three-second cadence.
+  peer.send({ t: "presence", visible: true });
+  await peer.barrier();
   processes = "";
   now += 6000;
   await delay(3100);
-  assert.ok(f.sessions.list().some(s => s.id === id && s.state === "stopped"), "completion is detected with no phone watching");
+  assert.ok(f.sessions.list().some(s => s.id === id && s.state === "stopped"), "completion is detected on the next visible-client poll");
   const changed = await peer.take("sessions", msg => msg.sessions.some(s => s.id === id && s.state === "stopped"));
   assert.equal(changed.msg.sessions[0]?.pending, 0);
 });

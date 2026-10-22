@@ -7,9 +7,11 @@
 // supervisor and temp files and never touch launchd, the user's settings or the live router.
 
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { ConfigStore, adminPort, type Config } from "../../router/src/config.ts";
 import { certPaths } from "./certs.ts";
+import { claudeBinary, claudeCodeLogin, claudeLoginHint, type ClaudeCodeLogin } from "./claude-auth.ts";
 import { applyAppProxy, currentAppProxy } from "./picker.ts";
 import { applyProxyEnv, settingsEnv } from "./settings.ts";
 import type { AgentState } from "./supervisor.ts";
@@ -43,6 +45,10 @@ export type RecoveryDeps = {
   sleep?: (ms: number) => Promise<void>;
   /** How long repair waits for the router to answer after starting it. */
   healthBudgetMs?: number;
+  /** Whether the phone host's background service is installed on this machine. */
+  remoteHostInstalled?: () => boolean | Promise<boolean>;
+  /** Whether the Claude Code CLI itself has a login (the phone host's sessions need one). */
+  claudeLogin?: () => Promise<ClaudeCodeLogin>;
 };
 
 export async function fetchRouterStatus(adminUrl: string, timeoutMs: number): Promise<RouterStatus | null> {
@@ -110,6 +116,21 @@ function configFile(home: string): string {
   return path.join(home, "config.json");
 }
 
+/**
+ * Whether the phone host's own background service is installed here (a launchd agent, a scheduled
+ * task, a systemd user unit). The host package owns that path, so it is asked for it; a host that
+ * is not installed cannot need a CLI login of its own.
+ */
+async function remoteHostInstalled(): Promise<boolean> {
+  try {
+    const { servicePaths } = await import("../../remote/src/host-service.ts");
+    return fs.existsSync(servicePaths(process.platform, os.homedir()).definition);
+  } catch {
+    // A host package that cannot be read is a host that is not installed here.
+    return false;
+  }
+}
+
 async function snapshot(deps: RecoveryDeps): Promise<Snapshot> {
   const installed = fs.existsSync(configFile(deps.home));
   const cfg = new ConfigStore(configFile(deps.home)).get();
@@ -140,6 +161,12 @@ async function snapshot(deps: RecoveryDeps): Promise<Snapshot> {
   if (desktop.stale) add("desktop-port-mismatch", `Claude Desktop is set to a ClaudeRipple port that is no longer used (${desktop.url}; the router listens on ${proxyUrl}).`);
   else if (desktop.proxy === "other") add("desktop-foreign-proxy", `Claude Desktop goes through another proxy (${desktop.url}), not ClaudeRipple.`);
   if (mode === "mixed") add("mixed-mode", `Claude Code ${cli.proxy === "ripple" ? "goes" : "does not go"} through ClaudeRipple, Claude Desktop ${desktop.proxy === "ripple" ? "does" : "does not"}.`);
+  // The phone host starts Claude Code through the Agent SDK and passes no credential of its own, so
+  // without a login of the CLI's own every turn fails at once (issue #71).
+  if (await (deps.remoteHostInstalled ?? remoteHostInstalled)()) {
+    const login = await (deps.claudeLogin ?? (() => claudeCodeLogin()))();
+    if (!login.ok) add("cli-not-logged-in", `Claude Code has no login on this computer, so the phone host's sessions fail at once. ${claudeLoginHint(claudeBinary())}`);
+  }
 
   return {
     report: {

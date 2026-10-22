@@ -5,7 +5,7 @@ import { execFileSync } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
 import { EventLog } from "./eventlog.ts";
-import { processCommands } from "./processes.ts";
+import { creationDateToFileTime, parseFileTime, processCommands, processSnapshot, sameFileTime, type ProcessSnapshot } from "./processes.ts";
 import { messageContent, sendUserFileImages, type ImageSink } from "./images.ts";
 import { PERMISSION_MODES, type BackgroundTask, type EventBody, type Figures, type PermissionMode, type SessionSummary, type ToolCall } from "./protocol.ts";
 
@@ -24,18 +24,63 @@ export interface DesktopProcess { sessionId: string; pid: number; status: "busy"
  * running it for every registry entry on every poll blocked the host (2026-10-12).
  */
 const verifiedStarts = new Map<number, string>();
-let snapshot: { dir: string; at: number; result: Map<string, DesktopProcess> } | null = null;
+let snapshot: { dir: string; platform: string; at: number; result: Map<string, DesktopProcess> } | null = null;
 
-/** Registry identity is authoritative; ps flags remain a legacy fallback only. Cached for 1 s. */
-export function liveDesktopProcesses(dir: string, maxAgeMs = 1000, platform = process.platform): Map<string, DesktopProcess> {
-  if (platform !== "darwin") return new Map();
+/**
+ * Is this pid the process the registry recorded? On macOS the start time comes from `ps`.
+ */
+function darwinAlive(): (pid: number, procStart: unknown) => boolean {
+  return (pid, procStart) => {
+    try {
+      process.kill(pid, 0);
+      if (typeof procStart === "string" && verifiedStarts.get(pid) !== procStart) {
+        const started = execFileSync("ps", ["-o", "lstart=", "-p", String(pid)], { encoding: "utf8", env: { ...process.env, LC_ALL: "C", TZ: "UTC" }, stdio: ["ignore", "pipe", "ignore"] }).trim();
+        if (started !== procStart) return false;
+        verifiedStarts.set(pid, started);
+      }
+      return true;
+    } catch { return false; } // Dead or recycled process, not a live desktop writer.
+  };
+}
+
+/**
+ * Is this pid the process the registry recorded? Windows has no `ps -o lstart=`: the registry's
+ * procStart is a FILETIME (100 ns ticks since 1601) and the OS reports the same instant as a
+ * CreationDate. A pid alone proves nothing there — Windows recycles pids — so the start times
+ * are compared (issue #70).
+ */
+function windowsAlive(processes: ProcessSnapshot): (pid: number, procStart: unknown) => boolean {
+  const running = new Set<number>();
+  const starts = new Map<number, bigint>();
+  for (const p of processes.current()) {
+    running.add(p.pid);
+    const start = typeof p.started === "string" ? creationDateToFileTime(p.started) : null;
+    if (start !== null) starts.set(p.pid, start);
+  }
+  return (pid, procStart) => {
+    if (!running.has(pid)) return false;
+    const started = starts.get(pid);
+    const recorded = parseFileTime(procStart);
+    if (started === undefined || recorded === null) return true; // Nothing to compare: the pid runs.
+    return sameFileTime(started, recorded);
+  };
+}
+
+/**
+ * Registry identity is authoritative; ps flags remain a legacy fallback only. Cached for 1 s.
+ * The Windows snapshot behind it is read in the background, so this never waits for PowerShell
+ * more than once (see ProcessSnapshot).
+ */
+export function liveDesktopProcesses(dir: string, maxAgeMs = 1000, platform = process.platform, processes: ProcessSnapshot = processSnapshot): Map<string, DesktopProcess> {
+  if (platform !== "darwin" && platform !== "win32") return new Map();
   const now = Date.now();
-  if (snapshot && snapshot.dir === dir && now - snapshot.at < maxAgeMs) return snapshot.result;
+  if (snapshot && snapshot.dir === dir && snapshot.platform === platform && now - snapshot.at < maxAgeMs) return snapshot.result;
   const result = new Map<string, DesktopProcess>();
-  snapshot = { dir, at: now, result };
+  snapshot = { dir, platform, at: now, result };
   let entries: fs.Dirent[];
   try { entries = fs.readdirSync(dir, { withFileTypes: true }); }
   catch (error) { if (missing(error)) return result; throw error; }
+  const candidates: { pid: number; procStart: unknown; entry: DesktopProcess }[] = [];
   for (const entry of entries) {
     if (!entry.isFile() || !/^\d+\.json$/.test(entry.name)) continue;
     const pid = Number(entry.name.slice(0, -5));
@@ -44,16 +89,14 @@ export function liveDesktopProcesses(dir: string, maxAgeMs = 1000, platform = pr
     catch (error) { if (missing(error)) continue; throw error; }
     if (!value || value.entrypoint !== "claude-desktop" || typeof value.sessionId !== "string" || !UUID.test(value.sessionId) || pid <= 1 || (value.pid !== undefined && value.pid !== pid)) continue;
     if (!["busy", "shell", "idle", "waiting"].includes(str(value.status))) continue;
-    try {
-      process.kill(pid, 0);
-      if (typeof value.procStart === "string" && verifiedStarts.get(pid) !== value.procStart) {
-        const started = execFileSync("ps", ["-o", "lstart=", "-p", String(pid)], { encoding: "utf8", env: { ...process.env, LC_ALL: "C", TZ: "UTC" }, stdio: ["ignore", "pipe", "ignore"] }).trim();
-        if (started !== value.procStart) continue;
-        verifiedStarts.set(pid, started);
-      }
-    } catch { continue; } // Dead or recycled process, not a live desktop writer.
     const status = value.status as DesktopProcess["status"];
-    result.set(value.sessionId, { sessionId: value.sessionId, pid, status, ...(typeof value.bridgeSessionId === "string" ? { bridgeSessionId: value.bridgeSessionId } : {}) });
+    candidates.push({ pid, procStart: value.procStart, entry: { sessionId: value.sessionId, pid, status, ...(typeof value.bridgeSessionId === "string" ? { bridgeSessionId: value.bridgeSessionId } : {}) } });
+  }
+  if (!candidates.length) return result;
+  const alive = platform === "win32" ? windowsAlive(processes) : darwinAlive();
+  for (const candidate of candidates) {
+    if (!alive(candidate.pid, candidate.procStart)) continue;
+    result.set(candidate.entry.sessionId, candidate.entry);
   }
   return result;
 }
@@ -415,9 +458,19 @@ export class DesktopSessions {
       let state = this.tailSubs.get(id);
       if (!state) { state = new Map(); this.tailSubs.set(id, state); }
       const resolve = (toolUseId: string, input: RecordValue) => this.subInfo(id, toolUseId, input);
-      return scanLines(fd, size, line => {
+      const next = scanLines(fd, size, line => {
         for (const body of transcriptEvents(line, source.summary.cwd, this.opts.summarize, sink, { state, resolve }).bodies) visit(body);
       }, offset);
+      // A worker's meta file, which names its model, is often written just after the line that
+      // started it: say the model once it is known instead of only when the worker ends.
+      for (const [toolUseId, running] of state) {
+        if (running.model) continue;
+        const info = resolve(toolUseId, running.input);
+        if (!info.model || info.ended) continue;
+        running.model = info.model;
+        visit({ kind: "subagent", toolUseId, sub: `sub-${toolUseId}`, description: running.description, model: running.model, status: "running", steps: info.steps });
+      }
+      return next;
     } finally { fs.closeSync(fd); }
   }
 

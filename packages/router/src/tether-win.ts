@@ -83,6 +83,14 @@ export function parseProfileNames(text: string): string[] {
   return names;
 }
 
+/** `netsh wlan show networks mode=ssid`: SSID is the protocol label, not the translated fields below it. */
+export function parseVisibleSsids(text: string): string[] {
+  return [...new Set(text.split(/\r?\n/).flatMap((line) => {
+    const name = /^\s*SSID\s+\d+\s*:\s?(.*)$/.exec(line)?.[1]?.trim();
+    return name ? [name] : [];
+  }))];
+}
+
 export type WifiProfile = { name: string; ssid: string; auto: boolean };
 
 function xmlText(s: string): string {
@@ -112,6 +120,7 @@ export async function listWifiProfiles(run: Runner): Promise<ProfileList> {
     // No `key=clear`: the passwords stay encrypted (and that would need elevation anyway).
     const r = await run(NETSH, ["wlan", "export", "profile", `folder="${dir}"`], { verbatim: true });
     if (needsLocation(r)) return { profiles: [], location: true };
+    if (r.code !== 0) return { profiles: [], error: (r.stderr || r.stdout).trim().slice(0, 200) || `profile export exited ${r.code}` };
     const parsed: WifiProfile[] = [];
     for (const f of fs.readdirSync(dir)) {
       if (!f.toLowerCase().endsWith(".xml")) continue;
@@ -199,8 +208,16 @@ export class WinTetherBackend implements TetherBackend {
   async returnBlocked(ssid: string): Promise<string | null> {
     const list = await listWifiProfiles(this.run);
     if (list.location) return "Windows needs Location on for Wi-Fi commands";
-    if (list.error) return null; // cannot tell: try anyway
-    return autoProfiles(list.profiles, ssid).length ? null : "no other Wi-Fi on this PC is set to connect automatically";
+    if (list.error) throw new Error(`saved Wi-Fi profiles failed: ${list.error}`);
+    const known = autoProfiles(list.profiles, ssid).filter((p) => p.ssid !== ssid);
+    if (!known.length) return "no other Wi-Fi on this PC is set to connect automatically";
+    if (!this.adapter) throw new Error("no Wi-Fi adapter for visibility scan");
+    const shown = await this.run(NETSH, ["wlan", "show", "networks", "mode=ssid", `interface="${this.adapter}"`], { verbatim: true, timeoutMs: 20_000 });
+    if (needsLocation(shown)) return "Windows needs Location on to scan for known Wi-Fi; visibility is unknown";
+    if (shown.code !== 0) throw new Error(`netsh Wi-Fi scan failed: ${(shown.stderr || shown.stdout).trim().slice(0, 200) || `exit ${shown.code}`}`);
+    const visible = parseVisibleSsids(shown.stdout);
+    if (!visible.length) return "no known Wi-Fi in range (netsh returned no usable SSIDs; empty, redacted or unsupported scan)";
+    return known.some((p) => visible.includes(p.ssid)) ? null : "no known Wi-Fi in range";
   }
 
   async leave(): Promise<string | null> {

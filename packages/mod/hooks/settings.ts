@@ -1,4 +1,4 @@
-import type { Calibration, Domain, Effort, Level, Mode, Rule, Rung, Settings, SettingsChange, Skin, Step, TierTarget } from '../types/index.d.ts'
+import type { Calibration, Domain, DomainRules, Effort, Level, Mode, Rule, Rung, Settings, SettingsChange, Skin, Step, TierTarget } from '../types/index.d.ts'
 
 /** Bump whenever a writer's normalization can lose another format's fields. */
 export const MOD_SETTINGS_SCHEMA_VERSION = 1
@@ -135,6 +135,19 @@ function ladderRungs(raw: unknown): Rule['rungs'] {
   return rungs
 }
 /**
+ * A domain ladder folded into two levels: light and standard hold one list, hard and plan another.
+ * The upper rung of each pair wins (standard's list for the light pair, plan's for the heavy one);
+ * an empty upper rung falls back to the lower. The general ladder keeps its four rungs.
+ */
+export function twoLevelRungs(rungs: Rule['rungs']): Rule['rungs'] {
+  const out: Rule['rungs'] = {}
+  const light = rungs.standard?.length ? rungs.standard : rungs.light
+  const heavy = rungs.plan?.length ? rungs.plan : rungs.hard
+  if (light?.length) { out.light = copy(light); out.standard = copy(light) }
+  if (heavy?.length) { out.hard = copy(heavy); out.plan = copy(heavy) }
+  return out
+}
+/**
  * The one rule left, the general ladder (the four workers). A ladder keeps its rungs; a pin from
  * before the ladder becomes one; Auto (experimental, removed 2026-10-12) becomes a ladder with no
  * rungs set, which the router fills from the ticked models (`fillLadder`). Field rules are gone.
@@ -150,6 +163,17 @@ function generalRule(raw: unknown): Rule {
     return ladderFromPin(targets, calibration(v))
   }
   return copy(DEFAULTS.rules.general)
+}
+
+/** Only optional domain ladders, never the retired per-field pin/Auto rules. */
+function domainRules(raw: unknown): DomainRules | undefined {
+  const source = object(raw)
+  const out: DomainRules = {}
+  for (const key of ['ui', 'backend'] as const) {
+    // A domain ladder has two levels, so its four rungs are folded on the way in.
+    if (object(source[key]).mode === 'ladder') out[key] = { mode: 'ladder', rungs: twoLevelRungs(generalRule(source[key]).rungs) }
+  }
+  return Object.keys(out).length ? out : undefined
 }
 
 type Worker = { name: string; provider: string }
@@ -242,7 +266,8 @@ export function normalizeModes(raw: unknown, base: Rule['rungs'] = DEFAULTS.rule
     const name = typeof v.name === 'string' ? v.name.trim().slice(0, MODE_NAME_MAX) : ''
     if (!id || !name || out.some(m => m.id === id)) continue
     const rungs = ladderRungs(v.rungs === undefined ? base : v.rungs)
-    out.push({ id, name, rungs, delegation: v.delegation === 'eager' ? 'eager' : 'normal', until: modeUntil(v.until, rungs) })
+    const domains = domainRules(v.domainRules)
+    out.push({ id, name, rungs, ...(domains ? { domainRules: domains } : {}), delegation: v.delegation === 'eager' ? 'eager' : 'normal', until: modeUntil(v.until, rungs) })
     if (out.length === MODES_MAX) break
   }
   return out
@@ -287,6 +312,8 @@ export function normalizeSettings(raw: unknown, workers?: readonly Worker[]): Se
   if (typeof value.swampAt === 'number' && Number.isFinite(value.swampAt) && value.swampAt >= 0 && value.swampAt <= 100) result.swampAt = value.swampAt
   if (Array.isArray(value.hide)) result.hide = [...new Set(value.hide.filter((part): part is string => typeof part === 'string' && ['timer', 'reason', 'route', 'limits'].includes(part)))]
   result.fallback = target(value.fallback, DEFAULTS.fallback)!
+  const domains = domainRules(value.domainRules)
+  if (domains) result.domainRules = domains
   result.modes = normalizeModes(value.modes, rules.general.rungs)
   // An active mode must be one of the modes; its start time stays only with it.
   if (typeof value.activeMode === 'string' && result.modes.some(m => m.id === value.activeMode)) {

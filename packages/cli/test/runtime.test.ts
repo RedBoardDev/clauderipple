@@ -2,13 +2,14 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
+import { needsPosixPaths } from "../../../test/capabilities.ts";
 const originalExecPath = process.execPath;
 const originalArgv1 = process.argv[1];
 const processWithResources = process as NodeJS.Process & { resourcesPath?: string };
 const hadResourcesPath = Object.hasOwn(processWithResources, "resourcesPath");
 const originalResourcesPath = processWithResources.resourcesPath;
 
-test("runtime uses packaged Electron executable and bundled sources", async () => {
+test("runtime uses packaged Electron executable and bundled sources", { skip: needsPosixPaths }, async () => {
   process.execPath = "/Applications/ClaudeRipple.app/Contents/MacOS/ClaudeRipple";
   processWithResources.resourcesPath = "/Applications/ClaudeRipple.app/Contents/Resources";
   try {

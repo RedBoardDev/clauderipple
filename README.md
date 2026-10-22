@@ -405,6 +405,10 @@ npm install -g clauderipple
 clauderipple install
 ```
 
+On Windows, PowerShell's default execution policy refuses the `clauderipple.ps1` npm adds, so
+run `clauderipple.cmd install` there (or use Command Prompt). `install` removes that file, and
+plain `clauderipple` works in PowerShell from then on. The install script never leaves one.
+
 Then open the dashboard and add a provider:
 
 ```sh
@@ -413,15 +417,16 @@ clauderipple ui
 
 **Providers** → add ChatGPT or paste an API key → **Model mapping**.
 
-**The menu-bar / tray app** is optional. It shows the router's state and opens the
-dashboard in a click:
+**The menu-bar / tray app** shows the router's state, opens the dashboard in a click, and
+keeps a repair screen that works while the router is down:
 
 ```sh
 clauderipple tray
 ```
 
-It runs on Electron, which is about 270MB and is therefore not installed by default.
-`clauderipple tray --install` fetches it once; everything else works without it.
+On macOS and Windows the install script adds it by default. It runs on Electron, about 270MB,
+fetched once; set `CLAUDERIPPLE_NO_TRAY=1` before the install command to skip it. On Linux, or
+after an npm-only install, `clauderipple tray --install` adds it. Everything else works without it.
 
 **Updating.** The tray offers a new version when there is one (**Check for Updates…**), or:
 
@@ -698,7 +703,7 @@ In daily use by the author, but young. Expect rough edges:
 
 ## Community
 
-Questions, bug reports and the Ripple Remote Android beta (a closed test on Google Play) are on Discord: [https://discord.gg/R8ZgGSNHjw](https://discord.gg/R8ZgGSNHjw). To join the Android beta, leave the Gmail address you use on Google Play there.
+Questions, bug reports and the Ripple Remote Android beta (a closed test on Google Play) are on Discord: [https://discord.gg/R8ZgGSNHjw](https://discord.gg/R8ZgGSNHjw). To join the Android beta, send the Gmail address you use on Google Play to @pbj_ripple as a direct message, not in a channel where everyone can read it.
 
 ## Not affiliated
 

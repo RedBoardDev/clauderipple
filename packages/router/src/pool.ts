@@ -41,6 +41,8 @@ export type Verdict =
 const DEFAULT_RATE_LIMIT_MS = 60_000;
 const TRANSIENT_MS = 10_000;
 const EXHAUSTED_MS = 30 * 60_000;
+/** A relay passing on its upstream's failure; whatever status it chose, the credential did nothing. */
+export const RELAY_UPSTREAM_FAILED = /upstream (request )?failed/i;
 /** A `Retry-After` beyond this is treated as "not within this session"; the credential is parked. */
 const MAX_COOLDOWN_MS = 6 * 60 * 60_000;
 
@@ -63,12 +65,17 @@ export function classify(status: number, retryAfterMs?: number, body = ""): Verd
     // held for no time at all rather than for a shorter time — any cooldown at all would move the
     // conversation to another credential and take the prompt cache with it (§4). `bounded` is
     // bypassed deliberately: its one-second floor is exactly the cache cost this avoids.
-    if (/upstream (request )?failed/i.test(body)) {
+    if (RELAY_UPSTREAM_FAILED.test(body)) {
       return { retryable: true, kind: "transient", cooldownMs: 0, quarantine: false };
     }
     return { retryable: true, kind: "auth", cooldownMs: bounded(retryAfterMs ?? DEFAULT_RATE_LIMIT_MS), quarantine: false };
   }
   if (status === 429) return { retryable: true, kind: "rate-limit", cooldownMs: bounded(retryAfterMs ?? DEFAULT_RATE_LIMIT_MS), quarantine: false };
+  // The same relay answers 402 for a model whose own endpoint is down ("server_error … Upstream
+  // request failed: Endpoint is unavailable", OpenCode Go for minimax-m3.1-flash-free, 2026-10-22).
+  // That is no statement about money: read as exhaustion it parked the whole account for half an
+  // hour and its other models with it.
+  if (status === 402 && RELAY_UPSTREAM_FAILED.test(body)) return { retryable: true, kind: "transient", cooldownMs: 0, quarantine: false };
   if (status === 402) return { retryable: true, kind: "exhausted", cooldownMs: bounded(retryAfterMs ?? EXHAUSTED_MS), quarantine: false };
   // 408 and 425 are the server saying "ask again"; 5xx is the server being broken. Both may work
   // somewhere else. 501 and 505 are the server saying it will never do this, so they are not here.

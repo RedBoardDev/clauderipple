@@ -1,4 +1,4 @@
-import type { Billing, Domain, Effort, LadderChoice, LadderOptions, Level, ModelScore, RouterModel, Rule, Rung, Settings, TierTarget, WorkerCandidate, WorkerVerdict } from '../types'
+import type { Billing, Domain, Effort, LadderChoice, LadderOptions, Level, ModelScore, RouterModel, Rule, Rung, Settings, TierTarget, WorkerCandidate, WorkerPick, WorkerVerdict } from '../types'
 import { CLAUDE_WORKERS, DOMAINS, EFFORTS, LEVELS, candidateKey, isAllowed } from './settings'
 import { MARKER } from './worker'
 import { t } from './i18n'
@@ -7,11 +7,19 @@ import { kindOf, parseEffortVerdict, verdictObject } from './judge'
 import { claudeChoices, rungAbove, rungOf, tickedChoices } from './ladder'
 
 /** The one agent the main chat delegates to; the judge picks the worker (docs/specs/2026-10-12-worker-tiers.md). */
+// The description line: a chat that had seen other workers' "Sol·high · " titles wrote one here
+// too, and the app's running-agent row showed "Sol·high" while Sonnet ran (2026-10-22). The row
+// shows the call as written; only the task list gets the mod's corrected title.
 export const AUTO_DESCRIPTION = 'Delegate any task here; ClaudeRipple picks the model. If a worker fails or returns nothing usable, delegate again here once and say the earlier attempt failed. ' +
+  'Write the Agent description as the task alone, with no model or effort in front: ClaudeRipple puts the model it picks there. ' +
   'If you know how hard the task is, put [[ripple: light]], [[ripple: standard]], [[ripple: hard]] or [[ripple: max]] on the prompt\'s first line: ' +
   'light = lookups, mechanical edits, one small fix; standard = carry out a designed change (even across several files), research, summarize, read-only review; ' +
   'hard = subtle debugging, security review, or work where a wrong call is costly; max = planning, design or architecture where the deliverable is the decision itself. ' +
-  'Size, file count or the brief\'s warnings do not by themselves make a task hard. Leave the marker out when unsure, and ClaudeRipple judges it.'
+  'Size, file count or the brief\'s warnings do not by themselves make a task hard. Leave the marker out when unsure, and ClaudeRipple judges it. ' +
+  'To run one particular model instead (the user asked for it, or a comparison needs it), name it on the first line: [[ripple: opus@high]] for a Claude model (opus, sonnet, haiku), or [[ripple: <worker agent name>@<effort>]]. ' +
+  'It runs as named, past every ClaudeRipple rule, and still shows in the agents panel; never start a model another way, such as claude -p, to get around the rules. ' +
+  'A brief states the scope, what must not be touched, the done criteria and how to verify them. Read the report for whether it did what was asked before using it. ' +
+  'Continue a worker with SendMessage only within 5 minutes of its last reply; later its cache has lapsed, so start a new one with a summary of what is done and what is left.'
 
 /**
  * The tier markers the main chat may write on a ripple:auto prompt, as the judge's verdict they
@@ -164,6 +172,27 @@ function sameTarget(a: TierTarget, b: TierTarget): boolean { return a.agent === 
 function candidateOf(target: TierTarget, candidates: readonly WorkerCandidate[]): WorkerCandidate | undefined {
   return candidates.find(c => sameTarget(c.target, target)) ?? (target.agent === 'general-purpose' ? { target, model: target.model ?? 'sonnet', provider: candidates.find(c => c.model === baseModel(target.model ?? 'sonnet'))?.provider ?? 'anthropic' } : undefined)
 }
+/** Domain overrides belong to the effective worker set; a missing override uses its general ladder. */
+export function workerRule(domain: Domain, settings: Settings): { rule: WorkerPick['rule']; ladder: Rule } {
+  const key = domain === 'design' || domain === 'frontend' ? 'ui' : domain === 'backend' ? 'backend' : 'general'
+  const ladder = key === 'general' ? undefined : settings.domainRules?.[key]
+  return ladder ? { rule: key, ladder } : { rule: 'general', ladder: settings.rules.general }
+}
+
+/**
+ * Visual design depends on the model's taste, not on how hard the task is (2026-10-21: a store
+ * screenshot redesign judged "design, standard" ran on the light pair). Under the ui ladder a design
+ * verdict on the light or standard rung is raised to the hard rung; frontend, other ladders and
+ * verdicts already on hard or plan are untouched.
+ */
+export function domainVerdict(verdict: WorkerVerdict, rule: WorkerPick['rule']): { verdict: WorkerVerdict; raised?: 'design' } {
+  if (rule !== 'ui' || verdict.domain !== 'design') return { verdict }
+  const rung = rungOf(verdict)
+  if (rung !== 'light' && rung !== 'standard') return { verdict }
+  const { sure: _sure, ...rest } = verdict
+  return { verdict: { ...rest, ...TIER_MARKERS.hard! }, raised: 'design' }
+}
+
 export type Resolution = { target?: TierTarget; effort: Effort; rung?: Rung; position?: number; skipped?: { rung: Rung; position: number; model: string; reason: string }[]; fallbackReason?: string }
 
 /** Claude Code's own agent with no model: the subagent runs on the session's model. */

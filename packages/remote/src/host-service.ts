@@ -85,6 +85,33 @@ async function waitForHost(dir = remoteHome()): Promise<void> {
   throw new Error("host service was registered but did not answer its authenticated status; check its logs");
 }
 
+/**
+ * What an update does to the phone host. Updating replaces the files but not the running process, so
+ * without a restart the host kept the old code until the machine rebooted (2026-10-22, a Windows
+ * user on 0.12.4 still got 0.12.3's "cannot send"). Only a host this installation registered is
+ * restarted — one run from a source checkout is someone else's — and never one mid-turn.
+ */
+export type RefreshPlan = "absent" | "foreign" | "busy" | "restart";
+export function refreshPlan(o: { installed: boolean; definition: string | null; script: string; busy: boolean | undefined }): RefreshPlan {
+  if (!o.installed || o.definition === null) return "absent";
+  const xml = o.script.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  if (![o.script, xml, o.script.replace(/'/g, "''")].some(form => o.definition!.includes(form))) return "foreign";
+  // An older host does not report it; its update came while the router sat idle, so most likely idle too.
+  return o.busy ? "busy" : "restart";
+}
+
+/** The running host's own answer; undefined when it does not answer or predates the field. */
+export async function hostBusy(dir = remoteHome()): Promise<boolean | undefined> {
+  try {
+    const cfg = loadConfig(dir, false);
+    const secret = fs.readFileSync(path.join(dir, "local.secret"), "utf8").trim();
+    const response = await fetch(`http://127.0.0.1:${cfg.port}/local/status`, { headers: { "x-ripple-local": secret }, redirect: "error", signal: AbortSignal.timeout(2000) });
+    if (!response.ok) { await response.body?.cancel(); return undefined; }
+    const body = await response.json() as { busy?: unknown };
+    return typeof body.busy === "boolean" ? body.busy : undefined;
+  } catch { return undefined; }
+}
+
 export async function installService(spec: Spec): Promise<string[]> {
   const platform = process.platform;
   if (platform === "darwin") return launchd.install(spec);

@@ -25,13 +25,13 @@ export interface BridgeFixture {
 }
 
 /** A Mac session in bridge mode with a scripted Remote Control transport. */
-export function bridgeFixture(t: import("node:test").TestContext, opts: { streamBodyless?: () => boolean } = {}): BridgeFixture {
+export function bridgeFixture(t: import("node:test").TestContext, opts: { streamBodyless?: () => boolean; registry?: () => Map<string, DesktopProcess> } = {}): BridgeFixture {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-redteam-"));
   const projects = path.join(root, "projects");
   fs.mkdirSync(path.join(projects, "project"), { recursive: true });
   const file = path.join(projects, "project", `${bridgeId}.jsonl`);
   fs.writeFileSync(file, line({ type: "user", uuid: "old", cwd: root, message: { content: "old prompt" } }));
-  const registry = new Map<string, DesktopProcess>([[bridgeId, { sessionId: bridgeId, pid: 42, status: "idle", bridgeSessionId: "bridge" }]]);
+  const registry = opts.registry?.() ?? new Map<string, DesktopProcess>([[bridgeId, { sessionId: bridgeId, pid: 42, status: "idle", bridgeSessionId: "bridge" }]]);
   const posts: Record<string, unknown>[] = [];
   let controller: ReadableStreamDefaultController<Uint8Array> | undefined;
   let now = Date.now(), workerStatus = "idle", stateReads = 0, sessionsCalls = 0;

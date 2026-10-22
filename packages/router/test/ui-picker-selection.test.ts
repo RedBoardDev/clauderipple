@@ -82,7 +82,7 @@ test("mode editor keeps reset disabled with an adjacent reason, and enabled cont
   const section = source.slice(source.indexOf('function modModeSection('), source.indexOf('function modWorkersCard('));
   const build = new Function('el', 'known', 'until', `
     const t = (key, vars) => vars ? key + JSON.stringify(vars) : key, modState = {settings:{}};
-    const modResetProviders = known ? ['chatgpt', 'anthropic'] : [], modRungRows = () => [];
+    const modResetProviders = known ? ['chatgpt', 'anthropic'] : [], modWorkerRows = () => [];
     const modResetLabel = provider => provider === 'anthropic' ? 'Claude' : 'ChatGPT', modResetDefault = () => modResetProviders[0];
     const modSelect = (key, items, value, label) => el('select', { 'data-key': key, items, value, 'aria-label': label });
     const modUpdateMode = () => {}, modSetActive = () => {}, modRemoveMode = () => {}, modLocalTime = () => '';
@@ -113,6 +113,87 @@ test("mode editor keeps reset disabled with an adjacent reason, and enabled cont
   // A saved provider whose reset is not known now stays chosen, marked unavailable.
   const gone = find(build(el, false, { reset: 'chatgpt' }), 'mode-until-reset')!;
   assert.deepEqual((gone.attrs.items as { value: string; label: string }[]).map(item => [item.value, item.label]), [['chatgpt', 'mod.modeUntilResetOf{"provider":"ChatGPT"}mod.unavailable']]);
+});
+
+test("domain editors copy, edit and remove only the selected set's rule; new modes deep-copy Base", () => {
+  const source = fs.readFileSync(new URL('../../ui/app.js', import.meta.url), 'utf8');
+  const block = (from: string, to: string) => source.slice(source.indexOf(from), source.indexOf(to));
+  type Node = { attrs: Record<string, unknown>; children: Node[]; value: string; checked: boolean; events: Record<string, () => void>; addEventListener: (name: string, fn: () => void) => void; appendChild: (node: Node) => void };
+  const el = (_tag: string, attrs: Record<string, unknown> = {}, children: Node[] = []): Node => {
+    const node: Node = { attrs, children: children.filter(Boolean), value: String(attrs.value ?? ''), checked: !!attrs.checked, events: {}, addEventListener(name, fn) { this.events[name] = fn; }, appendChild(child) { this.children.push(child); } };
+    for (const [key, value] of Object.entries(attrs)) if (key.startsWith('on') && typeof value === 'function') node.events[key.slice(2)] = value as () => void;
+    return node;
+  };
+  const cell = (_label: unknown, controls: Node | Node[], help: unknown) => el('cell', { help }, Array.isArray(controls) ? controls : [controls]);
+  const build = new Function('el', 'cell', `
+    const t = key => key, clone = value => JSON.parse(JSON.stringify(value));
+    const MOD_EFFORTS = ['low','medium','high','xhigh','max'];
+    ${block('const MOD_CLAUDE_MODELS', '// `base` is the router')}
+    const modState = { settings: clone(MOD_DEFAULTS), options: null };
+    let modModeTab = '', modSaveTimer = null;
+    const modRefresh = () => {}, modStatus = () => {}, setTimeout = () => 1, clearTimeout = () => {};
+    const toast = message => { throw new Error(message); };
+    ${block('function modCap(', '/** Rebuild a region')}
+    ${block('function modSwitch(', 'function modCard(')}
+    ${block('function modPatch(', 'async function saveMod(')}
+    ${block('function modChoices(', '// ---- The four workers: a meaning')}
+    ${block('function modRungs(', '/** Said once after settings')}
+    ${block('function modUpdateMode(', 'function modSetActive(')}
+    ${block('function modNewMode(', '/** A datetime-local')}
+    return { state: modState, rows: modWorkerRows, create: modNewMode };
+  `) as (el: unknown, cell: unknown) => { state: { settings: import('../../mod/types/index.d.ts').Settings }; rows: (mode?: import('../../mod/types/index.d.ts').Mode) => Node[]; create: () => Node };
+  const ui = build(el, cell);
+  const find = (nodes: Node[], key: string): Node | undefined => {
+    for (const node of nodes) { if (node.attrs['data-key'] === key) return node; const found = find(node.children, key); if (found) return found; }
+    return undefined;
+  };
+  const click = (nodes: Node[], key: string) => find(nodes, key)!.events.click!();
+  const toggle = (nodes: Node[], key: string, checked: boolean) => { const input = find(nodes, key)!; input.checked = checked; input.events.change!(); };
+  // The general tab keeps its four rungs.
+  const general = ui.rows();
+  for (const rung of ['light', 'standard', 'hard', 'plan']) assert.ok(find(general, `worker:base:general:${rung}:0`), rung);
+  click(ui.rows(), 'worker-domain:base:ui');
+  let rows = ui.rows();
+  assert.equal(rows[1]!.attrs.help, 'mod.domainFollowsGeneral');
+  assert.equal(find(rows, 'worker:base:ui:light:0'), undefined);
+  toggle(rows, 'worker-separate:base:ui', true);
+  const original = ui.state.settings.rules.general.rungs;
+  const copied = ui.state.settings.domainRules!.ui!.rungs;
+  // A domain ladder is the general one folded into two levels: standard's list for the light pair, plan's for the heavy one.
+  assert.deepEqual(copied, { light: original.standard, standard: original.standard, hard: original.plan, plan: original.plan });
+  assert.notEqual(copied.light![0]!.target, original.light![0]!.target);
+  rows = ui.rows();
+  // Two rows only: the light level and the heavy one.
+  assert.equal(find(rows, 'worker:base:ui:light:0')!.attrs['aria-label'], 'mod.domainLevel.light 1');
+  assert.equal(find(rows, 'worker:base:ui:heavy:0')!.attrs['aria-label'], 'mod.domainLevel.heavy 1');
+  assert.equal(find(rows, 'worker:base:ui:standard:0'), undefined);
+  const select = find(rows, 'worker:base:ui:light:0')!;
+  select.value = 'general-purpose+sonnet|high'; select.events.change!();
+  // The light level edits the whole light pair.
+  assert.equal(ui.state.settings.domainRules!.ui!.rungs.light![0]!.target.model, 'sonnet');
+  assert.equal(ui.state.settings.domainRules!.ui!.rungs.standard![0]!.target.model, 'sonnet');
+  assert.equal(original.light![0]!.target.agent, 'deepseek-v4-1-flash');
+  // New-mode creation is the actual form handler, not a reconstructed copy operation.
+  const form = ui.create();
+  find([form], 'mode-new-name')!.value = 'New';
+  click([form], 'mode-create');
+  const mode = ui.state.settings.modes[0]!;
+  assert.deepEqual(mode.domainRules, ui.state.settings.domainRules);
+  assert.notEqual(mode.domainRules!.ui!.rungs.light![0]!.target, ui.state.settings.domainRules!.ui!.rungs.light![0]!.target);
+  click(ui.rows(mode), `worker-domain:${mode.id}:backend`);
+  toggle(ui.rows(mode), `worker-separate:${mode.id}:backend`, true);
+  // The mode's own domain ladder is the mode's general rungs, folded the same way.
+  assert.deepEqual(ui.state.settings.modes[0]!.domainRules!.backend!.rungs, {
+    light: mode.rungs.standard, standard: mode.rungs.standard, hard: mode.rungs.plan, plan: mode.rungs.plan,
+  });
+  assert.equal(ui.state.settings.domainRules!.backend, undefined);
+  toggle(ui.rows(), 'worker-separate:base:ui', false);
+  assert.equal(ui.state.settings.domainRules, undefined);
+  assert.ok(ui.state.settings.modes[0]!.domainRules!.ui);
+  const current = ui.state.settings.modes[0]!;
+  toggle(ui.rows(current), `worker-separate:${mode.id}:backend`, false);
+  assert.equal(ui.state.settings.modes[0]!.domainRules!.backend, undefined);
+  assert.ok(ui.state.settings.modes[0]!.domainRules!.ui);
 });
 
 const { applyPickerSelections: apply, pickerSelectionsExcept: except } = loadPickerBlock();

@@ -81,6 +81,12 @@ export type TranslateOptions = {
   identity: boolean;
   instructionsAppend?: string;
   /**
+   * How to make an image through `/api/image`, for the session's own turns. A generated worker has
+   * this in its agent file; the main session had nothing, so a GPT session told the operator it could
+   * not make images and drew an SVG instead (2026-10-22). Not added to a subagent's turns.
+   */
+  imageHint?: string;
+  /**
    * Carry the conversation's reasoning back to the backend (see reasoning.ts). Default true — this is
    * the native shape. A false value is the retry after a backend refused the carrier: no replayed
    * items and no `include`, which is exactly the request this adapter sent before they existed.
@@ -92,6 +98,17 @@ export type TranslateOptions = {
    * another model, or on another account, is the one thing a 400 is reliably about (see reasoning.ts).
    */
   env?: { p: string; m: string };
+  /**
+   * The provider's Fast switches (config.json `fast`): `main` for the session's own turns,
+   * `subagent` for the turns a subagent makes. Claude Code never asks for `speed: "fast"` on a GPT
+   * request, so this is where the tier is chosen.
+   */
+  fast?: { main?: boolean; subagent?: boolean };
+  /**
+   * Whether this turn was made inside a subagent. Claude Code names the agent in the
+   * `x-claude-code-agent-id` header (CLI 2.1.304), and only a subagent's request carries it.
+   */
+  subagent?: boolean;
   /** Filled in as the input is built: how many items were replayed, and how many were unreadable. */
   carried?: { replayed: number; undecodable: number };
   /** Names the reason a carrier was dropped. Absent in tests, where the counts are enough. */
@@ -319,6 +336,7 @@ export function toResponsesRequest(req: AnthropicRequest, opts: TranslateOptions
   const sys = systemWithDroppedToolNote(req);
   if (sys) parts.push(sys);
   if (opts.instructionsAppend) parts.push(opts.instructionsAppend);
+  if (opts.imageHint && opts.subagent !== true) parts.push(opts.imageHint);
 
   const input: ResponsesInputItem[] = [];
   // Claude Code sends side queries whose history starts with a bare tool_result (e.g. summarising a
@@ -444,7 +462,11 @@ export function toResponsesRequest(req: AnthropicRequest, opts: TranslateOptions
   if (tool_choice) out.tool_choice = tool_choice;
   // Claude Code's `/fast` arrives as `speed: "fast"` (Anthropic fast mode). The ChatGPT backend's
   // equivalent is the Codex CLI's Fast mode, which bills the plan at a higher rate (Codex docs, Speed).
-  if (req.speed === "fast") out.service_tier = "priority";
+  // The CLI never sends `speed` for a GPT model, so the provider's own switches choose the tier:
+  // `fast.subagent` for a turn made inside a subagent, `fast.main` for the session's own turns.
+  const fast = opts.fast;
+  const fastOn = fast ? (opts.subagent === true ? fast.subagent === true : fast.main === true) : false;
+  if (req.speed === "fast" || fastOn) out.service_tier = "priority";
   return out;
 }
 

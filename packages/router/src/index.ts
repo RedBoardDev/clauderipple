@@ -12,6 +12,8 @@ import { ingressModels } from "./ingress/models.ts";
 import { ConfigStore, awakeSettings, configPath, homeDir, terminateHosts, tetherSettings } from "./config.ts";
 import { AwakeController, execRunner, type Activity } from "./awake.ts";
 import { TetherController } from "./tether.ts";
+import { AutoUpdater } from "./autoupdate.ts";
+import { runCli, startCliDetached } from "./cli-control.ts";
 import { powerPlatform } from "./power.ts";
 import { defaultAgentDir, syncAgentFiles } from "./agents.ts";
 import { CertStore } from "./certs.ts";
@@ -130,6 +132,10 @@ const activity = (): Activity => {
     ...(lastEndedAt !== undefined ? { lastEndedAt } : {}),
   };
 };
+const autoUpdater = new AutoUpdater({
+  home, version: VERSION, enabled: () => store.get().autoUpdate !== false,
+  activity, log, runCli, startCliDetached,
+});
 const awake = new AwakeController({
   platform: process.platform,
   run: powerRunner,
@@ -164,6 +170,7 @@ let draining = false;
 function beginDrain(reason: string): void {
   if (draining) return;
   draining = true;
+  autoUpdater.stop();
   log!.info(`${reason}: draining, proxy=${proxy.stats.messagesInFlight} ingress=${ingress.stats.messagesInFlight} model calls`);
   let lastReported = -1;
   // Each drain() closes the shared hold gate first (hold.ts): a call held for a network switch is
@@ -232,6 +239,7 @@ proxy
     // (2026-09-20). Ask once now, after listen(), and never wait for the answer.
     proxy.chatgptRefreshAll();
     const adminDeps: AdminDeps = {
+      autoUpdater,
       config: () => store.get(),
       configFile: configPath(),
       log: log!,
@@ -287,6 +295,7 @@ proxy
     // The first awake tick is the reconcile: a bit a previous process set is kept or cleared now.
     void awake.start().catch((e: Error) => log!.warn(`awake: ${e.message}`));
     tether.start();
+    if (!draining) autoUpdater.start();
     setImmediate(premintLeaves);
     // A minute in, once start-up traffic has settled: first the catalogue's context windows are
     // written into models already saved without one (a one-shot pass), then a few one-token requests

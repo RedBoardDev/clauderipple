@@ -53,9 +53,10 @@ const BODY = [
 /**
  * Added to the body when a ChatGPT provider is configured: how a worker makes an image. A worker has
  * no image tool, and `clauderipple` is not on PATH for everyone (a checkout runs from source), so
- * the instruction is the admin endpoint itself, which curl reaches on every platform.
+ * the instruction is the admin endpoint itself, which curl reaches on every platform. A GPT main
+ * session gets the same lines in its instructions (proxy.ts).
  */
-function imageLine(port: number): string {
+export function imageLine(port: number): string {
   return [
     "이미지가 필요하면 ChatGPT 구독으로 만든다(한 장 30초~수 분):",
     `\`curl -sS --fail-with-body -o <절대경로>.png -H 'content-type: application/json' -d '{"prompt":"…"}' http://127.0.0.1:${port}/api/image\``,

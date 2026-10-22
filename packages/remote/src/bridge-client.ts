@@ -10,6 +10,14 @@ import type { InputBlock } from "./images.ts";
 export const DESKTOP_BLOCKED = "Claude 앱에서 열려 있는 세션에 지금은 보낼 수 없습니다.";
 export const LOGIN_EXPIRED = "이 컴퓨터의 Claude 로그인이 만료되었습니다. Claude 앱을 한 번 열어 주십시오.";
 export const LOGIN_REFUSED = "이 컴퓨터의 Claude 로그인이 거절되었습니다 (401). Claude 앱을 한 번 열어 주십시오.";
+// The Claude Code CLI has no login of its own. The host starts the CLI through the Agent SDK and
+// passes no credential, so the CLI's own "Not logged in · Please run /login" is the whole error a
+// phone sees; this says it in the host's words (issue #71).
+export const CLI_NOT_LOGGED_IN = "이 컴퓨터의 Claude Code에 로그인되어 있지 않습니다. 터미널에서 Claude Code를 한 번 실행해 /login 해 주십시오.";
+/** The CLI's own words for the same thing, tolerant of the spacing around them. */
+export function isCliNotLoggedIn(text: string): boolean {
+  return /^\s*not\s+logged\s+in\b/i.test(text);
+}
 export interface BridgeAuth { accessToken: string; organizationUuid: string; expiresAt: number }
 class BridgeNetworkError extends Error {}
 /**
@@ -44,27 +52,63 @@ export function loadObservedAuth(now = Date.now(), home = process.env.CLAUDERIPP
   } catch { return null; }
 }
 
-export function loadBridgeAuth(): BridgeAuth {
-  if (process.platform !== "darwin") throw new Error(DESKTOP_BLOCKED);
-  const now = Date.now();
-  let organizationUuid: string;
-  try {
-    const account = object(object(JSON.parse(fs.readFileSync(path.join(os.homedir(), ".claude.json"), "utf8")))?.oauthAccount);
-    if (typeof account?.organizationUuid !== "string") throw new Error();
-    organizationUuid = account.organizationUuid;
-  } catch { throw new BridgeAuthError("이 컴퓨터의 Claude 로그인 정보를 읽을 수 없습니다."); }
-  let keychain: { accessToken: string; expiresAt: number } | null = null;
+export interface BridgeAuthOptions {
+  platform?: NodeJS.Platform;
+  /** The user's home directory: `.claude.json` and `.claude/.credentials.json` live in it. */
+  userHome?: string;
+  now?: number;
+  /** Reads a file. The macOS keychain is not a file and is read on its own. */
+  readFile?: (file: string) => string;
+  /** The login the router saw the Claude app use. */
+  observed?: (now: number) => { accessToken: string; expiresAt: number } | null;
+  /** The Claude Code CLI's own login: the macOS keychain item, the Windows credentials file. */
+  cli?: () => { accessToken: string; expiresAt: number } | null;
+}
+
+/** The Claude Code CLI's own login on macOS: the keychain item the CLI writes. */
+function keychainCredentials(): { accessToken: string; expiresAt: number } | null {
   try {
     const credentials = object(JSON.parse(execFileSync("security", ["find-generic-password", "-a", process.env.USER ?? os.userInfo().username, "-s", "Claude Code-credentials", "-w"], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] })));
     const oauth = object(credentials?.claudeAiOauth);
-    if (typeof oauth?.accessToken === "string" && oauth.accessToken && typeof oauth.expiresAt === "number") keychain = { accessToken: oauth.accessToken, expiresAt: oauth.expiresAt };
+    if (typeof oauth?.accessToken === "string" && oauth.accessToken && typeof oauth.expiresAt === "number") return { accessToken: oauth.accessToken, expiresAt: oauth.expiresAt };
   } catch { /* the observed login may still serve */ }
+  return null;
+}
+
+/**
+ * The Claude Code CLI's own login on Windows: `%USERPROFILE%\.claude\.credentials.json`. There is
+ * no keychain there, and the Claude app on its own keeps no credentials file of its own: it
+ * injects the login into the CLI it starts (issue #70).
+ */
+function windowsCredentials(read: (file: string) => string, userHome: string): { accessToken: string; expiresAt: number } | null {
+  try {
+    const credentials = object(JSON.parse(read(path.join(userHome, ".claude", ".credentials.json"))));
+    const oauth = object(credentials?.claudeAiOauth);
+    if (typeof oauth?.accessToken === "string" && oauth.accessToken && typeof oauth.expiresAt === "number") return { accessToken: oauth.accessToken, expiresAt: oauth.expiresAt };
+  } catch { /* the observed login may still serve */ }
+  return null;
+}
+
+export function loadBridgeAuth(options: BridgeAuthOptions = {}): BridgeAuth {
+  const platform = options.platform ?? process.platform;
+  if (platform !== "darwin" && platform !== "win32") throw new Error(DESKTOP_BLOCKED);
+  const now = options.now ?? Date.now();
+  const userHome = options.userHome ?? os.homedir();
+  const read = options.readFile ?? ((file: string) => fs.readFileSync(file, "utf8"));
+  let organizationUuid: string;
+  try {
+    const account = object(object(JSON.parse(read(path.join(userHome, ".claude.json"))))?.oauthAccount);
+    if (typeof account?.organizationUuid !== "string") throw new Error();
+    organizationUuid = account.organizationUuid;
+  } catch { throw new BridgeAuthError("이 컴퓨터의 Claude 로그인 정보를 읽을 수 없습니다."); }
+  // The CLI's own login: the macOS keychain item, or the credentials file Windows keeps.
+  const cli = options.cli ? options.cli() : platform === "darwin" ? keychainCredentials() : windowsCredentials(read, userHome);
   // The CLI's login while it is good; else the one the Claude app is working with; else the
   // CLI's expired one, so the phone is told it expired.
-  if (keychain && keychain.expiresAt - now > 5 * 60_000) return { ...keychain, organizationUuid };
-  const observed = loadObservedAuth(now);
+  if (cli && cli.expiresAt - now > 5 * 60_000) return { ...cli, organizationUuid };
+  const observed = options.observed ? options.observed(now) : loadObservedAuth(now);
   if (observed) return { ...observed, organizationUuid };
-  if (keychain) return { ...keychain, organizationUuid };
+  if (cli) return { ...cli, organizationUuid };
   throw new BridgeAuthError(LOGIN_EXPIRED);
 }
 export interface BridgeFrame { event: string; data: Record<string, unknown> }

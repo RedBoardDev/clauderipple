@@ -342,6 +342,11 @@ npm install -g clauderipple
 clauderipple install
 ```
 
+Windows PowerShell은 기본 실행 정책 때문에 npm이 만든 `clauderipple.ps1`을 실행하지 않습니다. 그래서
+PowerShell에서는 `clauderipple.cmd install`로 실행하십시오(명령 프롬프트에서는 그대로 됩니다). `install`이
+그 파일을 지우므로, 그다음부터는 PowerShell에서도 `clauderipple`만 입력하면 됩니다. 설치 스크립트로 설치하면
+이 파일이 남지 않습니다.
+
 그다음 대시보드를 열어 프로바이더를 추가합니다.
 
 ```sh
@@ -350,14 +355,15 @@ clauderipple ui
 
 **프로바이더** → ChatGPT 추가 또는 API 키 붙여 넣기 → **모델 매핑**.
 
-**메뉴 막대·트레이 앱은 선택 사항입니다.** 라우터 상태를 보여주고 한 번에 대시보드를 엽니다.
+**메뉴 막대·트레이 앱**은 라우터 상태를 보여주고, 한 번에 대시보드를 열고, 라우터가 죽어도 열리는 복구 화면을 갖고 있습니다.
 
 ```sh
 clauderipple tray
 ```
 
-Electron으로 도는데 용량이 270MB라 기본 설치에는 넣지 않았습니다. `clauderipple tray --install`이 한 번만
-받아 옵니다. 나머지 기능은 Electron 없이도 다 돕니다.
+macOS와 Windows에서는 설치 스크립트가 기본으로 함께 설치합니다. Electron으로 돌아 약 270MB이고 한 번만 받습니다.
+빼고 싶으면 설치 명령 앞에 `CLAUDERIPPLE_NO_TRAY=1`을 붙이세요. Linux나 npm으로만 설치했다면
+`clauderipple tray --install`로 추가합니다. 나머지 기능은 앱 없이도 다 돕니다.
 
 **업데이트.** 새 버전이 나오면 트레이가 알려 줍니다(**업데이트 확인…**). 터미널에서는:
 
@@ -569,7 +575,7 @@ Codex 앱 / CLI ──/v1/responses──▶ ClaudeRipple 입구 ──▶ Claud
 
 ## 커뮤니티
 
-질문, 버그 제보, Ripple Remote 안드로이드 베타(Google Play 비공개 테스트) 신청은 디스코드에서 받습니다: [https://discord.gg/R8ZgGSNHjw](https://discord.gg/R8ZgGSNHjw). 안드로이드 베타에 참여하려면 Google Play에서 쓰는 Gmail 주소를 남겨 주세요.
+질문, 버그 제보, Ripple Remote 안드로이드 베타(Google Play 비공개 테스트) 신청은 디스코드에서 받습니다: [https://discord.gg/R8ZgGSNHjw](https://discord.gg/R8ZgGSNHjw). 안드로이드 베타에 참여하려면 Google Play에서 쓰는 Gmail 주소를 @pbj_ripple에게 DM으로 보내 주세요. 모두가 읽는 채널에는 올리지 마세요.
 
 ## 비제휴
 

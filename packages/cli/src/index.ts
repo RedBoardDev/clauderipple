@@ -28,7 +28,7 @@ import { GROK_DEFAULT_URL } from "../../router/src/providers/grok/catalog.ts";
 import { claudeLogin, claudeLogout, desktopClaudeCodeDirs } from "./claude-auth.ts";
 import { openBrowser } from "./browser.ts";
 import { electronPath, installTrayRuntime, startTray } from "./tray.ts";
-import { FORK_UPDATE_STEPS, installKind, isNewer, latestVersion, PACKAGE, runUpdate, updateSource } from "./update.ts";
+import { dropPowerShellShim, FORK_UPDATE_STEPS, installKind, isNewer, latestVersion, PACKAGE, runUpdate, updateSource } from "./update.ts";
 import { ClaudeOAuthSession } from "../../router/src/providers/claude-oauth.ts";
 
 function setPickerEnabled(enabled: boolean): void {
@@ -223,6 +223,8 @@ async function install(): Promise<void> {
   // Persist the single execution contract so the GUI, admin API, hooks, and supervisor all use
   // this installation's runtime rather than any Node installation on the user's PATH.
   writePaths(installedRuntime, home);
+  const shim = dropPowerShellShim(installKind(installedRuntime));
+  if (shim) console.log(`✓ removed ${shim}: PowerShell's default policy refuses it, and clauderipple.cmd runs instead`);
   // Windows and Linux register node + the router script directly (schtasks.ts writes its own .cmd
   // launcher); a macOS source checkout gets a small .app so the agent shows a real name in Login Items.
   // registration.ts holds the mapping, so `repair` registers exactly the same thing.
@@ -267,6 +269,13 @@ async function install(): Promise<void> {
     else if (!app.ok) console.log(`  menu-bar app launcher not written: ${app.detail}`);
   } catch (e) {
     console.log(`  menu-bar app launcher not written: ${(e as Error).message}`);
+  }
+  // The phone host has the same problem as the router above: new files, old process. The host
+  // decides whether it is ours and idle (remote host-service refreshPlan). Never fatal.
+  try {
+    execFileSync(installedRuntime.node, [installedRuntime.cli, "remote", "refresh"], { env: { ...process.env, ...installedRuntime.env }, stdio: "inherit" });
+  } catch {
+    console.log("  the phone host was not restarted; if you use it, run: clauderipple remote install");
   }
   console.log("\nDone. New Claude Desktop Code sessions go through ClaudeRipple. Existing sessions pick up settings.json env changes on their next request.");
 }

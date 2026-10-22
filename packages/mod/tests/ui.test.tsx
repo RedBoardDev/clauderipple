@@ -575,7 +575,7 @@ const AGENTS: AgentRec[] = [
     description: 'Port the request log renderer',
     type: 'gpt-6-1-sol',
     model: 'gpt-6.1-sol@high',
-    pick: { domain: 'frontend', level: 'standard', effort: 'high', sure: 0.8, why: 'designed refactor', target: { agent: 'gpt-6-1-sol' }, by: 'haiku', ms: 900 },
+    pick: { domain: 'frontend', rule: 'ui', rung: 'standard', level: 'standard', effort: 'high', sure: 0.8, why: 'designed refactor', target: { agent: 'gpt-6-1-sol' }, by: 'haiku', ms: 900 },
     state: 'running',
     now: 'Edit hooks/ui/log.tsx',
     toolSince: NOW - 14_000,
@@ -619,8 +619,10 @@ test('the Agents pane draws live, finished and empty', async ($, on) => {
     expect(await ui.find({ type: 'Text', text: 'Summarize the docs' }), surface).toBeDefined()
     // Who picked it and why, on the terminal; the desktop's cards leave it out (2026-10-20).
     const why = await ui.find({ type: 'Text', text: /Frontend \/ Standard/ })
-    if (surface === 'terminal') expect(why, surface).toBeDefined()
-    else expect(why, surface).toBeUndefined()
+    if (surface === 'terminal') {
+      expect(why, surface).toBeDefined()
+      expect(why?.text).toContain('ui/')
+    } else expect(why, surface).toBeUndefined()
     // The API's own counts: 1200 + 38000 + 800 in, 95% of it from the cache, 5100 out, 12 tools.
     if (surface === 'terminal') expect(await ui.find({ type: 'Text', text: 'in 40k · cache 95% · out 5.1k · tools 12' }), surface).toBeDefined()
     else for (const value of ['40k', '95%', '5.1k', '12']) expect(await ui.find({ type: 'Text', text: value }), value).toBeDefined()

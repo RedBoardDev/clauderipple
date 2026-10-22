@@ -29,7 +29,7 @@ export type RequestRecord = {
   messageId?: string;
   upstreamCalled?: false;
   refusal?: "thread-continue" | "drain" | "unroutable" | "no-account" | "unknown-provider" | "web-search-unsupported" | "prompt-incompatible";
-  purpose?: "auto-mode-classifier" | "web-search";
+  purpose?: "auto-mode-classifier" | "web-search" | "web-fetch";
   requestedTier?: string;
   servedTier?: string;
   stopReason?: string;
@@ -42,6 +42,13 @@ export type RequestRecord = {
    * session ask what happened to its own requests.
    */
   session?: string;
+  /**
+   * The request was made inside a subagent: Claude Code names the agent in the
+   * `x-claude-code-agent-id` header, and only a subagent's request carries it (CLI 2.1.304).
+   * Absent on a main session's own turns. Recorded for every provider, so the header's arrival
+   * can be measured rather than assumed.
+   */
+  subagent?: true;
   /**
    * Not ok, but the client sends the request again on its own and nothing is lost: a thread the
    * API forgot, a stateless resend asked for, a refusal during a restart. Shown apart from failures

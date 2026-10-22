@@ -85,6 +85,17 @@ export function shouldNotifyDown(o: { downForMs: number; graceMs: number; alread
   return !o.alreadyNotified && !o.updating && !o.busy && o.downForMs >= o.graceMs && o.mode !== "direct";
 }
 
+/**
+ * Whether the "reopen Claude" step is still owed after a connection change at `changedAt`. Claude
+ * picks the change up on its next start, whoever restarts it: a Claude that is not running, or one
+ * that started after the change, owes nothing. Only an unknown start time keeps the step — the
+ * button used to be the only way to clear it, so reopening by hand left it on screen for good.
+ */
+export function restartStillOwed(changedAt: number, claudeStartedAt: number | null | undefined): boolean {
+  if (claudeStartedAt === undefined) return true;
+  return claudeStartedAt !== null && claudeStartedAt <= changedAt;
+}
+
 /** Lines for the "Details" fold after a repair: each step as ✓/✗ with what it said. */
 export function repairDetails(out: RepairOutput | null, raw: string): string[] {
   if (!out?.steps?.length) return raw ? tailLines(raw, 12) : [];

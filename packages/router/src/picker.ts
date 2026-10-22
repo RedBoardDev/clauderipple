@@ -63,7 +63,30 @@ function narrowThinking(entry: ModelEntry, levels: string[]): void {
 
 /** Resolve aliases/routes before advertising an entry; a chat-looking alias can target a judge. */
 export function chatPickerModels(cfg: Config): CliModel[] {
-  return cfg.cli.extraModels.filter(entry => !isJudgeOnlyModel(entry.model) && !isJudgeOnlyModel(resolve(entry.model, {}, cfg)?.model ?? cfg.aliases[entry.model.split("@")[0]!] ?? ""));
+  return cfg.cli.extraModels
+    .filter(entry => !isJudgeOnlyModel(entry.model) && !isJudgeOnlyModel(resolve(entry.model, {}, cfg)?.model ?? cfg.aliases[entry.model.split("@")[0]!] ?? ""))
+    .map(entry => {
+      if (entry.contextWindow) return entry;
+      const window = providerModelWindow(cfg, entry.model);
+      return window ? { ...entry, contextWindow: window } : entry;
+    });
+}
+
+/**
+ * The window a provider declared for `model` (its `/models` context length, or one set by hand),
+ * by id without an `@effort` suffix or through an alias. A picker entry saved without a window of
+ * its own used to fall to `cli.autoCompactWindow` although its provider knew better: a 1M MiniMax
+ * subagent compacted twice at ~240K (2026-10-21).
+ */
+export function providerModelWindow(cfg: Config, model: string): number | undefined {
+  const base = model.split("@")[0]!;
+  const ids = new Set([base, cfg.aliases[base] ?? base]);
+  for (const provider of Object.values(cfg.providers)) {
+    for (const entry of ("models" in provider && provider.models) || []) {
+      if (ids.has(entry.id) && typeof entry.contextWindow === "number" && entry.contextWindow > 0) return entry.contextWindow;
+    }
+  }
+  return undefined;
 }
 
 export type PickerModelEntry = { id: string; name: string };

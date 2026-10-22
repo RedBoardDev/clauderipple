@@ -1,7 +1,7 @@
 // `claude setup-token` invocation for a ClaudeRipple-owned, 0600 token file.
 // The token is never echoed, logged, or returned from this module.
 
-import { execFileSync } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -107,6 +107,108 @@ export function claudeBinary(pathValue = process.env.PATH): string | null {
     }
   }
   return latestDesktopClaude();
+}
+
+// ---- does the Claude Code CLI itself have a login? -------------------------------------------
+//
+// The Ripple Remote host drives Claude Code through the Agent SDK and passes no credential of its
+// own, so every turn needs the CLI's own login. Where only the Claude desktop app is used, that
+// login never exists and the CLI answers "Not logged in · Please run /login" (issue #71).
+//
+// This asks whether the login is there. It never reads, returns or logs a secret: the keychain
+// item is looked up by name only (without -w, so the password is never fetched) and the
+// credential file is only parsed for the shape of its content.
+//
+// The router reads the same two stores for its own `claude-code` provider
+// (router/src/providers/anthropic.ts:41-74). That reader is not reused here: it returns the
+// secret, and it parses a login as present only when it is also unexpired — this asks for
+// presence, and for a home directory of the caller's choosing.
+
+/** The keychain service the CLI keeps its OAuth grant in (the router names it the same way). */
+const KEYCHAIN_SERVICE = "Claude Code-credentials";
+
+export type ClaudeCodeLogin = { ok: boolean; where: string };
+
+export type ClaudeCodeLoginOptions = {
+  env?: NodeJS.ProcessEnv;
+  /** The home directory that holds `.claude`; defaults to this user's. */
+  home?: string;
+  platform?: NodeJS.Platform;
+  /** macOS only: is the keychain item there? The default is a child process; tests inject one. */
+  keychain?: () => Promise<boolean>;
+};
+
+/** Where the CLI keeps its credential file. */
+export function claudeCredentialsFile(home = os.homedir()): string {
+  return path.join(home, ".claude", ".credentials.json");
+}
+
+/**
+ * True when the file holds a `claudeAiOauth` block: a Claude Code login of its own. A file that
+ * only holds an `mcpOAuth` block is not one (that is what an MCP server's OAuth flow writes), and
+ * an empty access token is a login that was emptied rather than one that is there.
+ */
+export function hasClaudeAiOauth(raw: string | null): boolean {
+  if (!raw) return false;
+  try {
+    const parsed = JSON.parse(raw) as { claudeAiOauth?: unknown };
+    const oauth = parsed.claudeAiOauth;
+    if (oauth === null || typeof oauth !== "object" || Array.isArray(oauth)) return false;
+    const accessToken = (oauth as { accessToken?: unknown }).accessToken;
+    return accessToken === undefined || (typeof accessToken === "string" && accessToken.length > 0);
+  } catch {
+    return false;
+  }
+}
+
+/** macOS: the CLI's keychain item, looked up by name. The secret itself is never read. */
+async function keychainHasCredentials(): Promise<boolean> {
+  try {
+    // Without -w the password is never fetched, so what comes back is the item's attributes only.
+    await execFile("security", ["find-generic-password", "-s", KEYCHAIN_SERVICE], { timeout: 5_000, windowsHide: true });
+    return true;
+  } catch {
+    // No item, or the keychain would not answer: there is no login to count.
+    return false;
+  }
+}
+
+/**
+ * Whether the Claude Code CLI has a login of its own, and where it is. Presence only: no secret
+ * is read, returned or logged. The environment is checked first because it costs nothing, and the
+ * keychain probe (a child process) runs only when nothing cheaper answered.
+ */
+export async function claudeCodeLogin(options: ClaudeCodeLoginOptions = {}): Promise<ClaudeCodeLogin> {
+  const env = options.env ?? process.env;
+  const tokens: [string, string][] = [
+    ["CLAUDE_CODE_OAUTH_TOKEN", "the CLAUDE_CODE_OAUTH_TOKEN environment variable"],
+    ["ANTHROPIC_API_KEY", "the ANTHROPIC_API_KEY environment variable"],
+    ["ANTHROPIC_AUTH_TOKEN", "the ANTHROPIC_AUTH_TOKEN environment variable"],
+  ];
+  for (const [key, where] of tokens) if (env[key]) return { ok: true, where };
+
+  const platform = options.platform ?? process.platform;
+  if (platform === "darwin") {
+    const probe = options.keychain ?? keychainHasCredentials;
+    if (await probe()) return { ok: true, where: `the macOS keychain (${KEYCHAIN_SERVICE})` };
+  }
+
+  const home = options.home ?? os.homedir();
+  let raw: string | null = null;
+  try {
+    raw = fs.readFileSync(claudeCredentialsFile(home), "utf8");
+  } catch {
+    raw = null;
+  }
+  if (hasClaudeAiOauth(raw)) return { ok: true, where: `${claudeCredentialsFile(home)} (claudeAiOauth)` };
+  return { ok: false, where: "no Claude Code login: no token in the environment, no keychain item, no credential file" };
+}
+
+/** What a person whose Claude Code CLI has no login is told to do. */
+export function claudeLoginHint(binary: string | null): string {
+  return binary
+    ? `Run the Claude Code CLI once and log in with /login: ${binary}`
+    : "Run the Claude Code CLI once and log in with /login (install Claude Code if it is not on this computer)";
 }
 
 function needsTerminal(): string {

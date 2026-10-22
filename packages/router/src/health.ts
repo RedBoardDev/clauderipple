@@ -14,6 +14,7 @@
 import path from "node:path";
 import type { Runner } from "./awake.ts";
 import { PROBE_URLS } from "./tether.ts";
+import { RELAY_UPSTREAM_FAILED } from "./pool.ts";
 
 export type ProviderExhaustion = {
   reason: "insufficient_balance" | "billing_exhausted" | "quota_exhausted";
@@ -28,6 +29,8 @@ export type ProviderExhaustion = {
  */
 export function providerExhaustion(status: number, body = "", retryMs?: number, now = Date.now()): ProviderExhaustion | undefined {
   if (status !== 402 && status !== 429) return undefined;
+  // A relay's 402 for its upstream being down is not about money (pool.ts, RELAY_UPSTREAM_FAILED).
+  if (RELAY_UPSTREAM_FAILED.test(body)) return undefined;
   const balance = /\b(?:insufficient[_ -]+(?:balance|credits?|funds)|(?:balance|credits?)[_ -]+(?:insufficient|exhausted|depleted))\b/i.test(body);
   const billing = /\bbilling[_ -]+(?:hard[_ -]+)?(?:limit|exhausted|quota)|\b(?:exhausted|exceeded|insufficient)[_ -]+billing\b/i.test(body);
   const quota = /\b(?:insufficient_quota|usage_limit_reached|quota[_ -]+exhausted|exhausted[_ -]+quota)\b/i.test(body);

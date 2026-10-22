@@ -20,3 +20,7 @@ packages/mod/.claude-plugin/types/
 
 # The iOS app is kept out of the public repository; it lives only on the maintainer's machine.
 apps/ripple-remote/
+
+# Local only: agent worktrees, preview launch configs, and design/promo drafts.
+.claude/
+design-drafts/

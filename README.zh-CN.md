@@ -249,6 +249,10 @@ npm install -g clauderipple
 clauderipple install
 ```
 
+Windows PowerShell 的默认执行策略会拒绝运行 npm 生成的 `clauderipple.ps1`,所以在 PowerShell 中请输入
+`clauderipple.cmd install`(命令提示符中可直接运行)。`install` 会删除该文件,之后在 PowerShell 中
+直接输入 `clauderipple` 即可。用安装脚本安装不会留下这个文件。
+
 然后打开控制面板并添加供应商：
 
 ```sh
@@ -257,13 +261,13 @@ clauderipple ui
 
 **供应商** → 添加 ChatGPT 或粘贴 API 密钥 → **模型映射**。
 
-**菜单栏 / 托盘应用**是可选的。它显示路由服务的状态，点一下就能打开控制面板：
+**菜单栏 / 托盘应用**显示路由服务的状态，点一下就能打开控制面板，并带有路由服务停止时也能打开的修复界面：
 
 ```sh
 clauderipple tray
 ```
 
-它基于 Electron，体积约 270MB，因此默认不安装。`clauderipple tray --install` 会下载一次；除此之外的一切不需要它也能正常工作。
+在 macOS 和 Windows 上，安装脚本默认会一并安装它。它基于 Electron，约 270MB，只下载一次；如不需要，在安装命令前加上 `CLAUDERIPPLE_NO_TRAY=1` 即可跳过。在 Linux 上或仅通过 npm 安装时，用 `clauderipple tray --install` 添加。除此之外的一切不需要它也能正常工作。
 
 **更新。** 有新版本时，托盘应用会提示（**检查更新…**），也可以运行：
 
@@ -419,7 +423,7 @@ Codex app / CLI ──/v1/responses──▶ ClaudeRipple ingress ──▶ Clau
 
 ## 社区
 
-提问、报告问题以及报名 Ripple Remote Android 测试版（Google Play 封闭测试）都在 Discord：[https://discord.gg/R8ZgGSNHjw](https://discord.gg/R8ZgGSNHjw)。想参加 Android 测试版，请在那里留下你在 Google Play 上使用的 Gmail 地址。
+提问、报告问题以及报名 Ripple Remote Android 测试版（Google Play 封闭测试）都在 Discord：[https://discord.gg/R8ZgGSNHjw](https://discord.gg/R8ZgGSNHjw)。想参加 Android 测试版，请把你在 Google Play 上使用的 Gmail 地址私信发给 @pbj_ripple，不要发在所有人都能看到的频道里。
 
 ## 无关联声明
 

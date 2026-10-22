@@ -424,6 +424,11 @@ npm install -g clauderipple
 clauderipple install
 ```
 
+En Windows, la política de ejecución predeterminada de PowerShell rechaza el `clauderipple.ps1` que
+crea npm, así que ahí ejecuta `clauderipple.cmd install` (o usa el Símbolo del sistema). `install`
+borra ese archivo y desde entonces basta con `clauderipple` también en PowerShell. El script de
+instalación nunca lo deja.
+
 Luego abre el panel y añade un proveedor:
 
 ```sh
@@ -432,15 +437,17 @@ clauderipple ui
 
 **Proveedores** → añade ChatGPT o pega una clave de API → **Asignación de modelos**.
 
-**La app de la barra de menús / bandeja** es opcional. Muestra el estado del router y abre
-el panel con un clic:
+**La app de la barra de menús / bandeja** muestra el estado del router, abre el panel con un
+clic y ofrece una pantalla de reparación que funciona aunque el router esté caído:
 
 ```sh
 clauderipple tray
 ```
 
-Funciona con Electron, que ocupa unos 270 MB y por eso no se instala por defecto.
-`clauderipple tray --install` lo descarga una sola vez; todo lo demás funciona sin él.
+En macOS y Windows el script de instalación la añade por defecto. Funciona con Electron, unos
+270 MB que se descargan una sola vez; define `CLAUDERIPPLE_NO_TRAY=1` antes del comando de
+instalación para omitirla. En Linux, o tras instalar solo con npm, `clauderipple tray --install`
+la añade. Todo lo demás funciona sin ella.
 
 **Actualización.** La bandeja ofrece la nueva versión cuando la hay (**Buscar actualizaciones…**), o bien:
 
@@ -709,7 +716,7 @@ El autor lo usa a diario, pero es un proyecto joven. Cuenta con algunas aspereza
 
 ## Comunidad
 
-Las preguntas, los informes de errores y la beta de Ripple Remote para Android (una prueba cerrada en Google Play) están en Discord: [https://discord.gg/R8ZgGSNHjw](https://discord.gg/R8ZgGSNHjw). Para unirte a la beta de Android, deja allí la dirección de Gmail que usas en Google Play.
+Las preguntas, los informes de errores y la beta de Ripple Remote para Android (una prueba cerrada en Google Play) están en Discord: [https://discord.gg/R8ZgGSNHjw](https://discord.gg/R8ZgGSNHjw). Para unirte a la beta de Android, envía la dirección de Gmail que usas en Google Play a @pbj_ripple por mensaje directo, no en un canal donde todos pueden leerla.
 
 ## Sin afiliación
 

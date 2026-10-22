@@ -9,6 +9,7 @@ import { PermissionQueue } from "../src/permissions.ts";
 import { FRAME_CAP } from "../src/protocol.ts";
 import { reduce } from "../web/timeline.ts";
 import { BridgeClient } from "../src/bridge-client.ts";
+import { fileSymlinks } from "../../../test/capabilities.ts";
 
 const id = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
 const other = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
@@ -211,8 +212,8 @@ test("only recent top-level UUID files, no symlinks, host transcripts or travers
   fs.utimesSync(old, new Date(0), new Date(0));
   const outside = path.join(f.root, "outside.jsonl");
   fs.writeFileSync(outside, line(user));
-  fs.symlinkSync(outside, path.join(f.project, "cccccccc-cccc-cccc-cccc-cccccccccccc.jsonl"));
-  fs.symlinkSync(f.project, path.join(f.projects, "linked-project"));
+  if (fileSymlinks) fs.symlinkSync(outside, path.join(f.project, "cccccccc-cccc-cccc-cccc-cccccccccccc.jsonl"));
+  fs.symlinkSync(f.project, path.join(f.projects, "linked-project"), "junction");
   assert.deepEqual(f.desktop.list().map(s => s.id), [id]);
   assert.equal(f.desktop.has("../../outside"), false);
   assert.throws(() => f.desktop.log("../../outside"), /no such session/);

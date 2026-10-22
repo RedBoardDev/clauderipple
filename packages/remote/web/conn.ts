@@ -84,6 +84,16 @@ export class Link {
     this.connect();
   }
 
+  /**
+   * The app came back to the front. The time it spent in the background was the phone's, not the
+   * computer's silence: counting it put "no answer for 4 minutes" on screen the moment someone
+   * returned from another app (Discord, 2026-10-22). The count starts again from now.
+   */
+  foreground(): void {
+    if (this.status.downSince !== null) this.status = { ...this.status, downSince: this.deps.now() };
+    this.nudge();
+  }
+
   send(msg: ClientMsg): boolean {
     if (this.status.state !== "open" || !this.sock) return false;
     try { this.sock.send(JSON.stringify(msg)); return true; } catch { return false; }

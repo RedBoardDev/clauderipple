@@ -15,6 +15,8 @@ export interface LocalControlOptions {
   phones(): Phone[];
   rotate(token: string): void;
   shutdown?(): void;
+  /** A turn is in progress: an update restarts the host only when this is false. */
+  busy?(): boolean;
 }
 
 export function isLoopback(address: string | undefined): boolean {
@@ -78,6 +80,7 @@ export class LocalControl {
           reachableFromPhone: !!cfg.relay || this.where.reachableFromPhone, pushReady: !!cfg.relay,
           phones: this.opts.phones(), settings: { bind: saved.bind, ...(saved.relay ? { relay: saved.relay } : {}) }, defaultRelay: DEFAULT_RELAY,
           restartRequired: saved.bind !== cfg.bind || saved.relay !== cfg.relay,
+          busy: this.opts.busy?.() ?? false,
         });
         return;
       }

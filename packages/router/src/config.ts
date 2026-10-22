@@ -105,6 +105,13 @@ export type ChatGptProvider = {
   debugDump?: boolean | "all";
   /** Reasoning effort when the request carries none. Default "high". */
   defaultEffort?: string;
+  /**
+   * The Fast (Codex priority tier) switches. Claude Code never asks for `speed: "fast"` on a GPT
+   * request — its own client gate — so the tier is chosen here instead: `main` for the session's
+   * own turns, `subagent` for the turns a subagent makes. Both off by default: the fast tier bills
+   * the plan faster.
+   */
+  fast?: { main?: boolean; subagent?: boolean };
   /** Models offered in the GUI (the Codex backend has no listing endpoint). */
   models?: ProviderModel[];
 };
@@ -219,6 +226,19 @@ export type GrokProvider = {
 };
 
 export type Provider = AnthropicCompatibleProvider | ChatGptProvider | OpenAiCompatibleProvider | GoogleProvider | AnthropicProvider | GrokProvider;
+
+/**
+ * A provider's Fast switches as two plain booleans.
+ *
+ * Anything that is not exactly `true` is off: the switches are read from a file a person can edit
+ * by hand, and a value that is not a boolean ("yes", 1, null) must not be read as "on". A `fast`
+ * that is not an object at all is off the same way, rather than a crash on the first request.
+ */
+export function fastSwitches(provider: { fast?: { main?: unknown; subagent?: unknown } } | undefined): { main: boolean; subagent: boolean } {
+  const fast = provider?.fast;
+  if (!fast || typeof fast !== "object") return { main: false, subagent: false };
+  return { main: fast.main === true, subagent: fast.subagent === true };
+}
 
 /**
  * The provider's own key wherever its headers carry it, and every header that is not that one.
@@ -374,6 +394,8 @@ export type CliModel = {
 };
 
 export type Config = {
+  /** Install new versions while idle. Omitted means enabled; hot-reloaded. */
+  autoUpdate?: boolean;
   listen: { host: string; port: number; /** OpenAI-compatible ingress port. Defaults to port + 2. */ openaiPort?: number };
   upstream: string;
   providers: Record<string, Provider>;
@@ -714,6 +736,7 @@ function foldSplitProviders(c: Config): Config {
 
 export function validate(c: Config): string[] {
   const errors: string[] = [];
+  if (c.autoUpdate !== undefined && typeof c.autoUpdate !== "boolean") errors.push("autoUpdate must be true or false");
   if (c.autoModeClassifier !== undefined) {
     const target = c.autoModeClassifier;
     if (!target || typeof target !== "object") errors.push("autoModeClassifier must be an object");
@@ -812,6 +835,12 @@ export function validate(c: Config): string[] {
         errors.push(`provider ${name}: ${MODELS_SHAPE}`);
       }
       if (p.url && !/^https?:\/\//.test(p.url)) errors.push(`provider ${name}: url must start with http:// or https://`);
+      // Only the shape is refused here. A value inside that is not a boolean is not an error: it is
+      // read as off (fastSwitches), so a hand-edited file cannot put the router on a tier by
+      // accident, and one odd value does not keep the whole config from loading.
+      if (p.fast !== undefined && (!p.fast || typeof p.fast !== "object" || Array.isArray(p.fast))) {
+        errors.push(`provider ${name}: fast must be an object with main and subagent booleans`);
+      }
     } else if (p.type === "openai-compatible") {
       if (!/^https?:\/\//.test(p.url)) errors.push(`provider ${name}: url must start with http:// or https://`);
       if (p.wire !== undefined && p.wire !== "chat" && p.wire !== "responses") errors.push(`provider ${name}: wire must be "chat" or "responses"`);

@@ -525,7 +525,7 @@ test('ripple:auto is judged and rewritten to the light rung\'s agent at the rung
   expect(b.logs.length).toBe(1)
   expect(b.logs[0]!.startsWith('ClaudeRipple worker pick: ')).toBe(true)
   expect(JSON.parse(b.logs[0]!.slice('ClaudeRipple worker pick: '.length))).toEqual({
-    task: 'Rename variable', domain: 'general', level: 'light', kind: 'do', sure: 0.9, rung: 'light', position: 1, skipped: [],
+    task: 'Rename variable', domain: 'general', level: 'light', kind: 'do', sure: 0.9, rule: 'general', rung: 'light', position: 1, skipped: [],
     target: { agent: 'deepseek-v4-1-flash' }, model: 'deepseek-v4.1-flash@max', effort: 'max', by: 'haiku',
   })
   const persisted = b.files.get('/home/test/.clauderipple/logs/worker-picks.jsonl')!
@@ -652,6 +652,102 @@ for (const [tier, rung, agent, model] of [
   expect(b.files.get('/home/test/.clauderipple/logs/worker-picks.jsonl')!.trim().split('\n').filter(line => line.includes('"outcome"')).length).toBe(1)
 })
 
+for (const domain of ['design', 'frontend', 'backend', 'docs'] as const) test(`auto selects the ${domain} task's domain ladder or its own general fallback`, async ($, on) => {
+  const b = boundaries(on, { domainRules: {
+    ui: { mode: 'ladder', rungs: { light: [{ target: { agent: 'gpt-6-astra' }, effort: 'high' }], hard: [{ target: { agent: 'gpt-6-1-sol' }, effort: 'high' }] } },
+    backend: { mode: 'ladder', rungs: { light: [{ target: { agent: 'gpt-6-1-sol' }, effort: 'medium' }] } },
+  } })
+  http(on)
+  judgeStub(on, JSON.stringify({ domain, level: 'light', kind: 'do', effort: 'low', sure: 0.9, why: 'domain' }))
+  const sent = spawnStub(on)
+  await start($)
+  await $.agent.spawn(SPAWN)
+  const rule = domain === 'design' || domain === 'frontend' ? 'ui' : domain === 'backend' ? 'backend' : 'general'
+  // A light design verdict is raised to the heavy pair (visual taste, not difficulty); frontend keeps its level.
+  const raised = domain === 'design'
+  expect(sent[0]?.subagentType).toBe(rule === 'ui' ? (raised ? 'gpt-6-1-sol' : 'gpt-6-astra') : rule === 'backend' ? 'gpt-6-1-sol' : 'deepseek-v4-1-flash')
+  const row = JSON.parse(b.files.get('/home/test/.clauderipple/logs/worker-picks.jsonl')!)
+  expect(row).toMatchObject({ rule, domain, level: 'light', rung: raised ? 'hard' : 'light' })
+  expect(row.raised).toBe(raised ? 'design' : undefined)
+})
+
+test('a design task under the ui ladder takes the heavy level past a tier marker', async ($, on) => {
+  const b = boundaries(on, { domainRules: { ui: { mode: 'ladder', rungs: { light: [{ target: { agent: 'gpt-6-astra' }, effort: 'high' }], hard: [{ target: { agent: 'gpt-6-1-sol' }, effort: 'high' }] } } } })
+  http(on)
+  judgeStub(on, JSON.stringify({ domain: 'design', level: 'deep', kind: 'do', effort: 'high', sure: 0.9, why: 'domain' }))
+  const sent = spawnStub(on)
+  await start($)
+  await $.agent.spawn({ ...SPAWN, prompt: '[[ripple: light]]\nTweak a color.' })
+  expect(sent[0]?.subagentType).toBe('gpt-6-1-sol')
+  const row = JSON.parse(b.files.get('/home/test/.clauderipple/logs/worker-picks.jsonl')!.trim().split('\n').find(line => line.includes('"type":"pick"'))!)
+  expect(row).toMatchObject({ by: 'session', rule: 'ui', domain: 'design', rung: 'hard', raised: 'design' })
+})
+
+for (const domains of [false, true]) test(`tier marker ${domains ? 'awaits' : 'does not await'} one pending shadow judge with domain ladders ${domains ? 'on' : 'off'}`, async ($, on) => {
+  const b = boundaries(on, domains ? { domainRules: { ui: { mode: 'ladder', rungs: { light: [{ target: { agent: 'gpt-6-astra' }, effort: 'high' }] } } } } : {})
+  http(on)
+  let release!: () => void
+  const pending = new Promise<void>(resolve => { release = resolve })
+  let calls = 0
+  on('model.complete', async () => {
+    calls++
+    await pending
+    return { value: { isAnswered: true, text: JSON.stringify({ domain: 'frontend', level: 'deep', kind: 'plan', effort: 'max', sure: 0.1, why: 'conflicts with tier' }), usage: USAGE } }
+  })
+  const sent = spawnStub(on)
+  await start($)
+  const spawn = $.agent.spawn({ ...SPAWN, prompt: '[[ripple: light]]\nBuild the UI.' })
+  await b.clock.settle()
+  expect(calls).toBe(1)
+  expect(sent.length).toBe(domains ? 0 : 1)
+  release()
+  await spawn
+  await b.clock.settle()
+  expect(calls).toBe(1)
+  expect(sent[0]?.subagentType).toBe(domains ? 'gpt-6-astra' : 'deepseek-v4-1-flash')
+  const rows = b.files.get('/home/test/.clauderipple/logs/worker-picks.jsonl')!.trim().split('\n').map(line => JSON.parse(line))
+  const pick = rows.find(row => row.type === 'pick')
+  expect(pick).toMatchObject({ by: 'session', tier: 'light', rung: 'light', level: 'light', kind: 'do', rule: domains ? 'ui' : 'general', domain: domains ? 'frontend' : 'general' })
+  expect(pick.sure).toBeUndefined()
+  expect(rows.filter(row => row.type === 'shadow').length).toBe(1)
+  expect(rows.find(row => row.type === 'shadow')).toMatchObject({ pick: pick.id, rung: 'plan', verdict: { domain: 'frontend', sure: 0.1 } })
+})
+
+for (const error of ['api-error', 'aborted'] as const) test(`a marker retains its tier and uses general when its domain judge is ${error}`, async ($, on) => {
+  const b = boundaries(on, { domainRules: { ui: DEFAULTS.rules.general } })
+  http(on)
+  on('model.complete', async () => {
+    if (error === 'aborted') await b.clock.advance(6000)
+    return { value: error === 'aborted' ? { isAnswered: false, reason: 'aborted', usage: USAGE } : { isAnswered: false, reason: 'api-error', status: 503, error: 'overloaded', usage: USAGE } }
+  })
+  const sent = spawnStub(on)
+  await start($)
+  await $.agent.spawn({ ...SPAWN, prompt: '[[ripple: light]]\nRename a variable.' })
+  expect(sent[0]?.subagentType).toBe('deepseek-v4-1-flash')
+  const rows = b.files.get('/home/test/.clauderipple/logs/worker-picks.jsonl')!.trim().split('\n').map(line => JSON.parse(line))
+  expect(rows.find(row => row.type === 'pick')).toMatchObject({ by: 'session', domain: 'general', rule: 'general', rung: 'light', tier: 'light', verdict: null })
+  expect(rows.filter(row => row.type === 'shadow').length).toBe(1)
+})
+
+test('a mode without domain rules skips awaiting Base domains; explicit model markers still bypass the judge', async ($, on) => {
+  const b = boundaries(on, { domainRules: { ui: DEFAULTS.rules.general }, modes: [{ id: 'plain', name: 'Plain', rungs: DEFAULTS.rules.general.rungs, delegation: 'normal', until: 'none' }], activeMode: 'plain' })
+  http(on)
+  const judges = judgeStub(on, '{"domain":"frontend","level":"light","effort":"low","sure":0.9}')
+  const sent = spawnStub(on)
+  await start($)
+  await $.agent.spawn({ ...SPAWN, prompt: '[[ripple: light]]\nWork.' })
+  await b.clock.settle()
+  const rows = b.files.get('/home/test/.clauderipple/logs/worker-picks.jsonl')!.trim().split('\n').map(line => JSON.parse(line))
+  expect(rows.find(row => row.type === 'pick')).toMatchObject({ domain: 'general', rule: 'general', mode: 'Plain', verdict: null })
+  expect(judges.length).toBe(1)
+  // Turn Base on, so its domain override is effective for this explicit marker.
+  b.remote({ settings: normalizeSettings({ setupDone: true, domainRules: { ui: DEFAULTS.rules.general } }), revision: 2, stored: true })
+  await b.clock.advance(3000)
+  await $.agent.spawn({ ...SPAWN, prompt: '[[ripple: gpt-6-astra@max]]\nWork.' })
+  expect(judges.length).toBe(1)
+  expect(sent[1]).toMatchObject({ subagentType: 'gpt-6-astra', model: 'gpt-6-astra@max' })
+})
+
 test('the limits row shows Claude\'s plan on a chat that runs on another provider', async ($, on) => {
   const b = boundaries(on, { extras: ['limits'] })
   b.setModel('muse-spark-1.3-contributor')
@@ -669,6 +765,25 @@ test('the limits row shows Claude\'s plan on a chat that runs on another provide
   await b.clock.advance(15000)
   const ui = await band($, 'desktop')
   for (const text of [/^Claude$/, /^88%$/, /^Fable$/]) expect(await ui.find({ type: 'Text', text }), String(text)).toBeDefined()
+  await ui.unmount()
+})
+
+test('a failed first limits read is tried again at the next tick, not a minute later', async ($, on) => {
+  const b = boundaries(on, { extras: ['limits'] })
+  const limits = { providers: [{ provider: 'claude', type: 'anthropic', title: 'Claude', accounts: [{ account: 0, at: NOW, windows: [
+    { kind: 'seven_day', used_percent: 88, window_minutes: 10080, reset_at: (NOW + 7_200_000) / 1000 },
+  ] }] }] }
+  let reads = 0
+  on('http.fetch', ($, e, next) => {
+    if (e.url.endsWith('/api/mod-settings')) return next(e)
+    if (e.url.endsWith('/api/limits') && ++reads === 1) return { value: { ok: false, status: 503, headers: {}, text: '' } }
+    return { value: { ok: true, status: 200, headers: {}, text: JSON.stringify(e.url.endsWith('/api/limits') ? limits : { requests: [] }) } }
+  })
+  await start($)
+  await b.clock.advance(15000)
+  expect(reads).toBeGreaterThan(1)
+  const ui = await band($, 'desktop')
+  expect(await ui.find({ type: 'Text', text: /^88%$/ })).toBeDefined()
   await ui.unmount()
 })
 

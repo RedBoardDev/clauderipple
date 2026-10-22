@@ -140,7 +140,7 @@ export class App {
     link.onReady = () => this.onReady();
     window.addEventListener("online", () => link.nudge());
     window.addEventListener("offline", () => link.nudge());
-    document.addEventListener("visibilitychange", () => { this.sendPresence(); if (document.visibilityState === "visible") { link.nudge(); void this.refreshPush(); } });
+    document.addEventListener("visibilitychange", () => { this.sendPresence(); if (document.visibilityState === "visible") { link.foreground(); void this.refreshPush(); } });
     setInterval(() => { this.ui.now = Date.now(); this.renderChrome(); }, 1000);
     // While in front, say so every PING_MS: the host pushes nothing to a phone that is looking, and
     // stops counting one whose app froze in the background without saying "hidden".

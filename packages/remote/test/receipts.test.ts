@@ -4,6 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { MessageReceipts, OutcomeUnknownError } from "../src/receipts.ts";
+import { posixModes } from "../../../test/capabilities.ts";
 
 function file(t: import("node:test").TestContext): string {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ripple-receipts-"));
@@ -20,7 +21,7 @@ test("begin writes pending to disk, complete marks it completed", t => {
   assert.equal(receipts.inFlight("send:s:m1"), true);
   const stored = JSON.parse(fs.readFileSync(f, "utf8")) as { key: string; state: string }[];
   assert.deepEqual(stored.map(r => [r.key, r.state]), [["send:s:m1", "pending"]]);
-  assert.equal((fs.statSync(f).mode & 0o777), 0o600);
+  if (posixModes) assert.equal((fs.statSync(f).mode & 0o777), 0o600);
   receipts.complete("send:s:m1", "s");
   assert.equal(receipts.status("send:s:m1"), "completed");
   assert.equal(receipts.inFlight("send:s:m1"), false);

@@ -20,7 +20,7 @@ import { OpenAiIngress } from "../src/ingress/server.ts";
 import { Logger } from "../src/log.ts";
 import { Proxy } from "../src/proxy.ts";
 import { RequestLog } from "../src/requestlog.ts";
-import { TetherController } from "../src/tether.ts";
+import { DISASSOCIATE_JS, SCAN_KNOWN_JS, TetherController } from "../src/tether.ts";
 import { createCa } from "../src/x509.ts";
 
 // ---- The gate alone -----------------------------------------------------------------------------
@@ -179,7 +179,13 @@ test("postponed → hold engaged after the grace period → the held call waits,
     const run = async (file: string, args: string[]): Promise<RunResult> => {
       const line = [file, ...args].join(" ");
       if (line === "/usr/sbin/networksetup -listallhardwareports") return { code: 0, stdout: "Hardware Port: Wi-Fi\nDevice: en0\n", stderr: "" };
-      if (file === "/usr/bin/osascript") {
+      if (line === "/usr/sbin/networksetup -listpreferredwirelessnetworks en0") return { code: 0, stdout: "Preferred networks on en0:\n\tPBJ\n\tHome\n", stderr: "" };
+      if (file === "/usr/bin/osascript" && args[3] === SCAN_KNOWN_JS) {
+        assert.equal(hold.engaged, false, "visibility is established before the hold gate engages");
+        assert.deepEqual(JSON.parse(args[5]!), ["Home"]);
+        return { code: 0, stdout: "visible\n", stderr: "" };
+      }
+      if (file === "/usr/bin/osascript" && args[3] === DISASSOCIATE_JS) {
         events.push(`leave (held ${hold.waiting}, provider saw ${r.up.seen.join(",")})`);
         ip = "192.168.1.4";
         return { code: 0, stdout: "ok\n", stderr: "" };

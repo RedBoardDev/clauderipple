@@ -92,6 +92,8 @@ export type Calibration = { effortOffset?: -2 | -1 | 0 | 1 | 2; floor?: Effort; 
  */
 export type Rungs = Partial<Record<Rung, Step[]>>
 export type Rule = { mode: 'ladder'; rungs: Rungs }
+/** Optional ladders within one worker set; absent domains follow that set's general ladder. */
+export type DomainRules = { ui?: Rule; backend?: Rule }
 /** How a provider is paid for: what the Workers card tags each model with, and what presets read. */
 export type Billing = 'free' | 'payg' | 'subscription'
 /** A model a rung can run, as GET /api/mod-options describes it. */
@@ -129,6 +131,7 @@ export type Mode = {
   id: string
   name: string
   rungs: Rungs
+  domainRules?: DomainRules
   delegation: 'normal' | 'eager'
   until: 'none' | number | { reset: string }
 }
@@ -146,6 +149,8 @@ export type Settings = {
   jevSource: 'typesafe' | 'zen'
   /** Only the general ladder: the four workers replaced the per-field rules (2026-10-12). */
   rules: { general: Rule }
+  /** Base's optional domain ladders, separate from retired `rules.<domain>` overrides. */
+  domainRules?: DomainRules
   /**
    * The models the user ticked (docs/specs/2026-10-12-worker-tiers.md): worker agent names and
    * `general-purpose:<model>` for Claude's own. Empty means every model. Rungs run, and the fill
@@ -231,6 +236,8 @@ export type WorkerVerdict = {
 
 /** What a spawn of ripple:auto (or a taken-over spawn) was turned into. */
 export type WorkerPick = WorkerVerdict & {
+  /** The worker set's ladder selected for this task (explicit model choices bypass it). */
+  rule: 'ui' | 'backend' | 'general'
   /** The ladder rung that ran it (absent for explicit choices). */
   rung?: Rung
   /** One-based position in the selected rung; skipped entries explain ordered fallback. */

@@ -9,7 +9,8 @@
 - 서명·공증이 사라집니다. Apple Developer 인증서도, Windows 코드 서명 인증서(연 219~685달러, 하드웨어 토큰)도
   필요 없습니다. SmartScreen 경고도 없습니다.
 - 트레이에 필요한 Electron은 npm이 플랫폼에 맞는 바이너리를 받아 옵니다. 우리가 굽지 않습니다. 다만 270MB라
-  의존성에 넣지 않았습니다. 기본 설치는 828KB이고, `clauderipple tray --install`을 눌렀을 때만 받습니다(실측).
+  의존성에 넣지 않았습니다. npm 패키지는 828KB이고(실측), Electron은 `clauderipple tray --install`이 따로 받습니다.
+  macOS·Windows 설치 스크립트는 이 단계를 기본으로 돌리고, `CLAUDERIPPLE_NO_TRAY=1`이면 건너뜁니다.
 
 사용자에게 Node 24가 필요하지만, 설치 스크립트가 없으면 대신 깔아 줍니다.
 
@@ -55,18 +56,23 @@ Node를 우리가 내려받은 경우에는 npm이 만든 `env node` 셔뱅 링�
    ```
 
 4. 아무 폴더에나 설치해 실제로 도는지 봅니다. **주 설치본과 겹치지 않도록 홈과 포트를 따로 줍니다.**
+   메뉴 막대 앱 실행기(`~/Applications/ClaudeRipple.app`)도 `CLAUDERIPPLE_LAUNCHER_DIR`로 따로 둡니다.
+   빠뜨리면 확인용 설치가 실제 실행기를 덮어쓰고, `uninstall --purge`가 그것을 지웁니다(2026-10-21).
+   그랬다면 `clauderipple app --install`로 되살립니다.
 
    ```sh
    npm install --prefix /tmp/cr-check ./clauderipple-<버전>.tgz
    CLAUDERIPPLE_HOME=/tmp/cr-check/home \
    CLAUDE_SETTINGS_PATH=/tmp/cr-check/settings.json \
    CLAUDERIPPLE_LAUNCHD_LABEL=com.clauderipple.check \
+   CLAUDERIPPLE_LAUNCHER_DIR=/tmp/cr-check/apps \
      /tmp/cr-check/node_modules/.bin/clauderipple install --port 8890
    curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8891/
    # 확인이 끝나면
    CLAUDERIPPLE_HOME=/tmp/cr-check/home \
    CLAUDE_SETTINGS_PATH=/tmp/cr-check/settings.json \
    CLAUDERIPPLE_LAUNCHD_LABEL=com.clauderipple.check \
+   CLAUDERIPPLE_LAUNCHER_DIR=/tmp/cr-check/apps \
      /tmp/cr-check/node_modules/.bin/clauderipple uninstall --purge
    ```
 
@@ -83,6 +89,14 @@ Node를 우리가 내려받은 경우에는 npm이 만든 `env node` 셔뱅 링�
    등록돼 있어야 합니다. npm은 저장할 때 검사하지 않고 게시할 때 거절하므로, 틀리면 Actions 로그에
    `ENEEDAUTH`가 뜹니다. 게시 없이 검사만 하려면 Actions → Publish → Run workflow(`--dry-run`)를 씁니다.
    급할 때는 예전처럼 로컬에서 `npm publish`도 됩니다(브라우저 인증 필요).
+
+6. GitHub 릴리스를 만듭니다. 태그만으로는 저장소 첫 화면의 "Latest"가 바뀌지 않습니다. 0.10~0.12.5에서
+   이 단계를 빠뜨려 첫 화면에 열흘 넘게 0.9.0이 걸려 있었습니다(2026-10-22). 본문은 CHANGELOG의 그 버전 절과
+   설치 명령, Anthropic과 무관하다는 한 줄입니다.
+
+   ```sh
+   gh release create v<버전> --title "ClaudeRipple <버전> — <한 줄 요약>" --notes-file <본문> --latest
+   ```
 
 ## 빌드가 하는 일
 

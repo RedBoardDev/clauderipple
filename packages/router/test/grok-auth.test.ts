@@ -250,7 +250,7 @@ test("a CLI updated in place at the same path is asked for its version again", a
 test("one GrokAuth per Grok home and binary, however the home is spelled", () => {
   const dir = home();
   const link = `${dir}-link`;
-  fs.symlinkSync(dir, link);
+  fs.symlinkSync(dir, link, "junction");
   const a = sharedGrokAuth({ home: dir, log: quiet });
   assert.equal(sharedGrokAuth({ home: path.join(dir, "."), log: quiet }), a);
   assert.equal(sharedGrokAuth({ home: link, log: quiet }), a);
@@ -268,10 +268,10 @@ test("an instance found through a symlink keeps the home it was resolved to", as
   writeAuth(a, { "https://auth.x.ai::a": { key: "tok-in-a", expiresAt: NOW + 5 * HOUR } });
   writeAuth(b, { "https://auth.x.ai::b": { key: "tok-in-b", expiresAt: NOW + 5 * HOUR } });
   const link = `${a}-moving`;
-  fs.symlinkSync(a, link);
+  fs.symlinkSync(a, link, "junction");
   const viaLink = sharedGrokAuth({ home: link, log: quiet, env: { PATH: "", HOME: a } });
   fs.unlinkSync(link);
-  fs.symlinkSync(b, link);
+  fs.symlinkSync(b, link, "junction");
   const viaA = sharedGrokAuth({ home: a, log: quiet, env: { PATH: "", HOME: a } });
   assert.equal(viaA, viaLink);
   assert.equal(viaA.current()?.key, "tok-in-a", "a's instance reads a's session, not where the link points now");

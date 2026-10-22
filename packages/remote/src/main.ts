@@ -31,11 +31,12 @@ import type { WsLike } from "./relay.ts";
 import { RouterClient } from "./router.ts";
 import { HostServer } from "./server.ts";
 import { LocalControl } from "./local-control.ts";
-import { findClaude, specFor } from "./service.ts";
-import { installService, uninstallService, serviceStatus, servicePaths, renderService, supervisorName, controlShutdown } from "./host-service.ts";
+import { findClaude, specFor, cliLoginWarning } from "./service.ts";
+import { installService, uninstallService, serviceStatus, servicePaths, renderService, supervisorName, controlShutdown, refreshPlan, hostBusy } from "./host-service.ts";
 import { Sessions } from "./sessions.ts";
 import { desktopHandoff } from "./handoff.ts";
 import type { QueryFn } from "./sessions.ts";
+import { claudeBinary, claudeCodeLogin } from "../../cli/src/claude-auth.ts";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const VERSION = (JSON.parse(fs.readFileSync(path.join(here, "..", "package.json"), "utf8")) as { version: string }).version;
@@ -175,6 +176,7 @@ async function runHost(): Promise<void> {
       phones: () => server?.phones() ?? [],
       rotate: token => { server?.rotateToken(token); },
       shutdown: () => stop(),
+      busy: () => live.busy(),
     }),
   });
   server = host;
@@ -227,10 +229,34 @@ async function installCmd(): Promise<void> {
   // Read the running host's old port before command-line options persist a replacement.
   if (process.platform === "win32" && !process.argv.includes("--print")) await controlShutdown(dir);
   const cfg = process.argv.includes("--print") ? loadConfig(dir, false) : configFromArgs(dir);
-  const spec = specFor({ script: fileURLToPath(import.meta.url), claudePath: findClaude(cfg.claudePath), ...(process.env.RIPPLE_REMOTE_HOME ? { remoteHome: process.env.RIPPLE_REMOTE_HOME } : {}) });
+  // The CLI the host will start; also what a person is told to run when it has no login.
+  const claudePath = findClaude(cfg.claudePath);
+  const spec = hostSpec(claudePath);
   if (process.argv.includes("--print")) { out(renderService(spec)); return; }
   for (const line of await installService(spec)) out(`${line}\n`);
   out(`Pair the phone: clauderipple remote pair\n`);
+  // The host starts Claude Code through the Agent SDK and passes no credential of its own, so a
+  // machine where the CLI was never logged in fails on every turn (issue #71). Say so now; the
+  // install itself is never held up by it.
+  const warning = cliLoginWarning(await claudeCodeLogin(), claudePath ?? claudeBinary() ?? null);
+  if (warning) out(`⚠ ${warning}\n`);
+}
+
+function hostSpec(claudePath: string | undefined): ReturnType<typeof specFor> {
+  return specFor({ script: fileURLToPath(import.meta.url), claudePath, ...(process.env.RIPPLE_REMOTE_HOME ? { remoteHome: process.env.RIPPLE_REMOTE_HOME } : {}) });
+}
+
+/** Run by `clauderipple update` from the new files: restarts a host this installation registered (refreshPlan). */
+async function refreshCmd(): Promise<void> {
+  const p = servicePaths();
+  let definition: string | null = null;
+  try { definition = fs.readFileSync(p.definition, "utf8"); } catch { /* not registered */ }
+  const plan = refreshPlan({ installed: serviceStatus().installed, definition, script: fileURLToPath(import.meta.url), busy: definition === null ? undefined : await hostBusy() });
+  if (plan === "absent") return;
+  if (plan === "foreign") { out(`phone host: runs from other files (${p.definition}); left as it is\n`); return; }
+  if (plan === "busy") { out("phone host: a turn is in progress, so it keeps the old code; restart it afterwards with: clauderipple remote install\n"); return; }
+  const spec = hostSpec(findClaude(loadConfig(remoteHome(), false).claudePath));
+  for (const line of await installService(spec)) out(`phone host: ${line}\n`);
 }
 
 async function main(): Promise<void> {
@@ -238,6 +264,7 @@ async function main(): Promise<void> {
   switch (sub) {
     case null: return runHost();
     case "install": return installCmd();
+    case "refresh": return refreshCmd();
     case "uninstall": for (const line of await uninstallService()) out(`${line}\n`); return;
     case "status": return status();
     case "pair": { const dir = remoteHome(); printPairing(configFromArgs(dir), dir); return; }

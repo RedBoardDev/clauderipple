@@ -127,6 +127,14 @@ test("tool_choice and images map; string content works", () => {
   assert.ok(estimateTokens(turn1) > 10);
 });
 
+test("the image hint follows the addendum on the session's own turns, never a subagent's", () => {
+  const req = { model: "m", messages: [{ role: "user" as const, content: "draw a cat" }] };
+  const main = toResponsesRequest(req, { ...opts, identity: false, instructionsAppend: "Be brief.", imageHint: "IMG" });
+  assert.equal(main.instructions, "Be brief.\n\nIMG");
+  const sub = toResponsesRequest(req, { ...opts, identity: false, instructionsAppend: "Be brief.", imageHint: "IMG", subagent: true });
+  assert.equal(sub.instructions, "Be brief.");
+});
+
 test("stream mapper: text + tool call + completed → Anthropic events with usage and stop_reason", () => {
   const m = new StreamMapper("gpt-5.6-terra");
   const evs = [
@@ -371,6 +379,27 @@ test("Claude Code's fast mode asks the ChatGPT backend for the Codex fast tier",
   assert.equal(toResponsesRequest({ ...turn1, speed: "fast" }, opts).service_tier, "priority");
   assert.equal(toResponsesRequest(turn1, opts).service_tier, undefined);
   assert.equal(toResponsesRequest({ ...turn1, speed: "standard" }, opts).service_tier, undefined);
+});
+
+// Claude Code never asks for `speed: "fast"` on a GPT request (its own client gate), so the tier is
+// chosen by the provider's switches: one for the session's own turns, one for a subagent's.
+test("the provider's Fast switches ask for the Codex fast tier, main and subagent apart", () => {
+  assert.equal(toResponsesRequest(turn1, { ...opts, fast: { main: true } }).service_tier, "priority", "a main turn with fast.main on");
+  assert.equal(toResponsesRequest(turn1, { ...opts, fast: { subagent: true } }).service_tier, undefined, "a main turn is not a subagent's");
+  assert.equal(toResponsesRequest(turn1, { ...opts, fast: { subagent: true }, subagent: true }).service_tier, "priority", "a subagent turn with fast.subagent on");
+  assert.equal(toResponsesRequest(turn1, { ...opts, fast: { main: true }, subagent: true }).service_tier, undefined, "fast.main does not reach a subagent's turn");
+  assert.equal(toResponsesRequest(turn1, { ...opts, fast: { main: true, subagent: true } }).service_tier, "priority");
+  assert.equal(toResponsesRequest(turn1, { ...opts, fast: { main: false, subagent: false } }).service_tier, undefined);
+  assert.equal(toResponsesRequest(turn1, { ...opts, fast: {} }).service_tier, undefined);
+  assert.equal(toResponsesRequest(turn1, opts).service_tier, undefined, "no switches at all is the default");
+});
+
+test("`speed: fast` still asks for the fast tier whichever switch is on", () => {
+  assert.equal(toResponsesRequest({ ...turn1, speed: "fast" }, { ...opts, fast: { main: false, subagent: false } }).service_tier, "priority");
+  assert.equal(toResponsesRequest({ ...turn1, speed: "fast" }, { ...opts, fast: { main: true }, subagent: true }).service_tier, "priority");
+  // The switch is the provider's own choice, so it asks for the tier whatever `speed` says.
+  assert.equal(toResponsesRequest({ ...turn1, speed: "standard" }, { ...opts, fast: { main: true } }).service_tier, "priority");
+  assert.equal(toResponsesRequest({ ...turn1, speed: "standard" }, { ...opts, fast: { main: false, subagent: false } }).service_tier, undefined);
 });
 
 // ---- reasoning replay (reasoning.ts) -----------------------------------------------------------

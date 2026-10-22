@@ -39,7 +39,7 @@ export function eagerNote(s: Pick<Settings, 'modes' | 'activeMode' | 'activeSinc
 /** Modes replace the base worker set, without changing fallback, allow-list or provider policy. */
 export function routingSettings(s: Settings): Settings {
   const mode = activeModeOf(s)
-  return mode ? { ...s, rules: { general: { mode: 'ladder', rungs: mode.rungs } } } : s
+  return mode ? { ...s, rules: { general: { mode: 'ladder', rungs: mode.rungs } }, domainRules: mode.domainRules } : s
 }
 
 /** The provider whose quota reset ends the mode: 'anthropic' is Claude, any other a ChatGPT provider. */

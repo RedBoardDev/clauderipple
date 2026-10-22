@@ -279,3 +279,14 @@ test("an answer lifts a quarantine but does not cancel a live cooldown", () => {
   pool.succeed("p", "a");
   assert.equal(pool.report("p", all)[0]?.state, "ready", "a credential that answered is not rejected");
 });
+
+// OpenCode Go answered 402 for minimax-m3.1-flash-free while that model's endpoint was down
+// (2026-10-22). Read as exhaustion it parked the whole account, DeepSeek included, for 30 minutes.
+test("a relay's 402 for a failed upstream is transient, not exhaustion", () => {
+  const body = '{"error":{"type":"server_error","message":"Upstream request failed: Endpoint is unavailable."}}';
+  assert.equal(providerExhaustion(402, body), undefined);
+  assert.deepEqual(classify(402, undefined, body), { retryable: true, kind: "transient", cooldownMs: 0, quarantine: false });
+  // A real 402 still is.
+  assert.deepEqual(classify(402, undefined, '{"error":{"message":"Insufficient balance"}}'), { retryable: true, kind: "exhausted", cooldownMs: 30 * 60_000, quarantine: false });
+  assert.equal(providerExhaustion(402, "Insufficient Balance")?.reason, "insufficient_balance");
+});

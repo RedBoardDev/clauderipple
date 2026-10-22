@@ -12,6 +12,7 @@ import { CLAUDE_OAUTH, ClaudeOAuthSession, refreshClaudeOAuth } from "../src/pro
 import { claudeAccountsPath, readClaudeAccountsFile } from "../src/providers/anthropic-accounts.ts";
 import { readClaudeAuthFile, saveClaudeOAuthFile } from "../src/providers/anthropic-token-file.ts";
 import { ClaudeCodeAuthStore, ClaudeCodeCredentialStore } from "../src/providers/anthropic.ts";
+import { posixModes } from "../../../test/capabilities.ts";
 
 function freePort(): Promise<number> {
   return new Promise((resolve) => {
@@ -77,7 +78,7 @@ test("the authorize URL carries a PKCE challenge, and the loopback callback comp
   assert.equal(stored.expiresAt, 1_000_000 + 3600_000);
   assert.equal(session.snapshot.account?.id, stored.id);
   assert.doesNotMatch(JSON.stringify(session.snapshot), /at-1|rt-1/);
-  assert.equal(fs.statSync(claudeAccountsPath(home)).mode & 0o777, 0o600);
+  if (posixModes) assert.equal(fs.statSync(claudeAccountsPath(home)).mode & 0o777, 0o600);
   // The listener is gone: the port is free again.
   const again = await new Promise<boolean>((r) => {
     const s = net.createServer();

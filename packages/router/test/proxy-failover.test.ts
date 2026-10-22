@@ -26,6 +26,8 @@ import { saveGoogleAccount } from "../src/providers/google/accounts.ts";
 import { capacityRetry, GoogleAdapter } from "../src/providers/google/index.ts";
 import { saveClaudeOAuthAccount } from "../src/providers/anthropic-accounts.ts";
 
+const noClaudeCodeCredentialReaders = { keychain: () => null, credentialsFile: () => null };
+
 function freePort(): Promise<number> {
   return new Promise((resolve) => {
     const probe = net.createServer();
@@ -88,6 +90,7 @@ async function rig(providers: Config["providers"], routes: Config["routes"]): Pr
     health: new UpstreamHealth(() => 100, () => {}),
     home,
     requests: new RequestLog(path.join(home, "requests.jsonl")),
+    claudeCodeCredentialReaders: noClaudeCodeCredentialReaders,
   });
   await proxy.listen();
 
@@ -619,6 +622,7 @@ async function frig(opts: {
     health: new UpstreamHealth(() => 100, () => {}),
     home,
     requests,
+    claudeCodeCredentialReaders: noClaudeCodeCredentialReaders,
     agentDir: path.join(home, "agents"),
     upstreamPort: native.port,
     upstreamAgent: new https.Agent({ ca: ca.certPem }),

@@ -12,7 +12,13 @@ const LABELS: Record<string, string> = {
 interface ModOptions {
   models: { model: string; provider: string; name: string; judgeOnly: boolean }[];
   providers: { name: string; type: string; usable: boolean }[];
+  claudeEfforts?: string[];
 }
+/**
+ * Claude Code's own aliases for the current Opus, Sonnet and Haiku: the CLI resolves them, so this
+ * list never names a model version that goes stale.
+ */
+const CLAUDE_ALIASES = [{ model: "opus", name: "Opus" }, { model: "sonnet", name: "Sonnet" }, { model: "haiku", name: "Haiku" }];
 interface EffortLevels { providers: Record<string, { default: string[]; models?: Record<string, string[]> }> }
 interface RequestRecord { source?: string; target?: string; provider?: string; effort?: string; ok?: boolean; status?: number; at?: string; usage?: { input?: number; cached?: number; cacheWrite?: number; output?: number } }
 interface Window { used_percent?: number; window_minutes?: number; reset_at?: number }
@@ -114,6 +120,14 @@ export function groupModels(opts: ModOptions, levels: EffortLevels): ProviderGro
     let g = groups.get(m.provider);
     if (!g) { g = { provider: m.provider, label: LABELS[m.provider] ?? m.provider, usable: ok, models: [] }; groups.set(m.provider, g); }
     g.models.push({ model: m.model, name: m.name, provider: m.provider, efforts, usable: ok });
+  }
+  // A router that passes Claude straight through declares no anthropic provider, so Claude was
+  // missing from the phone's picker, and with no other provider the picker came up empty
+  // (Discord, 2026-10-22). Claude Code runs its own models with its own login either way.
+  if (!opts.providers.some((p) => p.type === "anthropic")) {
+    const efforts = (levels.providers.anthropic?.default ?? opts.claudeEfforts ?? []).map(toEffort).filter((e): e is Effort => e !== null && e !== "none" && e !== "minimal");
+    const models = CLAUDE_ALIASES.map(({ model, name }) => ({ model, name, provider: "claude-code", efforts, usable: true }));
+    return [{ provider: "claude-code", label: "Claude", usable: true, models }, ...groups.values()];
   }
   return Array.from(groups.values());
 }

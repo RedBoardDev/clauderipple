@@ -11,7 +11,9 @@ import { reduce } from "../web/timeline.ts";
 import { INLINE_CAP } from "../src/protocol.ts";
 import type { Effort, SessionEvent } from "../src/protocol.ts";
 import { Sessions, modelArg, nextAttention, summarize } from "../src/sessions.ts";
+import { CLI_NOT_LOGGED_IN } from "../src/bridge-client.ts";
 import type { CanUseTool, PermissionAnswer, QueryFn, SdkUserMessage, SessionsOptions } from "../src/sessions.ts";
+import { posixPaths } from "../../../test/capabilities.ts";
 
 const router = {
   status: async () => ({ ok: true, proxyEnv: { HTTPS_PROXY: "http://127.0.0.1:1" } }),
@@ -19,7 +21,7 @@ const router = {
   models: async () => [],
 } satisfies SessionsOptions["router"] & { models: () => Promise<never[]> };
 
-function scriptedQuery(script: { permission?: boolean; toolOutput?: unknown; images?: boolean; thinking?: boolean; sendFile?: string } = {}) {
+function scriptedQuery(script: { permission?: boolean; toolOutput?: unknown; images?: boolean; thinking?: boolean; sendFile?: string; failure?: { text: string; as: "result" | "throw" } } = {}) {
   const options: Record<string, unknown>[] = [];
   const users: SdkUserMessage[] = [];
   const answers: PermissionAnswer[] = [];
@@ -58,6 +60,11 @@ function scriptedQuery(script: { permission?: boolean; toolOutput?: unknown; ima
           const image = { type: "image", source: { type: "base64", media_type: "image/png", data: Buffer.from("sdk image").toString("base64") } };
           if (script.images) yield { type: "user", uuid: "sdk-image-user", message: { content: [image] } };
           yield { type: "assistant", parent_tool_use_id: null, message: { id, model: "x", content: [{ type: "text", text: "pong" }, ...(script.images ? [image] : []), ...(script.sendFile ? [{ type: "tool_use", id: "suf-1", name: "SendUserFile", input: { files: [script.sendFile], caption: "shot", status: "normal" } }] : [])] } };
+          if (script.failure?.as === "throw") throw new Error(script.failure.text);
+          if (script.failure?.as === "result") {
+            yield { type: "result", subtype: "error", is_error: true, result: script.failure.text, duration_ms: 1, num_turns: 0 };
+            return;
+          }
           yield { type: "result", subtype: "success", is_error: false, duration_ms: 5, num_turns: 1, modelUsage: { x: { contextWindow: 1000 } } };
         }
       },
@@ -93,6 +100,29 @@ function fixture(t: TestContext, script: Parameters<typeof scriptedQuery>[0] = {
     sessions.create({ clientMsgId, cwd, model, effort, text: "ping" });
   return { dir, cwd, permissionsFile, permissions, fake, sessions, instances, events, create };
 }
+
+test("a CLI without a login is told what to do, and the raw text stays in the host's log", async t => {
+  for (const how of ["result", "throw"] as const) {
+    const lines: string[] = [];
+    const f = fixture(t, { failure: { text: "Not logged in · Please run /login", as: how } }, { log: (line: string) => lines.push(line) });
+    const id = await f.create();
+    await waitFor(() => f.sessions.summaryOf(id)?.state === "error");
+    const stored = f.sessions.log(id).readAfter(0).events;
+    const failed = stored.filter(e => e.kind === "result");
+    assert.equal(failed.length, 1, how);
+    assert.equal(failed[0]!.error, CLI_NOT_LOGGED_IN, how);
+    assert.ok(lines.some((l) => l.includes("Not logged in")), `the raw CLI text is kept in the host log: ${lines.join(" | ")}`);
+  }
+});
+
+test("another CLI error is left exactly as it was", async t => {
+  const f = fixture(t, { failure: { text: "API Error: 500 internal error", as: "result" } });
+  const id = await f.create();
+  await waitFor(() => f.sessions.summaryOf(id)?.state === "error");
+  const stored = f.sessions.log(id).readAfter(0).events;
+  const failed = stored.filter(e => e.kind === "result");
+  assert.equal(failed[0]!.error, "API Error: 500 internal error");
+});
 
 test("thinking streams finalize at original block indices without exposing signatures", async t => {
   const f = fixture(t, { thinking: true });
@@ -284,6 +314,7 @@ function eventLabels(events: SessionEvent[]): string[] {
 for (const { model, effort, expected } of [
   { model: "claude-test", effort: "high" as const, expected: { model: "claude-test", effort: "high" } },
   { model: "gpt-test", effort: "max" as const, expected: { model: "gpt-test@max" } },
+  { model: "opus", effort: "high" as const, expected: { model: "opus", effort: "high" } },
 ]) {
   test(`create uses cwd, proxy env and modelArg for ${model}, and emits an ordered turn`, { timeout: 4500 }, async t => {
     const f = fixture(t);
@@ -560,7 +591,13 @@ test("summarize uses Bash's first line, cwd-relative Read paths and Grep pattern
   const cwd = path.resolve(os.tmpdir(), "summary-project");
   assert.equal(summarize("Bash", { command: "ls -la\npwd" }, cwd), "ls -la");
   assert.equal(summarize("Bash", { command: "\n\nls\npwd" }, cwd), "ls");
-  assert.equal(summarize("Read", { file_path: path.join(cwd, "src", "index.ts") }, cwd), "src/index.ts");
+  assert.equal(summarize("Read", { file_path: path.join(cwd, "src", "index.ts") }, cwd), path.join("src", "index.ts"));
+  if (!posixPaths) {
+    const forward = path.join(cwd, "src", "index.ts").replaceAll("\\", "/");
+    const drive = forward[0]!;
+    const otherDriveCase = (drive === drive.toUpperCase() ? drive.toLowerCase() : drive.toUpperCase()) + forward.slice(1);
+    assert.equal(summarize("Read", { file_path: otherDriveCase }, cwd), path.join("src", "index.ts"));
+  }
   assert.equal(summarize("Read", { file_path: cwd }, cwd), ".");
   const outside = `${cwd}-other/file.ts`;
   assert.equal(summarize("Read", { file_path: outside }, cwd), outside);

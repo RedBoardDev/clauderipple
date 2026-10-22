@@ -11,6 +11,7 @@ import { loadConfig, saveConfig } from "../src/config.ts";
 import { LocalControl, isLoopback, localSecret } from "../src/local-control.ts";
 import { HostServer } from "../src/server.ts";
 import { ExpoNotifier } from "../src/expo-push.ts";
+import { posixModes } from "../../../test/capabilities.ts";
 
 async function fixture(t: import("node:test").TestContext, relay?: string, listen = "127.0.0.1") {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ripple-local-"));
@@ -51,7 +52,7 @@ async function hello(t: import("node:test").TestContext, port: number, token: st
 test("local control requires both a loopback socket and the one persistent 0600 secret", async t => {
   const f = await fixture(t);
   assert.equal(localSecret(f.dir), f.secret);
-  assert.equal(fs.statSync(path.join(f.dir, "local.secret")).mode & 0o777, 0o600);
+  if (posixModes) assert.equal(fs.statSync(path.join(f.dir, "local.secret")).mode & 0o777, 0o600);
   for (const address of ["127.0.0.1", "127.0.0.2", "::1", "::ffff:127.0.0.1"]) assert.equal(isLoopback(address), true);
   for (const address of [undefined, "10.0.0.1", "100.64.0.1", "::ffff:192.168.1.2"]) assert.equal(isLoopback(address), false);
   for (const headers of [{}, { "x-ripple-local": "wrong" }, { "x-forwarded-for": "127.0.0.1" }]) {
@@ -133,6 +134,8 @@ test("settings validates before saving, preserves secrets and distinguishes runn
   const pending = await (await f.call("status")).json() as { mode: string; restartRequired: boolean; settings: { relay: string } };
   assert.equal(pending.mode, "local-only");
   assert.equal(pending.restartRequired, true);
+  // No busy callback (an embedder that never runs turns) reads as idle, never as missing.
+  assert.equal((pending as { busy?: unknown }).busy, false);
   assert.equal(pending.settings.relay, saved.relay);
   assert.deepEqual(await (await f.call("settings", { relay: "off", bind: "local" })).json(), { restartRequired: false });
   assert.equal(loadConfig(f.dir, false).relay, undefined);

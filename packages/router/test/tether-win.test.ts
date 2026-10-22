@@ -6,9 +6,10 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import {
   FIND_WIFI_PS, WIN_HINTS, autoProfiles, classifyNetshConnect, hotspotProfile, listWifiProfiles, needsLocation, parseAdapterName, parseProfileNames,
-  parseProfileXml, quotable,
+  parseProfileXml, parseVisibleSsids, quotable,
 } from "../src/tether-win.ts";
 import { TetherController, isHotspotAddress } from "../src/tether.ts";
+import { HoldGate } from "../src/hold.ts";
 import type { Activity, RunOptions, RunResult } from "../src/awake.ts";
 import { TETHER_DEFAULTS, type TetherSettings } from "../src/config.ts";
 
@@ -100,6 +101,9 @@ type Net = {
   /** Where Windows auto-joins after a disconnect (null = nothing). */
   autoJoin: string | null;
   connectCode: number;
+  visible: string[];
+  scan: RunResult | Error | null;
+  profileError: "show" | "export" | null;
 };
 
 function rig(o: { net?: Partial<Net>; settings?: Partial<TetherSettings>; activity?: () => Activity; stateFile?: string } = {}) {
@@ -117,6 +121,9 @@ function rig(o: { net?: Partial<Net>; settings?: Partial<TetherSettings>; activi
     lands: { "PBJ’s iPhone": "172.20.10.3", Home: "192.168.1.4" },
     autoJoin: "192.168.1.4",
     connectCode: 0,
+    visible: ["Home", "PBJ’s iPhone"],
+    scan: null,
+    profileError: null,
     ...o.net,
   };
   let settings: TetherSettings = { ...TETHER_DEFAULTS, enabled: true, hotspotSsid: "PBJ’s iPhone", ...o.settings };
@@ -131,6 +138,12 @@ function rig(o: { net?: Partial<Net>; settings?: Partial<TetherSettings>; activi
     }
     assert.equal(exe, "netsh.exe");
     if (net.location) return { code: 1, stdout: LOCATION, stderr: "" };
+    if (net.profileError && line.includes(`wlan ${net.profileError === "show" ? "show profiles" : "export profile"}`)) return { code: 1, stdout: "", stderr: "profiles unavailable" };
+    if (line === 'netsh.exe wlan show networks mode=ssid interface="Wi-Fi"') {
+      assert.equal(opts?.verbatim, true);
+      if (net.scan instanceof Error) throw net.scan;
+      return net.scan ?? ok(`\nInterface name : Wi-Fi\n${net.profiles.length} networks visible.\n${net.visible.map((ssid, i) => `SSID ${i + 1} : ${ssid}\n    Network type : Infrastructure\n    Authentication : WPA2-Personal`).join("\n")}\n`);
+    }
     if (line === "netsh.exe wlan show profiles") return ok(`\nUser profiles\n-------------\n${net.profiles.map((p) => `    All User Profile     : ${p.name}`).join("\n")}\n`);
     if (line.startsWith("netsh.exe wlan export profile folder=")) {
       assert.equal(opts?.verbatim, true);
@@ -154,7 +167,9 @@ function rig(o: { net?: Partial<Net>; settings?: Partial<TetherSettings>; activi
     throw new Error(`unexpected command: ${line}`);
   };
   const iface = (address: string): os.NetworkInterfaceInfo => ({ address, family: "IPv4", internal: false, netmask: "255.255.255.0", mac: "", cidr: null }) as os.NetworkInterfaceInfo;
+  const hold = new HoldGate();
   const c = new TetherController({
+    hold,
     platform: "win32",
     run,
     settings: () => settings,
@@ -174,7 +189,7 @@ function rig(o: { net?: Partial<Net>; settings?: Partial<TetherSettings>; activi
     }
   };
   const count = (re: RegExp) => calls.filter((x) => re.test(x.line)).length;
-  return { c, run, clock, calls, lines, net, ticks, count, set: (s: Partial<TetherSettings>) => (settings = { ...settings, ...s }) };
+  return { c, hold, run, clock, calls, lines, net, ticks, count, set: (s: Partial<TetherSettings>) => (settings = { ...settings, ...s }) };
 }
 
 test("listWifiProfiles: preference order from show profiles, SSID and mode from the XML; the temp folder is removed", async () => {
@@ -214,17 +229,18 @@ test("Windows failover without a saved hotspot profile, or without Location: the
   assert.match(b.c.status().hint ?? "", /Privacy & security → Location/);
 });
 
-test("Windows failover: connect accepted but no hotspot address reads as not broadcasting, retried after a minute", async () => {
+test("Windows failover: connect accepted but no hotspot address reads as not broadcasting, retried within seconds", async () => {
   const r = rig({ net: { probeOk: () => false, lands: {} } });
   await r.ticks(3);
   assert.equal(r.c.status().state, "hotspot-not-visible");
   assert.match(r.c.status().hint ?? "", /phone's hotspot\. On an iPhone, open Settings → Personal Hotspot/);
   assert.match(r.c.status().hint ?? "", /On Android, turn Wi-Fi hotspot on/);
   const n = r.count(/wlan connect/);
-  await r.ticks(4);
-  assert.equal(r.count(/wlan connect/), n);
-  await r.ticks(3);
-  assert.equal(r.count(/wlan connect/), n + 1);
+  // The join's own wait for an address moves this clock too, so only the first retry's timing is exact.
+  await r.ticks(1);
+  assert.equal(r.count(/wlan connect/), n + 1, "10 s later, not a minute");
+  await r.ticks(6);
+  assert.ok(r.count(/wlan connect/) < n + 1 + 6, "the gap grows: not one join per tick");
 });
 
 test("Windows return: disconnect, and Windows' own auto-connect brings Wi-Fi back", async () => {
@@ -235,6 +251,49 @@ test("Windows return: disconnect, and Windows' own auto-connect brings Wi-Fi bac
   assert.equal(r.c.status().state, "watching");
   assert.equal(r.c.status().lastSwitch?.ok, true);
   assert.ok(r.lines.some((l) => /so Windows joins the best known network/.test(l)));
+});
+
+test("netsh visible SSIDs: English/Korean fields, no BSSID or hidden/duplicate name false positives", () => {
+  const shown = `Interface name : Wi-Fi\r\nThere are 3 networks currently visible.\r\nSSID 1 : Home\r\n    Network type : Infrastructure\r\n    BSSID 1 : aa:bb:cc:dd:ee:ff\r\nSSID 2 : 맘보 2층\r\n    네트워크 종류 : 인프라\r\nSSID 3 : \r\nSSID 4 : Home\r\n`;
+  assert.deepEqual(parseVisibleSsids(shown), ["Home", "맘보 2층"]);
+  assert.deepEqual(parseVisibleSsids("There are 0 networks currently visible.\n"), []);
+  assert.deepEqual(parseVisibleSsids("All User Profile : Home\n    BSSID 1 : Home\n"), []);
+});
+
+for (const busy of [false, true]) {
+  const scenarios: { name: string; net: Partial<Net>; reason: RegExp }[] = [
+    { name: "hotspot and unknown only", net: { visible: ["PBJ’s iPhone", "Stranger"] }, reason: /no known Wi-Fi in range/ },
+    { name: "empty scan", net: { visible: [] }, reason: /no known Wi-Fi in range/ },
+    { name: "scan error", net: { scan: { code: 1, stdout: "", stderr: "scan failed" } }, reason: /scan failed/ },
+    { name: "Location refused during scan", net: { scan: { code: 0, stdout: LOCATION, stderr: "" } }, reason: /Location on to scan/ },
+    { name: "unsupported scan", net: { scan: { code: 0, stdout: "command is not supported", stderr: "" } }, reason: /no known Wi-Fi in range/ },
+    { name: "scan runner throws", net: { scan: new Error("scan timeout") }, reason: /scan failed.*scan timeout/ },
+    { name: "profile list fails", net: { profileError: "show" }, reason: /scan failed.*profiles unavailable/ },
+    { name: "profile export fails", net: { profileError: "export" }, reason: /scan failed.*profiles unavailable/ },
+    { name: "only manual known network visible", net: { visible: ["Cafe"], profiles: [{ name: "Home", ssid: "Home", mode: "auto" }, { name: "Cafe", ssid: "Cafe", mode: "manual" }] }, reason: /no known Wi-Fi in range/ },
+  ];
+  for (const scenario of scenarios) test(`Windows ${busy ? "gap" : "quiet"} return stays: ${scenario.name}`, async () => {
+    const r = rig({ net: { ip: "172.20.10.3", ...scenario.net }, activity: () => ({ inFlight: busy ? 1 : 0 }) });
+    await r.ticks(busy ? 43 : 31);
+    assert.equal(r.count(/wlan disconnect|wlan connect/), 0);
+    assert.equal(r.hold.engaged, false);
+    assert.ok(!r.lines.some((line) => /holding new model calls|hold released/.test(line)));
+    assert.equal(r.c.status().lastSwitch, null);
+    assert.equal(r.c.status().state, "on-hotspot");
+    const stays = r.lines.filter((line) => line.startsWith("tether: staying on the hotspot:"));
+    assert.equal(stays.length, 1);
+    assert.match(stays[0]!, scenario.reason);
+  });
+}
+
+test("Windows visibility matches the profile's SSID, not its name", async () => {
+  const profiles: Profile[] = [{ name: "Home profile", ssid: "맘보 2층", mode: "auto" }, { name: "Hotspot alias", ssid: "PBJ’s iPhone", mode: "auto" }];
+  const visible = rig({ net: { ip: "172.20.10.3", profiles, visible: ["맘보 2층"] } });
+  await visible.ticks(31);
+  assert.equal(visible.count(/wlan disconnect/), 1);
+  const nameOnly = rig({ net: { ip: "172.20.10.3", profiles, visible: ["Home profile", "PBJ’s iPhone"] } });
+  await nameOnly.ticks(31);
+  assert.equal(nameOnly.count(/wlan disconnect/), 0);
 });
 
 test("Windows return: nothing auto-joins after the disconnect, so the first automatic profile is asked for by name", async () => {
@@ -252,7 +311,7 @@ test("Windows return: no other automatic Wi-Fi means no attempt at all, and the 
   assert.equal(r.count(/wlan disconnect/), 0);
   assert.equal(r.c.status().state, "on-hotspot");
   // 5 min point reached at 300s and refused; the next is the 10 min point, ~290s later.
-  assert.ok(r.lines.some((l) => /staying on the hotspot \(no other Wi-Fi on this PC is set to connect automatically\); next try in (29[0-9]|300)s/.test(l)), r.lines.join("\n"));
+  assert.ok(r.lines.some((l) => /staying on the hotspot: no other Wi-Fi on this PC is set to connect automatically; next try in (29[0-9]|300)s/.test(l)), r.lines.join("\n"));
 });
 
 test("Windows return: Windows rejoins the hotspot by itself → stay, back off", async () => {

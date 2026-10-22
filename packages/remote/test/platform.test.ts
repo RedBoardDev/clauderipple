@@ -5,12 +5,12 @@ import os from "node:os";
 import fs from "node:fs";
 import http from "node:http";
 import { setTimeout as delay } from "node:timers/promises";
-import { listProcesses } from "../src/processes.ts";
+import { listProcesses, ProcessSnapshot } from "../src/processes.ts";
 import { processHasSession, liveDesktopProcesses } from "../src/desktop.ts";
 import { findClaude, specFor } from "../src/service.ts";
-import { renderService, TASK, UNIT, controlShutdown } from "../src/host-service.ts";
+import { renderService, TASK, UNIT, controlShutdown, refreshPlan } from "../src/host-service.ts";
 import { keepAwakeCommand, PowerHold, nodeSpawner } from "../src/power.ts";
-import { noisyFolder } from "../src/folders.ts";
+import { MAC_CONSENT_DENIED, MAC_CONSENT_PENDING, macConsent, macProtected, noisyFolder } from "../src/folders.ts";
 import { batchCommand, launcherOptions } from "../src/sdk-launcher.ts";
 import { HostServer } from "../src/server.ts";
 import { LocalControl, localSecret } from "../src/local-control.ts";
@@ -39,8 +39,14 @@ for (const platform of ["darwin", "linux"] as const) test(`${platform} snapshot 
     return ` PID COMMAND\n 42 claude --resume=${id}\n garbage\n`;
   }), [{ pid: 42, command: `claude --resume=${id}` }]);
 });
-test("desktop registry liveness is off before filesystem/process access on Windows and Linux", () => {
-  for (const platform of ["win32", "linux"] as const) assert.equal(liveDesktopProcesses("/not/a/registry", 0, platform).size, 0);
+test("desktop registry liveness is off on Linux and reads the Windows registry", t => {
+  assert.equal(liveDesktopProcesses("/not/a/registry", 0, "linux").size, 0);
+  // Windows reads the registry now: the process snapshot behind it decides who is live.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ripple-win-registry-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  fs.writeFileSync(path.join(dir, "42.json"), JSON.stringify({ sessionId: id, pid: 42, entrypoint: "claude-desktop", status: "idle", procStart: "134370764816580794" }));
+  const snapshot = new ProcessSnapshot({ platform: "win32", exec: () => JSON.stringify([{ ProcessId: 42, CommandLine: "claude.exe", CreationDate: "2026-10-21T17:14:41.6580790Z" }]) });
+  assert.equal(liveDesktopProcesses(dir, 0, "win32", snapshot).get(id)?.pid, 42);
 });
 test("findClaude discovers each Windows name on PATH and honors an explicit binary", () => {
   for (const name of ["claude.exe", "claude.cmd", "claude.bat"]) {
@@ -148,4 +154,35 @@ test("shutdown requires the existing loopback secret, answers before callback, a
   assert.equal((await fetch(url, { headers: { "x-ripple-local": localSecret(dir) } })).status, 404);
   await controlShutdown(dir);
   assert.equal(stops, 1);
+});
+
+test("an update restarts only the phone host this installation registered, and not mid-turn", () => {
+  const script = "/opt/cr/lib/node_modules/clauderipple/dist/remote/src/main.js";
+  const ours = `<string>${script}</string>`;
+  assert.equal(refreshPlan({ installed: false, definition: null, script, busy: undefined }), "absent");
+  assert.equal(refreshPlan({ installed: true, definition: null, script, busy: false }), "absent");
+  // A host run from a source checkout belongs to whoever set it up that way.
+  assert.equal(refreshPlan({ installed: true, definition: "<string>/Users/me/src/clauderipple/packages/remote/src/main.ts</string>", script, busy: false }), "foreign");
+  assert.equal(refreshPlan({ installed: true, definition: ours, script, busy: true }), "busy");
+  assert.equal(refreshPlan({ installed: true, definition: ours, script, busy: false }), "restart");
+  // A host from before the busy field, or one not answering, is restarted.
+  assert.equal(refreshPlan({ installed: true, definition: ours, script, busy: undefined }), "restart");
+  // The plist escapes XML; the Windows launcher doubles single quotes.
+  const odd = "/Users/a&b/cr's/main.js";
+  assert.equal(refreshPlan({ installed: true, definition: "<string>/Users/a&amp;b/cr's/main.js</string>", script: odd, busy: false }), "restart");
+  assert.equal(refreshPlan({ installed: true, definition: "'\"/Users/a&b/cr''s/main.js\"'", script: odd, busy: false }), "restart");
+});
+
+test("a read of a folder macOS guards reports the Mac's access dialog instead of hanging", async () => {
+  const home = "/Users/me";
+  for (const p of ["/Users/me/Documents", "/Users/me/Desktop/app", "/Users/me/Downloads/x", "/Users/me/Library/Mobile Documents/com~apple~CloudDocs/a", "/Volumes/USB/work"]) assert.equal(macProtected(p, home), true, p);
+  for (const p of ["/Users/me", "/Users/me/code/app", "/Users/me/DocumentsOld", "/opt/work"]) assert.equal(macProtected(p, home), false, p);
+  const never = (): Promise<string> => new Promise(() => {});
+  await assert.rejects(macConsent("/Users/me/Documents/new", never, { platform: "darwin", home, wait: 20 }), { message: MAC_CONSENT_PENDING });
+  const refused = (): Promise<string> => Promise.reject(Object.assign(new Error("operation not permitted"), { code: "EPERM" }));
+  await assert.rejects(macConsent("/Users/me/Documents/new", refused, { platform: "darwin", home, wait: 20 }), { message: MAC_CONSENT_DENIED });
+  assert.equal(await macConsent("/Users/me/Documents/new", async () => "listed", { platform: "darwin", home, wait: 20 }), "listed");
+  // Elsewhere, and on other systems, the read is left to answer or fail on its own.
+  await assert.rejects(macConsent("/Users/me/code", refused, { platform: "darwin", home, wait: 20 }), { code: "EPERM" });
+  await assert.rejects(macConsent("/Users/me/Documents/new", refused, { platform: "win32", home, wait: 20 }), { code: "EPERM" });
 });

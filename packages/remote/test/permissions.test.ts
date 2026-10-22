@@ -7,6 +7,7 @@ import { join } from "node:path";
 import { PermissionQueue } from "../src/permissions.ts";
 import type { PermissionRecord } from "../src/permissions.ts";
 import { readJson, writeFileAtomic } from "../src/fsutil.ts";
+import { posixModes } from "../../../test/capabilities.ts";
 
 function file(t: TestContext): string {
   const dir = mkdtempSync(join(tmpdir(), "ripple-permissions-"));
@@ -35,8 +36,10 @@ test("request and decision are persisted before the promise resolves", async t =
   });
   assert.deepEqual(queue.pending(), []);
   assert.deepEqual(PermissionQueue.open(path, () => now).get(record.id), decided);
-  assert.equal(statSync(path).mode & 0o777, 0o600);
-  assert.equal(statSync(join(path, "..")).mode & 0o777, 0o700);
+  if (posixModes) {
+    assert.equal(statSync(path).mode & 0o777, 0o600);
+    assert.equal(statSync(join(path, "..")).mode & 0o777, 0o700);
+  }
 });
 
 test("deciding a settled or unknown id is a no-op", async t => {

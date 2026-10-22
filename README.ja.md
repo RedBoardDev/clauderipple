@@ -250,6 +250,11 @@ npm install -g clauderipple
 clauderipple install
 ```
 
+Windows の PowerShell は既定の実行ポリシーにより、npm が作る `clauderipple.ps1` を実行しません。
+PowerShell では `clauderipple.cmd install` と入力してください(コマンドプロンプトならそのまま動きます)。
+`install` がこのファイルを削除するので、以後は PowerShell でも `clauderipple` だけで動きます。
+インストールスクリプトではこのファイルは残りません。
+
 続いてダッシュボードを開き、プロバイダーを追加します。
 
 ```sh
@@ -258,13 +263,13 @@ clauderipple ui
 
 **プロバイダー** → ChatGPTを追加するかAPIキーを貼り付け → **モデルマッピング**。
 
-**メニューバー / トレイアプリ**は任意です。ルーターの状態を表示し、ワンクリックでダッシュボードを開けます。
+**メニューバー / トレイアプリ**はルーターの状態を表示し、ワンクリックでダッシュボードを開き、ルーターが止まっていても開ける修復画面を備えています。
 
 ```sh
 clauderipple tray
 ```
 
-Electronで動作し、約270MBあるため、デフォルトではインストールされません。`clauderipple tray --install`で一度だけ取得します。それ以外の機能はすべてElectronなしで動きます。
+macOSとWindowsではインストールスクリプトが標準で追加します。Electronで動作し約270MBで、取得は一度だけです。不要ならインストールコマンドの前に`CLAUDERIPPLE_NO_TRAY=1`を付けてください。Linux、またはnpmだけでインストールした場合は`clauderipple tray --install`で追加します。それ以外の機能はすべてアプリなしで動きます。
 
 **アップデート**。新しいバージョンがあればトレイから案内されます（**アップデートを確認…**）。または次のコマンドを実行します。
 
@@ -420,7 +425,7 @@ Codex app / CLI ──/v1/responses──▶ ClaudeRipple ingress ──▶ Clau
 
 ## コミュニティ
 
-質問、不具合の報告、Ripple Remote Android 版ベータ（Google Play のクローズドテスト）への参加受付は Discord で行っています：[https://discord.gg/R8ZgGSNHjw](https://discord.gg/R8ZgGSNHjw)。Android 版ベータに参加するには、Google Play で使っている Gmail アドレスを Discord に書き込んでください。
+質問、不具合の報告、Ripple Remote Android 版ベータ（Google Play のクローズドテスト）への参加受付は Discord で行っています：[https://discord.gg/R8ZgGSNHjw](https://discord.gg/R8ZgGSNHjw)。Android 版ベータに参加するには、Google Play で使っている Gmail アドレスを @pbj_ripple にダイレクトメッセージで送ってください。誰でも読めるチャンネルには書き込まないでください。
 
 ## 提携関係について
 

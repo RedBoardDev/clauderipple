@@ -9,7 +9,7 @@ import path from "node:path";
 import type { Config } from "./config.ts";
 import { agentAliases } from "./agents.ts";
 import { isJudgeOnlyModel } from "./model-policy.ts";
-import { chatPickerModels } from "./picker.ts";
+import { chatPickerModels, providerModelWindow } from "./picker.ts";
 
 export const BOOTSTRAP_PATH = "/api/claude_cli/bootstrap";
 
@@ -61,7 +61,8 @@ export function injectBootstrap(body: Buffer, cfg: Config, agentDirs?: string[])
       const [base, effort] = id.split("@");
       const named = cfg.cli.extraModels.find((m) => m.model === base);
       // An "<model>@<effort>" entry is the same model with a different effort, so it has the same window.
-      return { model: id, name: `${named?.name ?? base}${effort ? ` · ${effort}` : ""}`, ...(named?.contextWindow ? { contextWindow: named.contextWindow } : {}) };
+      const window = named?.contextWindow ?? providerModelWindow({ ...cfg, aliases }, base ?? id);
+      return { model: id, name: `${named?.name ?? base}${effort ? ` · ${effort}` : ""}`, ...(window ? { contextWindow: window } : {}) };
     });
   const extra = chatPickerModels({ ...cfg, aliases, cli: { ...cfg.cli, extraModels: [...cfg.cli.extraModels, ...fromAgents] } });
   const win = cfg.cli.autoCompactWindow;

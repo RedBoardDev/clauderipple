@@ -93,7 +93,7 @@ function typeOf(agent: AgentRec, model: string): string {
 function whyLine(frame: Frame, agent: AgentRec): string {
   const pick = agent.pick
   if (!pick) return ''
-  const parts = [t(frame.lang, 'agents.by', { name: t(frame.lang, BY[pick.by]) }) + ' · ' + t(frame.lang, 'agents.domainLevel', { domain: t(frame.lang, 'workers.' + pick.domain), level: t(frame.lang, 'settings.' + pick.level) }) + (pick.rung ? ' · ' + t(frame.lang, 'workers.rung.' + pick.rung) : '')]
+  const parts = [t(frame.lang, 'agents.by', { name: t(frame.lang, BY[pick.by]) }) + ' · ' + t(frame.lang, 'agents.domainLevel', { domain: t(frame.lang, 'workers.' + pick.domain), level: t(frame.lang, 'settings.' + pick.level) }) + (pick.rung ? ' · ' + (pick.rule ?? 'general') + '/' + t(frame.lang, 'workers.rung.' + pick.rung) : '')]
   if (pick.why) parts.push('“' + pick.why + '”')
   return parts.join(' · ')
 }

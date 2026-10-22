@@ -27,6 +27,33 @@ async function macRunning(): Promise<boolean> {
   return r.ok && r.stdout.trim() === "true";
 }
 
+/**
+ * When the running Claude Desktop started (epoch ms), `null` when it is not running, `undefined`
+ * when that cannot be told here. Reopening it by hand applies a changed connection just as the
+ * window's button does, and this is how the window notices.
+ */
+export async function claudeStartedAt(): Promise<number | null | undefined> {
+  if (process.platform === "darwin") {
+    // `lstart` is the local start time ("Tue Oct 20 22:13:48 2026"), which Date.parse reads as local.
+    const r = await run("ps", ["-axo", "lstart=,comm="], 10_000);
+    if (!r.ok) return undefined;
+    const line = r.stdout.split("\n").find((l) => l.trimEnd().endsWith(".app/Contents/MacOS/Claude"));
+    if (!line) return null;
+    const at = Date.parse(line.trim().split(/\s+/).slice(0, 5).join(" "));
+    return Number.isFinite(at) ? at : undefined;
+  }
+  if (process.platform === "win32") {
+    const script = "$p = Get-Process -Name claude -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowHandle -ne 0 } | Select-Object -First 1; if ($p) { $p.StartTime.ToUniversalTime().ToString('o') }";
+    const r = await run("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], 15_000);
+    if (!r.ok) return undefined;
+    const text = r.stdout.trim();
+    if (!text) return null;
+    const at = Date.parse(text);
+    return Number.isFinite(at) ? at : undefined;
+  }
+  return undefined;
+}
+
 async function reopenMac(): Promise<boolean> {
   if (await macRunning()) {
     await run("osascript", ["-e", `tell application id "${MAC_BUNDLE_ID}" to quit`]);

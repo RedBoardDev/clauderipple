@@ -13,9 +13,9 @@ import { attachmentContent, messageContent, sendUserFileImages, type InputBlock 
 import { ATTACHMENT_CAP, ATTACHMENT_COUNT, type Attachment, type ImagePart, type SendBehavior } from "./protocol.ts";
 import { DesktopSessions, type DesktopProcess } from "./desktop.ts";
 import { DesktopSidebar, PHONE_GROUP, type SidebarOptions } from "./sidebar.ts";
-import { BridgeAuthError, BridgeClient, DESKTOP_BLOCKED, object, slashCommands, type BridgeFrame } from "./bridge-client.ts";
+import { BridgeAuthError, BridgeClient, CLI_NOT_LOGGED_IN, DESKTOP_BLOCKED, isCliNotLoggedIn, object, slashCommands, type BridgeFrame } from "./bridge-client.ts";
 import type { HandoffRunner } from "./handoff.ts";
-import { isDirectory } from "./folders.ts";
+import { isDirectory, macConsent, readableFolder } from "./folders.ts";
 import { readJson, writeFileAtomic } from "./fsutil.ts";
 import { createWorktree } from "./worktree.ts";
 import { MessageReceipts, OutcomeUnknownError } from "./receipts.ts";
@@ -132,16 +132,25 @@ class Inbox implements AsyncIterable<SdkUserMessage> {
 
 /** Routed models take their effort as `model@level`, which the router reads (ARCHITECTURE §3a); Claude models take the SDK's own option. */
 export function modelArg(model: string, effort: Effort | null): { model: string; effort?: Effort } {
-  if (model.startsWith("claude-")) return effort && ["low", "medium", "high", "xhigh", "max"].includes(effort) ? { model, effort } : { model };
+  // Claude Code's own aliases (router.ts offers them when no anthropic provider is declared) are
+  // Claude models too: `opus@high` would reach Anthropic as a model nobody has.
+  if (model.startsWith("claude-") || /^(opus|sonnet|haiku)(\[1m\])?$/.test(model)) return effort && ["low", "medium", "high", "xhigh", "max"].includes(effort) ? { model, effort } : { model };
   return { model: effort ? `${model}@${effort}` : model };
 }
 
 const str = (v: unknown): string => (typeof v === "string" ? v : "");
 const oneLine = (s: string, n = 200): string => { const l = s.split("\n").find((x) => x.trim()) ?? ""; return l.length > n ? l.slice(0, n - 1) + "…" : l; };
 
+function relativeToCwd(file: string, cwd: string): string {
+  if (!file || !path.isAbsolute(file)) return file;
+  const relative = path.relative(cwd, file);
+  if (!relative) return ".";
+  return relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative) ? relative : file;
+}
+
 /** One line a person reads to know what a tool call does. */
 export function summarize(tool: string, input: Record<string, unknown>, cwd: string): string {
-  const rel = (p: string): string => (p && path.isAbsolute(p) && (p === cwd || p.startsWith(cwd + "/")) ? path.relative(cwd, p) || "." : p);
+  const rel = (file: string): string => relativeToCwd(file, cwd);
   switch (tool) {
     case "Bash": return oneLine(str(input.command));
     case "Read": case "Write": case "Edit": case "MultiEdit": return rel(str(input.file_path));
@@ -745,6 +754,8 @@ export class Sessions {
     if (!PERMISSION_MODES.includes(mode)) throw new Error("invalid permission mode");
     const isolation = req.isolation ?? "local";
     if (isolation !== "local" && isolation !== "worktree") throw new Error("invalid isolation");
+    // Read first, so a folder macOS guards says so now rather than holding the session at "starting".
+    await macConsent(path.resolve(req.cwd), () => readableFolder(path.resolve(req.cwd)));
     // A worktree session runs in a fresh branch under the repo's parent; the picked folder itself is
     // never modified. The host validates everything (worktree.ts), refusing a folder that is not a repo.
     const cwd = isolation === "worktree"
@@ -1340,9 +1351,20 @@ export class Sessions {
     this.live.delete(r.id);
     this.opts.permissions.expireSession(r.id, "aborted");
     if (failure) {
-      this.append(r.id, { kind: "result", ok: false, error: failure, ms: this.now() - live.turnStart, turns: 0 });
-      this.setState(r, "error", failure.slice(0, 300));
+      const text = this.failureText(r.id, failure);
+      this.append(r.id, { kind: "result", ok: false, error: text, ms: this.now() - live.turnStart, turns: 0 });
+      this.setState(r, "error", text.slice(0, 300));
     } else if (r.state !== "idle" && r.state !== "error") this.setState(r, "stopped");
+  }
+
+  /**
+   * The CLI's own words for "no login" become the host's, so a phone reads what to do about it.
+   * The raw text stays in the host's own log line, where the exact CLI wording belongs.
+   */
+  private failureText(id: string, raw: string): string {
+    if (!isCliNotLoggedIn(raw)) return raw;
+    (this.opts.log ?? console.error)(`[session ${id.slice(0, 8)}] Claude Code CLI: ${raw.trim()}`);
+    return CLI_NOT_LOGGED_IN;
   }
 
   private handle(r: SessionRecord, live: Live, msg: Record<string, unknown>): void {
@@ -1464,7 +1486,7 @@ export class Sessions {
         const win = usage ? Object.values(usage).map((u) => u.contextWindow ?? 0).find((w) => w > 0) : undefined;
         if (win) r.contextWindow = win;
         for (const [model, u] of Object.entries(usage ?? {})) if (typeof u.contextWindow === "number") this.learnWindow(model, u.contextWindow);
-        const error = ok ? undefined : String(msg.result ?? (Array.isArray(msg.errors) ? msg.errors.join("; ") : msg.subtype ?? "error")).slice(0, 500);
+        const error = ok ? undefined : this.failureText(r.id, String(msg.result ?? (Array.isArray(msg.errors) ? msg.errors.join("; ") : msg.subtype ?? "error"))).slice(0, 500);
         this.append(r.id, { kind: "result", ok, ...(error ? { error } : {}), ms: typeof msg.duration_ms === "number" ? msg.duration_ms : this.now() - live.turnStart, turns: typeof msg.num_turns === "number" ? msg.num_turns : 0 });
         this.setState(r, live.pendingTurns > 0 ? "running" : ok ? "idle" : "error");
         if (live.pendingTurns === 0) this.handoff(r);
@@ -1514,7 +1536,15 @@ export class Sessions {
     const tools = (message.content ?? []).filter((b) => b.type === "tool_use" && b.id && b.name).map((b) => ({ id: b.id!, name: b.name!, summary: summarize(b.name!, b.input ?? {}, r.cwd), input: JSON.stringify(b.input ?? {}, null, 2) }));
     log.append({ kind: "assistant", msg: message.id ?? randomUUID(), model: message.model ?? "", ...converted, tools });
     const sub = live.subs.get(parent);
-    if (sub) { sub.steps++; if (message.model) sub.model = message.model; }
+    if (!sub) return;
+    sub.steps++;
+    // A named worker is spawned without a `model` argument, so its row had no model until it
+    // finished; its first answer says which model ran it.
+    if (message.model && sub.model !== message.model) {
+      const first = sub.model === null;
+      sub.model = message.model;
+      if (first) this.append(r.id, { kind: "subagent", toolUseId: parent, sub: `sub-${parent}`, description: sub.description, model: sub.model, status: "running", steps: sub.steps });
+    }
   }
 
   private flush(id: string, live: Live): void {

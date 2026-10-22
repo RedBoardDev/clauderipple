@@ -19,7 +19,7 @@ import { credentialHeaderValues, redactErrorText } from "../../redact.ts";
 import { codexClientVersion, latestCodexVersion, parseCodexCatalog } from "./catalog.ts";
 import fs from "node:fs";
 import path from "node:path";
-import { homeDir } from "../../config.ts";
+import { homeDir, fastSwitches } from "../../config.ts";
 
 export const DEFAULT_BASE = "https://chatgpt.com/backend-api";
 const PING_MS = 15_000;
@@ -1002,25 +1002,37 @@ export class ChatGptAdapter {
    * to replay is read out of the request itself; `carried` is filled in as the input is built and the
    * outcome lands in the request log. `replay: false` is the retry after the backend refused that
    * carrier, and it puts back exactly the request this adapter sent before any of this existed.
+   *
+   * `subagent` is the one bit about the caller the tier needs: Claude Code names the agent in the
+   * `x-claude-code-agent-id` header, and only a subagent's request carries it.
    */
-  private responsesOptions(carried: { replayed: number; undecodable: number }, model: string, effort: string | undefined, replay = true): TranslateOptions {
+  private responsesOptions(carried: { replayed: number; undecodable: number }, model: string, effort: string | undefined, replay = true, subagent = false, imageHint?: string): TranslateOptions {
     return {
       model,
       effort: effort ?? this.cfg.defaultEffort ?? "high",
       identity: this.cfg.identity ?? true,
       ...(this.cfg.instructionsAppend ? { instructionsAppend: this.cfg.instructionsAppend } : {}),
+      ...(imageHint ? { imageHint } : {}),
       replay,
       // The envelope names this provider and this model, and the request builder refuses anything
       // else: reasoning outlives the turn that made it, and a conversation moved to another model
       // must not carry the old one's sealed state with it (reasoning.ts).
       env: { p: this.name, m: model },
+      // The Fast switches are the provider's own, so the tier is the same however the turn arrived.
+      fast: fastSwitches(this.cfg),
+      subagent,
       carried,
       log: (line) => this.log.info(`chatgpt ${this.name}: ${line} (${model})`),
     };
   }
 
-  /** Handle a fully-read Messages request. `model`/`effort` already resolved by routing. */
-  async handle(req: http.IncomingMessage, res: http.ServerResponse, path: string, json: AnthropicRequest, model: string, effort: string | undefined): Promise<ChatGptOutcome> {
+  /**
+   * Handle a fully-read Messages request. `model`/`effort` already resolved by routing.
+   *
+   * `options.subagent` says the turn was made inside a subagent, which is what the provider's
+   * `fast.subagent` switch is about. `options.imageHint` is how the session makes an image (translate.ts).
+   */
+  async handle(req: http.IncomingMessage, res: http.ServerResponse, path: string, json: AnthropicRequest, model: string, effort: string | undefined, options?: { subagent?: boolean; imageHint?: string }): Promise<ChatGptOutcome> {
     if (path.startsWith("/v1/messages/count_tokens")) {
       const body = JSON.stringify({ input_tokens: estimateTokens(json) });
       res.writeHead(200, { "content-type": "application/json", "content-length": String(body.length) }).end(body);
@@ -1033,7 +1045,8 @@ export class ChatGptAdapter {
     if (serverTools.size > 0) this.log.warn(`chatgpt ${this.name}: dropped server tools for ${model}: ${[...serverTools].join(", ")} (Anthropic runs these; this provider cannot)`);
 
     const carried = { replayed: 0, undecodable: 0 };
-    let upstreamReq = toResponsesRequest(json, this.responsesOptions(carried, model, effort));
+    const subagent = options?.subagent === true;
+    let upstreamReq = toResponsesRequest(json, this.responsesOptions(carried, model, effort, true, subagent, options?.imageHint));
     let body = JSON.stringify(upstreamReq);
     const cacheKey = upstreamReq.prompt_cache_key;
     // Input estimate for message_start: a conversation only grows, so the last measured total is a floor.
@@ -1075,7 +1088,7 @@ export class ChatGptAdapter {
     // must never be the reason a user's turn fails (reasoning.ts).
     if (carried.replayed > 0 && sent.kind === "refused" && refusesReplayedReasoning(sent.status, sent.text)) {
       this.log.warn(`chatgpt ${this.name}: upstream ${sent.status} refused ${carried.replayed} replayed reasoning item(s) for ${model}; asking again without them: ${sent.text.slice(0, 200)}`);
-      upstreamReq = toResponsesRequest(json, this.responsesOptions({ replayed: 0, undecodable: 0 }, model, effort, false));
+      upstreamReq = toResponsesRequest(json, this.responsesOptions({ replayed: 0, undecodable: 0 }, model, effort, false, subagent, options?.imageHint));
       body = JSON.stringify(upstreamReq);
       carried.replayed = 0;
       sent = await ask();

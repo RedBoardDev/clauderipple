@@ -7,6 +7,7 @@ import { createDecipheriv, randomBytes } from 'node:crypto';
 import { ExpoNotifier, expoBody, expoSender, type ExpoPayload } from '../src/expo-push.ts';
 import { pushContent } from '../src/push-content.ts';
 import type { EventBody } from '../src/protocol.ts';
+import { posixModes } from '../../../test/capabilities.ts';
 const token = 'ExpoPushToken[device_one]';
 const secret = 'PRIVATE PROMPT OUTPUT PATH ERROR';
 const permission: EventBody = { kind: 'permission', id: 'p', tool: secret, title: secret, summary: secret, input: secret, canAlways: true };
@@ -107,7 +108,7 @@ test('keyed iOS/Android encrypt localized private content, authenticate it, pers
     assert.equal((decrypt(sent[0]!.data.e!, key) as { body: string }).body, `실패 · ${secret}`);
     assert.equal((decrypt(sent[1]!.data.e!, key) as { body: string }).body, `Failed · ${secret}`);
     const file = path.join(dir, 'expo-push.json');
-    assert.equal(fs.statSync(file).mode & 0o777, 0o600);
+    if (posixModes) assert.equal(fs.statSync(file).mode & 0o777, 0o600);
     restored.unsubscribe('ios'); restored.unsubscribe('android');
     assert.deepEqual(JSON.parse(fs.readFileSync(file, 'utf8')), {});
     assert.ok(!fs.readFileSync(file, 'utf8').includes(key));

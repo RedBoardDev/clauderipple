@@ -20,6 +20,7 @@ import {
   saveClaudeOAuthAccount,
 } from "../src/providers/anthropic-accounts.ts";
 import { readClaudeAuthFile, saveClaudeOAuthFile } from "../src/providers/anthropic-token-file.ts";
+import { posixModes } from "../../../test/capabilities.ts";
 
 function home(): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), "cr-claude-accounts-"));
@@ -53,7 +54,7 @@ test("account storage is private, exposes safe summaries, and never stores the u
   const dir = home();
   try {
     const account = saveClaudeOAuthAccount(dir, grant("one"), "2026-09-20T00:00:00.000Z");
-    assert.equal(fs.statSync(claudeAccountsPath(dir)).mode & 0o777, 0o600);
+    if (posixModes) assert.equal(fs.statSync(claudeAccountsPath(dir)).mode & 0o777, 0o600);
     const raw = fs.readFileSync(claudeAccountsPath(dir), "utf8");
     assert.doesNotMatch(raw, /upstream-one/);
     assert.match(raw, /[0-9a-f]{64}/);

@@ -96,12 +96,14 @@ function fileImage(file: string, sink?: ImageSink): ImagePart {
     throw error;
   }
   try {
-    const stat = fs.fstatSync(fd);
+    const stat = fs.fstatSync(fd, { bigint: true });
     const checked = imageCachePath(file);
     if (checked !== real) return unavailable;
-    const current = fs.statSync(checked);
-    if (current.dev !== stat.dev || current.ino !== stat.ino) return unavailable;
-    if (!stat.isFile() || stat.size > MAX_BYTES || !MIME.has(mediaType)) return unavailable;
+    const current = fs.statSync(checked, { bigint: true });
+    // Windows path stats report dev as zero while handle stats do not; its ino, size and birth time agree.
+    const sameDevice = current.dev === 0n || stat.dev === 0n || current.dev === stat.dev;
+    if (!sameDevice || current.ino !== stat.ino || current.size !== stat.size || current.birthtimeNs !== stat.birthtimeNs) return unavailable;
+    if (!stat.isFile() || stat.size > BigInt(MAX_BYTES) || !MIME.has(mediaType)) return unavailable;
     return { ...unavailable, blob: sink(fs.readFileSync(fd).toString("base64")) };
   } catch (error) {
     if (["ENOENT", "ENOTDIR", "EACCES", "ELOOP"].includes((error as NodeJS.ErrnoException).code ?? "")) return unavailable;

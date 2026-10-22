@@ -30,9 +30,15 @@ function ps(value: string): string {
   return `'${value.replace(/'/g, "''")}'`;
 }
 
+/**
+ * Windows PowerShell writes to a pipe in the console's code page, which we would read as UTF-8: on
+ * a Korean Windows an account named in Hangul came back garbled, so the registered task never
+ * matched and every install tried to register it again (measured 2026-10-13). The script sets
+ * UTF-8 first.
+ */
 function run(script: string): { ok: boolean; out: string } {
   try {
-    const out = execFileSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], {
+    const out = execFileSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", `[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; ${script}`], {
       env: windowsPowerShellEnv(),
       stdio: ["ignore", "pipe", "pipe"],
       windowsHide: true,

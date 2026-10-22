@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { parseJsonOutput, repairDetails, routeRequest, shouldNotifyDown, tailLines, trayState, type Doctor } from "../src/status-model.ts";
+import { parseJsonOutput, repairDetails, restartStillOwed, routeRequest, shouldNotifyDown, tailLines, trayState, type Doctor } from "../src/status-model.ts";
 
 const direct: Doctor = { mode: "direct", router: { responding: false }, desktop: { proxy: "none" }, cli: { proxy: "none" }, problems: [] };
 const down: Doctor = { mode: "ripple", router: { responding: false }, problems: [{ code: "router-down", message: "x" }] };
@@ -53,4 +53,12 @@ test("ripple:// routing: /api goes to the router, files stay inside the UI folde
   assert.equal(routeRequest("/x%00.js"), null);
   // /apix is a file, not the API.
   assert.deepEqual(routeRequest("/apix.js"), { kind: "file", rel: "apix.js" });
+});
+
+test("reopen Claude: owed only while the Claude that ran before the change is still running", () => {
+  assert.equal(restartStillOwed(1000, 500), true);
+  assert.equal(restartStillOwed(1000, 1000), true);
+  assert.equal(restartStillOwed(1000, 1500), false, "reopened by hand after the change");
+  assert.equal(restartStillOwed(1000, null), false, "quit: the next start picks the change up");
+  assert.equal(restartStillOwed(1000, undefined), true, "unknown keeps the step");
 });

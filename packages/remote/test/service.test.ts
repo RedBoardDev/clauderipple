@@ -9,8 +9,9 @@ import { PowerHold } from "../src/power.ts";
 import type { Held } from "../src/power.ts";
 import { Notifier, loadVapid, pushFor } from "../src/push.ts";
 import type { Sender } from "../src/push.ts";
-import { LABEL, agentPath, install, parseLaunchctlPrint, plist, specFor, uninstall } from "../src/service.ts";
+import { LABEL, agentPath, cliLoginWarning, install, parseLaunchctlPrint, plist, specFor, uninstall } from "../src/service.ts";
 import type { EventBody, PushSubscriptionJSON, SessionSummary } from "../src/protocol.ts";
+import { posixModes, posixPaths } from "../../../test/capabilities.ts";
 
 const tmp = (t: { after(fn: () => void): void }): string => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ripple-host-"));
@@ -33,15 +34,17 @@ test("the plist runs this checkout's main.ts with an absolute node, KeepAlive, a
   assert.match(xml, /<key>KeepAlive<\/key>\s*<true\/>/);
   assert.match(xml, /<key>ThrottleInterval<\/key>\s*<integer>10<\/integer>/);
   assert.match(xml, /<key>ProcessType<\/key>\s*<string>Interactive<\/string>/);
-  assert.match(xml, /<key>StandardOutPath<\/key>\s*<string>\/Users\/me\/\.clauderipple\/logs\/host\.log<\/string>/);
-  assert.match(xml, /<key>StandardErrorPath<\/key>\s*<string>\/Users\/me\/\.clauderipple\/logs\/host\.log<\/string>/);
   assert.match(xml, /<key>HOME<\/key>\s*<string>\/Users\/me<\/string>/);
-  assert.match(xml, /<key>WorkingDirectory<\/key>\s*<string>\/Users\/me\/Ripple &amp; Co<\/string>/);
-  // `claude` and node are found without a login shell's PATH.
-  const pathValue = /<key>PATH<\/key>\s*<string>([^<]*)<\/string>/.exec(xml)![1]!.split(":");
-  assert.equal(pathValue[0], "/Users/me/.local/bin");
-  assert.equal(pathValue[1], "/opt/node/bin");
-  assert.ok(pathValue.includes("/usr/bin") && pathValue.includes("/bin"));
+  if (posixPaths) {
+    assert.match(xml, /<key>StandardOutPath<\/key>\s*<string>\/Users\/me\/\.clauderipple\/logs\/host\.log<\/string>/);
+    assert.match(xml, /<key>StandardErrorPath<\/key>\s*<string>\/Users\/me\/\.clauderipple\/logs\/host\.log<\/string>/);
+    assert.match(xml, /<key>WorkingDirectory<\/key>\s*<string>\/Users\/me\/Ripple &amp; Co<\/string>/);
+    // `claude` and node are found without a login shell's PATH.
+    const pathValue = /<key>PATH<\/key>\s*<string>([^<]*)<\/string>/.exec(xml)![1]!.split(":");
+    assert.equal(pathValue[0], "/Users/me/.local/bin");
+    assert.equal(pathValue[1], "/opt/node/bin");
+    assert.ok(pathValue.includes("/usr/bin") && pathValue.includes("/bin"));
+  }
 });
 
 // The launchd agent's PATH: other platforms pass the inherited PATH through.
@@ -93,6 +96,17 @@ test("launchctl print: state, pid and last exit are read from the first matching
   const out = "gui/501/x = {\n\tactive count = 1\n\tstate = running\n\n\tpid = 15580\n\tlast exit code = 75: EX_TEMPFAIL\n\tendpoints = {\n\t\tstate = active\n";
   assert.deepEqual(parseLaunchctlPrint(out), { state: "running", pid: 15580, lastExit: "75: EX_TEMPFAIL" });
   assert.deepEqual(parseLaunchctlPrint(""), { state: null, pid: null, lastExit: null });
+});
+
+// ---- the Claude Code login the host needs (issue #71) ---------------------------------------------
+
+test("the install warning names the binary to run, and a machine with a login says nothing", () => {
+  const warning = cliLoginWarning({ ok: false, where: "no Claude Code login" }, "/Applications/Claude/claude.app/Contents/MacOS/claude");
+  assert.ok(warning);
+  assert.match(warning, /\/login/);
+  assert.match(warning, /\/Applications\/Claude\/claude/);
+  assert.equal(warning.includes("\n"), false, "one line");
+  assert.equal(cliLoginWarning({ ok: true, where: "the macOS keychain" }, "/x/claude"), null);
 });
 
 // ---- power ---------------------------------------------------------------------------------------
@@ -217,6 +231,6 @@ test("VAPID keys are made once, kept 0600, and survive a reload", (t) => {
   const b = loadVapid(dir, "https://relay.example");
   assert.equal(a.publicKey, b.publicKey);
   assert.equal(b.subject, "https://relay.example");
-  assert.equal(fs.statSync(path.join(dir, "vapid.json")).mode & 0o777, 0o600);
+  if (posixModes) assert.equal(fs.statSync(path.join(dir, "vapid.json")).mode & 0o777, 0o600);
   assert.equal(Buffer.from(a.publicKey, "base64url").length, 65, "an uncompressed P-256 point");
 });

@@ -20,6 +20,7 @@ import {
 import { CredentialPool } from "../src/pool.ts";
 import { Logger } from "../src/log.ts";
 import type { AnthropicRequest } from "../src/providers/chatgpt/translate.ts";
+import { posixModes } from "../../../test/capabilities.ts";
 
 const log = new Logger(null, 1e9, 0, false);
 const codexHome = fs.mkdtempSync(path.join(os.tmpdir(), "cr-gpt-codex-"));
@@ -58,7 +59,7 @@ test("store: distinct accounts are added, the same one signing in again replaces
   assert.equal(stored.length, 3);
   assert.equal(stored[0]!.accessToken, "tok-new");
   assert.equal(stored[0]!.planType, "plus");
-  assert.equal(fs.statSync(chatgptAccountsPath(home)).mode & 0o777, 0o600);
+  if (posixModes) assert.equal(fs.statSync(chatgptAccountsPath(home)).mode & 0o777, 0o600);
 });
 
 test("store: the single-login file is one account until the first write, then imported and retired", () => {

@@ -8,6 +8,7 @@ import { performance } from "node:perf_hooks";
 import { EventLog } from "../src/eventlog.ts";
 import { FRAME_CAP, INLINE_CAP } from "../src/protocol.ts";
 import type { SessionEvent, Text } from "../src/protocol.ts";
+import { posixModes } from "../../../test/capabilities.ts";
 
 function directory(t: TestContext): string {
   const dir = mkdtempSync(join(tmpdir(), "ripple-eventlog-"));
@@ -63,8 +64,10 @@ test("seq and epoch survive reopen; files are private", t => {
   assert.equal(reopened.append({ kind: "state", state: "stopped" }).seq, 3);
   assert.deepEqual(reopened.readAfter(3), { events: [], more: false });
   assert.deepEqual(reopened.readAfter(999), { events: [], more: false });
-  assert.equal(statSync(dir).mode & 0o777, 0o700);
-  for (const file of readdirSync(dir)) assert.equal(statSync(join(dir, file)).mode & 0o777, 0o600);
+  if (posixModes) {
+    assert.equal(statSync(dir).mode & 0o777, 0o700);
+    for (const file of readdirSync(dir)) assert.equal(statSync(join(dir, file)).mode & 0o777, 0o600);
+  }
   reopened.close();
   assert.throws(() => reopened.append({ kind: "state", state: "idle" }), /closed/);
 });
@@ -195,8 +198,10 @@ test("large text fields externalize and round-trip, and blob ids cannot escape",
   assert.equal(typeof small.text, "string");
   assert.equal(log.blob("../x"), null);
   assert.equal(log.blob("00000000-0000-0000-0000-000000000000"), null);
-  assert.equal(statSync(join(dir, "blobs")).mode & 0o777, 0o700);
-  for (const file of readdirSync(join(dir, "blobs"))) assert.equal(statSync(join(dir, "blobs", file)).mode & 0o777, 0o600);
+  if (posixModes) {
+    assert.equal(statSync(join(dir, "blobs")).mode & 0o777, 0o700);
+    for (const file of readdirSync(join(dir, "blobs"))) assert.equal(statSync(join(dir, "blobs", file)).mode & 0o777, 0o600);
+  }
   log.close();
   const reopened = open(t, dir);
   blobRoundTrip(reopened, assistant.text, original);

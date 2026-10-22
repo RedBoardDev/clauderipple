@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { ConfigStore, DEFAULTS, providerFor, validate } from "../src/config.ts";
+import { ConfigStore, DEFAULTS, fastSwitches, providerFor, validate } from "../src/config.ts";
 import type { AnthropicCompatibleProvider, Config, GoogleProvider, OpenAiCompatibleProvider } from "../src/config.ts";
 import { Logger } from "../src/log.ts";
 
@@ -60,6 +60,23 @@ test("validate accepts native Anthropic providers and confines account pools to 
   assert.deepEqual(validate({ ...DEFAULTS, providers: { ok: { type: "anthropic", auth: "claude-code", limits: false } } }), []);
   assert.ok(validate({ ...DEFAULTS, providers: { bad: { type: "anthropic", auth: "claude-code", limits: "no" as unknown as boolean } } }).some((error) => error.includes("limits must be true or false")));
   assert.ok(validate({ ...DEFAULTS, providers: { bad: { type: "chatgpt", limits: 1 as unknown as boolean } } }).some((error) => error.includes("limits must be true or false")));
+});
+
+test("validate accepts a chatgpt provider's Fast switches and refuses a fast that is not an object", () => {
+  assert.deepEqual(validate({ ...DEFAULTS, providers: { gpt: { type: "chatgpt", fast: { main: true, subagent: false } } } }), []);
+  assert.deepEqual(validate({ ...DEFAULTS, providers: { gpt: { type: "chatgpt", fast: {} } } }), []);
+  assert.ok(validate({ ...DEFAULTS, providers: { gpt: { type: "chatgpt", fast: "yes" as unknown as { main: boolean } } } }).some((error) => error.includes("fast must be an object")));
+});
+
+test("a Fast switch that is not a boolean reads as off", () => {
+  assert.deepEqual(fastSwitches({ fast: { main: true, subagent: true } }), { main: true, subagent: true });
+  assert.deepEqual(fastSwitches({ fast: { main: false } }), { main: false, subagent: false });
+  assert.deepEqual(fastSwitches({ fast: {} }), { main: false, subagent: false });
+  assert.deepEqual(fastSwitches(undefined), { main: false, subagent: false });
+  // A hand-edited file can hold anything: a value that is not `true` is off, never "on".
+  assert.deepEqual(fastSwitches({ fast: { main: "yes" as unknown as boolean, subagent: 1 as unknown as boolean } }), { main: false, subagent: false });
+  assert.deepEqual(fastSwitches({ fast: null as unknown as { main: boolean } }), { main: false, subagent: false });
+  assert.deepEqual(fastSwitches({ fast: "yes" as unknown as { main: boolean } }), { main: false, subagent: false });
 });
 
 test("validate accepts compatible caps and rejects invalid values", () => {

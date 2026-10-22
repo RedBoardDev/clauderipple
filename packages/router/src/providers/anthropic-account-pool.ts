@@ -66,6 +66,7 @@ export class ClaudeAccountAuthPool {
       ...(options.observed ? { observed: options.observed } : {}),
       ...(options.env ? { env: options.env } : {}),
       ...(options.now ? { now: options.now } : {}),
+      ...(options.credentialReaders ? { credentialReaders: options.credentialReaders } : {}),
     });
   }
 

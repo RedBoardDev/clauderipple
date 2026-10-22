@@ -4,7 +4,7 @@ import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { claudeBinary } from "../../cli/src/claude-auth.ts";
+import { claudeBinary, claudeLoginHint, type ClaudeCodeLogin } from "../../cli/src/claude-auth.ts";
 
 export const LABEL = "com.clauderipple.host";
 
@@ -26,6 +26,16 @@ export function findClaude(configured: string | undefined, exists: (p: string) =
   }
   // Shared discovery also covers both AppData roots and Desktop's version/hash cache layout.
   return platform === process.platform && exists === fs.existsSync ? claudeBinary() ?? undefined : undefined;
+}
+
+/**
+ * The one line `remote install` prints when the Claude Code CLI has no login of its own: the host
+ * starts Claude Code through the Agent SDK and passes no credential, so every phone turn would
+ * fail at once with the CLI's own "Not logged in" (issue #71). Null when there is a login.
+ */
+export function cliLoginWarning(login: ClaudeCodeLogin, binary: string | null): string | null {
+  if (login.ok) return null;
+  return `Claude Code has no login on this computer, so phone sessions will fail until it has one. ${claudeLoginHint(binary)}`;
 }
 
 // ---- launchd ------------------------------------------------------------------------------------

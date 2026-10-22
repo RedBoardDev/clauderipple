@@ -14,6 +14,7 @@ import {
 } from "../src/providers/anthropic.ts";
 import { ObservedClaudeCodeAuth } from "../src/providers/anthropic-observed.ts";
 import { saveClaudeAuthFile } from "../src/providers/anthropic-token-file.ts";
+import { posixModes } from "../../../test/capabilities.ts";
 
 test("borrowed Claude Code credential is cached for 60 seconds and never refreshed", () => {
   let reads = 0;
@@ -83,7 +84,7 @@ test("expired observed header falls through env, stored CLI credential, then 060
   observed.observe(["authorization", "Bearer stale-secret"], 0);
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "cr-claude-auth-"));
   saveClaudeAuthFile(home, "file-secret", "2026-09-13T00:00:00.000Z");
-  assert.equal(fs.statSync(path.join(home, "claude-auth.json")).mode & 0o777, 0o600);
+  if (posixModes) assert.equal(fs.statSync(path.join(home, "claude-auth.json")).mode & 0o777, 0o600);
   const missing = new ClaudeCodeCredentialStore(() => null, () => 12 * 60 * 60 * 1_000 + 1);
   const fromFile = new ClaudeCodeAuthStore(missing, { observed, home, env: {}, now: () => 12 * 60 * 60 * 1_000 + 1 }).get();
   assert.ok(!(fromFile instanceof Error));

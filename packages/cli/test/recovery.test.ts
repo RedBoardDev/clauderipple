@@ -16,6 +16,7 @@ import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
+import { posixModes, posixPaths } from "../../../test/capabilities.ts";
 
 const root = fs.mkdtempSync(path.join(os.tmpdir(), "cr-recovery-"));
 const label = `com.clauderipple.check-${crypto.randomBytes(4).toString("hex")}`;
@@ -151,7 +152,7 @@ test("registration mirrors install: packaged/Windows/Linux run node + router, a 
   const linux = registration(rt, "/h", "1.0.0", "linux", null);
   assert.deepEqual(linux, { program: rt.node, args: [rt.router], bundleId: "com.clauderipple.app", env: { A: "1" }, bundle: null });
   const mac = registration(rt, "/h", "1.0.0", "darwin", "/s.json");
-  assert.equal(mac.program, "/h/ClaudeRipple.app/Contents/MacOS/ClaudeRipple");
+  if (posixPaths) assert.equal(mac.program, "/h/ClaudeRipple.app/Contents/MacOS/ClaudeRipple");
   assert.deepEqual(mac.env, { CLAUDE_SETTINGS_PATH: "/s.json" });
   assert.deepEqual(mac.bundle, { node: rt.node, script: rt.router, version: "1.0.0" });
 });
@@ -185,7 +186,7 @@ test("doctor: a plist whose program no longer exists is named, with the router d
   fs.writeFileSync(plistPath(), renderPlist({ program: gone, args: ["/old/router/src/index.js"], home, stdoutLog: path.join(home, "logs", "launchd.log") }));
   const reg = registration(fakeRuntime(path.join(root, "rt-doc")), home, "1.0.0");
   const lc = fakeLaunchctl({ loaded: true, running: false });
-  const d = await doctor({ home, version: "1.0.0", supervisor: launchdSupervisor(reg, home, lc.run), routerStatus: silent });
+  const d = await doctor({ home, version: "1.0.0", supervisor: launchdSupervisor(reg, home, lc.run), routerStatus: silent, remoteHostInstalled: () => false });
   assert.equal(d.supervisor.registered, true);
   assert.equal(d.supervisor.program, gone);
   assert.equal(d.supervisor.programExists, false);
@@ -203,7 +204,7 @@ test("doctor: shape, mode and proxies on a healthy install", async () => {
   fs.writeFileSync(settings, JSON.stringify({ env: { HTTPS_PROXY: proxyUrl, NODE_EXTRA_CA_CERTS: path.join(home, "ca.pem") } }));
   applyAppProxy(proxyUrl);
   const { ops } = fakeSupervisor({ pid: 77 });
-  const d = await doctor({ home, version: "9.9.9", supervisor: ops, routerStatus: answering("9.9.9") });
+  const d = await doctor({ home, version: "9.9.9", supervisor: ops, routerStatus: answering("9.9.9"), remoteHostInstalled: () => false });
   assert.deepEqual(d, {
     mode: "ripple",
     router: { responding: true, version: "9.9.9", pid: 77, url: proxyUrl, adminUrl: "http://127.0.0.1:18792" },
@@ -212,6 +213,25 @@ test("doctor: shape, mode and proxies on a healthy install", async () => {
     cli: { proxy: "ripple", url: proxyUrl },
     problems: [],
   });
+});
+
+test("doctor: a phone host whose Claude Code CLI has no login is named, with the fix (issue #71)", async () => {
+  const { home, proxyUrl, settings } = scratch({ listen: { host: "127.0.0.1", port: 18791 } });
+  fs.writeFileSync(settings, JSON.stringify({ env: { HTTPS_PROXY: proxyUrl } }));
+  const { ops } = fakeSupervisor({});
+  const noLogin = async () => ({ ok: false, where: "no Claude Code login" });
+  const d = await doctor({ home, version: "1.0.0", supervisor: ops, routerStatus: answering("1.0.0"), remoteHostInstalled: () => true, claudeLogin: noLogin });
+  const problem = d.problems.find((p) => p.code === "cli-not-logged-in");
+  assert.ok(problem, d.problems.map((p) => p.code).join());
+  assert.match(problem!.message, /\/login/);
+
+  // With a login of its own, nothing is said about one.
+  const loggedIn = await doctor({ home, version: "1.0.0", supervisor: ops, routerStatus: answering("1.0.0"), remoteHostInstalled: () => true, claudeLogin: async () => ({ ok: true, where: "the macOS keychain" }) });
+  assert.equal(loggedIn.problems.some((p) => p.code === "cli-not-logged-in"), false);
+
+  // Without the phone host, a missing CLI login is nobody's problem.
+  const noHost = await doctor({ home, version: "1.0.0", supervisor: ops, routerStatus: answering("1.0.0"), remoteHostInstalled: () => false, claudeLogin: noLogin });
+  assert.equal(noHost.problems.some((p) => p.code === "cli-not-logged-in"), false);
 });
 
 // ---- repair ------------------------------------------------------------------------------
@@ -232,6 +252,7 @@ test("repair re-registers a plist whose program is gone, starts it and waits for
     routerStatus: async () => (lc.isRunning() ? { version: "1.0.0" } : null),
     sleep: noSleep,
     healthBudgetMs: 2_000,
+    remoteHostInstalled: () => false,
   };
   const r = await repair(deps);
   assert.deepEqual(r.steps.map((s) => [s.name, s.ok]), [["supervisor", true], ["start", true], ["health", true]]);
@@ -255,7 +276,7 @@ test("repair re-registers a plist whose program is gone, starts it and waits for
 test("repair leaves a router that answers alone even when its entry names another installation", async () => {
   const { home } = scratch();
   const { ops, calls } = fakeSupervisor({ current: false, program: process.execPath });
-  const r = await repair({ home, version: "1.0.0", supervisor: ops, routerStatus: answering("1.0.0"), sleep: noSleep });
+  const r = await repair({ home, version: "1.0.0", supervisor: ops, routerStatus: answering("1.0.0"), sleep: noSleep, remoteHostInstalled: () => false });
   assert.deepEqual(calls, []);
   assert.equal(r.ok, true);
   assert.match(r.steps[0]!.detail, /left as it is/);
@@ -264,7 +285,7 @@ test("repair leaves a router that answers alone even when its entry names anothe
 test("repair reports a router that never comes up, and a supervisor that cannot register", async () => {
   const { home } = scratch();
   const { ops } = fakeSupervisor({ registered: false, state: "not-loaded" }, { register: () => { throw new Error("launchctl bootstrap failed: 5"); }, start: "failed" });
-  const r = await repair({ home, version: "1.0.0", supervisor: ops, routerStatus: silent, sleep: noSleep, healthBudgetMs: 0 });
+  const r = await repair({ home, version: "1.0.0", supervisor: ops, routerStatus: silent, sleep: noSleep, healthBudgetMs: 0, remoteHostInstalled: () => false });
   assert.equal(r.ok, false);
   assert.deepEqual(r.steps.map((s) => [s.name, s.ok]), [["supervisor", false], ["start", false], ["health", false]]);
   assert.match(r.steps[0]!.detail, /bootstrap failed/);
@@ -273,7 +294,7 @@ test("repair reports a router that never comes up, and a supervisor that cannot 
 test("repair without an installation says so and does nothing", async () => {
   const { home } = scratch(null);
   const { ops, calls } = fakeSupervisor({ registered: false });
-  const r = await repair({ home, version: "1.0.0", supervisor: ops, routerStatus: silent, sleep: noSleep });
+  const r = await repair({ home, version: "1.0.0", supervisor: ops, routerStatus: silent, sleep: noSleep, remoteHostInstalled: () => false });
   assert.equal(r.ok, false);
   assert.deepEqual(r.steps.map((s) => s.name), ["config"]);
   assert.deepEqual(calls, []);
@@ -285,7 +306,7 @@ test("repair moves Claude settings that are ours on an old port, and only those"
   fs.writeFileSync(settings, JSON.stringify({ env: { HTTPS_PROXY: "http://127.0.0.1:9999", NODE_EXTRA_CA_CERTS: ca, KEEP: "1" }, model: "opus" }));
   applyAppProxy("http://127.0.0.1:9999");
   const { ops } = fakeSupervisor({});
-  const r = await repair({ home, version: "1.0.0", supervisor: ops, routerStatus: answering("1.0.0"), sleep: noSleep });
+  const r = await repair({ home, version: "1.0.0", supervisor: ops, routerStatus: answering("1.0.0"), sleep: noSleep, remoteHostInstalled: () => false });
   assert.ok(r.steps.some((s) => s.name === "cli-proxy" && s.ok));
   assert.ok(r.steps.some((s) => s.name === "desktop-proxy" && s.ok));
   const s = JSON.parse(fs.readFileSync(settings, "utf8"));
@@ -295,7 +316,7 @@ test("repair moves Claude settings that are ours on an old port, and only those"
   // A proxy with someone else's CA is not ours, whatever its port.
   const foreign = JSON.stringify({ env: { HTTPS_PROXY: "http://127.0.0.1:3128", NODE_EXTRA_CA_CERTS: "/corp.pem" } });
   fs.writeFileSync(settings, foreign);
-  const r2 = await repair({ home, version: "1.0.0", supervisor: ops, routerStatus: answering("1.0.0"), sleep: noSleep });
+  const r2 = await repair({ home, version: "1.0.0", supervisor: ops, routerStatus: answering("1.0.0"), sleep: noSleep, remoteHostInstalled: () => false });
   assert.equal(fs.readFileSync(settings, "utf8"), foreign);
   assert.ok(r2.doctor.problems.some((p) => p.code === "cli-foreign-proxy"));
 });
@@ -345,7 +366,7 @@ test("direct on then off: only our values leave, other keys stay, and everything
   assert.deepEqual(JSON.parse(fs.readFileSync(directStatePath(ctx.home), "utf8")).cli, saved.cli);
 
   const { ops, calls } = fakeSupervisor({});
-  const off = await directOff({ home: ctx.home, version: "1.0.0", supervisor: ops, routerStatus: answering("1.0.0"), sleep: noSleep });
+  const off = await directOff({ home: ctx.home, version: "1.0.0", supervisor: ops, routerStatus: answering("1.0.0"), sleep: noSleep, remoteHostInstalled: () => false });
   assert.equal(off.ok, true, off.detail);
   assert.equal(off.mode, "ripple");
   assert.deepEqual(calls, [], "a router that answers is not repaired");
@@ -365,7 +386,7 @@ test("direct off refuses a proxy set in the meantime unless forced", async () =>
   const foreign = JSON.stringify(s);
   fs.writeFileSync(ctx.settings, foreign);
   const { ops } = fakeSupervisor({});
-  const deps = { home: ctx.home, version: "1.0.0", supervisor: ops, routerStatus: answering("1.0.0"), sleep: noSleep };
+  const deps = { home: ctx.home, version: "1.0.0", supervisor: ops, routerStatus: answering("1.0.0"), sleep: noSleep, remoteHostInstalled: () => false };
   const refused = await directOff(deps);
   assert.equal(refused.ok, false);
   assert.match(refused.detail, /http:\/\/corp:8080.*--force/);
@@ -383,7 +404,7 @@ test("direct off refuses a Claude Desktop proxy entry applied in the meantime", 
   fs.writeFileSync(path.join(configLibraryDir(), "vpn.json"), JSON.stringify({ egressProxyUrl: "http://vpn:1080" }));
   fs.writeFileSync(path.join(configLibraryDir(), "_meta.json"), JSON.stringify({ ...meta(), appliedId: "vpn" }));
   const { ops } = fakeSupervisor({});
-  const r = await directOff({ home: ctx.home, version: "1.0.0", supervisor: ops, routerStatus: answering("1.0.0"), sleep: noSleep });
+  const r = await directOff({ home: ctx.home, version: "1.0.0", supervisor: ops, routerStatus: answering("1.0.0"), sleep: noSleep, remoteHostInstalled: () => false });
   assert.equal(r.ok, false);
   assert.match(r.detail, /vpn:1080/);
   assert.equal(meta().appliedId, "vpn");
@@ -422,7 +443,7 @@ test("macOS launcher: a minimal bundle in the overridden Applications dir that r
   assert.match(plist, new RegExp(`<key>CFBundleIdentifier</key><string>${LAUNCHER_BUNDLE_ID.replace(/\./g, "\\.")}</string>`));
   assert.doesNotMatch(plist, /com\.clauderipple\.router/);
   const exe = path.join(app, "Contents", "MacOS", "ClaudeRipple");
-  assert.equal(fs.statSync(exe).mode & 0o111, 0o111);
+  if (posixModes) assert.equal(fs.statSync(exe).mode & 0o111, 0o111);
   const script = fs.readFileSync(exe, "utf8");
   assert.match(script, /^#!\/bin\/sh/);
   assert.ok(script.includes(`export CLAUDERIPPLE_HOME='${home}'`));

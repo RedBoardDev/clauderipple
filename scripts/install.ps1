@@ -11,6 +11,7 @@
 #   CLAUDERIPPLE_PREFIX    where to install            (default: $HOME\.clauderipple)
 #   CLAUDERIPPLE_PACKAGE   what to install             (default: clauderipple, from npm)
 #   CLAUDERIPPLE_NO_SETUP  1 = install only, no setup  (default: run `clauderipple install`)
+#   CLAUDERIPPLE_NO_TRAY   1 = do not add the menu-bar app (Electron is ~270MB)
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
@@ -161,6 +162,26 @@ if ($env:CLAUDERIPPLE_NO_SETUP -eq '1') {
 
 Write-Host ''
 & $cmd install
-if ($RestartTray) { & $cmd tray }
+
+# Part of the default install on Windows: it carries the dashboard that opens with the router down
+# (repair, switch to Claude's own connection), which is the entry point a non-terminal user needs.
+# Electron is ~270MB, so CLAUDERIPPLE_NO_TRAY=1 skips it.
+$trayReady = $false
+if ($env:CLAUDERIPPLE_NO_TRAY -ne '1') {
+  Write-Host ''
+  Write-Host 'Adding the menu-bar app (Electron, about 270MB, fetched once)...'
+  & $cmd tray --install
+  if ($LASTEXITCODE -eq 0) {
+    & $cmd app --install
+    if ($LASTEXITCODE -ne 0) { Write-Host "The menu-bar app's launcher was not added; try again with: clauderipple app --install" }
+    $trayReady = $true
+  } else {
+    Write-Host ''
+    Write-Host 'The router is installed; the menu-bar app was not. Add it later with: clauderipple tray --install'
+  }
+}
+# Started once: either because the new tray was just installed, or because the old one was stopped
+# to move its Electron.
+if ($RestartTray -or $trayReady) { & $cmd tray }
 Write-Host ''
 Write-Host 'Open the dashboard with: clauderipple ui'

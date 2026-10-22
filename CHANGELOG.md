@@ -1,5 +1,157 @@
 # Changelog
 
+## 0.12.7 — 2026-10-22
+
+### Fixed
+
+- **A GPT main session knows it can make images.** How to call `/api/image` was written only into
+  generated worker files, so a session running GPT as its own model said it had no image tool and
+  drew an SVG. The same lines now end its instructions; subagent turns are unchanged.
+- **A relay's 402 for a downed model no longer parks the whole account.** OpenCode Go answered 402
+  while one model's endpoint was down, which read as billing exhaustion and rested the account for
+  30 minutes, DeepSeek included. A refusal whose body says the upstream failed is now transient.
+- **A failed hotspot join is tried again within seconds** (10 s, 20 s, 30 s … up to a minute)
+  instead of waiting out the once-a-minute switch rule.
+- **`ripple:auto` asks for a bare task description,** so the Claude app's running-agent row no
+  longer shows another worker's model name copied into the title.
+
+## 0.12.6 — 2026-10-22
+
+### Fixed
+
+- **The phone can pick a folder on another Windows drive.** Browsing starts in `C:\Users\<name>`,
+  and a drive root had nowhere to go up to, so a project on `E:` was out of reach. A drive root now
+  lists the other drives first.
+- **The phone's model picker always offers Claude.** It listed only what the router's providers
+  declare, so a router that passes Claude straight through showed no Claude, and with no other
+  provider the picker was empty. Claude Code's own Opus, Sonnet and Haiku are now offered when no
+  Claude provider is configured.
+- **A running worker's row names its model** as soon as the worker's first answer (or, for a Claude
+  app session, its meta file) says which model ran it, instead of only when it finishes.
+- **A quiet computer reads as a wait, not a lost connection.** The phone's red "connection lost"
+  card came after 30 seconds of silence, which a phone that slept or switched networks often
+  reaches. It now comes after a minute, in the warning tone, as "waiting for your computer", and
+  time the phone app spent in the background no longer counts toward it.
+- **Jev gets 5 seconds to answer** before Haiku judges instead. It answers in about 2.1–2.4
+  seconds, so 3 seconds timed out whenever OpenCode slowed down.
+- **`clauderipple install` removes npm's `clauderipple.ps1` on Windows.** PowerShell runs it before
+  `clauderipple.cmd`, and its default execution policy refuses it, so an `npm install -g` user could
+  not run `clauderipple` in PowerShell. The README now says to start with `clauderipple.cmd` there.
+- **The phone says when the Mac is asking for folder access.** Opening a folder macOS guards
+  (Desktop, Documents, Downloads, iCloud Drive, another volume) for the first time puts up the
+  Mac's "would like to access" dialog, and the phone waited in silence, then said the computer did
+  not answer. It now says the dialog is up within two seconds, and where to allow access if it was
+  refused.
+- **The band's limits row comes back at the next check after a failed read**, not a minute later.
+
+## 0.12.5 — 2026-10-22
+
+### Changed
+
+- **The install script adds the menu-bar app on macOS and Windows.** It carries the repair
+  screen that opens while the router is down, which someone who does not use a terminal needs.
+  Electron is about 270MB and fetched once; `CLAUDERIPPLE_NO_TRAY=1` skips it, and a failed
+  fetch leaves the router installed with a hint to add the app later. Linux keeps it opt-in.
+
+### Fixed
+
+- **Updating restarts the phone host too.** An update replaced the files but left the running
+  host on the old code until the machine restarted, so a fix like 0.12.4's Windows sending did
+  not arrive. `install` (which every update ends with) now restarts a phone host this
+  installation registered, unless a turn is in progress; then it says to run
+  `clauderipple remote install` afterwards. A host run from a source checkout is left alone.
+- **Windows with a non-ASCII account name no longer re-registers the router on every install.**
+  The scheduled task was read back in the console's code page, so it never matched (#74, #75 by
+  @115dkk). Tests that assumed "/" paths or POSIX permission bits now run only where those hold
+  (#76).
+
+## 0.12.4 — 2026-10-22
+
+### Added
+
+- **On Windows, the phone can send to a session open in the Claude app.** Before, such a session
+  could be read but not written to. It needs Remote Control turned on in the Claude app, the same
+  as on macOS; with only the Claude app in use, the login ClaudeRipple saw the app use carries it.
+  Handing a phone session over to the Claude app is still macOS only.
+
+## 0.12.3 — 2026-10-22
+
+### Added
+
+- **Fast for GPT, separately for the main session and for subagents.** The ChatGPT provider's
+  settings have two switches, both off: "Fast for the main session" and "Fast for subagents".
+  When on, those GPT requests go out on Codex's fast tier, which answers sooner and uses the
+  subscription faster. Claude Code's own Fast toggle does not reach GPT models, so these are the
+  way to turn it on. Each request in the log now says whether a subagent made it.
+
+### Fixed
+
+- **The phone host says when Claude Code has no login of its own.** On a computer that only ever
+  used the Claude app, every phone turn failed at once with "Not logged in". `clauderipple doctor`
+  and `clauderipple remote install` now warn about it and say how to log in, and the phone shows
+  that instead of the raw error.
+
+## 0.12.2 — 2026-10-22
+
+### Fixed
+
+- **Back on Wi-Fi only when a known Wi-Fi is in range.** After a hotspot failover, the way back
+  no longer drops the hotspot for a Wi-Fi that is not there, which cut the connection on the move.
+
+### Changed
+
+- **Naming a model on a delegation is now explained to the main chat.** `ripple:auto`'s
+  description says that `[[ripple: opus@high]]` (or a worker's name) on the first line runs that
+  model past every ClaudeRipple rule and still shows in the agents panel, so a session no longer
+  starts models outside it to get one. It also says what a brief should state, to check that the
+  report did what was asked, and to resume a worker only within 5 minutes of its last reply.
+
+## 0.12.1 — 2026-10-21
+
+### Changed
+
+- **One web setting covers page reading too.** WebFetch downloads a page and has the small, fast
+  model answer from it; that answer now comes from the model picked for web search, as WebSearch
+  already did, instead of Haiku on Claude quota. The Clients row is "Web search & page reading". If
+  that model fails before answering, the request goes where it went before.
+- **Design work takes the heavy level of the frontend + design ladder**, whatever tier it was
+  given: a task judged design runs on the heavy workers, since its result depends on the model's
+  taste rather than on difficulty. Frontend tasks still pick by tier.
+
+## 0.12.0 — 2026-10-21
+
+### Added
+
+- **ClaudeRipple updates itself.** The router checks for a new version 10 minutes after it starts
+  and every 12 hours, and installs it once nothing has been in flight for 10 minutes; requests in
+  flight finish before the restart. A version that fails to come up is not retried for 24 hours.
+  The tray shows a desktop notification when an update has landed, or when one is available where
+  nothing installs by itself. Off with the switch in the dashboard's About view. Versions before
+  this one need one manual update to get here.
+- **Frontend + design and backend can have workers of their own.** Each worker set (Base and every
+  mode) can give those two domains their own ladder of two levels, light work and heavy work; every
+  other task keeps the four general workers. When the main chat names a task's tier, the judge is
+  asked for its domain only while such a ladder is set.
+- **Base has its own delegation strength.** Eager delegation no longer needs a mode to be on.
+- **Web search gets its own model.** The Clients view picks the model that answers `WebSearch`
+  apart from the small, fast one, from the models ClaudeRipple can actually search with. It applies
+  at once, without a new session.
+- **OpenCode Go's Gemini model works** (#68). A model can speak Google's `generateContent` wire
+  inside one provider; `gemini-4-argon-contributor` is listed on it, sent with OpenCode's session
+  header.
+- **The Phone view introduces Ripple Remote**, with an App Store button for your language's store,
+  until a phone is paired.
+- **Image generations appear in the request log and the usage counts.**
+- **The Compact icon shows how many times the chat has been compacted.**
+
+### Fixed
+
+- **A routed model's compaction window falls back to the one its provider declared**, not the
+  global default: a 1M-token subagent was compacting at about 240K.
+- **"Reopen Claude" goes away once Claude has restarted**, however it was restarted.
+- **OpenCode Go's DeepSeek is no longer offered as a search model**; it never ran a search.
+- **A router that briefly lost its settings no longer sends every chat back to setup.**
+
 ## 0.11.1 — 2026-10-20
 
 ### Fixed

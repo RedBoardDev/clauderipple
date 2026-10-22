@@ -178,6 +178,18 @@ test("each routed model and slot keeps its own compaction window; the global val
   assert.equal(out.auto_compact_windows["claude-opus-4-6"], 258400);
 });
 
+test("a picker model with no window of its own takes its provider's before the global fallback", () => {
+  const fromProvider: Config = {
+    ...cfg,
+    routes: {},
+    providers: { ...cfg.providers, go: { type: "openai-compatible", url: "https://example.test/v1", models: [{ id: "minimax-m3.1-flash-free", contextWindow: 1_000_000 }] } },
+    cli: { extraModels: [{ model: "minimax-m3.1-flash-free", name: "MiniMax" }, { model: "gpt-6-astra@high", name: "GPT-6 Astra" }], autoCompactWindow: 258400 },
+  };
+  const out = JSON.parse(injectBootstrap(Buffer.from(JSON.stringify({})), fromProvider, []).toString());
+  assert.equal(out.auto_compact_windows["minimax-m3.1-flash-free"], 1_000_000, "the provider declared 1M");
+  assert.equal(out.auto_compact_windows["gpt-6-astra@high"], 258400, "nobody declared one → global fallback");
+});
+
 test("a per-model window applies even with no global autoCompactWindow", () => {
   const noGlobal: Config = {
     ...cfg,

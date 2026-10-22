@@ -64,6 +64,18 @@ today and need a Windows path before Ripple Remote ships on Windows:
 | Live-session check | `~/.claude/sessions/<pid>.json` (shared) + `ps` fallback (`src/desktop.ts`) | replace the `ps` fallback |
 
 First confirm the Windows Claude app writes the same session registry and supports Remote Control.
+
+**Measured 2026-10-22 (issue #70), Windows 11 arm64 VM, Claude app 2.42304.0 (Store), CLI 2.1.299:**
+the registry is the same file with the same keys, except `procStart` is a FILETIME string (100 ns
+ticks since 1601 UTC) that equals `Win32_Process.CreationDate` exactly, and `pidDomain` is
+`win32:<hex>`. `bridgeSessionId` is written only when the app's Remote Control is on (a session
+opened with it off had none; one opened after turning it on had one). The app-started CLI's command
+line carries no session id for a new session, so the registry, not the command line, identifies
+it. With only the app in use there is no `~/.claude/.credentials.json`; the bridge then uses the
+router's observed login. Sending through the bridge from the VM put the message into the app
+session's transcript under its uuid and the session answered. Ported: the live-session check and the
+bridge login (`desktop.ts`, `bridge-client.ts`, `processes.ts`'s cached snapshot). Still macOS-only:
+handoff (ConPTY), the desktop sidebar, away detection.
 Verify in the Parallels VM (prlctl exec).
 
 ## Acceptance

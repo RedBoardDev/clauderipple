@@ -27,7 +27,9 @@ import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import http from "node:http";
-import { execFile, spawn } from "node:child_process";
+import { runCli, startCliDetached, parseUpdateCheck, type DetachedCli } from "./cli-control.ts";
+import { AutoUpdater } from "./autoupdate.ts";
+export { parseUpdateCheck, type UpdateCheck } from "./cli-control.ts";
 import { fileURLToPath } from "node:url";
 import type { Config, Provider, ProviderModel } from "./config.ts";
 import { adminPort, headerValueProblem, homeDir, searchProviderFor, ssidProblem, validate } from "./config.ts";
@@ -36,8 +38,8 @@ import { generatedAgents } from "./agents.ts";
 import { isJudgeOnlyModel } from "./model-policy.ts";
 import { ModSettingsInputError, readModSettings, validateSettings, validateSettingsSchema, writeModSettings } from "./mod-settings.ts";
 import { billingOf, claudeChoices, fillLadder, ladderNeedsFill } from "../../mod/hooks/ladder.ts";
-import { normalizeSettings } from "../../mod/hooks/settings.ts";
-import type { Billing, Effort, LadderChoice, Settings } from "../../mod/types/index.d.ts";
+import { normalizeSettings, twoLevelRungs } from "../../mod/hooks/settings.ts";
+import type { Billing, DomainRules, Effort, LadderChoice, Settings } from "../../mod/types/index.d.ts";
 import { chatPickerModels } from "./picker.ts";
 import type { Logger } from "./log.ts";
 import type { ProviderExhaustion } from "./health.ts";
@@ -50,7 +52,7 @@ import { CHATGPT_FALLBACK_MODELS } from "./providers/chatgpt/catalog.ts";
 import { measureModel, refusedByPlan, type Measured, type WireCandidate } from "./capabilities.ts";
 import { catalogEntry } from "./catalog.ts";
 import { ModelScoreCatalog, buildModelScores } from "./model-scores.ts";
-import { ClaudeCodeAuthStore, nativeAnthropicHeaders } from "./providers/anthropic.ts";
+import { ClaudeCodeAuthStore, nativeAnthropicHeaders, type ClaudeCodeCredentialReaders } from "./providers/anthropic.ts";
 import type { ObservedClaudeCodeAuth } from "./providers/anthropic-observed.ts";
 import { fetchClaudeModels, newClaudeReleases, type ClaudeModel } from "./providers/anthropic-models.ts";
 import { codexEnabled, codexHome } from "../../cli/src/codex.ts";
@@ -152,10 +154,13 @@ export type AdminDeps = {
   picker?: () => { enabled: boolean; hosts: string[]; last: unknown };
   /** Optional: observed CLI credentials held by the live proxy, never serialized directly. */
   observedClaudeCodeAuth?: ObservedClaudeCodeAuth;
+  /** Test seam for Claude Code's keychain and credential-file readers. */
+  claudeCodeCredentialReaders?: ClaudeCodeCredentialReaders;
   /** Test seam for the local CLI side effects. Production uses the installed CLI runtime. */
   runCli?: (args: string[], timeout?: number) => Promise<{ ok: boolean; output: string }>;
   /** Test seam for a CLI run that must outlive this router (the update). */
-  startCliDetached?: (args: string[], log: string) => void;
+  startCliDetached?: (args: string[], log: string, env?: NodeJS.ProcessEnv) => DetachedCli | void;
+  autoUpdater?: AutoUpdater;
   /** Test seam for the native Anthropic API-key probe. */
   probeFetch?: (url: string, init: RequestInit) => Promise<Response>;
   /** Test seam for a provider model probe (`POST /api/providers/probe`), which in production uses a timeout. */
@@ -407,23 +412,6 @@ let chatgptLogin: ChatgptLogin = { running: false };
 let claudeOAuth: ClaudeOAuthSession | null = null;
 /** The Google (Antigravity) sign-in in progress (or the last one), for GET /api/google-login. */
 let googleOAuth: GoogleOAuthSession | null = null;
-/** When the GUI last started an update. It restarts this router, so a fresh process starts at 0. */
-let updateStartedAt = 0;
-const UPDATE_RUN_MS = 10 * 60 * 1000;
-
-export type UpdateCheck = { current: string; latest: string | null; newer: boolean; kind: string };
-
-/** The last line of `clauderipple update --check --json`, or null when it said something else. */
-export function parseUpdateCheck(output: string): UpdateCheck | null {
-  try {
-    const check = JSON.parse(output.trim().split("\n").pop() ?? "") as Partial<UpdateCheck>;
-    if (typeof check.current !== "string" || typeof check.newer !== "boolean" || typeof check.kind !== "string") return null;
-    return { current: check.current, latest: typeof check.latest === "string" ? check.latest : null, newer: check.newer, kind: check.kind };
-  } catch {
-    return null;
-  }
-}
-
 /** Shared catalog for the GUI: model-specific values override provider defaults. */
 export function effortLevels(cfg: Config): { providers: Record<string, { default: string[]; models?: Record<string, string[]> }> } {
   const providers: Record<string, { default: string[]; models?: Record<string, string[]> }> = {
@@ -725,12 +713,16 @@ function ladderChoices(options: ModOptions): LadderChoice[] {
  */
 async function withFilledLadder(deps: AdminDeps, scores: ModelScoreCatalog, settings: Settings): Promise<Settings> {
   const general = settings.rules.general;
-  if (![general, ...settings.modes].some(set => ladderNeedsFill(set.rungs))) return settings;
+  const sets = [settings, ...settings.modes];
+  const domains = sets.flatMap(set => Object.values(set.domainRules ?? {}));
+  if (![general, ...settings.modes, ...domains].some(set => ladderNeedsFill(set.rungs))) return settings;
   try {
     const choices = ladderChoices(await modOptions(deps, scores));
-    const { rungs } = fillLadder(general.rungs, settings.allow, choices, settings.allowKnown);
-    const modes = settings.modes.map(mode => ({ ...mode, rungs: fillLadder(mode.rungs, settings.allow, choices, settings.allowKnown).rungs }));
-    return { ...settings, rules: { general: { mode: "ladder", rungs } }, modes };
+    const fill = (rungs: Settings['rules']['general']['rungs']) => fillLadder(rungs, settings.allow, choices, settings.allowKnown).rungs;
+    // A domain ladder has two levels: the fold keeps each pair equal, before and after the fill.
+    const fillDomains = (rules: DomainRules): DomainRules => Object.fromEntries(Object.entries(rules).map(([key, rule]) => [key, { mode: "ladder", rungs: twoLevelRungs(fill(twoLevelRungs(rule.rungs))) }]));
+    const modes = settings.modes.map(mode => ({ ...mode, rungs: fill(mode.rungs), ...(mode.domainRules ? { domainRules: fillDomains(mode.domainRules) } : {}) }));
+    return { ...settings, rules: { general: { mode: "ladder", rungs: fill(general.rungs) } }, ...(settings.domainRules ? { domainRules: fillDomains(settings.domainRules) } : {}), modes };
   } catch (error) {
     deps.log.warn(`admin: filling the worker ladder failed: ${(error as Error).message}`);
     return settings;
@@ -810,6 +802,7 @@ async function buildStatus(deps: AdminDeps, opts: { refresh?: boolean } = {}): P
   for (const [name, p] of Object.entries(providers)) if (p.reachable === false) problems.push(`provider:${name}`);
   return {
     version: deps.version,
+    autoUpdate: deps.autoUpdater?.status() ?? { enabled: cfg.autoUpdate !== false, running: false },
     readiness: { ready: problems.length === 0, problems },
     // Which files this process is running, so the app can tell an old router from its own after
     // an update: a zip unpacked next to the previous install left the old one serving (2026-09-15).
@@ -855,48 +848,6 @@ function pickerTrust(): { caTrusted: boolean; appProxy: boolean } {
   }
   pickerTrustMemo = { at: now, value };
   return value;
-}
-
-/** The ClaudeRipple CLI and the Node that installed us (`<home>/paths.json`, written by `install`). */
-function cliInvocation(): { node: string; cli: string; env: NodeJS.ProcessEnv } {
-  let node = process.execPath;
-  // Same walk either way; the extension says which layout this file was loaded from.
-  let cli = path.resolve(here, `../../cli/src/index${path.extname(fileURLToPath(import.meta.url))}`);
-  let runtimeEnv: Record<string, string> = {};
-  try {
-    const p = JSON.parse(fs.readFileSync(path.join(homeDir(), "paths.json"), "utf8")) as { node?: string; env?: Record<string, string>; cli?: string };
-    if (p.node) node = p.node;
-    if (p.env) runtimeEnv = p.env;
-    if (p.cli) cli = p.cli;
-  } catch {
-    /* not installed via the CLI: fall back to our own node + repo layout */
-  }
-  return { node, cli, env: { ...process.env, ...runtimeEnv, CLAUDERIPPLE_HOME: homeDir() } };
-}
-
-function runCli(args: string[], timeout = 180_000): Promise<{ ok: boolean; output: string }> {
-  return new Promise((resolveP) => {
-    const { node, cli, env } = cliInvocation();
-    execFile(node, [cli, ...args], { env, timeout }, (err, stdout, stderr) => {
-      resolveP({ ok: !err, output: `${stdout}${stderr}${err ? `\n${err.message}` : ""}`.trim() });
-    });
-  });
-}
-
-/**
- * Start the CLI in its own process group, writing to `log`. An update ends by restarting this
- * router, and launchd stops a job by killing its whole process group — an ordinary child would die
- * with the router halfway through the install that restarted it.
- */
-function startCliDetached(args: string[], log: string): void {
-  const { node, cli, env } = cliInvocation();
-  fs.mkdirSync(path.dirname(log), { recursive: true });
-  const out = fs.openSync(log, "w");
-  try {
-    spawn(node, [cli, ...args], { env, detached: true, stdio: ["ignore", out, out], windowsHide: true }).unref();
-  } finally {
-    fs.closeSync(out);
-  }
 }
 
 /**
@@ -1044,7 +995,11 @@ function codexState(): { enabled: boolean; codexHome: string; configPath: string
 }
 
 function claudeAuthStore(deps: AdminDeps): ClaudeCodeAuthStore {
-  return new ClaudeCodeAuthStore(undefined, { home: homeDir(), ...(deps.observedClaudeCodeAuth ? { observed: deps.observedClaudeCodeAuth } : {}) });
+  return new ClaudeCodeAuthStore(undefined, {
+    home: homeDir(),
+    ...(deps.observedClaudeCodeAuth ? { observed: deps.observedClaudeCodeAuth } : {}),
+    ...(deps.claudeCodeCredentialReaders ? { credentialReaders: deps.claudeCodeCredentialReaders } : {}),
+  });
 }
 
 async function probeAnthropicApiKey(apiKey: string, probeFetch: (url: string, init: RequestInit) => Promise<Response> = fetchWithTimeout): Promise<{ ok: boolean; auth: ProbeAuth; models: ModelEntry[]; error?: string }> {
@@ -1803,6 +1758,13 @@ function serveStatic(urlPath: string, res: http.ServerResponse): void {
 }
 
 export function startAdmin(deps: AdminDeps): Promise<{ port: number; close(): void }> {
+  // Standalone admin users share the same coordinator, but only the router entry starts scheduling.
+  const updater = deps.autoUpdater ?? new AutoUpdater({
+    home: homeDir(), version: deps.version, enabled: () => deps.config().autoUpdate !== false,
+    activity: () => ({ inFlight: 0 }), log: deps.log,
+    runCli: deps.runCli ?? runCli, startCliDetached: deps.startCliDetached ?? startCliDetached,
+  });
+  deps = { ...deps, autoUpdater: updater };
   const scores = new ModelScoreCatalog({ home: homeDir(), warn: message => deps.log.warn(message), ...(deps.modelScoresFetch ? { fetch: deps.modelScoresFetch } : {}) });
   // Set again once the socket is bound (port 0 in tests); the Origin check below compares against it.
   let boundPort = adminPort(deps.config());
@@ -2575,12 +2537,13 @@ export function startAdmin(deps: AdminDeps): Promise<{ port: number; close(): vo
         // The CLI answers both: it knows how this copy was installed, which decides what an update is
         // (the tray asks it the same way). A POST checks again rather than trusting the page.
         const r = await (deps.runCli ?? runCli)(["update", "--check", "--json"], 30_000);
-        const check = parseUpdateCheck(r.output);
+        const check = r.ok ? parseUpdateCheck(r.output) : null;
         if (!check) {
           sendJson(res, 502, { error: "could not check for updates", output: r.output.slice(-2000) });
           return;
         }
-        const running = updateStartedAt > 0 && Date.now() - updateStartedAt < UPDATE_RUN_MS;
+        updater.observe(check);
+        const running = updater.running();
         if (method === "GET") {
           sendJson(res, 200, { ...check, running });
           return;
@@ -2597,9 +2560,7 @@ export function startAdmin(deps: AdminDeps): Promise<{ port: number; close(): vo
           sendJson(res, 409, { error: "an update is already running", ...check, running });
           return;
         }
-        updateStartedAt = Date.now();
-        const log = path.join(homeDir(), "logs", "update.log");
-        (deps.startCliDetached ?? startCliDetached)(["update"], log);
+        const log = updater.install(check);
         deps.log.info(`admin: update ${check.current} -> ${check.latest ?? "?"} started via GUI (output in ${log})`);
         sendJson(res, 202, { started: true, ...check, log });
         return;

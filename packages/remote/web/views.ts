@@ -58,7 +58,9 @@ function textOf(v: Text): string {
 /** A link is "lost" (not merely reconnecting) once it has been down for 30 s: say so plainly. */
 export function linkKind(link: LinkStatus, now: number): "open" | "connecting" | "waiting" | "offline" | "denied" | "lost" {
   if (link.state === "open" || link.state === "denied" || link.state === "offline") return link.state;
-  if (link.downSince !== null && now - link.downSince > 30_000) return "lost";
+  // A phone that slept or switched networks is often silent for half a minute; saying "lost" then
+  // alarmed people over nothing (Discord, 2026-10-22). It is a calm wait, not an error, either way.
+  if (link.downSince !== null && now - link.downSince > 60_000) return "lost";
   return link.state;
 }
 
@@ -96,7 +98,7 @@ export function banner(ui: UI): string {
   }
   if (kind === "lost") {
     const ago = duration(ui.now - (ui.link.downSince ?? ui.now));
-    return `<div class="banner bad">${ripple("sleepy", 40)}<div class="txt"><b>${esc(t("conn.lost.title", { host: hostName(ui) }))}</b>${esc(t("conn.lost.body", { ago, host: hostName(ui) }))}${seen ? `<small>${esc(seen)}</small>` : ""}<div class="act"><button class="btn primary" data-act="retry">${esc(t("conn.retryNow"))}</button></div></div></div>`;
+    return `<div class="banner warn">${ripple("sleepy", 40)}<div class="txt"><b>${esc(t("conn.lost.title", { host: hostName(ui) }))}</b>${esc(t("conn.lost.body", { ago, host: hostName(ui) }))}${seen ? `<small>${esc(seen)}</small>` : ""}<div class="act"><button class="btn primary" data-act="retry">${esc(t("conn.retryNow"))}</button></div></div></div>`;
   }
   if (ui.link.attempt === 0) return "";
   return `<div class="banner slim">${icon.clock(16)}<span>${esc(ui.link.lastRx ? t("conn.stale", { time: clock(ui.link.lastRx) }) : t("conn.connecting"))}</span></div>`;

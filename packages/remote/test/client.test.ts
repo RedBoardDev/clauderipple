@@ -262,3 +262,20 @@ test("a Mac session's working time runs from the person's last message, not from
   assert.equal(reduce(idle).turnStartedAt, null);
   assert.equal(reduce([...idle, { kind: "state", state: "running", seq: 7, at: 6000 }]).turnStartedAt, 6000, "woken without a message: from when it started");
 });
+
+// Coming back from another app counted the time spent there as the computer's silence (Discord,
+// 2026-10-22): the banner said "no answer for 4 minutes" the moment the app returned.
+test("the time spent in the background does not count as the computer's silence", () => {
+  const { clock, sockets, link } = setup();
+  link.start();
+  sockets[0]!.open();
+  sockets[0]!.recv(ready);
+  sockets[0]!.close();
+  const lostAt = link.status.downSince!;
+  clock.advance(4 * 60_000);
+  link.foreground();
+  assert.equal(link.status.downSince, lostAt + 4 * 60_000);
+  sockets.at(-1)!.open();
+  sockets.at(-1)!.recv(ready);
+  assert.equal(link.status.downSince, null);
+});
