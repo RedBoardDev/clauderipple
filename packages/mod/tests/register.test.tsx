@@ -33,8 +33,10 @@ const MOD_OPTIONS = {
 const CONFIG = { admin: { port: 9992 }, providers: { deepseek: { models: [{ id: 'deepseek-v4.1-flash' }] }, chatgpt: { models: [{ id: 'gpt-6.1-sol' }, { id: 'gpt-6-astra' }] }, anthropic: { models: [{ id: 'claude-sonnet-5-5' }] } } }
 const SPAWN: AgentSpawnInput = { tool_use_id: 'tool1', subagentType: 'ripple:auto', prompt: 'Rename one local variable and verify it.', description: 'Rename variable', parentModel: 'claude-opus-5-5', provider: { plugin: 'engine', tier: 'core' }, background: false, fork: false }
 const MESSAGES: SessionMessage[] = [{ role: 'user', text: 'Implement the specified change and verify it.', toolUses: [] }, { role: 'assistant', text: 'The implementation is ready.', toolUses: [] }]
+// The user naming the workers a test spawns by name (worker.ts userNamed).
+const NAMED: SessionMessage[] = [{ role: 'user', text: 'Use Sol, Astra or DeepSeek for this.', toolUses: [] }]
 
-function boundaries(on: On, patch: Partial<Settings> = {}, options: { config?: unknown; paths?: string[]; key?: string; envFile?: string | (() => string); language?: unknown; env?: Record<string, string>; platform?: string; browserFailure?: 'exit' | 'throw'; appleLocale?: string; appleFail?: boolean; limits?: { kind: string; percentUsed: number; resetsAt?: string }[]; agentMessages?: (agentId: string) => SessionMessage[] } = {}) {
+function boundaries(on: On, patch: Partial<Settings> = {}, options: { config?: unknown; paths?: string[]; key?: string; envFile?: string | (() => string); language?: unknown; env?: Record<string, string>; platform?: string; browserFailure?: 'exit' | 'throw'; appleLocale?: string; appleFail?: boolean; limits?: { kind: string; percentUsed: number; resetsAt?: string }[]; agentMessages?: (agentId: string) => SessionMessage[]; messages?: SessionMessage[] } = {}) {
   const clock = mock.clock(on, { now: NOW })
   const saved = new Map<string, unknown>()
   const storeWrites: string[] = []
@@ -116,7 +118,7 @@ function boundaries(on: On, patch: Partial<Settings> = {}, options: { config?: u
   on('command.list', () => ({ value: [{ name: 'clear', description: 'Clear', source: 'builtin' }, { name: 'compact', description: 'Compact', source: 'builtin' }, { name: 'model', description: 'Model', source: 'builtin' }] }))
   on('session.id', () => ({ value: 'session-test' }))
   on('session.model', () => ({ value: model }))
-  on('session.messages', ($, e) => ({ value: e.agentId && options.agentMessages ? options.agentMessages(e.agentId) : MESSAGES }))
+  on('session.messages', ($, e) => ({ value: e.agentId && options.agentMessages ? options.agentMessages(e.agentId) : options.messages ?? MESSAGES }))
   on('session.usage', () => ({ value: { startedAt: NOW, context: { percent, tokens: 40000, window: 200000 }, rateLimits: options.limits ?? [] } }))
   on('ui.status', () => ({ value: undefined }))
   on('ui.toast', ($, e) => { toasts.push(e.text); return { value: undefined } })
@@ -549,7 +551,7 @@ test('ripple:auto is judged and rewritten to the light rung\'s agent at the rung
 })
 
 test('worker pick persistence keeps the last 3,000 lines and concurrent marker picks, never the prompt', async ($, on) => {
-  const b = boundaries(on, {}, { env: { CLAUDERIPPLE_HOME: '/custom/ripple' } })
+  const b = boundaries(on, {}, { env: { CLAUDERIPPLE_HOME: '/custom/ripple' }, messages: NAMED })
   http(on)
   const judges = judgeStub(on)
   spawnStub(on)
@@ -627,13 +629,13 @@ for (const prefix of ['ripple:', '']) for (const [level, kind, rung, agent, mode
   }
 })
 
-// The main chat may name the tier itself; the judge then only rates it in the shadow (2026-10-15).
+// The main chat names the tier itself; the judge is not asked (its shadow rating ended 2026-10-22).
 for (const [tier, rung, agent, model] of [
   ['light', 'light', 'deepseek-v4-1-flash', 'deepseek-v4.1-flash@max'],
   ['standard', 'standard', 'gpt-6-1-sol', 'gpt-6.1-sol@medium'],
   ['hard', 'hard', 'gpt-6-astra', 'gpt-6-astra@high'],
   ['max', 'plan', 'general-purpose', 'opus'],
-] as const) test(`a [[ripple: ${tier}]] marker runs the ${rung} rung, the judge rating it only in the log`, async ($, on) => {
+] as const) test(`a [[ripple: ${tier}]] marker runs the ${rung} rung without asking the judge`, async ($, on) => {
   const b = boundaries(on)
   http(on)
   const judges = judgeStub(on, JSON.stringify({ domain: 'backend', level: 'deep', kind: 'do', effort: 'high', sure: 0.8, why: 'judged' }))
@@ -645,10 +647,9 @@ for (const [tier, rung, agent, model] of [
   expect(sent[0]).toMatchObject({ subagentType: agent, model, prompt: 'Rename one local variable and verify it.' })
   const rows = b.files.get('/home/test/.clauderipple/logs/worker-picks.jsonl')!.trim().split('\n').map(line => JSON.parse(line))
   const pick = rows.find(row => row.type === 'pick')
-  expect(pick).toMatchObject({ by: 'session', tier, rung, judge: null, verdict: null })
-  // The judge still rated the same brief, beside the pick, without holding the spawn.
-  expect(judges.length).toBe(1)
-  expect(rows.find(row => row.type === 'shadow')).toMatchObject({ pick: pick.id, rung: 'hard', judge: 'haiku', verdict: { level: 'deep', kind: 'do' } })
+  expect(pick).toMatchObject({ by: 'session', tier, rung, domain: 'general', judge: null, verdict: null })
+  expect(judges.length).toBe(0)
+  expect(rows.some(row => row.type === 'shadow')).toBe(false)
   // The worker's end joins the same pick.
   await complete($, 'worker-1', 'Renamed and tested.')
   const after = b.files.get('/home/test/.clauderipple/logs/worker-picks.jsonl')!.trim().split('\n').map(line => JSON.parse(line))
@@ -669,88 +670,50 @@ for (const domain of ['design', 'frontend', 'backend', 'docs'] as const) test(`a
   await start($)
   await $.agent.spawn(SPAWN)
   const rule = domain === 'design' || domain === 'frontend' ? 'ui' : domain === 'backend' ? 'backend' : 'general'
-  // A light design verdict is raised to the heavy pair (visual taste, not difficulty); frontend keeps its level.
-  const raised = domain === 'design'
-  expect(sent[0]?.subagentType).toBe(rule === 'ui' ? (raised ? 'gpt-6-1-sol' : 'gpt-6-astra') : rule === 'backend' ? 'gpt-6-1-sol' : 'deepseek-v4-1-flash')
+  // Light work takes a domain ladder's light row, design included.
+  expect(sent[0]?.subagentType).toBe(rule === 'ui' ? 'gpt-6-astra' : rule === 'backend' ? 'gpt-6-1-sol' : 'deepseek-v4-1-flash')
   const row = JSON.parse(b.files.get('/home/test/.clauderipple/logs/worker-picks.jsonl')!)
-  expect(row).toMatchObject({ rule, domain, level: 'light', rung: raised ? 'hard' : 'light' })
-  expect(row.raised).toBe(raised ? 'design' : undefined)
+  expect(row).toMatchObject({ rule, domain, level: 'light', rung: 'light' })
+  expect(row.raised).toBeUndefined()
 })
 
-test('a design task under the ui ladder takes the heavy level past a tier marker', async ($, on) => {
-  const b = boundaries(on, { domainRules: { ui: { mode: 'ladder', rungs: { light: [{ target: { agent: 'gpt-6-astra' }, effort: 'high' }], hard: [{ target: { agent: 'gpt-6-1-sol' }, effort: 'high' }] } } } })
+// The ladder a tier marker reaches is the one its domain word names; the judge is never asked.
+for (const [prompt, agent, rule, rung] of [
+  ['[[ripple: light ui]]\nTweak a color.', 'gpt-6-astra', 'ui', 'light'],
+  ['[[ripple: standard ui]]\nBuild the settings screen.', 'gpt-6-1-sol', 'ui', 'standard'],
+  ['[[ripple: standard backend]]\nAdd the endpoint.', 'gpt-6-astra', 'backend', 'standard'],
+  ['[[ripple: standard]]\nRewrite strings in the dictionary, app and server.', 'gpt-6-1-sol', 'general', 'standard'],
+] as const) test(`${prompt.split('\n')[0]} runs the ${rule} ladder's ${rung} rung`, async ($, on) => {
+  const b = boundaries(on, { domainRules: {
+    ui: { mode: 'ladder', rungs: { light: [{ target: { agent: 'gpt-6-astra' }, effort: 'high' }], hard: [{ target: { agent: 'gpt-6-1-sol' }, effort: 'high' }] } },
+    backend: { mode: 'ladder', rungs: { light: [{ target: { agent: 'deepseek-v4-1-flash' }, effort: 'high' }], plan: [{ target: { agent: 'gpt-6-astra' }, effort: 'high' }] } },
+  } })
   http(on)
-  judgeStub(on, JSON.stringify({ domain: 'design', level: 'deep', kind: 'do', effort: 'high', sure: 0.9, why: 'domain' }))
+  const judges = judgeStub(on, JSON.stringify({ domain: 'frontend', level: 'deep', kind: 'plan', effort: 'max', sure: 0.6, why: 'judged' }))
   const sent = spawnStub(on)
   await start($)
-  await $.agent.spawn({ ...SPAWN, prompt: '[[ripple: light]]\nTweak a color.' })
-  expect(sent[0]?.subagentType).toBe('gpt-6-1-sol')
-  const row = JSON.parse(b.files.get('/home/test/.clauderipple/logs/worker-picks.jsonl')!.trim().split('\n').find(line => line.includes('"type":"pick"'))!)
-  expect(row).toMatchObject({ by: 'session', rule: 'ui', domain: 'design', rung: 'hard', raised: 'design' })
+  await $.agent.spawn({ ...SPAWN, prompt })
+  expect(sent[0]).toMatchObject({ subagentType: agent, prompt: prompt.split('\n')[1] })
+  expect(judges.length).toBe(0)
+  const row = JSON.parse(b.files.get('/home/test/.clauderipple/logs/worker-picks.jsonl')!.trim())
+  expect(row).toMatchObject({ by: 'session', rule, rung, verdict: null })
 })
 
-for (const domains of [false, true]) test(`tier marker ${domains ? 'awaits' : 'does not await'} one pending shadow judge with domain ladders ${domains ? 'on' : 'off'}`, async ($, on) => {
-  const b = boundaries(on, domains ? { domainRules: { ui: { mode: 'ladder', rungs: { light: [{ target: { agent: 'gpt-6-astra' }, effort: 'high' }] } } } } : {})
-  http(on)
-  let release!: () => void
-  const pending = new Promise<void>(resolve => { release = resolve })
-  let calls = 0
-  on('model.complete', async () => {
-    calls++
-    await pending
-    return { value: { isAnswered: true, text: JSON.stringify({ domain: 'frontend', level: 'deep', kind: 'plan', effort: 'max', sure: 0.1, why: 'conflicts with tier' }), usage: USAGE } }
-  })
-  const sent = spawnStub(on)
-  await start($)
-  const spawn = $.agent.spawn({ ...SPAWN, prompt: '[[ripple: light]]\nBuild the UI.' })
-  await b.clock.settle()
-  expect(calls).toBe(1)
-  expect(sent.length).toBe(domains ? 0 : 1)
-  release()
-  await spawn
-  await b.clock.settle()
-  expect(calls).toBe(1)
-  expect(sent[0]?.subagentType).toBe(domains ? 'gpt-6-astra' : 'deepseek-v4-1-flash')
-  const rows = b.files.get('/home/test/.clauderipple/logs/worker-picks.jsonl')!.trim().split('\n').map(line => JSON.parse(line))
-  const pick = rows.find(row => row.type === 'pick')
-  expect(pick).toMatchObject({ by: 'session', tier: 'light', rung: 'light', level: 'light', kind: 'do', rule: domains ? 'ui' : 'general', domain: domains ? 'frontend' : 'general' })
-  expect(pick.sure).toBeUndefined()
-  expect(rows.filter(row => row.type === 'shadow').length).toBe(1)
-  expect(rows.find(row => row.type === 'shadow')).toMatchObject({ pick: pick.id, rung: 'plan', verdict: { domain: 'frontend', sure: 0.1 } })
-})
-
-for (const error of ['api-error', 'aborted'] as const) test(`a marker retains its tier and uses general when its domain judge is ${error}`, async ($, on) => {
-  const b = boundaries(on, { domainRules: { ui: DEFAULTS.rules.general } })
-  http(on)
-  on('model.complete', async () => {
-    if (error === 'aborted') await b.clock.advance(6000)
-    return { value: error === 'aborted' ? { isAnswered: false, reason: 'aborted', usage: USAGE } : { isAnswered: false, reason: 'api-error', status: 503, error: 'overloaded', usage: USAGE } }
-  })
-  const sent = spawnStub(on)
-  await start($)
-  await $.agent.spawn({ ...SPAWN, prompt: '[[ripple: light]]\nRename a variable.' })
-  expect(sent[0]?.subagentType).toBe('deepseek-v4-1-flash')
-  const rows = b.files.get('/home/test/.clauderipple/logs/worker-picks.jsonl')!.trim().split('\n').map(line => JSON.parse(line))
-  expect(rows.find(row => row.type === 'pick')).toMatchObject({ by: 'session', domain: 'general', rule: 'general', rung: 'light', tier: 'light', verdict: null })
-  expect(rows.filter(row => row.type === 'shadow').length).toBe(1)
-})
-
-test('a mode without domain rules skips awaiting Base domains; explicit model markers still bypass the judge', async ($, on) => {
-  const b = boundaries(on, { domainRules: { ui: DEFAULTS.rules.general }, modes: [{ id: 'plain', name: 'Plain', rungs: DEFAULTS.rules.general.rungs, delegation: 'normal', until: 'none' }], activeMode: 'plain' })
+test('a mode without domain rules sends a ui-marked task to its general ladder; explicit model markers still bypass the judge', async ($, on) => {
+  const b = boundaries(on, { domainRules: { ui: DEFAULTS.rules.general }, modes: [{ id: 'plain', name: 'Plain', rungs: DEFAULTS.rules.general.rungs, delegation: 'normal', until: 'none' }], activeMode: 'plain' }, { messages: NAMED })
   http(on)
   const judges = judgeStub(on, '{"domain":"frontend","level":"light","effort":"low","sure":0.9}')
   const sent = spawnStub(on)
   await start($)
-  await $.agent.spawn({ ...SPAWN, prompt: '[[ripple: light]]\nWork.' })
+  await $.agent.spawn({ ...SPAWN, prompt: '[[ripple: light ui]]\nWork.' })
   await b.clock.settle()
   const rows = b.files.get('/home/test/.clauderipple/logs/worker-picks.jsonl')!.trim().split('\n').map(line => JSON.parse(line))
-  expect(rows.find(row => row.type === 'pick')).toMatchObject({ domain: 'general', rule: 'general', mode: 'Plain', verdict: null })
-  expect(judges.length).toBe(1)
+  expect(rows.find(row => row.type === 'pick')).toMatchObject({ domain: 'frontend', rule: 'general', mode: 'Plain', verdict: null })
   // Turn Base on, so its domain override is effective for this explicit marker.
   b.remote({ settings: normalizeSettings({ setupDone: true, domainRules: { ui: DEFAULTS.rules.general } }), revision: 2, stored: true })
   await b.clock.advance(3000)
   await $.agent.spawn({ ...SPAWN, prompt: '[[ripple: gpt-6-astra@max]]\nWork.' })
-  expect(judges.length).toBe(1)
+  expect(judges.length).toBe(0)
   expect(sent[1]).toMatchObject({ subagentType: 'gpt-6-astra', model: 'gpt-6-astra@max' })
 })
 
@@ -934,7 +897,7 @@ test('each spawn refreshes provider health before picking and toasts the exhaust
 })
 
 test('explicit generated worker preserves the old dropped-model and misplaced-marker fix', async ($, on) => {
-  const b = boundaries(on)
+  const b = boundaries(on, {}, { messages: NAMED })
   http(on)
   const judges = judgeStub(on)
   const sent = spawnStub(on)
@@ -947,7 +910,7 @@ test('explicit generated worker preserves the old dropped-model and misplaced-ma
 })
 
 test('an explicit marker on ripple:auto bypasses its judge', async ($, on) => {
-  boundaries(on)
+  boundaries(on, {}, { messages: NAMED })
   http(on)
   const judges = judgeStub(on)
   const sent = spawnStub(on)
@@ -955,6 +918,73 @@ test('an explicit marker on ripple:auto bypasses its judge', async ($, on) => {
   await $.agent.spawn({ ...SPAWN, prompt: '[[ripple: gpt-6-1-sol@xhigh]]\nReview this.' })
   expect(judges.length).toBe(0)
   expect(sent[0]).toMatchObject({ subagentType: 'gpt-6-1-sol', model: 'gpt-6.1-sol@xhigh' })
+})
+
+// 2026-10-22: asked twice for Gemini proofreading, a session went on to give Gemini an implementation
+// task on its own. A model the user did not name is ignored and the tier decides.
+test('an explicit marker the user did not name is dropped; the judge decides, or a tier marker under it', async ($, on) => {
+  const b = boundaries(on)
+  http(on)
+  const judges = judgeStub(on, JSON.stringify({ domain: 'general', level: 'light', kind: 'do', effort: 'low', sure: 0.9, why: 'judged' }))
+  const sent = spawnStub(on)
+  await start($)
+  await $.agent.spawn({ ...SPAWN, prompt: '[[ripple: gpt-6-1-sol@xhigh]]\nReview this.' })
+  expect(judges.length).toBe(1)
+  expect(sent[0]).toMatchObject({ subagentType: 'deepseek-v4-1-flash', prompt: 'Review this.' })
+  expect(b.toasts.some(text => text.includes('gpt-6-1-sol') && text.includes('by tier'))).toBe(true)
+  const row = JSON.parse(b.files.get('/home/test/.clauderipple/logs/worker-picks.jsonl')!.trim())
+  expect(row.by).not.toBe('marker')
+})
+
+for (const [label, spawn] of [
+  ['a worker agent called directly', { subagentType: 'gpt-6-1-sol', prompt: '[[ripple: hard]]\nFix the race.' }],
+  ['general-purpose given a model', { subagentType: 'general-purpose', model: 'sonnet', prompt: '[[ripple: hard]]\nFix the race.' }],
+  ['a model marker on another agent', { subagentType: 'general-purpose', prompt: '[[ripple: gpt-6-1-sol@high]]\n[[ripple: hard]]\nFix the race.' }],
+] as const) test(`${label}, not named by the user, goes through the ladder`, async ($, on) => {
+  const b = boundaries(on, { agentAuto: 'auto' })
+  http(on)
+  const judges = judgeStub(on)
+  const sent = spawnStub(on)
+  await start($)
+  await $.agent.spawn({ ...SPAWN, ...spawn })
+  expect(judges.length).toBe(0)
+  expect(sent[0]).toMatchObject({ subagentType: 'gpt-6-astra', model: 'gpt-6-astra@high', prompt: 'Fix the race.' })
+  expect(b.toasts.some(text => text.includes('by tier'))).toBe(true)
+  expect(JSON.parse(b.files.get('/home/test/.clauderipple/logs/worker-picks.jsonl')!.trim())).toMatchObject({ by: 'session', tier: 'hard', rung: 'hard' })
+})
+
+test("a Workflow's ripple:auto whose marker names a worker runs on that worker's model; a tier marker or none is left alone", async ($, on) => {
+  // 2026-10-23: 31 Workflow workers sent as ripple:auto with [[ripple: gpt-6-1-sol@medium]] ran on Sol
+  // through the router but showed as Opus 5.5, and their later turns lost the marker.
+  boundaries(on, {}, { messages: MESSAGES })
+  http(on)
+  const judges = judgeStub(on)
+  const sent = spawnStub(on)
+  await start($)
+  const WORKFLOW = { ...SPAWN, workflow: true } as AgentSpawnInput
+  await $.agent.spawn({ ...WORKFLOW, prompt: "[[ripple: gpt-6-1-sol@medium]]\nWrite the review." })
+  // The engine keeps a workflow agent's type and description; its model is what can change.
+  expect(sent[0]).toMatchObject({ subagentType: "ripple:auto", prompt: "Write the review.", model: "gpt-6.1-sol@medium", description: "Rename variable" })
+  await $.agent.spawn({ ...WORKFLOW, prompt: "[[ripple: hard]]\nWrite the review." })
+  expect(sent[1]?.model).toBeUndefined()
+  await $.agent.spawn({ ...WORKFLOW, prompt: "Write the review." })
+  expect(sent[2]?.model).toBeUndefined()
+  expect(judges.length).toBe(0)
+})
+
+test('a worker the user named in their last message runs as called, after a short go-ahead too', async ($, on) => {
+  boundaries(on, {}, { messages: [
+    { role: 'user', text: '이 문구들 다듬어 줘', toolUses: [] },
+    { role: 'assistant', text: '솔에게 교정안을 받겠습니다. 진행할까요?', toolUses: [] },
+    { role: 'user', text: 'ㄱㄱ', toolUses: [] },
+  ] })
+  http(on)
+  const judges = judgeStub(on)
+  const sent = spawnStub(on)
+  await start($)
+  await $.agent.spawn({ ...SPAWN, subagentType: 'gpt-6-1-sol', prompt: 'Propose fixes.' })
+  expect(judges.length).toBe(0)
+  expect(sent[0]).toMatchObject({ subagentType: 'gpt-6-1-sol', prompt: 'Propose fixes.' })
 })
 
 test('failed worker judge uses the standard rung; a missing worker moves up to the next rung', async ($, on) => {
@@ -1009,7 +1039,7 @@ test('Zen without a key explains the missing key and falls back to Haiku', async
 })
 
 test('provider off refuses named workers and every-provider-off refuses automatic spawning', async ($, on) => {
-  boundaries(on, { providers: { chatgpt: false, deepseek: false, anthropic: false } })
+  boundaries(on, { providers: { chatgpt: false, deepseek: false, anthropic: false } }, { messages: NAMED })
   http(on)
   judgeStub(on)
   const sent = spawnStub(on)
@@ -2296,5 +2326,27 @@ test('the band Clear asks first, and confirming runs the clear once', async ($, 
   await b.clock.advance(3000)
   expect(commands).toEqual(['clear'])
   expect(await ui.find({ type: 'Text', text: 'Start this conversation over?' })).toBeUndefined()
+  await ui.unmount()
+})
+
+// The host keeps what the phone queued (packages/remote/src/queue.ts); the band reads its file and
+// floats a strip over itself while this chat has something waiting, then lets it go.
+for (const surface of ['terminal', 'desktop'] as const) test(`the phone queue strip shows over the ${surface} band only while this chat has something queued`, async ($, on) => {
+  const b = boundaries(on)
+  http(on)
+  const file = '/home/test/.clauderipple/remote/queue.json'
+  b.files.set(file, JSON.stringify({ other: { items: [{ id: 'x', text: 'not this chat', attachments: [], at: 1 }], held: false } }))
+  await start($)
+  const ui = await band($, surface)
+  await b.clock.advance(3000)
+  expect(JSON.stringify(await ui.drawn())).not.toContain('Phone queue')
+  b.files.set(file, JSON.stringify({ phone: { desktopId: 'session-test', items: [{ id: 'a', text: 'fix the header', attachments: [], at: 1 }, { id: 'b', text: 'then the footer', attachments: [], at: 2 }], held: false } }))
+  await b.clock.advance(3000)
+  const shown = JSON.stringify(await ui.drawn())
+  expect(shown).toContain('Phone queue 2')
+  expect(shown).toContain('fix the header')
+  b.files.set(file, JSON.stringify({}))
+  await b.clock.advance(3000)
+  expect(JSON.stringify(await ui.drawn())).not.toContain('Phone queue')
   await ui.unmount()
 })

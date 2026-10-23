@@ -18,6 +18,7 @@ import { Proxy } from "../src/proxy.ts";
 import { RequestLog, type RequestRecord } from "../src/requestlog.ts";
 import { createCa } from "../src/x509.ts";
 import { saveGoogleAccount } from "../src/providers/google/accounts.ts";
+import { PRESETS } from "../src/presets.ts";
 
 function freePort(): Promise<number> {
   return new Promise((resolve) => {
@@ -31,7 +32,7 @@ function freePort(): Promise<number> {
 
 type Rig = { home: string; send: (body: unknown, path?: string) => Promise<{ status: number; body: string }>; records: () => RequestRecord[]; stop: () => Promise<void>; seen: { path: string; headers: http.IncomingHttpHeaders; body: Record<string, unknown> }[] };
 
-async function rig(promptRefusal = false): Promise<Rig> {
+async function rig(promptRefusal = false, argon?: "google" | "opencode"): Promise<Rig> {
   const seen: Rig["seen"] = [];
   const upstream = http.createServer((req, res) => {
     const chunks: Buffer[] = [];
@@ -66,10 +67,16 @@ async function rig(promptRefusal = false): Promise<Rig> {
   fs.writeFileSync(path.join(home, "ca.pem"), ca.certPem);
   fs.writeFileSync(path.join(home, "ca.key"), ca.keyPem);
   const proxyPort = await freePort();
+  const go = PRESETS.find(p => p.id === "opencode-go")!;
+  const argonModel = go.fallbackModels.find(m => m.id === "gemini-4-argon-contributor")!;
   const cfg: Config = {
     ...DEFAULTS,
     listen: { host: "127.0.0.1", port: proxyPort },
-    providers: { google: { type: "google", auth: promptRefusal ? "antigravity" : "api-key", apiKey: "test-key", url: `http://127.0.0.1:${upstreamPort}`, models: [{ id: "gemini-3-pro-preview" }] } },
+    providers: argon === "opencode" ? { "opencode-go": {
+      type: "openai-compatible", preset: go.id, ...(go.wire ? { wire: go.wire } : {}),
+      url: `http://127.0.0.1:${upstreamPort}/zen/go/v1`, headers: { authorization: "Bearer test-key" }, ...(go.sessionHeader ? { sessionHeader: go.sessionHeader } : {}),
+      models: [{ ...argonModel, url: `http://127.0.0.1:${upstreamPort}/inference/go/google`, effortLevels: ["low", "medium", "high"] }],
+    } } : { google: { type: "google", auth: promptRefusal ? "antigravity" : "api-key", apiKey: "test-key", url: `http://127.0.0.1:${upstreamPort}`, models: [{ id: argon ? "gemini-4-argon" : "gemini-3-pro-preview" }] } },
     routes: {},
     direct: [],
     aliases: {},
@@ -200,6 +207,26 @@ test("a declared google model is routed to the provider over TLS and logged GOOG
     await r.stop();
   }
 });
+
+for (const provider of ["google", "opencode"] as const) {
+  test(`Gemini 4 Argon @high reaches the ${provider} upstream as a thinkingLevel`, async () => {
+    const r = await rig(false, provider);
+    try {
+      const model = provider === "google" ? "gemini-4-argon" : "gemini-4-argon-contributor";
+      const response = await r.send({ model: `${model}@high`, max_tokens: 16, stream: true, messages: [{ role: "user", content: "hi" }] });
+      assert.equal(response.status, 200);
+      assert.equal(r.seen.length, 1);
+      const sent = r.seen[0]!;
+      const prefix = provider === "google" ? "" : "/inference/go/google";
+      assert.equal(sent.path, `${prefix}/v1beta/models/${model}:streamGenerateContent?alt=sse`);
+      assert.deepEqual(sent.body.generationConfig, { maxOutputTokens: 16, thinkingConfig: { thinkingLevel: "high" } });
+      assert.equal(sent.body.reasoning_effort, undefined, "this model uses Google's wire even on OpenCode");
+      assert.equal(sent.headers["x-goog-api-key"], "test-key");
+      assert.equal(sent.headers.authorization, undefined);
+      if (provider === "opencode") assert.ok(sent.headers["x-opencode-session"]);
+    } finally { await r.stop(); }
+  });
+}
 
 test("a google model is refused a web_search side request, not sent upstream", async () => {
   const r = await rig();

@@ -32,7 +32,7 @@ export function providerExhaustion(status: number, body = "", retryMs?: number, 
   // A relay's 402 for its upstream being down is not about money (pool.ts, RELAY_UPSTREAM_FAILED).
   if (RELAY_UPSTREAM_FAILED.test(body)) return undefined;
   const balance = /\b(?:insufficient[_ -]+(?:balance|credits?|funds)|(?:balance|credits?)[_ -]+(?:insufficient|exhausted|depleted))\b/i.test(body);
-  const billing = /\bbilling[_ -]+(?:hard[_ -]+)?(?:limit|exhausted|quota)|\b(?:exhausted|exceeded|insufficient)[_ -]+billing\b/i.test(body);
+  const billing = /\bbilling[_ -]+(?:hard[_ -]+)?(?:limit|exhausted|quota)|\b(?:exhausted|exceeded|insufficient)[_ -]+billing\b|\byour project has exceeded its monthly spending cap\b/i.test(body);
   const quota = /\b(?:insufficient_quota|usage_limit_reached|quota[_ -]+exhausted|exhausted[_ -]+quota)\b/i.test(body);
   if (status !== 402 && !balance && !billing && !quota) return undefined;
   const reason = balance ? "insufficient_balance" : billing || status === 402 ? "billing_exhausted" : "quota_exhausted";

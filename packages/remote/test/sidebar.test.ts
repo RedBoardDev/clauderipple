@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { DesktopSidebar, PHONE_GROUP, UNGROUPED } from "../src/sidebar.ts";
+import { DesktopSidebar, PHONE_GROUP, UNGROUPED, windowsSidebarRoot } from "../src/sidebar.ts";
 import { SidebarStorage } from "../src/sidebar-storage.ts";
 import { sidebarSections, sidebarState } from "../web/sidebar.ts";
 import type { SessionSummary } from "../src/protocol.ts";
@@ -40,6 +40,22 @@ function fixture(t: import("node:test").TestContext) {
   let now = 0;
   return { root, dir, storage, config, write, session, sidebar: new DesktopSidebar({ root, now: () => now }), advance: () => { now += 3001; } };
 }
+test("Windows sidebar discovers only one complete, verified packaged-app layout", t => {
+  const f = fixture(t);
+  const appData = fs.mkdtempSync(path.join(os.tmpdir(), "sidebar-appdata-"));
+  t.after(() => fs.rmSync(appData, { recursive: true, force: true }));
+  assert.equal(windowsSidebarRoot(appData), undefined);
+  const root = path.join(appData, "Claude-Data", "claude_package");
+  fs.cpSync(f.root, root, { recursive: true });
+  assert.equal(windowsSidebarRoot(appData), root);
+  assert.deepEqual(new DesktopSidebar({ root: windowsSidebarRoot(appData)! }).read().groups, f.sidebar.read().groups);
+  fs.cpSync(f.root, path.join(appData, "Claude-Data", "claude_other"), { recursive: true });
+  assert.equal(windowsSidebarRoot(appData), undefined, "ambiguous app profiles are not guessed");
+  fs.rmSync(path.join(root, "claude_desktop_config.json"));
+  fs.rmSync(path.join(appData, "Claude-Data", "claude_other"), { recursive: true });
+  assert.equal(windowsSidebarRoot(appData), undefined, "incomplete data does not enable the sidebar");
+});
+
 test("app group order, recency, exact titles and unread IDs (unless focused since the last activity)", t => {
   const f = fixture(t), snapshot = f.sidebar.read();
   assert.deepEqual(snapshot.groups.map(g => g.name), ["사용자 그룹", UNGROUPED]);
@@ -68,13 +84,16 @@ test("app group order, recency, exact titles and unread IDs (unless focused sinc
   assert.equal(sidebarState({ ...joined[1]!, state: "idle", background: true }), "running");
   assert.equal(sidebarState({ ...joined[1]!, state: "idle", tasks: 2 }), "read");
 });
-test("mtime cache obeys three-second gate; archive index hides rows and SDK IDs join phone handoffs", t => {
+test("mtime cache obeys three-second gate; archived rows reach the phone and SDK IDs join phone handoffs", t => {
   const f = fixture(t); f.sidebar.read();
   f.session(id, 300, { title: "새 이름", isArchived: true });
   assert.equal(f.sidebar.read().sessions.get(id)?.title, "앱 제목 c");
   f.write(`claude-code-sessions/${account}/${org}/archived-sessions.idx`, { v: 1, archived: [`local_${other}`] });
   f.advance();
-  assert.deepEqual(f.sidebar.join([summary(id), summary(other)], s => s), []);
+  const archived = f.sidebar.join([summary(id), { ...summary(other, "host"), desktopBridge: true }], s => s);
+  assert.deepEqual(archived.map(s => [s.id, s.archived]), [[id, true], [other, true]]);
+  assert.equal(archived[0]?.title, "새 이름");
+  assert.equal(f.sidebar.join([{ ...summary("host-id", "host"), desktopBridge: true }], () => id)[0]?.archived, true);
   f.session(id, 400, { title: "휴대폰 전달" }); f.advance();
   const joined = f.sidebar.join([summary("host-id", "host")], () => id);
   assert.equal(joined[0]?.id, "host-id"); assert.equal(joined[0]?.group, "사용자 그룹"); assert.equal(joined[0]?.title, "휴대폰 전달");
@@ -143,4 +162,9 @@ test("a CLI id the app session has moved on from is not listed beside it", t => 
   f.session(id, 100, { priorCliSessionIds: [old] }); f.advance();
   const joined = f.sidebar.join([summary(id, "host"), summary(old, "host"), summary("phone", "host")], s => s);
   assert.deepEqual(joined.map(s => s.id), [id, "phone"]);
+});
+test("a /clear names no prior id: an app session's record that no app session holds is not listed", t => {
+  const f = fixture(t), cleared = "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee";
+  const joined = f.sidebar.join([{ ...summary(id, "host"), desktopBridge: true }, { ...summary(cleared, "host"), desktopBridge: true }, summary("phone", "host")], s => s);
+  assert.deepEqual(joined.map(s => s.id), [id, "phone"], "a phone session has no app row and stays");
 });

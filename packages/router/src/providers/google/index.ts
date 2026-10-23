@@ -157,6 +157,7 @@ export type GoogleAccountStatus = GoogleAccountSummary & {
   /** Google's page for finishing the check, while the account is `needs-verification`. */
   verifyUrl?: string;
   active: boolean;
+  inUse: boolean;
 };
 
 /** How a send across the accounts ended. */
@@ -269,6 +270,7 @@ export class GoogleAdapter {
         ...(state === "needs-verification" && verifyUrl ? { verifyUrl } : {}),
         ...(report?.cooldownSeconds ? { cooldownSeconds: report.cooldownSeconds } : {}),
         active: summary.id === this.activeOwner,
+        inUse: report?.inUse === true,
       };
     });
   }
@@ -320,7 +322,7 @@ export class GoogleAdapter {
 
   /** Put a cooling account back into rotation now (dashboard action). */
   clearCooldown(ownerId: string): void {
-    for (const c of this.accounts.peekCredentials()) if (c.ownerId === ownerId) this.pool.clear(this.name, c.id);
+    this.pool.clear(this.name, ownerId);
   }
 
   /**

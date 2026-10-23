@@ -12,6 +12,7 @@ import { ClaudeCodeAuthStore, ClaudeCodeCredentialStore } from "../src/providers
 import { RequestLog } from "../src/requestlog.ts";
 import type { Config } from "../src/config.ts";
 
+const noClaudeCodeCredentialReaders = { keychain: () => null, credentialsFile: () => null };
 const seen: { headers: http.IncomingHttpHeaders; body: Record<string, unknown> }[] = [];
 const upstream = http.createServer((req, res) => {
   const chunks: Buffer[] = [];
@@ -51,7 +52,7 @@ const config: Config = {
 };
 const log = new Logger(null, 1e9, 0, false);
 const requests = new RequestLog(path.join(root, "requests.jsonl"));
-const ingress = new OpenAiIngress({ config: () => config, log, requests });
+const ingress = new OpenAiIngress({ config: () => config, log, requests, claudeCodeCredentialReaders: noClaudeCodeCredentialReaders });
 const ingressPort = await ingress.listen();
 
 async function call(pathname: string, body?: unknown, port = ingressPort): Promise<{ status: number; text: string }> {

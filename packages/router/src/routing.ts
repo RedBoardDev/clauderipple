@@ -27,6 +27,12 @@ const REMINDER = /<system-reminder>[\s\S]*?<\/system-reminder>/g;
 // with it; a compaction summary that *quotes* one does not, and on 2026-09-20 such a quote in a
 // GPT-6 Astra session's summary re-routed the whole session to `muse` on ChatGPT (400 on every turn).
 const MARKER = /^\s*\[\[\s*(?:ripple|gpt)\s*:\s*([A-Za-z0-9.\-]+)\s*(?:@\s*([A-Za-z]+))?\s*\]\]/;
+// A Workflow script's agent gets its prompt inside the harness's frame (CLI 2.1.308, 2026-10-22): a
+// relayed user request, then one header line ending "The computed task text follows:" and the
+// script's text with every line indented. The script's first line is that prompt's top, as a spawned
+// subagent's is; read from above the header, a `[[ripple: gemini-3-8-flash@high]]` there was missed
+// and eight workers ran on the session's Opus.
+const WORKFLOW_TASK = /^\s*\[Workflow harness — computed task\][^\n]*\n/;
 
 type MessageBlock = { type?: string; text?: string };
 type Message = { role?: string; content?: string | MessageBlock[] };
@@ -40,12 +46,14 @@ function scanMarker(body: unknown): { name: string; effort?: string } | null {
     if (m?.role !== "user") continue;
     if (++seen > 5) break; // the task prompt is always near the top
     const c = m.content;
-    const text = typeof c === "string"
-      ? c
+    const parts = typeof c === "string"
+      ? [c]
       : Array.isArray(c)
-        ? c.filter((b) => b && b.type === "text").map((b) => b.text ?? "").join(" ")
-        : "";
-    const hit = MARKER.exec(text.replace(REMINDER, ""));
+        ? c.filter((b) => b && b.type === "text").map((b) => b.text ?? "")
+        : [];
+    // Claude Code may merge the frame's two turns into one message, so each block is looked at alone.
+    const framed = parts.map((p) => p.replace(REMINDER, "")).find((p) => WORKFLOW_TASK.test(p));
+    const hit = MARKER.exec(parts.join(" ").replace(REMINDER, "")) ?? (framed ? MARKER.exec(framed.replace(WORKFLOW_TASK, "")) : null);
     if (hit) {
       const name = hit[1]!.toLowerCase();
       const effort = hit[2]?.toLowerCase();
@@ -136,6 +144,13 @@ export function resolve(model: unknown, body: unknown, cfg: Config): Resolved | 
   // leave, so nothing that routes today routes differently.
   const ov = markerOverride(body, cfg.aliases);
   const finalModel = ov?.model ?? base;
+  // A marker's target takes its own prefix rule even when the incoming Claude model had no rule.
+  // Prefixes deliberately cover models not declared yet, so ownership alone cannot place it.
+  const ownDirect = ov ? cfg.direct.find((d) => finalModel.startsWith(d.prefix)) : undefined;
+  if (ownDirect) {
+    if (ingressOnly(ownDirect.provider)) return null;
+    return { provider: ownDirect.provider, model: finalModel, effort: ov?.effort ?? effort, tag: `${model}->${finalModel} (marker)` };
+  }
   const owners = declaredBy(finalModel, cfg);
 
   // Two providers offering the same id is a question only the operator can answer (one config has
@@ -277,6 +292,23 @@ export function threadDecision(json: Record<string, unknown>): "refuse" | "strip
   const thread = json.thread as { type?: unknown } | undefined;
   if (!thread || typeof thread !== "object") return "none";
   return thread.type === "continue" ? "refuse" : "strip";
+}
+
+/** The id every translated answer here is given (chatgpt, openai and google translators, web search). */
+const MINTED_MESSAGE_ID = /^msg_[0-9a-f]{24}$/;
+
+/**
+ * A `continue` of a translated or remembered vendor answer. Compatible vendors mint their own ids;
+ * the proxy remembers those as the answer passes. A continue carries only new messages, so a marker is not
+ * there to route by: such a request used to pass through to Anthropic, which has no such thread and
+ * answers 404, and the CLI resent the whole turn — every turn of every workflow worker (414 in a day,
+ * 2026-10-23). The 404 is not the refusal that makes the CLI go stateless; THREAD_UNSUPPORTED is.
+ */
+export function continuesTranslatedTurn(json: Record<string, unknown>, messageIds?: ReadonlySet<string>): boolean {
+  const thread = json.thread as { type?: unknown; previous_message_id?: unknown } | undefined;
+  return !!thread && typeof thread === "object" && thread.type === "continue"
+    && typeof thread.previous_message_id === "string"
+    && (MINTED_MESSAGE_ID.test(thread.previous_message_id) || messageIds?.has(thread.previous_message_id) === true);
 }
 
 export function stripThreadFields(json: Record<string, unknown>): void {

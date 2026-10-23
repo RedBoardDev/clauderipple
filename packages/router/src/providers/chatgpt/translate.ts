@@ -45,8 +45,13 @@ export type AnthropicRequest = {
 
 // ---- Responses side -----------------------------------------------------------------
 
+export type ResponsesContentPart =
+  | { type: "input_text" | "output_text"; text: string }
+  | { type: "input_image"; image_url: string }
+  | { type: "input_file"; filename: string; file_data: string };
+
 export type ResponsesInputItem =
-  | { type: "message"; role: "user" | "assistant"; content: ({ type: "input_text" | "output_text"; text: string } | { type: "input_image"; image_url: string })[] }
+  | { type: "message"; role: "user" | "assistant"; content: ResponsesContentPart[] }
   | { type: "function_call"; call_id: string; name: string; arguments: string }
   | { type: "function_call_output"; call_id: string; output: string }
   | ReplayedReasoning;
@@ -128,6 +133,39 @@ function blockText(c: string | AnthropicBlock[] | undefined): string {
     .map((b) => (b.type === "text" ? (b as { text: string }).text : b.type === "image" ? "[image]" : ""))
     .filter((s) => s.length > 0)
     .join("\n");
+}
+
+/** Binary documents can use the destination wire's native file part; text stays text. */
+export function documentFile(block: AnthropicBlock): { mimeType: string; data: string; filename: string } | undefined {
+  const source = (block as { source?: { type?: unknown; media_type?: unknown; data?: unknown } }).source;
+  if (source?.type !== "base64" || typeof source.data !== "string") return undefined;
+  const mimeType = typeof source.media_type === "string" ? source.media_type : "application/pdf";
+  const title = (block as { title?: unknown }).title;
+  return { mimeType, data: source.data, filename: typeof title === "string" && title ? title : mimeType === "application/pdf" ? "document.pdf" : "document" };
+}
+
+/** Text documents, including content-block sources, must never disappear in translation. */
+export function documentText(block: AnthropicBlock): string {
+  const doc = block as { title?: unknown; content?: unknown; source?: { type?: unknown; data?: unknown; content?: unknown } };
+  if (doc.source?.type === "text" && typeof doc.source.data === "string") return doc.source.data;
+  const content = doc.source?.type === "content" ? doc.source.content : doc.content;
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    const text = content.flatMap((part: unknown) => {
+      if (!part || typeof part !== "object") return [];
+      const value = part as { type?: unknown; text?: unknown };
+      return value.type === "text" && typeof value.text === "string" ? [value.text] : [];
+    }).join("\n");
+    if (text) return text;
+  }
+  return `[문서를 전달하지 못했습니다. 이 형식은 해당 입력에서 지원되지 않습니다.${typeof doc.title === "string" ? ` 문서 제목: ${doc.title}` : ""}]`;
+}
+
+export function documentResponsePart(block: AnthropicBlock, role: "user" | "assistant"): ResponsesContentPart {
+  const file = role === "user" ? documentFile(block) : undefined;
+  return file
+    ? { type: "input_file", filename: file.filename, file_data: `data:${file.mimeType};base64,${file.data}` }
+    : { type: role === "user" ? "input_text" : "output_text", text: documentText(block) };
 }
 
 function toolResultText(content: string | AnthropicBlock[] | undefined): string {
@@ -237,7 +275,7 @@ export function scrubSchema(node: unknown, removed?: { count: number }): unknown
       if (removed) removed.count++;
       continue;
     }
-    out[k] = scrubSchema(v, removed);
+    out[k] = ["const", "enum", "default", "examples"].includes(k) ? v : scrubSchema(v, removed);
   }
   return out;
 }
@@ -352,7 +390,7 @@ export function toResponsesRequest(req: AnthropicRequest, opts: TranslateOptions
       continue;
     }
     if (!Array.isArray(m.content)) continue;
-    let pending: ({ type: "input_text" | "output_text"; text: string } | { type: "input_image"; image_url: string })[] = [];
+    let pending: ResponsesContentPart[] = [];
     const flush = (): void => {
       if (pending.length > 0) input.push({ type: "message", role, content: pending });
       pending = [];
@@ -388,6 +426,10 @@ export function toResponsesRequest(req: AnthropicRequest, opts: TranslateOptions
           if (t.length > 0) pending.push({ type: role === "user" ? "input_text" : "output_text", text: t });
           break;
         }
+        case "document": {
+          pending.push(documentResponsePart(b, role));
+          break;
+        }
         case "image": {
           const src = (b as { source: { type: string; media_type?: string; data?: string; url?: string } }).source;
           if (role === "user") {
@@ -414,6 +456,7 @@ export function toResponsesRequest(req: AnthropicRequest, opts: TranslateOptions
           if (knownCalls.has(tr.tool_use_id)) input.push({ type: "function_call_output", call_id: tr.tool_use_id, output: out });
           else pending.push({ type: "input_text", text: `[Tool result]\n${out}` });
           for (const image_url of images) pending.push({ type: "input_image", image_url });
+          if (Array.isArray(tr.content)) for (const doc of tr.content) if (doc.type === "document") pending.push(documentResponsePart(doc, "user"));
           break;
         }
         default:
@@ -487,12 +530,15 @@ export type AnthropicUsage = {
 
 export type AnthropicEvent = { event: string; data: Record<string, unknown> };
 
+type ToolCallBlock = { type: "tool_use"; id: string; name: string; input: unknown; _args?: string; _streamed?: boolean };
+type ToolCallState = { block: ToolCallBlock; index: number; closed: boolean };
+
 /** Stateful mapper: feed Responses SSE events, get Anthropic SSE events. */
 export class StreamMapper {
   private started = false;
   private blockIndex = -1;
   /** `signed` marks a thinking block that already carries its signature — the envelope we wrote. */
-  private open: { kind: "text" | "thinking" | "tool"; itemId?: string; signed?: boolean } | null = null;
+  private open: { kind: "text" | "thinking"; itemId?: string; signed?: boolean } | null = null;
   private sawToolCall = false;
   private finished = false;
   readonly messageId: string;
@@ -502,7 +548,11 @@ export class StreamMapper {
   /** Latest `codex.rate_limits` payload, if the backend sent one. */
   rateLimits: Record<string, unknown> | null = null;
   /** Accumulated content for non-streaming responses. */
-  readonly content: ({ type: "text"; text: string } | { type: "thinking"; thinking: string; signature: string } | { type: "tool_use"; id: string; name: string; input: unknown; _args?: string })[] = [];
+  /** `_streamed`: some of a call's arguments already reached the client as input_json_delta. */
+  readonly content: ({ type: "text"; text: string } | { type: "thinking"; thinking: string; signature: string } | ToolCallBlock)[] = [];
+  private readonly calls = new Set<ToolCallState>();
+  private readonly callsById = new Map<string, ToolCallState>();
+  private readonly callsByOutput = new Map<number, ToolCallState>();
   stopReason: "end_turn" | "tool_use" | "max_tokens" = "end_turn";
   /**
    * How many reasoning items this response carried whole — the ones the client will replay. The
@@ -575,7 +625,41 @@ export class StreamMapper {
     return evs;
   }
 
-  private openBlock(kind: "text" | "thinking" | "tool", block: Record<string, unknown>, itemId?: string): AnthropicEvent[] {
+  /**
+   * A call whose arguments arrived only whole (on `.done`) still has to reach a streaming client:
+   * Claude Code builds a tool's input from input_json_delta alone and runs `{}` otherwise. Once per
+   * call, and never on top of deltas already sent, which would hand it the arguments twice.
+   */
+  private sendWholeArguments(call: ToolCallState, args: string): AnthropicEvent[] {
+    if (call.block._streamed || !args || call.closed) return [];
+    call.block._streamed = true;
+    return [{ event: "content_block_delta", data: { type: "content_block_delta", index: call.index, delta: { type: "input_json_delta", partial_json: args } } }];
+  }
+
+  private toolCall(ev: Record<string, unknown>, itemId?: string): ToolCallState | undefined {
+    const id = ev.item_id ?? itemId;
+    if (typeof id === "string") return this.callsById.get(id);
+    if (typeof ev.output_index === "number") return this.callsByOutput.get(ev.output_index);
+    const pending = [...this.calls].filter((call) => !call.closed);
+    return pending.length === 1 ? pending[0] : undefined;
+  }
+
+  private completeArguments(call: ToolCallState, value: unknown): AnthropicEvent[] {
+    const args = typeof value === "string" ? value : call.block._args ?? "";
+    if (call.block._args !== undefined || typeof value === "string") {
+      try { call.block.input = args ? JSON.parse(args) : {}; } catch { call.block.input = {}; }
+      delete call.block._args;
+    }
+    return this.sendWholeArguments(call, args);
+  }
+
+  private closeTool(call: ToolCallState): AnthropicEvent[] {
+    if (call.closed) return [];
+    call.closed = true;
+    return [{ event: "content_block_stop", data: { type: "content_block_stop", index: call.index } }];
+  }
+
+  private openBlock(kind: "text" | "thinking", block: Record<string, unknown>, itemId?: string): AnthropicEvent[] {
     const evs = this.closeBlock();
     this.blockIndex++;
     this.open = itemId ? { kind, itemId } : { kind };
@@ -632,6 +716,7 @@ export class StreamMapper {
 
   /** Map one upstream event. Returns Anthropic events to emit (possibly none). */
   feed(ev: Record<string, unknown>): AnthropicEvent[] {
+    if (this.finished) return [];
     const type = ev.type as string;
     const out: AnthropicEvent[] = [...this.start()];
     switch (type) {
@@ -639,7 +724,7 @@ export class StreamMapper {
         this.rateLimits = ev;
         break;
       case "response.output_item.added": {
-        const item = ev.item as { type: string; call_id?: string; name?: string; id?: string; encrypted_content?: unknown; summary?: unknown };
+        const item = ev.item as { type: string; call_id?: string; name?: string; id?: string; encrypted_content?: unknown; summary?: unknown; arguments?: unknown };
         if (item.type === "function_call") {
           this.sawToolCall = true;
           const id = item.call_id ?? item.id ?? `call_${crypto.randomBytes(8).toString("hex")}`;
@@ -647,8 +732,15 @@ export class StreamMapper {
           const called = item.name ?? "tool";
           const name = this.toolNames.get(called) ?? called;
           this.lastCallId = id;
-          this.content.push({ type: "tool_use", id, name, input: {}, _args: "" });
-          out.push(...this.openBlock("tool", { type: "tool_use", id, name, input: {} }, item.id));
+          // An item can arrive with its arguments already in it; kept for the item's end, like deltas.
+          const block: ToolCallBlock = { type: "tool_use", id, name, input: {}, _args: typeof item.arguments === "string" ? item.arguments : "" };
+          this.content.push(block);
+          out.push(...this.closeBlock());
+          const call: ToolCallState = { block, index: ++this.blockIndex, closed: false };
+          this.calls.add(call);
+          if (item.id) this.callsById.set(item.id, call);
+          if (typeof ev.output_index === "number") this.callsByOutput.set(ev.output_index, call);
+          out.push({ event: "content_block_start", data: { type: "content_block_start", index: call.index, content_block: { type: "tool_use", id, name, input: {} } } });
         } else if (item.type === "reasoning") {
           // The item's reasoning is held until it is complete and handed over whole (see
           // `sealReasoning`): one thinking block whose signature carries the envelope. The summary,
@@ -700,26 +792,27 @@ export class StreamMapper {
       }
       case "response.function_call_arguments.delta": {
         const delta = String(ev.delta ?? "");
-        const last = this.content[this.content.length - 1];
-        if (last?.type === "tool_use") last._args = (last._args ?? "") + delta;
-        if (this.open?.kind === "tool") out.push({ event: "content_block_delta", data: { type: "content_block_delta", index: this.blockIndex, delta: { type: "input_json_delta", partial_json: delta } } });
-        break;
-      }
-      case "response.function_call_arguments.done": {
-        const last = this.content[this.content.length - 1];
-        if (last?.type === "tool_use") {
-          const args = typeof ev.arguments === "string" ? ev.arguments : last._args ?? "";
-          try {
-            last.input = args ? JSON.parse(args) : {};
-          } catch {
-            last.input = {};
-          }
-          delete last._args;
+        const call = this.toolCall(ev);
+        if (call && !call.closed && delta) {
+          call.block._args = (call.block._args ?? "") + delta;
+          call.block._streamed = true;
+          out.push({ event: "content_block_delta", data: { type: "content_block_delta", index: call.index, delta: { type: "input_json_delta", partial_json: delta } } });
         }
         break;
       }
+      case "response.function_call_arguments.done": {
+        const call = this.toolCall(ev);
+        if (call) out.push(...this.completeArguments(call, ev.arguments));
+        break;
+      }
       case "response.output_item.done": {
-        const done = ev.item as { type?: unknown; encrypted_content?: unknown; summary?: unknown } | undefined;
+        const done = ev.item as { id?: string; type?: unknown; encrypted_content?: unknown; summary?: unknown; arguments?: unknown } | undefined;
+        // Whole-only arguments must reach this call's own block, once, even with parallel calls.
+        const call = this.toolCall(ev, done?.id);
+        if (call && (done?.type === "function_call" || done?.type === undefined)) {
+          out.push(...this.completeArguments(call, done?.arguments), ...this.closeTool(call));
+          break;
+        }
         // The backend may put `encrypted_content` only on the completed item, so the seal is taken
         // here as well as from `response.output_item.added`, and the item is only handed over now
         // anyway — a half-assembled reasoning block must not reach the client.
@@ -745,7 +838,7 @@ export class StreamMapper {
             cache_creation_input_tokens: 0,
           };
         }
-        this.stopReason = this.sawToolCall ? "tool_use" : r?.incomplete_details?.reason === "max_output_tokens" ? "max_tokens" : "end_turn";
+        this.stopReason = r?.incomplete_details?.reason === "max_output_tokens" ? "max_tokens" : this.sawToolCall ? "tool_use" : "end_turn";
         out.push(...this.finish());
         break;
       }
@@ -769,6 +862,7 @@ export class StreamMapper {
     if (this.finished) return [];
     this.finished = true;
     const out = [...this.start(), ...this.closeBlock()];
+    for (const call of this.calls) out.push(...this.completeArguments(call, undefined), ...this.closeTool(call));
     out.push({ event: "message_delta", data: { type: "message_delta", delta: { stop_reason: this.stopReason, stop_sequence: null }, usage: this.usage } });
     out.push({ event: "message_stop", data: { type: "message_stop" } });
     return out;
@@ -781,14 +875,14 @@ export class StreamMapper {
     const type = contextOverflow ? "invalid_request_error" : code === "server_is_overloaded" ? "overloaded_error" : code === "rate_limit_exceeded" || code === "usage_limit_reached" ? "rate_limit_error" : "api_error";
     if (contextOverflow) message = `prompt is too long: ${message}`;
     this.failure = { type, message, ...(code ? { code } : {}) };
-    return [...this.start(), ...this.closeBlock(), { event: "error", data: { type: "error", error: { type, message } } }];
+    return [...this.start(), ...this.closeBlock(), ...[...this.calls].flatMap((call) => this.closeTool(call)), { event: "error", data: { type: "error", error: { type, message } } }];
   }
 
   /** Non-streaming body once finished. */
   message(): Record<string, unknown> {
     const content = this.content.map((b) => {
       if (b.type === "tool_use") {
-        const { _args, ...rest } = b;
+        const { _args, _streamed: _, ...rest } = b;
         if (_args !== undefined) {
           try {
             rest.input = _args ? JSON.parse(_args) : {};

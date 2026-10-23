@@ -152,19 +152,22 @@ function powershell(script: string, opts: { stdio?: "ignore" | "inherit" | "pipe
  * Measured on Windows 11 (2026-09-14) as a standard user: the import succeeded with no UAC prompt,
  * only that dialog. Removal shows a second confirmation, so `picker off` prompts the user too.
  */
-export function caTrusted(caPem: string): boolean {
-  if (isLinux) return nssTrusted(caPem);
+export function caTrusted(caPem: string, opts: { platform?: NodeJS.Platform; run?: (command: string, args: string[]) => string } = {}): boolean {
+  const platform = opts.platform ?? process.platform;
+  if (platform === "linux") return nssTrusted(caPem);
+  const run = opts.run ?? ((command, args) => execFileSync(command, args, { env: windowsPowerShellEnv(), stdio: ["ignore", "pipe", "ignore"], windowsHide: true }).toString());
   try {
-    if (isWindows) {
-      const out = powershell(`@(Get-ChildItem Cert:\\CurrentUser\\Root | Where-Object { $_.Subject -eq 'CN=${CA_NAME}' }).Count`);
+    const fingerprint = new X509Certificate(fs.readFileSync(caPem)).fingerprint.replace(/:/g, "");
+    if (platform === "win32") {
+      const out = run("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", `@(Get-ChildItem Cert:\\CurrentUser\\Root | Where-Object { $_.Thumbprint -eq '${fingerprint}' }).Count`]);
       return Number(out.trim()) > 0;
     }
-    // Ask for the trust setting, not the keychain item: the certificate can sit in the login keychain
-    // with no trust (new Mac, 2026-10-06), and a presence check then made `picker on` skip the trust
-    // step while Claude Desktop rejected every claude.ai certificate (ERR_CERT_AUTHORITY_INVALID).
-    // `add-trusted-cert` without -d writes the user trust domain, which this lists one "Cert N: <name>" per line.
-    const out = execFileSync("security", ["dump-trust-settings"], { stdio: ["ignore", "pipe", "ignore"] }).toString();
-    return out.split("\n").some((line) => /^Cert \d+: /.test(line) && line.slice(line.indexOf(": ") + 2).trim() === CA_NAME);
+    // User trust settings are keyed by the certificate's SHA-1, not its non-unique subject.
+    // Presence alone is not trust: verify the current certificate against that keychain too.
+    const settings = run("security", ["trust-settings-export", "/dev/stdout"]);
+    if (!settings.toUpperCase().includes(`<KEY>${fingerprint}</KEY>`)) return false;
+    run("security", ["verify-cert", "-c", caPem, "-p", "basic", "-k", loginKeychain()]);
+    return true;
   } catch {
     return false;
   }

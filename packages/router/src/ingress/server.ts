@@ -19,7 +19,7 @@ import { SseParser } from "../providers/chatgpt/sse.ts";
 import { ingressModels } from "./models.ts";
 import { requestId, type RequestLog, type RequestRecord, type RequestUsage } from "../requestlog.ts";
 import { credentialHeaderValues, redactErrorText } from "../redact.ts";
-import { CLAUDE_CODE_IDENTITY, fromClaudeCodeToolName, nativeAnthropicHeaders, toClaudeCodeToolName } from "../providers/anthropic.ts";
+import { CLAUDE_CODE_IDENTITY, fromClaudeCodeToolName, nativeAnthropicHeaders, toClaudeCodeToolName, type ClaudeCodeCredentialReaders } from "../providers/anthropic.ts";
 import { ClaudeAccountAuthPool } from "../providers/anthropic-account-pool.ts";
 import { ObservedClaudeCodeAuth } from "../providers/anthropic-observed.ts";
 import type { ChatGptAdapter } from "../providers/chatgpt/index.ts";
@@ -43,6 +43,8 @@ type IngressDeps = {
   requests: RequestLog;
   /** Shared process-memory OAuth observation; never persisted or exposed by ingress. */
   observedClaudeCodeAuth?: ObservedClaudeCodeAuth;
+  /** Test seam for Claude Code's keychain and credential-file readers. */
+  claudeCodeCredentialReaders?: ClaudeCodeCredentialReaders;
   home?: string;
   /** Test seams; production uses the local account projection and api.anthropic.com. */
   claudeAccounts?: ClaudeAccountAuthPool;
@@ -186,6 +188,7 @@ export class OpenAiIngress {
     this.claudeAccounts = deps.claudeAccounts ?? new ClaudeAccountAuthPool({
       home: deps.home ?? (process.env.CLAUDERIPPLE_HOME?.trim() || path.join(os.homedir(), ".clauderipple")),
       ...(deps.observedClaudeCodeAuth ? { observed: deps.observedClaudeCodeAuth } : {}),
+      ...(deps.claudeCodeCredentialReaders ? { credentialReaders: deps.claudeCodeCredentialReaders } : {}),
       log: deps.log,
     });
     this.server = http.createServer({ maxHeaderSize: 64 * 1024 }, (req, res) => void this.handle(req, res));

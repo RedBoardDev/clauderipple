@@ -17,43 +17,53 @@ import { fileURLToPath } from "node:url";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const dist = path.join(root, "dist");
-const npm = process.platform === "win32" ? "npm.cmd" : "npm";
-
-fs.rmSync(dist, { recursive: true, force: true });
-execFileSync(npm, ["exec", "--", "tsc", "-p", "tsconfig.build.json"], { cwd: root, stdio: "inherit" });
-execFileSync(npm, ["--workspace", "@clauderipple/app", "run", "build"], { cwd: root, stdio: "inherit" });
-
-fs.cpSync(path.join(root, "packages", "ui"), path.join(dist, "ui"), { recursive: true });
-// Host runtime metadata and browser modules are not TypeScript server compilation outputs.
-fs.copyFileSync(path.join(root, "packages", "remote", "package.json"), path.join(dist, "remote", "package.json"));
-const remoteWeb = path.join(root, "packages", "remote", "web");
-if (fs.existsSync(remoteWeb)) fs.cpSync(remoteWeb, path.join(dist, "remote", "web"), { recursive: true });
-// SHARED keeps .ts browser URLs in both checkout and installed host layouts.
-for (const name of ["protocol.ts", "tool-details.ts", "e2ee.ts"]) {
-  fs.copyFileSync(path.join(root, "packages", "remote", "src", name), path.join(dist, "remote", "src", name));
+/** @param {NodeJS.Platform} platform @param {typeof execFileSync} run */
+export function npmBuildSteps(platform = process.platform, run = execFileSync) {
+  const npm = platform === "win32" ? "npm.cmd" : "npm";
+  // .cmd is not a PE executable; Windows needs cmd.exe to interpret npm's shim.
+  const options = { cwd: root, stdio: "inherit", shell: platform === "win32" };
+  run(npm, ["exec", "--", "tsc", "-p", "tsconfig.build.json"], options);
+  run(npm, ["--workspace", "@clauderipple/app", "run", "build"], options);
 }
-// The status mod is loaded by Claude Code itself, as TypeScript; the API types it writes beside the
-// manifest when it loads one are its own and are left out, as is the design preview (a dev tool).
-fs.cpSync(path.join(root, "packages", "mod"), path.join(dist, "mod"), {
-  recursive: true,
-  filter: (source) => !source.includes(`${path.sep}.claude-plugin${path.sep}types`) && !source.includes(`${path.sep}mod${path.sep}preview`),
-});
-fs.cpSync(path.join(root, "packages", "app", "dist"), path.join(dist, "app", "dist"), { recursive: true });
-fs.cpSync(path.join(root, "packages", "app", "assets"), path.join(dist, "app", "assets"), { recursive: true });
-// The app icon travels with the tray's assets: `clauderipple app --install` puts it on the launcher
-// it makes (icns on macOS, png on Linux, ico on Windows) and the tray uses it for its window.
-for (const name of ["icon.icns", "icon.png", "icon.ico"]) {
-  if (!fs.existsSync(path.join(dist, "app", "assets", name))) throw new Error(`packages/app/assets/${name} is missing; run: npm --workspace @clauderipple/app run icons`);
-}
-// The tray is compiled to CommonJS, but the package root says "type": "module", and the nearest
-// package.json decides: without this one Electron loaded main.js as an ES module and died with
-// "exports is not defined in ES module scope" (issue #8, Windows, 0.3.1). In a checkout
-// packages/app has its own package.json, which is why development never showed it.
-// It carries the version too: Electron's app.getVersion() reads it and, finding none, answers
-// with Electron's own version.
-const { version } = JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf8"));
-fs.writeFileSync(path.join(dist, "app", "package.json"), JSON.stringify({ private: true, version, type: "commonjs" }, null, 2) + "\n");
 
-const entry = path.join(dist, "cli", "src", "index.js");
-if (!fs.existsSync(entry)) throw new Error(`build produced no CLI entry point at ${entry}`);
-console.log(`✓ built ${path.relative(root, entry)}`);
+function build() {
+  fs.rmSync(dist, { recursive: true, force: true });
+  npmBuildSteps();
+
+  fs.cpSync(path.join(root, "packages", "ui"), path.join(dist, "ui"), { recursive: true });
+  // Host runtime metadata and browser modules are not TypeScript server compilation outputs.
+  fs.copyFileSync(path.join(root, "packages", "remote", "package.json"), path.join(dist, "remote", "package.json"));
+  const remoteWeb = path.join(root, "packages", "remote", "web");
+  if (fs.existsSync(remoteWeb)) fs.cpSync(remoteWeb, path.join(dist, "remote", "web"), { recursive: true });
+  // SHARED keeps .ts browser URLs in both checkout and installed host layouts.
+  for (const name of ["protocol.ts", "tool-details.ts", "e2ee.ts"]) {
+    fs.copyFileSync(path.join(root, "packages", "remote", "src", name), path.join(dist, "remote", "src", name));
+  }
+  // The status mod is loaded by Claude Code itself, as TypeScript; the API types it writes beside the
+  // manifest when it loads one are its own and are left out, as is the design preview (a dev tool).
+  fs.cpSync(path.join(root, "packages", "mod"), path.join(dist, "mod"), {
+    recursive: true,
+    filter: (source) => !source.includes(`${path.sep}.claude-plugin${path.sep}types`) && !source.includes(`${path.sep}mod${path.sep}preview`),
+  });
+  fs.cpSync(path.join(root, "packages", "app", "dist"), path.join(dist, "app", "dist"), { recursive: true });
+  fs.cpSync(path.join(root, "packages", "app", "assets"), path.join(dist, "app", "assets"), { recursive: true });
+  // The app icon travels with the tray's assets: `clauderipple app --install` puts it on the launcher
+  // it makes (icns on macOS, png on Linux, ico on Windows) and the tray uses it for its window.
+  for (const name of ["icon.icns", "icon.png", "icon.ico"]) {
+    if (!fs.existsSync(path.join(dist, "app", "assets", name))) throw new Error(`packages/app/assets/${name} is missing; run: npm --workspace @clauderipple/app run icons`);
+  }
+  // The tray is compiled to CommonJS, but the package root says "type": "module", and the nearest
+  // package.json decides: without this one Electron loaded main.js as an ES module and died with
+  // "exports is not defined in ES module scope" (issue #8, Windows, 0.3.1). In a checkout
+  // packages/app has its own package.json, which is why development never showed it.
+  // It carries the version too: Electron's app.getVersion() reads it and, finding none, answers
+  // with Electron's own version.
+  const { version } = JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf8"));
+  fs.writeFileSync(path.join(dist, "app", "package.json"), JSON.stringify({ private: true, version, type: "commonjs" }, null, 2) + "\n");
+
+  const entry = path.join(dist, "cli", "src", "index.js");
+  if (!fs.existsSync(entry)) throw new Error(`build produced no CLI entry point at ${entry}`);
+  console.log(`✓ built ${path.relative(root, entry)}`);
+}
+
+if (import.meta.main) build();

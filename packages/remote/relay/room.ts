@@ -112,7 +112,8 @@ export class Room<S extends Sock> {
 
   hostData(ws: S, conn: string): void {
     const old = this.ctx.sockets(`d:${conn}`);
-    this.ctx.accept(ws, ["data", `d:${conn}`]);
+    const at = Math.max(this.ctx.now(), ...old.map(o => this.acceptedAt(o) + 1));
+    this.ctx.accept(ws, ["data", `d:${conn}`, `at:${at}`]);
     for (const o of old) shut(o, RELAY_CLOSE.replaced, "replaced");
     const phone = this.ctx.sockets(`c:${conn}`)[0];
     if (!phone) { shut(ws, RELAY_CLOSE.peerGone, "phone gone"); return; }
@@ -138,7 +139,10 @@ export class Room<S extends Sock> {
     const phone = this.connOf(ws, "c:");
     if (phone) for (const d of this.ctx.sockets(`d:${phone}`)) if (d !== ws) shut(d, 1000, "phone left");
     const host = this.connOf(ws, "d:");
-    if (host) for (const c of this.ctx.sockets(`c:${host}`)) if (c !== ws) shut(c, RELAY_CLOSE.peerGone, "host left");
+    // A replaced socket can close long after its successor was accepted, even after hibernation.
+    if (host && !this.ctx.sockets(`d:${host}`).some(d => d !== ws && this.acceptedAt(d) > this.acceptedAt(ws))) {
+      for (const c of this.ctx.sockets(`c:${host}`)) shut(c, RELAY_CLOSE.peerGone, "host left");
+    }
   }
 
   /** 0 for a host socket accepted before sockets carried the tag (older than any tagged one). */

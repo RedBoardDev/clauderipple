@@ -6,6 +6,7 @@ import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { BUNDLE_ID, launcherPath } from "./bundle.ts";
 
 export const LABEL = "com.clauderipple.router";
 
@@ -16,8 +17,71 @@ export function launchdLabel(): string {
 
 /** Test-only override (CLAUDERIPPLE_LAUNCH_AGENTS_DIR); production always uses ~/Library/LaunchAgents. */
 export function plistPath(): string {
+  return agentPlistPath(launchdLabel());
+}
+
+function agentPlistPath(label: string): string {
   const dir = process.env.CLAUDERIPPLE_LAUNCH_AGENTS_DIR ?? path.join(os.homedir(), "Library", "LaunchAgents");
-  return path.join(dir, `${launchdLabel()}.plist`);
+  return path.join(dir, `${label}.plist`);
+}
+
+export function trayLaunchdLabel(): string {
+  return process.env.CLAUDERIPPLE_TRAY_LAUNCHD_LABEL
+    ?? (process.env.CLAUDERIPPLE_LAUNCHD_LABEL ? `${launchdLabel()}.tray` : "com.clauderipple.tray");
+}
+
+export function trayPlistPath(): string {
+  return agentPlistPath(trayLaunchdLabel());
+}
+
+/** macOS cannot launch an npm tray by opening its bare Electron bundle without a script. */
+export function trayLoginItemDecision(opts: { platform: NodeJS.Platform; packaged: boolean; initialized: boolean; electronOpenAtLogin: boolean }): { removeElectronItem: boolean; enableAgent: boolean } | null {
+  if (opts.platform !== "darwin" || opts.packaged) return null;
+  return { removeElectronItem: opts.electronOpenAtLogin, enableAgent: !opts.initialized || opts.electronOpenAtLogin };
+}
+
+export function renderTrayPlist(home: string): string {
+  const log = path.join(home, "logs", "launcher.log");
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>${esc(trayLaunchdLabel())}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>${esc(launcherPath(home))}</string>
+    <string>tray</string>
+  </array>
+  <key>AssociatedBundleIdentifiers</key>
+  <array><string>${BUNDLE_ID}</string></array>
+  <key>EnvironmentVariables</key>
+  <dict><key>CLAUDERIPPLE_HOME</key><string>${esc(home)}</string></dict>
+  <key>RunAtLoad</key><true/>
+  <key>LimitLoadToSessionType</key><string>Aqua</string>
+  <key>StandardOutPath</key><string>${esc(log)}</string>
+  <key>StandardErrorPath</key><string>${esc(log)}</string>
+</dict>
+</plist>
+`;
+}
+
+/** Next login only: never bootstrap, bootout or kickstart the tray's one-shot agent. */
+export function installTrayAgent(home: string): string {
+  const file = trayPlistPath();
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.mkdirSync(path.join(home, "logs"), { recursive: true });
+  fs.writeFileSync(file, renderTrayPlist(home));
+  return file;
+}
+
+export function removeTrayAgent(): boolean {
+  try {
+    fs.unlinkSync(trayPlistPath());
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    return false;
+  }
 }
 
 function esc(s: string): string {
@@ -130,12 +194,16 @@ export function kickstart(opts: { force?: boolean } = {}, run: Launchctl = launc
  * used to be the "Start Router" path, so pressing it while launchd was still bringing the router
  * up killed it and started the wait over (observed 2026-09-14: three runs in the four minutes
  * after login). Re-bootstraps the plist when the agent was unloaded by `clauderipple stop`.
+ *
+ * `kickstart` succeeding only means launchd accepted the request; a plist whose program is gone
+ * fails after that, silently. So the pid is waited for, as on Windows (#80).
  */
-export function startAgent(run: Launchctl = launchctl): "already-running" | "started" | "failed" {
+export function startAgent(run: Launchctl = launchctl, opts: { waitMs?: number } = {}): "already-running" | "started" | "failed" {
   if (agentState(run) === "running") return "already-running";
-  if (kickstart({}, run)) return "started";
+  const budget = opts.waitMs ?? START_BUDGET_MS;
+  if (kickstart({}, run)) return waitForPid(run, budget) ? "started" : "failed";
   const file = plistPath();
-  if (fs.existsSync(file) && run(["bootstrap", domain(), file]).ok) return "started";
+  if (fs.existsSync(file) && run(["bootstrap", domain(), file]).ok && waitForPid(run, budget)) return "started";
   return "failed";
 }
 
@@ -150,6 +218,18 @@ function sleepSync(ms: number): void {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
 
+/** How long a job launchd accepted is given to produce a process before it counts as a failure. */
+const START_BUDGET_MS = 15_000;
+
+function waitForPid(run: Launchctl, budgetMs: number, pollMs = 250): boolean {
+  const deadline = Date.now() + budgetMs;
+  while (Date.now() < deadline) {
+    if (agentPid(run) !== null) return true;
+    sleepSync(pollMs);
+  }
+  return agentPid(run) !== null;
+}
+
 /**
  * Graceful restart. `launchctl kickstart -k` SIGKILLs about 5s after its SIGTERM (measured
  * 2026-09-13: the drain was cut and two in-flight model calls died), so instead we send
@@ -159,11 +239,11 @@ function sleepSync(ms: number): void {
  */
 export function restartAgent(opts: { waitMs?: number; onProgress?: (msg: string) => void } = {}): "drained" | "kickstarted" | "failed" {
   const pid = agentPid();
-  if (pid === null) return kickstart({ force: true }) ? "kickstarted" : "failed";
+  if (pid === null) return kickstart({ force: true }) && waitForPid(launchctl, START_BUDGET_MS) ? "kickstarted" : "failed";
   try {
     process.kill(pid, "SIGTERM");
   } catch {
-    return kickstart({ force: true }) ? "kickstarted" : "failed";
+    return kickstart({ force: true }) && waitForPid(launchctl, START_BUDGET_MS) ? "kickstarted" : "failed";
   }
   const t0 = Date.now();
   const deadline = t0 + (opts.waitMs ?? 120_000);
@@ -183,14 +263,14 @@ export function restartAgent(opts: { waitMs?: number; onProgress?: (msg: string)
     }
     sleepSync(250);
   }
-  if (!exited) return kickstart({ force: true }) ? "kickstarted" : "failed";
+  if (!exited) return kickstart({ force: true }) && waitForPid(launchctl, START_BUDGET_MS) ? "kickstarted" : "failed";
   // KeepAlive relaunches it; ThrottleInterval is 2s.
   const upBy = Date.now() + 15_000;
   while (Date.now() < upBy) {
     if (agentState() === "running" && agentPid() !== pid) return "drained";
     sleepSync(250);
   }
-  return kickstart({ force: true }) ? "kickstarted" : "failed";
+  return kickstart({ force: true }) && waitForPid(launchctl, START_BUDGET_MS) ? "kickstarted" : "failed";
 }
 
 export function stopAgent(): boolean {

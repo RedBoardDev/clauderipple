@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { Sessions } from "../src/sessions.ts";
+import { Sessions, type QueryFn, type SessionsOptions } from "../src/sessions.ts";
 import { BridgeClient } from "../src/bridge-client.ts";
 import { PermissionQueue } from "../src/permissions.ts";
 import type { DesktopProcess } from "../src/desktop.ts";
@@ -25,7 +25,7 @@ export interface BridgeFixture {
 }
 
 /** A Mac session in bridge mode with a scripted Remote Control transport. */
-export function bridgeFixture(t: import("node:test").TestContext, opts: { streamBodyless?: () => boolean; registry?: () => Map<string, DesktopProcess> } = {}): BridgeFixture {
+export function bridgeFixture(t: import("node:test").TestContext, opts: { streamBodyless?: () => boolean; registry?: () => Map<string, DesktopProcess>; query?: QueryFn; failSend?: boolean; watchTranscript?: SessionsOptions["watchTranscript"]; onEvent?: SessionsOptions["onEvent"]; stateResponse?: () => Promise<Response> } = {}): BridgeFixture {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-redteam-"));
   const projects = path.join(root, "projects");
   fs.mkdirSync(path.join(projects, "project"), { recursive: true });
@@ -39,11 +39,11 @@ export function bridgeFixture(t: import("node:test").TestContext, opts: { stream
   const client = new BridgeClient({ auth: () => ({ accessToken: "private-token", organizationUuid: "org", expiresAt: Date.now() + 60_000 }), fetch: async (url, options) => {
     if (options?.method === "POST") {
       posts.push(JSON.parse(String(options.body)));
-      return new Response("{}", { status: 200 });
+      return new Response("{}", { status: opts.failSend ? 503 : 200 });
     }
     if (String(url).endsWith("/sessions/bridge")) {
       stateReads++;
-      return Response.json({ worker_status: workerStatus });
+      return opts.stateResponse ? opts.stateResponse() : Response.json({ worker_status: workerStatus });
     }
     if (String(url).includes("/events?sort_order=asc")) return Response.json({ data: history });
     if (String(url).includes("/events?sort_order=desc")) return Response.json({ data: [] });
@@ -53,7 +53,7 @@ export function bridgeFixture(t: import("node:test").TestContext, opts: { stream
   const permissions = PermissionQueue.open(path.join(root, "permissions.json"));
   const sessions = new Sessions({ now: () => now, log() {}, dir: path.join(root, "host"), desktopProjects: projects, desktopRegistry: () => registry, desktopProcesses: () => "", bridgeClient: client, permissions,
     router: { status: async () => ({ ok: true, proxyEnv: {} }), figures: async () => { throw new Error("unused"); } },
-    queryFn: () => { throw new Error("must not spawn SDK"); }, onEvent() {}, onSessions: () => { sessionsCalls++; } });
+    queryFn: opts.query ?? (() => { throw new Error("must not spawn SDK"); }), ...(opts.watchTranscript ? { watchTranscript: opts.watchTranscript } : {}), onEvent: opts.onEvent ?? (() => {}), onSessions: () => { sessionsCalls++; } });
   t.after(async () => { sessions.shutdown(); await tick(); fs.rmSync(root, { recursive: true, force: true }); });
   let sequence = 0;
   return { root, file, registry, sessions, posts, permissions, history,

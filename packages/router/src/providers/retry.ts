@@ -106,10 +106,10 @@ export async function fetchWithRetry(
       continue;
     }
     if (res.ok) return res;
-    // A 403's meaning is in its body and a relay reports its own broken upstream there; every other
-    // status is judged from the status alone. Cloned rather than read, so the caller still gets the
-    // body to show when this attempt turns out to be the last one.
-    const inspect = res.status === 403 || (opts.stopOn !== undefined && res.status >= 500);
+    // A relay reports its own broken upstream in a 402/403 body; the status alone would mistake it
+    // for billing or auth failure. Clone it so the caller still gets the provider's own body when
+    // this attempt turns out to be the last one.
+    const inspect = res.status === 402 || res.status === 403 || (opts.stopOn !== undefined && res.status >= 500);
     const text = inspect ? await res.clone().text().catch(() => "") : "";
     if (opts.stopOn?.(res.status, text)) return res;
     if (!isWorthRetrying(res.status, text) || n === attempts) return res;

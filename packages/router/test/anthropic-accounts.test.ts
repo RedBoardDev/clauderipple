@@ -65,6 +65,7 @@ test("account storage is private, exposes safe summaries, and never stores the u
       expiresAt: 2_000_000,
       needsReauth: false,
       preferred: false,
+      paused: false,
     }]);
     assert.doesNotMatch(JSON.stringify(listClaudeAccounts(dir)), /access-one|refresh-one|upstream-one/);
   } finally {

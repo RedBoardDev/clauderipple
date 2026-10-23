@@ -11,7 +11,8 @@ import { reduce } from "../web/timeline.ts";
 import { INLINE_CAP } from "../src/protocol.ts";
 import type { Effort, SessionEvent } from "../src/protocol.ts";
 import { Sessions, modelArg, nextAttention, summarize } from "../src/sessions.ts";
-import { CLI_NOT_LOGGED_IN } from "../src/bridge-client.ts";
+import { BridgeClient, CLI_NOT_LOGGED_IN } from "../src/bridge-client.ts";
+import type { DesktopProcess } from "../src/desktop.ts";
 import type { CanUseTool, PermissionAnswer, QueryFn, SdkUserMessage, SessionsOptions } from "../src/sessions.ts";
 import { posixPaths } from "../../../test/capabilities.ts";
 
@@ -77,7 +78,37 @@ function scriptedQuery(script: { permission?: boolean; toolOutput?: unknown; ima
   return { queryFn, options, users, answers, suggestions, spies };
 }
 
-function fixture(t: TestContext, script: Parameters<typeof scriptedQuery>[0] = {}, extra: Pick<SessionsOptions, "handoff" | "log"> = {}) {
+/** A query boundary whose input reading, result delivery and control replies are independent. */
+function controlledQueries(readInputs = true) {
+  const queries: { options: Record<string, unknown>; users: SdkUserMessage[]; emit: (event: Record<string, unknown>) => void; closed: boolean; interruptReply: ReturnType<typeof Promise.withResolvers<void>>; modeReply: ReturnType<typeof Promise.withResolvers<void>> | null; modes: string[] }[] = [];
+  const queryFn: QueryFn = params => {
+    let wake = Promise.withResolvers<void>();
+    const events: Record<string, unknown>[] = [];
+    const control = { options: params.options, users: [] as SdkUserMessage[], closed: false,
+      interruptReply: Promise.withResolvers<void>(), modeReply: null as ReturnType<typeof Promise.withResolvers<void>> | null, modes: [] as string[],
+      emit: (event: Record<string, unknown>) => { events.push(event); wake.resolve(); },
+    };
+    queries.push(control);
+    if (readInputs || queries.length > 1) void (async () => { for await (const user of params.prompt) control.users.push(user); })();
+    return {
+      async *[Symbol.asyncIterator]() {
+        while (!control.closed) {
+          const event = events.shift();
+          if (event) { yield event; continue; }
+          await wake.promise;
+          wake = Promise.withResolvers<void>();
+        }
+      },
+      interrupt: () => control.interruptReply.promise,
+      setModel: async () => {},
+      setPermissionMode: async mode => { control.modes.push(mode); await control.modeReply?.promise; },
+      close: () => { control.closed = true; wake.resolve(); },
+    };
+  };
+  return { queryFn, queries };
+}
+
+function fixture(t: TestContext, script: Parameters<typeof scriptedQuery>[0] = {}, extra: Partial<Pick<SessionsOptions, "handoff" | "log" | "queryFn" | "desktopProjects" | "desktopRegistry" | "desktopProcesses" | "bridgeClient">> = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ripple-sessions-"));
   const cwd = path.join(dir, "project");
   fs.mkdirSync(cwd);
@@ -133,6 +164,71 @@ test("thinking streams finalize at original block indices without exposing signa
   assert.deepEqual(thoughts.map(e => [e.block, e.text, e.delta === true]), [[2, "thought 2", true], [2, "thought 2 complete", false], [4, "thought 4", true], [4, "thought 4 complete", false]]);
   assert.ok(!JSON.stringify(stored).includes("private signature"));
   assert.deepEqual(reduce(stored).items.filter(i => i.type === "thinking").map(i => i.text), ["thought 2 complete", "thought 4 complete"]);
+});
+
+test("an effort restart carries every accepted input, whether still in the inbox or prefetched by the SDK", async t => {
+  for (const prefetch of [false, true]) {
+    const boundary = controlledQueries(prefetch);
+    const f = fixture(t, {}, { queryFn: boundary.queryFn });
+    const id = await f.create();
+    await waitFor(() => boundary.queries.length === 1);
+    const first = boundary.queries[0]!;
+    first.emit({ type: "system", subtype: "init", session_id: "sdk-restart" });
+    await nextTick();
+    await f.sessions.send(id, "second", "second input");
+    await f.sessions.send(id, "third", "third input");
+    await nextTick();
+    assert.equal(first.users.length, prefetch ? 3 : 0);
+    await f.sessions.setModel(id, "claude-test", "max");
+    first.emit({ type: "result", subtype: "success" });
+    await waitFor(() => boundary.queries.length === 2);
+    const second = boundary.queries[1]!;
+    await waitFor(() => second.users.length === 2);
+    assert.equal(first.closed, true);
+    assert.equal(second.options.resume, "sdk-restart");
+    assert.equal(second.options.effort, "max");
+    assert.deepEqual(second.users.map(u => u.message.content), ["second input", "third input"]);
+    assert.equal(f.sessions.summaryOf(id)?.state, "running");
+    const receipts = MessageReceipts.open(path.join(f.dir, "receipts.json"));
+    for (const key of ["second", "third"]) {
+      assert.equal(receipts.status(`send:${id}:${key}`), "completed");
+      assert.equal(await f.sessions.send(id, key, "resend"), id);
+    }
+    await nextTick();
+    assert.equal(second.users.length, 2, "completed receipts cover the carried input, not a dropped message");
+    assert.equal(f.sessions.log(id).tail().events.filter(e => e.kind === "user").length, 3);
+    second.emit({ type: "result", subtype: "success" });
+    second.emit({ type: "result", subtype: "success" });
+    await waitFor(() => f.sessions.summaryOf(id)?.state === "idle");
+  }
+});
+
+test("a plan approval cancelled during the mode control restores plan mode and its original return mode", async t => {
+  const boundary = controlledQueries();
+  const f = fixture(t, {}, { queryFn: boundary.queryFn });
+  const id = await f.create();
+  await waitFor(() => boundary.queries.length === 1);
+  await f.sessions.setMode(id, "bypassPermissions");
+  await f.sessions.setMode(id, "plan");
+  const query = boundary.queries[0]!;
+  const callback = query.options.canUseTool as CanUseTool;
+  const abort = new AbortController();
+  const answer = callback("ExitPlanMode", { plan: "Implement" }, { signal: abort.signal });
+  const permission = f.permissions.pending(id)[0]!;
+  query.modeReply = Promise.withResolvers<void>();
+  const deciding = f.sessions.decide(id, permission.id, "allow");
+  await waitFor(() => query.modes.length === 3);
+  abort.abort();
+  query.modeReply.resolve();
+  assert.equal(await deciding, false);
+  assert.equal((await answer).behavior, "deny");
+  assert.equal(f.permissions.get(permission.id)?.state, "expired");
+  assert.equal(f.sessions.summaryOf(id)?.permissionMode, "plan");
+  assert.deepEqual(query.modes, ["bypassPermissions", "plan", "bypassPermissions", "plan"]);
+  const again = callback("ExitPlanMode", { plan: "Revised" }, { signal: new AbortController().signal });
+  assert.equal(await f.sessions.decide(id, f.permissions.pending(id)[0]!.id, "allow"), true);
+  assert.equal((await again).behavior, "allow");
+  assert.equal(f.sessions.summaryOf(id)?.permissionMode, "bypassPermissions");
 });
 
 test("steer keeps the running query; interrupt closes it and withdraws unstarted inputs", async t => {
@@ -414,6 +510,45 @@ for (const decision of ["allow", "allow_always", "deny"] as const) {
   });
 }
 
+for (const damage of ["duplicate-seq", "invalid-json", "unreadable"] as const) test(`recovery skips only a ${damage} session and preserves its files`, async t => {
+  const f = fixture(t);
+  const bad = await f.create("bad");
+  const good = await f.create("good");
+  await waitFor(() => f.sessions.list().every(s => s.state === "idle"));
+  const seq = f.sessions.log(bad).lastSeq;
+  f.permissions.request({ session: bad, tool: "Bash", title: "", summary: "ls", input: {} });
+  f.sessions.shutdown();
+  const file = path.join(f.dir, "sessions.json");
+  const records = JSON.parse(fs.readFileSync(file, "utf8")) as { id: string; state: string }[];
+  fs.writeFileSync(file, JSON.stringify(records.map(r => ({ ...r, state: r.id === good ? "running" : "idle" }))));
+  const segment = path.join(f.dir, "sessions", bad, "events-000001.jsonl");
+  if (damage === "duplicate-seq") {
+    fs.appendFileSync(segment, [
+      { seq: seq + 1, at: 1, kind: "notice", code: "host_restarted" },
+      { seq: seq + 2, at: 1, kind: "state", state: "stopped" },
+      { seq: seq + 1, at: 2, kind: "user", text: "original writer" },
+    ].map(e => JSON.stringify(e) + "\n").join(""));
+  } else if (damage === "invalid-json") fs.appendFileSync(segment, "invalid json\n{}\n");
+  else { fs.unlinkSync(segment); fs.mkdirSync(segment); }
+  const before = damage === "unreadable" ? null : fs.readFileSync(segment);
+  const lines: string[] = [];
+  const recovered = new Sessions({ dir: f.dir, router, permissions: PermissionQueue.open(f.permissionsFile),
+    queryFn: f.fake.queryFn, log: line => lines.push(line), onEvent: () => {}, onSessions: () => {} });
+  f.instances.push(recovered);
+  recovered.recover();
+  assert.deepEqual(recovered.list().map(s => [s.id, s.state]), [[good, "stopped"]]);
+  assert.equal(recovered.has(bad), false);
+  assert.throws(() => recovered.log(bad), /unreadable/);
+  assert.equal(lines.length, 1);
+  assert.ok(lines[0]!.includes(bad) && lines[0]!.includes("session files preserved"));
+  await recovered.send(good, "continue-good", "continue");
+  await waitFor(() => recovered.summaryOf(good)?.state === "idle");
+  const saved = JSON.parse(fs.readFileSync(file, "utf8")) as { id: string }[];
+  assert.ok(saved.some(r => r.id === bad), "healthy saves retain the skipped record");
+  if (before) assert.deepEqual(fs.readFileSync(segment), before);
+  else assert.ok(fs.statSync(segment).isDirectory());
+});
+
 test("recover expires persisted permissions, stops a mid-turn session and resumes sdk-1", { timeout: 4500 }, async t => {
   const f = fixture(t);
   const id = await f.create();
@@ -517,16 +652,112 @@ test("desktop handoff waits until already queued turns finish", async t => {
   assert.deepEqual(counts, [2]);
 });
 
-test("desktop handoff failure is logged and never retried", async t => {
+test("desktop handoff failures persist and retry only at a later idle, at most three times across restarts", async t => {
   let calls = 0;
   const logs: string[] = [];
-  const f = fixture(t, {}, { handoff: async () => { calls++; throw new Error("timeout"); }, log: line => logs.push(line) });
+  const handoff = async () => { calls++; throw new Error("timeout"); };
+  const f = fixture(t, {}, { handoff, log: line => logs.push(line) });
   const id = await f.create();
   await waitFor(() => logs.length === 1);
-  f.sessions.send(id, "retry-turn", "again");
-  await waitFor(() => f.fake.users.length === 2 && f.sessions.summaryOf(id)?.state === "idle");
-  assert.equal(calls, 1);
+  const saved = () => (JSON.parse(fs.readFileSync(path.join(f.dir, "sessions.json"), "utf8")) as { desktopHandoff: string; desktopHandoffAttempts: number; desktopHandoffError: string }[])[0]!;
+  assert.deepEqual([saved().desktopHandoff, saved().desktopHandoffAttempts, saved().desktopHandoffError], ["failed", 1, "timeout"]);
+  for (let i = 0; i < 5; i++) await f.sessions.pollDesktop();
+  assert.equal(calls, 1, "polls without a new turn do not spin retries");
+  await f.sessions.send(id, "retry-turn", "again");
+  await waitFor(() => logs.length === 2);
+  assert.equal(saved().desktopHandoffAttempts, 2);
+  f.sessions.shutdown();
+  const recovered = new Sessions({ dir: f.dir, router, permissions: f.permissions, queryFn: f.fake.queryFn,
+    handoff, log: line => logs.push(line), onEvent: () => {}, onSessions: () => {} });
+  f.instances.push(recovered);
+  recovered.recover();
+  await recovered.send(id, "retry-after-restart", "again");
+  await waitFor(() => logs.length === 3);
+  await recovered.send(id, "past-limit", "again");
+  await waitFor(() => f.fake.users.length === 4 && recovered.summaryOf(id)?.state === "idle");
+  assert.equal(calls, 3);
+  assert.equal(saved().desktopHandoffAttempts, 3);
   assert.match(logs[0]!, /failed: timeout/);
+  assert.match(logs[2]!, /attempt 3\/3/);
+});
+
+test("handoff closes an idle SDK writer and waits for real process exit before invoking the runner", async t => {
+  const exited = Promise.withResolvers<void>();
+  const boundary = controlledQueries();
+  let calls = 0;
+  const f = fixture(t, {}, { queryFn: params => ({ ...boundary.queryFn(params), processExited: exited.promise }),
+    handoff: async () => { assert.equal(boundary.queries[0]!.closed, true); calls++; return "opened"; }, log: () => {} });
+  const id = await f.create();
+  await waitFor(() => boundary.queries.length === 1);
+  const first = boundary.queries[0]!;
+  first.emit({ type: "system", subtype: "init", session_id: "sdk-exiting" });
+  first.emit({ type: "result", subtype: "success" });
+  await waitFor(() => first.closed);
+  assert.equal(calls, 0, "close() alone must not permit a second writer");
+  await f.sessions.send(id, "while-exiting", "kept until exit");
+  await nextTick();
+  assert.equal(boundary.queries.length, 1);
+  exited.resolve();
+  await waitFor(() => calls === 1 && boundary.queries.length === 2);
+  await waitFor(() => boundary.queries[1]!.users.length === 1);
+  assert.equal(boundary.queries[1]!.users[0]!.message.content, "kept until exit");
+  boundary.queries[1]!.emit({ type: "result", subtype: "success" });
+  await waitFor(() => f.sessions.summaryOf(id)?.state === "idle");
+  assert.equal(calls, 1);
+});
+
+for (const reachable of [true, false]) test(`input accepted during handoff ${reachable ? "uses the new app bridge" : "fails visibly when the app is not reachable"}, never a second SDK writer`, async t => {
+  const projects = fs.mkdtempSync(path.join(os.tmpdir(), "handoff-app-projects-"));
+  t.after(() => fs.rmSync(projects, { recursive: true, force: true }));
+  const sdkId = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+  const registry = new Map<string, DesktopProcess>();
+  const posts: string[] = [];
+  const bridgeClient = new BridgeClient({ auth: () => ({ accessToken: "fixture-token", organizationUuid: "org", expiresAt: Date.now() + 60_000 }), fetch: async (url, options) => {
+    if (options?.method === "POST") { posts.push(String(options.body)); return Response.json({}); }
+    if (String(url).includes("/events/stream")) return new Response(new ReadableStream({ start(controller) { options?.signal?.addEventListener("abort", () => controller.close(), { once: true }); } }));
+    return Response.json({ data: [], worker_status: "idle" });
+  } });
+  const boundary = controlledQueries();
+  const finish = Promise.withResolvers<void>();
+  let called = false;
+  const f = fixture(t, {}, { queryFn: boundary.queryFn, desktopProjects: projects, desktopRegistry: () => registry, desktopProcesses: () => "", bridgeClient,
+    handoff: async () => { called = true; await finish.promise; return "opened"; }, log: () => {} });
+  const id = await f.create();
+  await waitFor(() => boundary.queries.length === 1);
+  fs.mkdirSync(path.join(projects, "project"));
+  fs.writeFileSync(path.join(projects, "project", `${sdkId}.jsonl`), JSON.stringify({ type: "user", uuid: "first", cwd: f.cwd, message: { content: "ping" } }) + "\n");
+  const first = boundary.queries[0]!;
+  first.emit({ type: "system", subtype: "init", session_id: sdkId });
+  first.emit({ type: "result", subtype: "success" });
+  await waitFor(() => called);
+  await f.sessions.send(id, "during-app-handoff", "accepted during handoff");
+  registry.set(sdkId, { sessionId: sdkId, pid: 42, status: "idle", ...(reachable ? { bridgeSessionId: "bridge" } : {}) });
+  finish.resolve();
+  await waitFor(() => reachable ? posts.length === 1 : f.sessions.summaryOf(id)?.state === "error");
+  assert.equal(first.closed, true);
+  assert.equal(boundary.queries.length, 1);
+  if (reachable) {
+    assert.match(posts[0]!, /accepted during handoff/);
+    assert.equal(f.sessions.summaryOf(id)?.desktopBridge, true);
+    assert.equal(f.sessions.list().length, 1);
+  } else assert.ok(f.sessions.log(id).tail().events.some(event => event.kind === "result" && event.ok === false));
+});
+
+test("a successful later handoff clears the durable failure and is not attempted again", async t => {
+  let calls = 0;
+  const lines: string[] = [];
+  const f = fixture(t, {}, { handoff: async () => { if (++calls === 1) throw new Error("app unavailable"); return "opened"; }, log: line => lines.push(line) });
+  const id = await f.create();
+  await waitFor(() => lines.length === 1);
+  await f.sessions.send(id, "retry-success", "again");
+  await waitFor(() => lines.length === 2);
+  const record = (JSON.parse(fs.readFileSync(path.join(f.dir, "sessions.json"), "utf8")) as Record<string, unknown>[])[0]!;
+  assert.equal(record.desktopHandoff, "attempted");
+  assert.equal(record.desktopHandoffAttempts, 2);
+  assert.equal(record.desktopHandoffError, undefined);
+  await f.sessions.send(id, "after-success", "again");
+  await waitFor(() => f.fake.users.length === 3 && f.sessions.summaryOf(id)?.state === "idle");
+  assert.equal(calls, 2);
 });
 
 test("attention: a permission request is set, survives `seen`, and clears when the approval is answered", async t => {
@@ -654,4 +885,125 @@ test("a create resend orphaned by a restart answers outcome_unknown", { timeout:
   assert.equal(fake.options.length, 0);
   assert.equal(recovered.list().length, 1, "no duplicate session was started");
   void id;
+});
+
+// 2026-10-22: a message queued on the phone during a 25-minute turn was still on the phone three
+// minutes after the turn ended — the app was asleep in a pocket. The host holds the queue now.
+test("a queued message waits for the turn, then goes one at a time with no phone attached", { timeout: 4500 }, async t => {
+  const f = fixture(t, { permission: true });
+  const id = await f.create();
+  await waitFor(() => f.permissions.pending(id).length === 1);
+  f.sessions.enqueue(id, "q-1", "first queued");
+  f.sessions.enqueue(id, "q-2", "second queued");
+  f.sessions.enqueue(id, "q-1", "first queued");
+  assert.equal(f.fake.users.length, 1, "nothing goes while the turn waits on a permission");
+  assert.deepEqual(f.sessions.summaryOf(id)?.queue?.map(item => [item.id, item.text]), [["q-1", "first queued"], ["q-2", "second queued"]], "a resent id is queued once");
+  assert.equal(f.sessions.decide(id, f.permissions.pending(id)[0]!.id, "allow"), true);
+  await waitFor(() => f.fake.users.length === 2);
+  assert.equal(f.fake.users[1]!.message.content, "first queued");
+  // The second waits for the turn the first started, which is now waiting on its own permission.
+  await waitFor(() => f.permissions.pending(id).length === 1);
+  await delay(30);
+  assert.equal(f.fake.users.length, 2);
+  assert.deepEqual(f.sessions.summaryOf(id)?.queue?.map(item => item.id), ["q-2"]);
+  assert.equal(f.sessions.decide(id, f.permissions.pending(id)[0]!.id, "allow"), true);
+  await waitFor(() => f.fake.users.length === 3);
+  assert.equal(f.fake.users[2]!.message.content, "second queued");
+  assert.equal(f.sessions.summaryOf(id)?.queue, undefined);
+  // The queue's sends are ordinary user messages in the log, under the phone's ids.
+  const users = f.sessions.log(id).readAfter(0).events.filter(e => e.kind === "user").map(e => e.kind === "user" ? e.clientMsgId : "");
+  assert.deepEqual(users.slice(-2), ["q-1", "q-2"]);
+  await waitFor(() => f.permissions.pending(id).length === 1);
+  f.sessions.decide(id, f.permissions.pending(id)[0]!.id, "deny");
+});
+
+test("an idle session takes a queued message at once; Stop holds the queue until a send or resume", { timeout: 4500 }, async t => {
+  const f = fixture(t, { permission: true });
+  const id = await f.create();
+  await waitFor(() => f.permissions.pending(id).length === 1);
+  f.sessions.enqueue(id, "held-1", "after the stop");
+  await f.sessions.interrupt(id);
+  f.sessions.holdQueue(id);
+  await waitFor(() => f.sessions.summaryOf(id)?.state === "idle");
+  await delay(30);
+  assert.equal(f.fake.users.length, 1, "a held queue does not go when the turn ends");
+  assert.equal(f.sessions.summaryOf(id)?.queueHeld, true);
+  // Edit: the text comes back and the item is gone.
+  assert.deepEqual(f.sessions.removeQueued(id, "held-1"), { text: "after the stop", attachments: [] });
+  assert.equal(f.sessions.summaryOf(id)?.queue, undefined);
+  assert.equal(f.sessions.summaryOf(id)?.queueHeld, undefined);
+  f.sessions.enqueue(id, "held-2", "again");
+  f.sessions.holdQueue(id);
+  await delay(30);
+  assert.equal(f.fake.users.length, 2, "an idle, unheld session took held-2 at once");
+  assert.equal(f.fake.users[1]!.message.content, "again");
+  await waitFor(() => f.permissions.pending(id).length === 1);
+  f.sessions.enqueue(id, "held-3", "resumed");
+  f.sessions.holdQueue(id);
+  f.sessions.decide(id, f.permissions.pending(id)[0]!.id, "allow");
+  await waitFor(() => f.sessions.summaryOf(id)?.state === "idle");
+  await delay(30);
+  assert.equal(f.fake.users.length, 2);
+  f.sessions.resumeQueue(id);
+  await waitFor(() => f.fake.users.length === 3);
+  assert.equal(f.fake.users[2]!.message.content, "resumed");
+  await waitFor(() => f.permissions.pending(id).length === 1);
+  f.sessions.decide(id, f.permissions.pending(id)[0]!.id, "deny");
+});
+
+test("taking a queued message back restores upload-shaped attachments and retains bytes until the edited send", async t => {
+  const f = fixture(t, { permission: true });
+  const id = await f.create();
+  await waitFor(() => f.permissions.pending(id).length === 1);
+  const photo = Buffer.from("editing photo").toString("base64");
+  const file = Buffer.from("editing document").toString("base64");
+  const attachments = [
+    { blob: f.sessions.log(id).image(photo), name: "photo.png", mediaType: "image/png" },
+    { blob: f.sessions.log(id).image(file), name: "notes.txt", mediaType: "text/plain" },
+  ];
+  f.sessions.enqueue(id, "edit-queued", "original", attachments);
+  const removed = f.sessions.removeQueued(id, "edit-queued");
+  assert.deepEqual(removed, { text: "original", attachments });
+  assert.equal(f.sessions.summaryOf(id)?.queue, undefined);
+  assert.equal(fs.readdirSync(path.join(f.dir, "queue")).length, 2, "removing the queue item did not delete its draft files");
+  assert.equal(f.sessions.removeQueued(id, "edit-queued"), null);
+  // A desktop rebase can discard upload blobs after the item was returned to the composer.
+  fs.rmSync(path.join(f.dir, "sessions", id, "blobs"), { recursive: true });
+  assert.equal(f.sessions.blob(id, attachments[0]!.blob), photo);
+  assert.equal(f.sessions.blob(id, attachments[1]!.blob), file);
+  const retained = (await import("../src/queue.ts")).SendQueue.open(f.dir);
+  assert.equal(retained.editingBlob(id, attachments[0]!.blob), photo, "the editing bytes also survive a host restart");
+  await f.sessions.send(id, "edited-new-id", "edited", removed!.attachments);
+  await waitFor(() => f.fake.users.length === 2);
+  const content = f.fake.users[1]!.message.content;
+  assert.ok(Array.isArray(content));
+  assert.equal(content.find(block => block.type === "image")?.source.data, photo);
+  const files = fs.readdirSync(path.join(f.cwd, ".ripple-attachments"));
+  assert.equal(fs.readFileSync(path.join(f.cwd, ".ripple-attachments", files[0]!), "utf8"), "editing document");
+  assert.equal(fs.readdirSync(path.join(f.dir, "queue")).length, 0, "the accepted edited send releases draft files");
+  assert.equal(f.sessions.log(id).blob(attachments[0]!.blob), photo, "the event keeps its own image bytes");
+  await waitFor(() => f.permissions.pending(id).length === 1);
+  f.sessions.decide(id, f.permissions.pending(id)[0]!.id, "allow");
+});
+
+test("send-now puts a queued message into the running turn; the queue survives a host restart", { timeout: 4500 }, async t => {
+  const f = fixture(t, { permission: true });
+  const id = await f.create();
+  await waitFor(() => f.permissions.pending(id).length === 1);
+  f.sessions.enqueue(id, "now-1", "steer this in");
+  f.sessions.enqueue(id, "later-1", "kept on disk");
+  await f.sessions.sendQueued(id, "now-1");
+  // Sent at once into the running query (the scripted one reads it when its turn ends).
+  assert.ok(f.sessions.log(id).readAfter(0).events.some(e => e.kind === "user" && e.clientMsgId === "now-1"));
+  assert.deepEqual(f.sessions.summaryOf(id)?.queue?.map(item => item.id), ["later-1"]);
+  await assert.rejects(f.sessions.sendQueued(id, "gone"), /no longer queued/);
+  // A new host over the same directory still holds what was queued.
+  const reopened = JSON.parse(fs.readFileSync(path.join(f.dir, "queue.json"), "utf8"));
+  assert.deepEqual(reopened[id].items.map((item: { id: string }) => item.id), ["later-1"]);
+  assert.throws(() => f.sessions.enqueue("missing", "x-1", "text"), /no such session/);
+  assert.throws(() => f.sessions.enqueue(id, "bad id!", "text"), /Invalid message id/);
+  assert.throws(() => f.sessions.enqueue(id, "x-2", "  "), /Nothing to queue/);
+  f.sessions.removeQueued(id, "later-1");
+  await waitFor(() => f.permissions.pending(id).length >= 1);
+  for (const p of f.permissions.pending(id)) f.sessions.decide(id, p.id, "deny");
 });

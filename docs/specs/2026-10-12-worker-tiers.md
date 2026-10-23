@@ -67,9 +67,33 @@ gave 18 (light 1, standard 43, max 0).
   and to leave it out when unsure. `TIER_MARKERS` maps them to the verdicts `rungOf` reads; the
   marker is stripped before the worker or the router sees it (on any other worker it is just
   dropped, never routed as a model).
-- With a marker the spawn does not wait for the judge. The judge still rates the same brief
-  (`shadowJudge`), only into the log.
+- With a marker the judge is not asked. After the tier the marker may carry a domain word —
+  `[[ripple: standard ui]]`, `[[ripple: hard backend]]` (`markerDomain`: `ui`/`frontend` →
+  frontend, `design`, `backend`/`server` → backend) — which picks the domain ladder; no word is
+  general. Until 2026-10-22 the judge still rated every tiered brief into the log (`shadow` rows)
+  and, with domain ladders on, the spawn waited for its domain guess.
 - No marker: the judge decides, as before.
+
+**The shadow judge ended 2026-10-22.** Over 362 tiered delegations (2026-10-15..22) it agreed with
+the main chat on the rung 76% of the time; it rated higher 38 times and lower 48, and neither side
+failed more (error/abort/empty answer: 5.3% where the main chat chose lower, 4.2% where it chose
+higher, 6.5% where they agreed). What it did decide — the domain, once domain ladders existed — it
+decided worse than the main chat: a text cleanup across a dictionary, the app and the server read
+as `frontend` at sure 0.6 and ran on the design ladder's Sonnet, and work on this mod read as
+`frontend` at 0.67, while the main chat's own titles ("UI 디자인 ·", "서버 핵심 ·") named every
+domain right. So the main chat names the domain too, and the spawn no longer waits ~0.6 s.
+
+**A model the main chat picks by name must be one the user named (2026-10-22).** After the
+explicit marker was described (below), sessions named a model 22 times in two days, nearly never
+before: Sonnet, Sol and Gemini chosen on the session's own judgment. One, asked twice for Gemini
+proofreading, went on to give Gemini an implementation task. Now `userNamed` (`worker.ts`) checks the
+user's last two messages — and the answer before a short go-ahead like "ㄱㄱ" — for the model's
+words (`modelWords`: `gpt-6.1-sol` → gpt, sol; generic words like flash dropped) or their Korean
+names, a Korean name counting only before a particle or a non-Korean character ("솔한테" yes,
+"솔직히" no). Unnamed, the marker is dropped with a toast and the tier decides. The same holds for
+the other ways to choose a model: a worker agent called directly, `general-purpose` given a
+`model`, and a model marker on any other agent (`sessionPickedModel`); those spawns are rerouted
+through `ripple:auto`'s pick. Workflow agents, forks and teammates are left alone.
 
 **Added 2026-10-22: the description also names the explicit-model marker.** A session that wanted
 Opus for a server review, where the backend ladder's hard rung is Sol, started seven `claude -p
@@ -89,7 +113,7 @@ continuing a worker only within 5 minutes (after an 8-minute wait, three resumes
 | `type` | written | fields |
 |---|---|---|
 | `pick` | at spawn | `by` (`session`/`haiku`/`jev`/`model`/`marker`/`default`), `tier`, `verdict` (with Jev's per-question `odds`), `rung`, `model`, `effort`, `promptChars` |
-| `shadow` | after a session-tiered spawn | the judge's `verdict`, its `rung`, `judge`, `ms` |
+| `shadow` | after a session-tiered spawn, until 2026-10-22 | the judge's `verdict`, its `rung`, `judge`, `ms` |
 | `outcome` | when the worker's turn completes | `reason` (`answer`/`aborted`/`refusal`/`error`), `aborted`, `ms`, `answerChars`, `cost` (weighted tokens) |
 
 Lines before 2026-10-15 have no `type` (picks only). The brief itself is never logged; to re-judge
@@ -176,12 +200,9 @@ existing modes gain no overrides on load. Normalization keeps only valid optiona
 reuses ordered-step validation, then folds them into two levels (below). Retired per-field
 pin/Auto rules remain retired.
 
-A tier marker still owns the rung. **Only when the effective set has a domain override** does the
-spawn await its existing shadow judge, taking only its domain and reusing the same result for the
-shadow log. This conditional wait is necessary because the domain determines which ladder to
-consult; the judge cannot replace the marker's level/kind/confidence or promote its rung. Judge
-failure/timeout uses general. Without domain overrides, the shadow judge remains unawaited and
-does not affect dispatch or its latency. Explicit model markers keep their existing priority.
+A tier marker owns the rung, and its domain word the ladder (since 2026-10-22; before, the spawn
+awaited the shadow judge's domain when the set had a domain override). Explicit model markers keep
+their existing priority.
 Every `WorkerPick` and pick log records `rule: 'ui' | 'backend' | 'general'` beside the rung.
 Availability, ticked models, provider policy and within-ladder fallback are unchanged.
 
@@ -192,12 +213,19 @@ the override. The router fills empty rungs in existing Base and mode domain ladd
 same `fillLadder` as general, without creating absent overrides. All six UI languages cover the
 controls. The shared model checklist stays on Base.
 
-**A domain ladder has two levels, not four (2026-10-21).** The stored shape keeps the four rungs,
-so `ladderPick` and `rungOf` are untouched, but the two pairs are equal: `light` and `standard`
-hold one list, `hard` and `plan` another. Normalization folds every domain ladder (`ui`,
-`backend`, in Base and in each saved mode) with `twoLevelRungs`: the upper rung of each pair wins
-— `standard`'s list for the light pair, `plan`'s for the heavy one — and an empty upper rung
-falls back to the lower. The general ladder is **not** folded: it keeps four distinct rungs.
+**A domain ladder has two levels, not four (2026-10-21; the split moved 2026-10-22).** The stored
+shape keeps the four rungs, so `ladderPick` and `rungOf` are untouched. Light work is the `light`
+rung alone; heavy work is `standard`, `hard` and `plan`, which hold one list. Normalization folds
+every domain ladder (`ui`, `backend`, in Base and in each saved mode) with `twoLevelRungs`: light
+reads its own rung, else `standard`'s; heavy reads `plan`, else `hard`, else `standard`, else
+`light`. The general ladder is **not** folded: it keeps four distinct rungs.
+
+Until 2026-10-22 the split was light+standard / hard+plan. The owner had set the two rows as "easy
+design on Sonnet, ordinary to hard design on Opus"; that split sent ordinary design to Sonnet, and
+the design-only raise below patched it for one domain while sending easy design to Opus. Moving
+`standard` into heavy work gives the rows the meaning their owner gave them, for both domains, and
+stored settings migrate on read (light = standard = Sonnet, hard = plan = Opus becomes light =
+Sonnet, the rest Opus).
 
 Why: in practice a domain does not have four different tiers. The four general rungs are four
 models of the same ladder, and a domain ladder with four lists mostly sent trivial CSS edits to
@@ -205,13 +233,14 @@ the design model — the mistake the domain ladder itself was meant to prevent. 
 choice the user actually makes ("this domain's cheap work" vs "this domain's hard work"), while
 the router still climbs rung by rung inside a level.
 
-**Design always takes the heavy level (2026-10-21).** Under the `ui` ladder a `design` verdict on the light or standard rung is raised to the hard rung (`domainVerdict` in `workers.ts`, logged as `raised: 'design'` beside `rule`); This holds past a tier marker too, the one exception to the marker owning the rung: the main chat tiers by difficulty, and by that measure design is `standard`. `frontend`, the `backend` ladder, the general ladder and explicit model markers keep their rung. Why: a store-screenshot redesign was judged `design`/`standard` and ran on the light pair; the main chat stopped it and resent it as `hard` (pick log, 2026-10-21). Visual design depends on the model's taste, not on difficulty.
+**Design always takes the heavy level (2026-10-21, removed 2026-10-22 with the new split above).** Under the `ui` ladder a `design` verdict on the light or standard rung is raised to the hard rung (`domainVerdict` in `workers.ts`, logged as `raised: 'design'` beside `rule`); This holds past a tier marker too, the one exception to the marker owning the rung: the main chat tiers by difficulty, and by that measure design is `standard`. `frontend`, the `backend` ladder, the general ladder and explicit model markers keep their rung. Why: a store-screenshot redesign was judged `design`/`standard` and ran on the light pair; the main chat stopped it and resent it as `hard` (pick log, 2026-10-21). Visual design depends on the model's taste, not on difficulty.
 
-The dashboard shows the two levels instead of four rows: `가벼운 작업` edits the light pair
-(the same list is written to `light` and `standard`), `무거운 작업` edits the heavy pair (`hard`
-and `plan`). Each row shows the pair's upper rung. Switching `따로 정하기` on copies the set's
-general rungs folded the same way (light pair ← `general.standard`, heavy pair ← `general.plan`).
-The router fills a domain ladder and folds it again, so the pairs stay equal after the fill.
+The dashboard shows the two levels instead of four rows: `가벼운 작업` edits the `light` rung,
+`무거운 작업` edits `standard`, `hard` and `plan` (the same list written to all three). Each row
+shows its level's top filled rung, and a note under the switch says only easy work takes the light
+row. Switching `따로 정하기` on copies the set's general rungs folded the same way (light ←
+`general.light`, heavy ← `general.plan`). The router fills a domain ladder and folds it again, so
+heavy work keeps one list after the fill.
 
 ## Acceptance
 

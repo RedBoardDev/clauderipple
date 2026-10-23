@@ -35,6 +35,23 @@ test("explicit billing/quota errors mark exhaustion; transient 429 and unrelated
   assert.equal(providerExhaustion(402)?.reason, 'billing_exhausted');
 });
 
+test("Google's monthly spending cap is billing exhaustion, including its JSON error message", () => {
+  const now = 1_000_000;
+  const message = "Your project has exceeded its monthly spending cap.";
+  for (const body of [message, JSON.stringify({ error: { code: 429, message, status: "RESOURCE_EXHAUSTED" } })]) {
+    const exhaustion = providerExhaustion(429, body, undefined, now);
+    assert.deepEqual(exhaustion, { reason: "billing_exhausted", at: now, until: now + 1_800_000 });
+    const health = new ProviderHealth();
+    health.observe("google-gemini", 429, exhaustion);
+    assert.equal(health.snapshot(now)["google-gemini"]?.reason, "billing_exhausted");
+    assert.deepEqual(providerExhaustion(429, body, 60_000, now), { reason: "billing_exhausted", at: now, until: now + 60_000 });
+  }
+  for (const message of ["RESOURCE_EXHAUSTED", "Rate limit exceeded.", "Your project has a monthly spending cap.", "Monthly spending cap may be exceeded.", "Your project has exceeded its requests per minute quota."]) {
+    assert.equal(providerExhaustion(429, JSON.stringify({ error: { code: 429, message, status: "RESOURCE_EXHAUSTED" } })), undefined, message);
+  }
+  for (const status of [400, 401, 403, 500, 503]) assert.equal(providerExhaustion(status, message), undefined);
+});
+
 /** A clock the test drives, so cooldowns are asserted rather than waited for. */
 function clock(start = 1_000_000) {
   let t = start;
@@ -79,6 +96,18 @@ test("a conversation keeps its credential — moving it would cost the prompt ca
   assert.equal(pool.pick("p", all, "conv-1")?.id, "a");
   assert.equal(pool.pick("p", all, "conv-1")?.id, "a", "same conversation, same credential");
   assert.equal(pool.pick("p", all, "conv-2")?.id, "a", "a healthy credential is not spread for its own sake");
+});
+
+test("regression: visiting another provider preserves each provider's conversation credential", () => {
+  const c = clock();
+  const pool = new CredentialPool({ now: c.now });
+  const a = creds("a1", "a2");
+  const b = creds("b1", "b2");
+  pool.penalise("a", "a1", 429, 1_000);
+  assert.equal(pool.pick("a", a, "conv")?.id, "a2");
+  assert.equal(pool.pick("b", b, "conv")?.id, "b1");
+  c.advance(2_000);
+  assert.equal(pool.pick("a", a, "conv")?.id, "a2", "a1 recovered, but a2 still holds the cached prefix");
 });
 
 test("a token refresh keeps the conversation on its durable account without inheriting runtime health", () => {

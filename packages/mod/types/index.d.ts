@@ -258,15 +258,17 @@ export type WorkerPick = WorkerVerdict & {
   id?: string
 }
 
-export type AgentState = 'running' | 'waiting' | 'done' | 'failed'
+export type AgentState = 'running' | 'waiting' | 'done' | 'failed' | 'killed'
 
 export type AgentRec = {
   id: string
-  description: string
-  /** The agent type that ran. */
-  type: string
+  /** Workflow agents and records from older mods may have no title or type. */
+  description?: string
+  /** The agent type that ran, when recorded. */
+  type?: string
   model?: string
-  pick?: WorkerPick
+  /** Kept session records can name the judge or the former tier picker directly. */
+  pick?: Omit<WorkerPick, 'by'> & { by: WorkerPick['by'] | 'judge' | 'tier' }
   state: AgentState
   /** The tool it is in now, in a few words. */
   now?: string
@@ -363,6 +365,8 @@ declare module 'claude-code' {
   interface PluginState {
     ripple: {
       line: StatusLine
+      /** What the phone queued for this chat, from the host's queue.json; null when nothing. */
+      phoneQueue: { count: number; first: string } | null
       last: StatusRequest | null
       requests: StatusRequest[]
       logOpen: boolean
@@ -423,6 +427,8 @@ declare module 'claude-code' {
       agentRunsOpen: string[]
       /** Counts the Agents pane's seconds while an agent runs: a write redraws its clocks. */
       agentsTick: number
+      /** The person's last two prompts as submitted, mid-turn ones included (userNamed). */
+      heardPrompts: string[]
       jev: JevState
       routerModels: RouterModel[]
       /** The router's rung choices and presets (GET /api/mod-options), for the quick settings. */

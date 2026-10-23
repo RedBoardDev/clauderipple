@@ -13,7 +13,7 @@
 
 import crypto from "node:crypto";
 import { clampEffort } from "../../compat.ts";
-import { estimateTokens, normalizeSchema, serverToolNames, systemWithDroppedToolNote, toolNameForResponses, type AnthropicBlock, type AnthropicRequest, type AnthropicTool } from "../chatgpt/translate.ts";
+import { documentFile, documentText, estimateTokens, normalizeSchema, serverToolNames, systemWithDroppedToolNote, toolNameForResponses, type AnthropicBlock, type AnthropicRequest, type AnthropicTool } from "../chatgpt/translate.ts";
 import { identityPrefix, instructionsSuffix } from "../../identity.ts";
 
 // ---- Gemini wire -------------------------------------------------------------------
@@ -131,6 +131,11 @@ function inlineImages(content: string | AnthropicBlock[] | undefined): InlineIma
 //     ai.google.dev/api/generate-content), which does not agree with the guide — so this is
 //     (assumption)-grade and the lower-case guide spelling is used. Our seven-step ladder is
 //     clamped onto those four: `max`/`xhigh`→`high`, `none`→`minimal`.
+//   - Gemini 4 Argon uses the same thinkingLevel field, but only low/medium/high (default
+//     medium): https://ai.google.dev/gemini-api/docs/thinking#thinking-levels (2026-10-23).
+//     The guide now shows Interactions' snake_case field; generateContent's nested camelCase
+//     field is documented at https://ai.google.dev/api/generate-content#ThinkingConfig and is
+//     recommended for Gemini 3 or later. Argon cannot disable thinking: none/minimal → low.
 //   - Gemini 2.5 takes a token *budget* on `generationConfig.thinkingConfig.thinkingBudget`
 //     (an integer; `0` disables thinking). The per-generation ranges are (assumption): flash
 //     0..24576, pro 128..32768 — the numbers below stay well inside both.
@@ -170,7 +175,8 @@ function gemini25Budget(effort: string): number | undefined {
   }
 }
 
-function thinkingFamily(model: string): "gemini3" | "gemini25" | null {
+function thinkingFamily(model: string): "gemini4" | "gemini3" | "gemini25" | null {
+  if (/^gemini-4-argon(?:-|$)/.test(model)) return "gemini4";
   if (/^gemini-3[-.]/.test(model)) return "gemini3";
   if (/^gemini-2\.5/.test(model)) return "gemini25";
   return null;
@@ -189,9 +195,9 @@ function namedEffort(opts: GoogleTranslateOptions): string | undefined {
 function thinkingConfigFor(model: string, effort: string | undefined): GeminiGenerationConfig["thinkingConfig"] | undefined {
   if (!effort) return undefined;
   const family = thinkingFamily(model);
-  if (family === "gemini3") {
+  if (family === "gemini3" || family === "gemini4") {
     const level = gemini3Level(effort);
-    return level ? { thinkingLevel: level } : undefined;
+    return level ? { thinkingLevel: family === "gemini4" && level === "minimal" ? "low" : level } : undefined;
   }
   if (family === "gemini25") {
     const budget = gemini25Budget(effort);
@@ -211,6 +217,26 @@ function systemForGoogle(sys: string, opts: GoogleTranslateOptions): string {
 
 type PendingCall = { id: string; wireName: string };
 
+function userParts(blocks: AnthropicBlock[]): GeminiPart[] {
+  const parts: GeminiPart[] = [];
+  for (const block of blocks) {
+    if (block.type === "text") {
+      const text = String((block as { text?: unknown }).text ?? "");
+      if (text) parts.push({ text });
+    } else if (block.type === "image") {
+      const image = inlineImages([block])[0];
+      if (image) parts.push({ inlineData: image });
+      else parts.push({ text: `[image: ${String((block as { source?: { url?: unknown } }).source?.url ?? "")}]` });
+    } else if (block.type === "document") {
+      const file = documentFile(block);
+      parts.push(file ? { inlineData: { mimeType: file.mimeType, data: file.data } } : { text: documentText(block) });
+    } else if (block.type === "tool_result") {
+      parts.push(...orphanResultParts(block));
+    }
+  }
+  return parts;
+}
+
 /** Build `contents` from the Anthropic history, repairing the tool_call/tool_result adjacency Gemini needs. */
 function toContents(req: AnthropicRequest, opts: GoogleTranslateOptions): GeminiContent[] {
   const contents: GeminiContent[] = [];
@@ -222,6 +248,7 @@ function toContents(req: AnthropicRequest, opts: GoogleTranslateOptions): Gemini
 
     if (message.role === "assistant") {
       const parts: GeminiPart[] = [];
+      if (typeof message.content === "string" && message.content) parts.push({ text: message.content });
       const calls: PendingCall[] = [];
       // Gemini signs only the first functionCall of a step, so a parallel call with no signature of
       // its own is normal, not missing. The sentinel is for a turn that has no real signature at all
@@ -233,6 +260,8 @@ function toContents(req: AnthropicRequest, opts: GoogleTranslateOptions): Gemini
         if (block.type === "text") {
           const text = String((block as { text?: unknown }).text ?? "");
           if (text) parts.push({ text });
+        } else if (block.type === "document") {
+          parts.push(...userParts([block]));
         } else if (block.type === "tool_use") {
           const call = block as { id: string; name: string; input: unknown };
           const wireName = toolNameForResponses(call.name);
@@ -258,6 +287,7 @@ function toContents(req: AnthropicRequest, opts: GoogleTranslateOptions): Gemini
         const required = new Map(calls.map((call) => [call.id, call]));
         const results = new Map<string, AnthropicBlock>();
         const orphanResults: AnthropicBlock[] = [];
+        const userBlocks: AnthropicBlock[] = [];
         let j = i + 1;
         while (j < messages.length) {
           const next = messages[j]!;
@@ -265,6 +295,7 @@ function toContents(req: AnthropicRequest, opts: GoogleTranslateOptions): Gemini
           if (next.role === "assistant" || !Array.isArray(nextContent)) break;
           const resultBlocks = nextContent.filter((b) => b.type === "tool_result");
           if (resultBlocks.length === 0) break;
+          userBlocks.push(...nextContent.filter((block) => block.type !== "tool_result"));
           for (const block of resultBlocks) {
             const id = (block as { tool_use_id?: unknown }).tool_use_id;
             if (typeof id === "string" && required.has(id) && !results.has(id)) results.set(id, block);
@@ -274,7 +305,13 @@ function toContents(req: AnthropicRequest, opts: GoogleTranslateOptions): Gemini
         }
         const responseParts: GeminiPart[] = [];
         for (const call of calls) responseParts.push(functionResponsePart(call, results.get(call.id)));
+        // Keep the functionResponse batch together, then carry the tool's attachments as user parts.
+        for (const call of calls) {
+          const result = results.get(call.id) as { content?: string | AnthropicBlock[] } | undefined;
+          if (Array.isArray(result?.content)) responseParts.push(...userParts(result.content.filter((block) => block.type === "image" || block.type === "document")));
+        }
         for (const orphan of orphanResults) responseParts.push(...orphanResultParts(orphan));
+        responseParts.push(...userParts(userBlocks));
         contents.push({ role: "user", parts: responseParts });
         i = j - 1;
         continue;
@@ -287,23 +324,7 @@ function toContents(req: AnthropicRequest, opts: GoogleTranslateOptions): Gemini
       if (message.content) contents.push({ role: "user", parts: [{ text: message.content }] });
       continue;
     }
-    const parts: GeminiPart[] = [];
-    for (const block of blocks ?? []) {
-      if (block.type === "text") {
-        const text = String((block as { text?: unknown }).text ?? "");
-        if (text) parts.push({ text });
-      } else if (block.type === "image") {
-        const image = inlineImages([block])[0];
-        // Gemini takes base64 bytes through inlineData; a remote URL carries no bytes we hold, so a
-        // short marker stands in rather than inlining the URL as a huge text blob.
-        if (image) parts.push({ inlineData: { mimeType: image.mimeType, data: image.data } });
-        else parts.push({ text: `[image: ${String((block as { source?: { url?: unknown } }).source?.url ?? "")}]` });
-      } else if (block.type === "tool_result") {
-        // A result with no adjacent call cannot be a functionResponse; it is sent as user text.
-        parts.push(...orphanResultParts(block));
-      }
-      // thinking etc. dropped
-    }
+    const parts = userParts(blocks ?? []);
     if (parts.length > 0) contents.push({ role: "user", parts });
   }
 
@@ -345,6 +366,7 @@ function functionResponsePart(call: PendingCall, result: AnthropicBlock | undefi
   const block = result as { content?: string | AnthropicBlock[]; is_error?: boolean };
   let output = textOf(block.content);
   if (block.is_error && !output) output = "Tool execution failed";
+  if (!output && Array.isArray(block.content) && block.content.some((part) => part.type === "image" || part.type === "document")) output = "Tool returned attachment content.";
   if (!output) output = EMPTY_TOOL_OUTPUT;
   return { functionResponse: { name: call.wireName, response: { result: output }, id: call.id } };
 }
@@ -355,7 +377,7 @@ function orphanResultParts(block: AnthropicBlock): GeminiPart[] {
   if (b.is_error && !output) output = "Tool execution failed";
   if (!output) output = EMPTY_TOOL_OUTPUT;
   const parts: GeminiPart[] = [{ text: `[Tool result]\n${output}` }];
-  for (const image of inlineImages(b.content)) parts.push({ inlineData: { mimeType: image.mimeType, data: image.data } });
+  if (Array.isArray(b.content)) parts.push(...userParts(b.content.filter((part) => part.type === "image" || part.type === "document")));
   return parts;
 }
 
@@ -584,7 +606,7 @@ export class GoogleStreamMapper {
   finish(): AnthropicEvent[] {
     if (this.finished) return [];
     this.finished = true;
-    this.stopReason = this.sawTool ? "tool_use" : this.finishReason === "MAX_TOKENS" ? "max_tokens" : "end_turn";
+    this.stopReason = this.finishReason === "MAX_TOKENS" ? "max_tokens" : this.sawTool ? "tool_use" : "end_turn";
     return [...this.start(), ...this.closeBlock(), { event: "message_delta", data: { type: "message_delta", delta: { stop_reason: this.stopReason, stop_sequence: null }, usage: this.usage } }, { event: "message_stop", data: { type: "message_stop" } }];
   }
 

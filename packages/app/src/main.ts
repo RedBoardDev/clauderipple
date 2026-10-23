@@ -626,7 +626,14 @@ function loginItemLaunch(): { path: string; args: string[] } | undefined {
   return { path: process.execPath, args: [path.resolve(process.argv[1])] };
 }
 
+let trayAgentOn = false;
+
+function usesTrayAgent(): boolean {
+  return process.platform === "darwin" && !app.isPackaged;
+}
+
 function loginItemOn(): boolean {
+  if (usesTrayAgent()) return trayAgentOn;
   try {
     return app.getLoginItemSettings(loginItemLaunch()).openAtLogin;
   } catch {
@@ -634,13 +641,46 @@ function loginItemOn(): boolean {
   }
 }
 
-function setLoginItem(on: boolean): void {
+/** Keep launchd's paths and plist definition in the CLI, not in the separately built Electron app. */
+async function changeTrayAgent(mode: "on" | "off" | "init", flags: string[] = []): Promise<{ removeElectronItem: boolean }> {
+  const result = await runCliResult(["tray", "--login", mode, ...flags], 15_000);
+  const state = parseJsonOutput<{ on: boolean; removeElectronItem: boolean }>(result.stdout);
+  if (!result.ok || typeof state?.on !== "boolean" || typeof state.removeElectronItem !== "boolean") throw new Error(result.output || "invalid tray login item response");
+  trayAgentOn = state.on;
+  return state;
+}
+
+async function setLoginItem(on: boolean): Promise<void> {
   try {
-    app.setLoginItemSettings({ openAtLogin: on, ...loginItemLaunch() });
-  } catch {
-    /* macOS may refuse in an unsigned development build */
+    if (usesTrayAgent()) await changeTrayAgent(on ? "on" : "off");
+    else app.setLoginItemSettings({ openAtLogin: on, ...loginItemLaunch() });
+    writeAppState({ loginItemInitialized: true });
+  } catch (error) {
+    console.error(`ClaudeRipple login item could not be changed: ${error}`);
   }
-  writeAppState({ loginItemInitialized: true });
+  render();
+}
+
+async function initializeLoginItem(): Promise<void> {
+  const initialized = !!appState().loginItemInitialized;
+  if (usesTrayAgent()) {
+    const electronOpen = app.getLoginItemSettings().openAtLogin;
+    // Remember the migration until the agent write succeeds, so a failed CLI can retry next start.
+    if (electronOpen) writeAppState({ loginItemInitialized: false });
+    let removeElectronItem = electronOpen;
+    try {
+      const decision = await changeTrayAgent("init", [...(initialized ? ["--initialized"] : []), ...(electronOpen ? ["--electron-login"] : [])]);
+      removeElectronItem = decision.removeElectronItem;
+      writeAppState({ loginItemInitialized: true });
+    } finally {
+      // Even if the agent write fails, never leave bare Electron registered for the next login.
+      if (removeElectronItem) app.setLoginItemSettings({ openAtLogin: false });
+    }
+    return;
+  }
+  if (!initialized) await setLoginItem(true);
+  // Windows entries from older versions omitted the tray script.
+  else if (loginItemLaunch() && app.getLoginItemSettings().openAtLogin && !loginItemOn()) await setLoginItem(true);
 }
 
 // Overrides for running this app against stand-ins instead of the real installation (tests, and
@@ -1044,7 +1084,7 @@ async function act(id: BridgeAction): Promise<void> {
       render();
       return;
     case "login-item":
-      setLoginItem(true);
+      await setLoginItem(true);
       render();
       return;
   }
@@ -1334,7 +1374,7 @@ function render(): void {
       ? [{ label: updating ? L.updating(availableUpdate.latest ?? "") : L.updateAvailableItem(availableUpdate.latest ?? ""), enabled: !updating, click: () => void offerUpdate(availableUpdate!) } as Electron.MenuItemConstructorOptions]
       : []),
     { type: "separator" },
-    { label: L.startAtLogin, type: "checkbox", checked: loginItemOn(), click: (item) => setLoginItem(item.checked) },
+    { label: L.startAtLogin, type: "checkbox", checked: loginItemOn(), click: (item) => { void setLoginItem(item.checked); } },
     { type: "separator" },
     { label: unconfigured ? L.runSetup : L.rerunSetup, click: () => void setup() },
     ...(unconfigured
@@ -1386,7 +1426,7 @@ app.on("second-instance", () => {
   if (app.isReady()) showWindow(last ? undefined : "health");
 });
 
-app.whenReady().then(() => {
+app.whenReady().then(async () => {
   L = STRINGS[uiLang()];
   handleScheme(uiRoot(), adminUrl);
   wireBridge();
@@ -1395,14 +1435,12 @@ app.whenReady().then(() => {
   // macOS keeps its application menu (it owns Cmd-Q and the edit shortcuts); elsewhere it is noise.
   if (!isMac) Menu.setApplicationMenu(null);
   if (isMac) app.dock?.hide();
-  // Default to starting at login on first run; after that the user's choice stands.
-  if (!appState().loginItemInitialized) setLoginItem(true);
-  // An entry an older version wrote names bare Electron (the query without args finds it); the
-  // user had start-at-login on, so it is rewritten with the script rather than left broken.
-  else if (loginItemLaunch() && app.getLoginItemSettings().openAtLogin && !loginItemOn()) setLoginItem(true);
   tray = new Tray(icon("down"));
   tray.on("click", () => tray?.popUpContextMenu());
   render();
+  // First-run default and migration from bare Electron both use the npm tray's LaunchAgent. It runs
+  // the CLI, so the icon is drawn first and the menu's checkbox follows when it answers.
+  void initializeLoginItem().then(render, (error: unknown) => console.error(`ClaudeRipple login item initialization failed: ${error}`));
   // Opened from its icon (the CLI sets this; a login launch does not): show the window, not just a
   // tray icon the person may never notice. Taken out so an update's relaunch does not inherit it.
   if (process.env.CLAUDERIPPLE_APP_SHOW === "1") {

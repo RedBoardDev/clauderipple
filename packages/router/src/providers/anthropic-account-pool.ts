@@ -124,6 +124,7 @@ export class ClaudeAccountAuthPool {
   /** Current projection without network I/O, used by status and pre-routing health checks. */
   peekCredentials(): Credential[] {
     const out: Credential[] = [];
+    const accounts = readClaudeOAuthAccounts(this.home);
     const current = this.current.get();
     let currentToken: string | undefined;
     if (!(current instanceof Error)) {
@@ -145,8 +146,11 @@ export class ClaudeAccountAuthPool {
         });
       }
     }
-    for (const account of readClaudeOAuthAccounts(this.home)) {
-      if (account.needsReauth || this.now() >= account.expiresAt) continue;
+    const currentAccount = accounts.find((account) => account.token === currentToken);
+    if (currentAccount?.paused) out.length = 0;
+    else if (currentAccount && out[0]) out[0].preferred = currentAccount.preferred === true;
+    for (const account of accounts) {
+      if (account.paused || account.needsReauth || this.now() >= account.expiresAt) continue;
       // The legacy single-account file is also what ClaudeCodeAuthStore read as current. Until the
       // first migration write, omit that duplicate instead of trying the same token twice.
       if (currentToken && account.token === currentToken) continue;
@@ -154,6 +158,7 @@ export class ClaudeAccountAuthPool {
         id: credentialId(account.id, account.token, account.refreshToken),
         ownerId: account.id,
         label: account.label,
+        preferred: account.preferred === true,
         headers: nativeAnthropicHeaders(
           { type: "anthropic", auth: "claude-code" },
           { accessToken: account.token, expiresAt: account.expiresAt },
@@ -165,6 +170,15 @@ export class ClaudeAccountAuthPool {
       else out.push(credential);
     }
     return out;
+  }
+
+  /** Runtime owner aliases for cooldown clearing; a legacy/current duplicate shares one token. */
+  cooldownOwners(ownerId: string): string[] {
+    const account = readClaudeOAuthAccounts(this.home).find((account) => account.id === ownerId);
+    const current = this.current.get();
+    if (!account || current instanceof Error) return [ownerId];
+    const token = current.source === "observed" ? current.observed.authorization.replace(/^Bearer\s+/i, "") : current.credentials.accessToken;
+    return account.token === token ? [ownerId, "current"] : [ownerId];
   }
 
   /** Persist a rejected stored account as requiring re-login. The current CLI account stays external. */

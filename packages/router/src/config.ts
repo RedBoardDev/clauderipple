@@ -52,9 +52,21 @@ export type ProviderCredential = {
   headers: Record<string, string>;
   /** Shown in the dashboard instead of the id. Not a secret, so keep the key out of it. */
   label?: string;
+  preferred?: boolean;
+  paused?: boolean;
 };
 
-export type AnthropicCompatibleProvider = {
+/**
+ * A provider's display name, shown by the dashboard instead of its key.
+ *
+ * Provider keys are slugs (`[a-z0-9_-]`), so a provider the user calls "하이브" is stored as
+ * `thehive` or `provider`; the label is the one place that name lives. It is never used for
+ * routing — routes, fallbacks, `direct` rules and `webSearch` all name the key — so changing it
+ * changes nothing but the screen.
+ */
+export type ProviderLabel = { label?: string };
+
+export type AnthropicCompatibleProvider = ProviderLabel & {
   /** An HTTP(S) endpoint that speaks Anthropic Messages (DeepSeek, Kimi, GLM, MiniMax, proxenos, ...). */
   type: "anthropic-compatible";
   /** e.g. "http://127.0.0.1:8787" or "https://api.deepseek.com/anthropic" */
@@ -88,7 +100,7 @@ export type AnthropicCompatibleProvider = {
   caps?: CompatibleCaps;
 };
 
-export type ChatGptProvider = {
+export type ChatGptProvider = ProviderLabel & {
   /** Your ChatGPT subscription through the Codex backend; Anthropic Messages translated to OpenAI Responses. */
   type: "chatgpt";
   /** "borrow-codex" reads ~/.codex/auth.json (never refreshed by us); "own" uses `clauderipple login` tokens. Default: own if present, else borrow. */
@@ -116,12 +128,18 @@ export type ChatGptProvider = {
   models?: ProviderModel[];
 };
 
-export type OpenAiCompatibleProvider = {
+export type OpenAiCompatibleProvider = ProviderLabel & {
   /** An OpenAI-compatible API base, e.g. https://api.x.ai/v1. */
   type: "openai-compatible";
   url: string;
   /** Optional vendor headers, normally authorization: Bearer <key>. Never logged. */
   headers?: Record<string, string>;
+  /**
+   * Complete header sets sharing the same sticky credential pool as anthropic-compatible providers.
+   * Absent, the provider keeps its single credential. With two or more, `headers` mirrors the first
+   * entry for probes and discovery; retain id "default" when converting an existing single key.
+   */
+  credentials?: ProviderCredential[];
   /**
    * A header this vendor uses to recognise a conversation, filled with a value that is stable for
    * one conversation and different between two (`x-opencode-session`, for instance). Vendors that
@@ -145,7 +163,7 @@ export type OpenAiCompatibleProvider = {
   caps?: { effortLevels?: string[]; reasoning?: "effort" | "none" };
 };
 
-export type GoogleProvider = {
+export type GoogleProvider = ProviderLabel & {
   /**
    * Google Gemini, spoken on its own generative-language wire (Anthropic Messages translated to
    * `generateContent`). `auth: "api-key"` is an AI Studio key; `auth: "antigravity"` is a Google
@@ -182,7 +200,7 @@ export type GoogleProvider = {
   defaultEffort?: string;
 };
 
-export type AnthropicProvider = {
+export type AnthropicProvider = ProviderLabel & {
   /** Native Anthropic Messages API. */
   type: "anthropic";
   /** Console API key, or Claude Code/ClaudeRipple OAuth accounts. */
@@ -199,7 +217,7 @@ export type AnthropicProvider = {
   limits?: boolean;
 };
 
-export type GrokProvider = {
+export type GrokProvider = ProviderLabel & {
   /**
    * Grok on a SuperGrok / X Premium subscription, through the chat proxy the Grok CLI itself uses
    * (Anthropic Messages translated to Chat Completions). Signs in with the CLI's own session
@@ -324,6 +342,9 @@ export function providerFor(provider: Provider, model: string | undefined): Prov
     ...provider,
     ...(url !== undefined ? { url } : {}),
     ...(headers !== undefined ? { headers } : {}),
+    ...("credentials" in provider && provider.credentials && entry.authHeader
+      ? { credentials: provider.credentials.map((credential) => ({ ...credential, headers: reauthorized(credential.headers, entry.authHeader!)! })) }
+      : {}),
   };
 
   // Anthropic Messages needs no translation, so this model is served by the anthropic-compatible
@@ -784,10 +805,15 @@ export function validate(c: Config): string[] {
   }
   for (const [name, p] of Object.entries(c.providers)) {
     // Carried by every provider that puts together a system prompt, so checked once for all of them.
-    const shared = p as { identity?: unknown; instructionsAppend?: unknown; limits?: unknown };
+    const shared = p as { identity?: unknown; instructionsAppend?: unknown; limits?: unknown; label?: unknown };
     if (shared.identity !== undefined && typeof shared.identity !== "boolean") errors.push(`provider ${name}: identity must be true or false`);
     if (shared.instructionsAppend !== undefined && typeof shared.instructionsAppend !== "string") errors.push(`provider ${name}: instructionsAppend must be a string`);
     if (shared.limits !== undefined && typeof shared.limits !== "boolean") errors.push(`provider ${name}: limits must be true or false`);
+    // Display only. Refused here so a blank label cannot render a provider as an unlabelled blank in
+    // the dashboard; routing keeps using the key whatever this says.
+    if (shared.label !== undefined && (typeof shared.label !== "string" || !shared.label.trim() || shared.label.length > 60)) {
+      errors.push(`provider ${name}: label must be a non-empty string of at most 60 characters`);
+    }
     // Ids key the router's cooldown and quarantine state, so a duplicate would make two credentials
     // share one health record and take each other down.
     const pool = (p as { credentials?: unknown }).credentials;
@@ -796,7 +822,7 @@ export function validate(c: Config): string[] {
       else {
         const seen = new Set<string>();
         pool.forEach((entry, i) => {
-          const cred = entry as { id?: unknown; headers?: unknown; label?: unknown } | null;
+          const cred = entry as { id?: unknown; headers?: unknown; label?: unknown; preferred?: unknown; paused?: unknown } | null;
           if (!cred || typeof cred !== "object") { errors.push(`provider ${name}: credential ${i} must be an object`); return; }
           if (typeof cred.id !== "string" || !cred.id) errors.push(`provider ${name}: credential ${i} needs a non-empty id`);
           else if (seen.has(cred.id)) errors.push(`provider ${name}: credential id "${cred.id}" is used twice`);
@@ -811,7 +837,11 @@ export function validate(c: Config): string[] {
             }
           }
           if (cred.label !== undefined && typeof cred.label !== "string") errors.push(`provider ${name}: credential ${i} label must be a string`);
+          for (const field of ["preferred", "paused"] as const) {
+            if (cred[field] !== undefined && typeof cred[field] !== "boolean") errors.push(`provider ${name}: credential ${i} ${field} must be a boolean`);
+          }
         });
+        if (pool.filter((entry) => entry && typeof entry === "object" && entry.preferred === true).length > 1) errors.push(`provider ${name}: at most one credential may be preferred`);
       }
     }
     if (p.type === "anthropic-compatible") {

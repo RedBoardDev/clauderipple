@@ -4,7 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { ConfigStore, DEFAULTS, fastSwitches, providerFor, validate } from "../src/config.ts";
-import type { AnthropicCompatibleProvider, Config, GoogleProvider, OpenAiCompatibleProvider } from "../src/config.ts";
+import type { AnthropicCompatibleProvider, Config, GoogleProvider, OpenAiCompatibleProvider, Provider } from "../src/config.ts";
 import { Logger } from "../src/log.ts";
 
 test("validate rejects an unusable Auto mode classifier target", () => {
@@ -60,6 +60,28 @@ test("validate accepts native Anthropic providers and confines account pools to 
   assert.deepEqual(validate({ ...DEFAULTS, providers: { ok: { type: "anthropic", auth: "claude-code", limits: false } } }), []);
   assert.ok(validate({ ...DEFAULTS, providers: { bad: { type: "anthropic", auth: "claude-code", limits: "no" as unknown as boolean } } }).some((error) => error.includes("limits must be true or false")));
   assert.ok(validate({ ...DEFAULTS, providers: { bad: { type: "chatgpt", limits: 1 as unknown as boolean } } }).some((error) => error.includes("limits must be true or false")));
+});
+
+test("every provider kind takes a display label, and a blank or overlong one is refused", () => {
+  const providers: Record<string, Provider> = {
+    hive: { type: "anthropic-compatible", url: "https://api.example.test", label: "하이브" },
+    gpt: { type: "chatgpt", label: "Codex" },
+    openrouter: { type: "openai-compatible", url: "https://openrouter.ai/api/v1", label: "OpenRouter" },
+    gemini: { type: "google", auth: "api-key", label: "Gemini" },
+    claude: { type: "anthropic", auth: "api-key", label: "Claude" },
+    grok: { type: "grok", label: "Grok" },
+  };
+  assert.deepEqual(validate({ ...DEFAULTS, providers }), []);
+  for (const [name, p] of Object.entries(providers)) {
+    for (const label of ["", "   ", 7, "x".repeat(61)]) {
+      const errors = validate({ ...DEFAULTS, providers: { ...providers, [name]: { ...p, label: label as string } } });
+      assert.ok(errors.some((error) => error.includes(`provider ${name}: label must be a non-empty string of at most 60 characters`)), `${name} accepted ${JSON.stringify(label)}`);
+    }
+    // Exactly 60 characters, and no label at all, are both fine.
+    assert.deepEqual(validate({ ...DEFAULTS, providers: { ...providers, [name]: { ...p, label: "가".repeat(60) } } }), []);
+    const { label: _label, ...unlabelled } = p as Provider & { label?: string };
+    assert.deepEqual(validate({ ...DEFAULTS, providers: { ...providers, [name]: unlabelled as Provider } }), []);
+  }
 });
 
 test("validate accepts a chatgpt provider's Fast switches and refuses a fast that is not an object", () => {

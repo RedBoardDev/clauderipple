@@ -244,6 +244,10 @@ export function item(it: TimelineItem, ui: UI): string {
       return `<div class="foot">${esc(t("turn.footer", { model: modelName(ui.models, it.model), effort: effortLabel(it.effort) || "—", dur: duration(it.ms) }))}</div>`;
     case "notice":
       return `<div class="notice">${esc(t(`notice.${it.code}` as Key, { text: it.text ?? "", host: hostName(ui) }))}</div>`;
+    case "chapter":
+      return `<div class="start" title="${esc(it.summary)}">${esc(it.title)}</div>`;
+    case "wrapUp":
+      return `<div class="msg-asst">${it.recap ? `<p>${esc(it.recap)}</p>` : ""}${it.ask ? `<p><strong>${esc(it.ask)}</strong></p>` : ""}</div>`;
   }
 }
 

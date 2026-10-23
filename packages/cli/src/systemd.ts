@@ -111,10 +111,15 @@ export function agentPid(): number | null {
   return r.ok && Number.isSafeInteger(pid) && pid > 0 ? pid : null;
 }
 
-/** Idempotent, like launchd's: a running router is left alone (ARCHITECTURE §5, "Start Router"). */
-export function startAgent(): "already-running" | "started" | "failed" {
+/**
+ * Idempotent, like launchd's: a running router is left alone (ARCHITECTURE §5, "Start Router").
+ * `systemctl start` returns once the unit is activated — a service that exits at once is still
+ * "started" at that point — so the MainPID is waited for, as on Windows (#80).
+ */
+export function startAgent(opts: { waitMs?: number } = {}): "already-running" | "started" | "failed" {
   if (agentState() === "running") return "already-running";
-  return systemctl(["start", unitName()]).ok ? "started" : "failed";
+  if (!systemctl(["start", unitName()]).ok) return "failed";
+  return waitForPid(opts.waitMs ?? START_BUDGET_MS) ? "started" : "failed";
 }
 
 export function stopAgent(): boolean {
@@ -127,5 +132,24 @@ export function stopAgent(): boolean {
  */
 export function restartAgent(opts: { waitMs?: number; onProgress?: (msg: string) => void } = {}): "drained" | "failed" {
   opts.onProgress?.("waiting for in-flight model calls to finish (up to 120s)…");
-  return systemctl(["restart", unitName()]).ok ? "drained" : "failed";
+  if (!systemctl(["restart", unitName()]).ok) return "failed";
+  // The restart command returned; the successor still has to appear. A unit that cannot start
+  // answers "failed" here rather than being reported as a restart (2026-10-22, #80).
+  return waitForPid(START_BUDGET_MS) ? "drained" : "failed";
+}
+
+/** How long a unit systemd accepted is given to produce a process before it counts as a failure. */
+const START_BUDGET_MS = 15_000;
+
+function sleepSync(ms: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+function waitForPid(budgetMs: number, pollMs = 500): boolean {
+  const deadline = Date.now() + budgetMs;
+  while (Date.now() < deadline) {
+    if (agentPid() !== null) return true;
+    sleepSync(pollMs);
+  }
+  return agentPid() !== null;
 }

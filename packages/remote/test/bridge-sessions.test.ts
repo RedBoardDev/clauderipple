@@ -14,7 +14,7 @@ const id = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
 const tick = () => new Promise(resolve => setImmediate(resolve));
 const line = (value: unknown) => JSON.stringify(value) + "\n";
 
-function fixture(t: import("node:test").TestContext, rejected = false, resumed = false) {
+function fixture(t: import("node:test").TestContext, rejected = false, resumed: boolean | string = false) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-session-test-"));
   const projects = path.join(root, "projects");
   fs.mkdirSync(path.join(projects, "project"), { recursive: true });
@@ -44,7 +44,7 @@ function fixture(t: import("node:test").TestContext, rejected = false, resumed =
   if (resumed) {
     fs.mkdirSync(path.join(root, "host"), { recursive: true });
     fs.writeFileSync(path.join(root, "host", "sessions.json"), JSON.stringify([{
-      id, sdkSessionId: id, cwd: root, model: "claude-sonnet-4-5", effort: null, title: "resumed",
+      id: typeof resumed === "string" ? resumed : id, sdkSessionId: id, cwd: root, model: "claude-sonnet-4-5", effort: null, title: "resumed",
       createdAt: now, updatedAt: now, state: "idle", createdBy: "earlier", contextWindow: null, desktopHandoff: "excluded",
     }]));
   }
@@ -71,6 +71,42 @@ test("a desktop bridge summary carries the Claude app transcript's permission mo
   f.sessions.log(id); // import as a Remote Control (bridge) record
   await f.sessions.pollDesktop();
   assert.equal(f.sessions.summaryOf(id)!.permissionMode, "bypassPermissions");
+});
+
+test("a phone-created session opens desktop workers by its SDK id after the app takes over", async t => {
+  const phoneId = "phone-session-id";
+  const f = fixture(t, false, phoneId);
+  const workers = path.join(path.dirname(f.file), id, "subagents");
+  fs.mkdirSync(workers, { recursive: true });
+  fs.writeFileSync(path.join(workers, "agent-task.meta.json"), JSON.stringify({ toolUseId: "desktop-worker", model: "sol" }));
+  fs.writeFileSync(path.join(workers, "agent-task.jsonl"), line({ type: "assistant", isSidechain: true, message: { model: "sol", content: [{ type: "text", text: "desktop worker conversation" }] } }));
+  await f.sessions.pollDesktop();
+  assert.equal(f.sessions.summaryOf(phoneId)?.desktopBridge, true);
+  assert.equal(f.sessions.list().length, 1, "the SDK id is not listed as another session");
+  const log = f.sessions.subLog(phoneId, "sub-desktop-worker");
+  assert.ok(log);
+  const answer = log.tail().events.find(e => e.kind === "assistant");
+  assert.equal(answer?.text, "desktop worker conversation");
+  assert.equal(f.queries(), 0);
+});
+
+test("a desktop model change updates the bridged record, summary, timeline and next turn", async t => {
+  const f = fixture(t);
+  fs.appendFileSync(f.file, line({ type: "assistant", uuid: "old-model", message: { model: "old-model", content: [{ type: "text", text: "old answer" }] } }));
+  f.sessions.log(id);
+  assert.equal(f.sessions.summaryOf(id)?.model, "old-model");
+  fs.appendFileSync(f.file, line({ type: "assistant", uuid: "new-model", message: { model: "new-model", content: [{ type: "text", text: "new answer" }] } }) +
+    line({ type: "assistant", isSidechain: true, message: { model: "worker-not-main", content: [{ type: "text", text: "worker" }] } }));
+  f.advance();
+  await f.sessions.pollDesktop();
+  assert.equal(f.sessions.summaryOf(id)?.model, "new-model");
+  assert.equal(f.sessions.list()[0]?.model, "new-model");
+  const newest = f.sessions.log(id).tail().events.filter(e => e.kind === "assistant").at(-1);
+  assert.equal(newest?.model, "new-model");
+  const records = JSON.parse(fs.readFileSync(path.join(f.root, "host", "sessions.json"), "utf8")) as { model: string }[];
+  assert.equal(records[0]?.model, "new-model");
+  await f.sessions.send(id, "after-model-change", "continue");
+  assert.equal(f.sessions.log(id).tail().events.filter(e => e.kind === "turn").at(-1)?.model, "new-model");
 });
 
 test("bridge worker state overrides busy registry for listed and opened sessions, caches and falls back on failure", async t => {
@@ -115,10 +151,11 @@ test("live registry verifies pid and procStart and ignores stale/non-desktop ent
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "registry-test-"));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const file = path.join(root, `${process.pid}.json`);
-  const value = { sessionId: id, pid: process.pid, entrypoint: "claude-desktop", status: "idle", bridgeSessionId: "bridge" };
+  const value = { sessionId: id, pid: process.pid, entrypoint: "claude-desktop", status: "idle", bridgeSessionId: "bridge", cwd: "/moved/folder" };
   fs.writeFileSync(file, JSON.stringify(value));
   // The registry is a Mac Desktop's: named so the check also runs on the Linux CI runner.
   assert.equal(liveDesktopProcesses(root, 0, "darwin").get(id)?.bridgeSessionId, "bridge");
+  assert.equal(liveDesktopProcesses(root, 0, "darwin").get(id)?.cwd, "/moved/folder");
   for (const override of [{ procStart: "wrong identity" }, { entrypoint: "sdk-cli" }, { pid: 1 }, { status: "unknown" }]) {
     fs.writeFileSync(file, JSON.stringify({ ...value, ...override }));
     assert.equal(liveDesktopProcesses(root, 0, "darwin").size, 0);
@@ -277,4 +314,39 @@ test("attach replays approvals requested before the stream connected, skipping a
   assert.equal(await f.sessions.decide(id, pending[0]!.id, "deny"), true);
   assert.equal(f.posts.length, 1);
   assert.equal(await f.sessions.decide(id, pending[0]!.id, "deny"), false, "the second answer resolves nothing again");
+});
+
+// The queue for a Claude app session goes over Remote Control when the app says the turn ended,
+// and the next only after the turn the last one started has answered and ended.
+test("a queued message for a Mac session goes when its turn ends, the next after that turn's answer", async t => {
+  const f = fixture(t);
+  f.status("running");
+  await f.sessions.pollDesktop();
+  assert.equal(f.sessions.list()[0]!.state, "running");
+  f.sessions.enqueue(id, "q-mac-1", "after this turn");
+  f.sessions.enqueue(id, "q-mac-2", "then this");
+  await tick();
+  assert.equal(f.posts.length, 0, "nothing goes while the Mac turn runs");
+  assert.equal(f.sessions.list()[0]!.queue?.length, 2);
+  f.advance(); f.status("idle");
+  await f.sessions.pollDesktop();
+  await tick(); await tick();
+  assert.equal(f.posts.length, 1, "the turn ended: the head went");
+  assert.match(JSON.stringify(f.posts[0]), /after this turn/);
+  // Remote Control can still read idle before the new turn starts: the second waits for an answer.
+  f.advance();
+  await f.sessions.pollDesktop();
+  await tick(); await tick();
+  assert.equal(f.posts.length, 1);
+  assert.deepEqual(f.sessions.summaryOf(id)!.queue?.map(item => item.id), ["q-mac-2"]);
+  fs.appendFileSync(f.file, line({ type: "user", uuid: "q-mac-1", message: { content: "after this turn" } }) + line({ type: "assistant", uuid: "reply-1", message: { model: "model", content: [{ type: "text", text: "done" }] } }));
+  f.advance(); f.status("running");
+  await f.sessions.pollDesktop();
+  f.advance(); f.status("idle");
+  await f.sessions.pollDesktop();
+  await tick(); await tick();
+  assert.equal(f.posts.length, 2);
+  assert.match(JSON.stringify(f.posts[1]), /then this/);
+  assert.equal(f.sessions.summaryOf(id)!.queue, undefined);
+  assert.equal(f.queries(), 0, "never an SDK query of the host's own");
 });

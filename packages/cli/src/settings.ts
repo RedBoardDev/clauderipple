@@ -59,7 +59,21 @@ export function checkProxyEnv(opts: { proxyUrl: string; force: boolean }): void 
   refuseForeignProxy(currentProxyEnv().HTTPS_PROXY, opts.proxyUrl, opts.force);
 }
 
-export function applyProxyEnv(opts: { proxyUrl: string; caPath: string; force: boolean; maxContextTokens?: number; models?: ModelSlots; preserveUnnamedSlots?: boolean }): SettingsEdit {
+function slotOwnershipPath(): string {
+  // Tie ownership to the settings file, including when a caller uses an isolated settings path.
+  return `${settingsPath()}.clauderipple-model-slots.json`;
+}
+
+function ownedSlots(): ModelSlots {
+  const file = slotOwnershipPath();
+  if (!fs.existsSync(file)) return {};
+  return JSON.parse(fs.readFileSync(file, "utf8")) as ModelSlots;
+}
+
+export function applyProxyEnv(opts: { proxyUrl: string; caPath: string; force: boolean; maxContextTokens?: number; models?: ModelSlots; preserveUnnamedSlots?: boolean; respectDirect?: boolean }): SettingsEdit {
+  if (opts.respectDirect && fs.existsSync(path.join(path.dirname(opts.caPath), "direct.json"))) {
+    return { changed: false, backup: null, notes: ["left as it was: Claude is on its default connection (direct on)"], wroteSlots: [] };
+  }
   const file = settingsPath();
   const s = readSettings(file);
   const env = { ...((s.env as Record<string, string> | undefined) ?? {}) };
@@ -73,6 +87,7 @@ export function applyProxyEnv(opts: { proxyUrl: string; caPath: string; force: b
     const model = opts.models?.[slot as keyof ModelSlots];
     if (model) want[name] = model;
   }
+  const ownership = ownedSlots();
   const wroteSlots: SlotName[] = [];
   let changed = false;
   for (const [k, v] of Object.entries(want)) {
@@ -105,6 +120,14 @@ export function applyProxyEnv(opts: { proxyUrl: string; caPath: string; force: b
   if (!changed) return { changed: false, backup: null, notes, wroteSlots: [] };
   const b = backup(file);
   write(file, { ...s, env });
+  for (const slot of wroteSlots) {
+    const value = env[MODEL_SLOT_ENV[slot]];
+    if (value === undefined) delete ownership[slot];
+    else ownership[slot] = value;
+  }
+  if (wroteSlots.length > 0) {
+    fs.writeFileSync(slotOwnershipPath(), JSON.stringify(ownership) + "\n", { mode: 0o600 });
+  }
   return { changed: true, backup: b, notes, wroteSlots };
 }
 
@@ -129,7 +152,7 @@ export function syncModelSlots(opts: { proxyUrl: string; caPath: string; force: 
   return applyProxyEnv({ ...opts, preserveUnnamedSlots: true });
 }
 
-export function removeProxyEnv(opts: { proxyUrl: string; caPath: string }): SettingsEdit {
+export function removeProxyEnv(opts: { proxyUrl: string; caPath: string; models?: ModelSlots }): SettingsEdit {
   const file = settingsPath();
   const s = readSettings(file);
   const env = { ...((s.env as Record<string, string> | undefined) ?? {}) };
@@ -143,14 +166,16 @@ export function removeProxyEnv(opts: { proxyUrl: string; caPath: string }): Sett
     delete env.NODE_EXTRA_CA_CERTS;
     changed = true;
   } else if (env.NODE_EXTRA_CA_CERTS) notes.push(`left NODE_EXTRA_CA_CERTS=${env.NODE_EXTRA_CA_CERTS} (not ours)`);
-  // Uninstalling must hand the CLI back to Anthropic completely: a model slot still pointing at a
-  // routed model would send every search and subagent somewhere the router no longer serves.
-  for (const name of Object.values(MODEL_SLOT_ENV)) {
-    if (env[name] !== undefined) {
+  // A recorded write is ours only while its exact value remains. Older installations can use
+  // their configured slots as evidence, but never delete an unrelated hand-written model choice.
+  const ownership = fs.existsSync(slotOwnershipPath()) ? ownedSlots() : opts.models ?? {};
+  for (const [slot, name] of Object.entries(MODEL_SLOT_ENV)) {
+    if (ownership[slot as SlotName] !== undefined && env[name] === ownership[slot as SlotName]) {
       delete env[name];
       changed = true;
     }
   }
+  fs.rmSync(slotOwnershipPath(), { force: true });
   if (!changed) return { changed: false, backup: null, notes, wroteSlots: [] };
   const b = backup(file);
   const next = { ...s };

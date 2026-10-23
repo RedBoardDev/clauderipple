@@ -12,10 +12,23 @@ const string = (v: unknown): string => typeof v === "string" ? v : "";
 const array = (v: unknown): unknown[] => Array.isArray(v) ? v : [];
 export const UNGROUPED = "sidebar:ungrouped";
 export const PHONE_GROUP = "sidebar:phone";
-export interface SidebarSession { cliSessionId: string; sessionId: string; title: string; unread: boolean; archived: boolean; group: string; order: number; activity: number; created: number }
+export interface SidebarSession { cliSessionId: string; sessionId: string; title: string; unread: boolean; archived: boolean; hidden?: boolean; group: string; order: number; activity: number; created: number }
 /** `superseded`: CLI session ids an app session has moved on from (resume, compact, handoff); its row is the one that lists. */
 export interface SidebarSnapshot { groups: { name: string; sessions: string[] }[]; sessions: Map<string, SidebarSession>; superseded: Set<string> }
 export interface SidebarOptions { root?: string; now?: () => number; onError?: (error: unknown) => void }
+
+/** Verified on Windows with bundled CLI 2.1.304: app data moved out of Roaming/Claude.
+ * Enable only a single on-disk layout we recognize, never a guessed AppData path. */
+export function windowsSidebarRoot(localAppData = process.env.LOCALAPPDATA): string | undefined {
+  if (!localAppData) return undefined;
+  const parent = path.join(localAppData, "Claude-Data");
+  let entries: fs.Dirent[];
+  try { entries = fs.readdirSync(parent, { withFileTypes: true }); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined; throw error; }
+  const roots = entries.filter(entry => entry.isDirectory() && /^claude_/i.test(entry.name)).map(entry => path.join(parent, entry.name))
+    .filter(root => ["config.json", "claude_desktop_config.json", "claude-code-sessions", path.join("Local Storage", "leveldb")].every(name => fs.existsSync(path.join(root, name))));
+  return roots.length === 1 ? roots[0] : undefined;
+}
 
 export class DesktopSidebar {
   private root: string;
@@ -122,20 +135,22 @@ export class DesktopSidebar {
       result.groups.push(group);
       selected.forEach((r, order) => { consumed.add(r.cliSessionId); result.sessions.set(r.cliSessionId, { ...r, group: groupName, order }); });
     }
-    // Archived and hidden rows remain in the index so joins can exclude them.
-    for (const r of rows) if (!result.sessions.has(r.cliSessionId)) result.sessions.set(r.cliSessionId, { ...r, archived: true });
+    // Archived rows must reach the phone's archive; hidden sections are a separate exclusion.
+    for (const r of rows) if (!result.sessions.has(r.cliSessionId)) result.sessions.set(r.cliSessionId, { ...r, ...(!r.archived ? { hidden: true } : {}) });
   }
   join(sessions: SessionSummary[], cliId: (id: string) => string): SessionSummary[] {
     const sidebar = this.read();
     if (!sidebar.groups.length) return sessions;
     return sessions.flatMap(s => {
       const row = sidebar.sessions.get(cliId(s.id));
-      if (row?.archived) return [];
+      if (row?.hidden) return [];
       // The host keeps one record per CLI session id; an app session that has moved on from one
       // (2026-10-13: 클로드리플 and 클로드리플2 each listed twice, the old half stuck at "42 min").
-      if (!row && sidebar.superseded.has(cliId(s.id))) return [];
+      // A /clear moves on without naming the old id (2026-10-23: 맘보2 twice, the old half at "1 hour"):
+      // an app session's record that no app session holds now is not in the app's sidebar either.
+      if (!row && (sidebar.superseded.has(cliId(s.id)) || s.desktopBridge)) return [];
       if (!row) return [{ ...s, group: s.origin === "desktop" ? UNGROUPED : PHONE_GROUP }];
-      return [{ ...s, title: row.title || s.title, unread: row.unread, group: row.group, order: row.order, updatedAt: row.activity }];
+      return [{ ...s, ...(row.archived ? { archived: true } : {}), title: row.title || s.title, unread: row.unread, group: row.group, order: row.order, updatedAt: row.activity }];
     });
   }
 }

@@ -40,6 +40,9 @@
 ### 2단계 — 입력창과 턴 제어
 
 - 실행 중 전송: **steer**(기본, 진행 중 턴에 끼워 넣기) / interrupt / queue. 큐는 항목 편집·즉시 보내기·첨부 포함, 유휴가 되면 하나씩 자동 전송 (paseo `app/.../composer/input/state.ts:120–135`, `composer/actions.ts:245–335`, `runtime/host-runtime.ts:2396–2448`).
+  - **큐는 호스트가 가진다(2026-10-22).** 앱이 들고 있으면 휴대폰이 잠든 동안 턴이 끝나도 아무것도 안 간다(25분 턴 뒤 3분간 미전송, 실측).
+    호스트가 `queue.json`에 두고, 턴이 끝나면(결과, 또는 답 뒤의 idle) 한 건씩 보낸다(`packages/remote/src/queue.ts`). 휴대폰 Stop은 큐를 멈춘다.
+    맥 Claude 앱은 이 큐를 모르므로 리플 띠 위에 "휴대폰 대기열 N" 줄을 띄운다(`packages/mod/hooks/ui/queue.tsx`).
 - 정지 버튼 별도 (paseo `composer/actions.ts:169–183`). 정지 시 아직 시작 안 한 입력은 철회 (paseo `claude/agent.ts:4223–4283`).
 - 실행 중 모델·강도 변경을 네이티브에도. 강도 변경은 "다음 턴부터" 안내 (paseo `claude/agent.ts:2604–2621`).
 - 사진(다중)·파일 첨부, 붙여넣기 (paseo `hooks/use-image-attachment-picker.ts`, `use-file-picker.ts`).

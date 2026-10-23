@@ -6,6 +6,8 @@
 //   GET /ws/host?server=<id>               host control socket   (header x-ripple-host-secret)
 //   GET /ws/host-data?server=<id>&conn=<c> host data socket       (same header)
 //   GET /ws/client?server=<id>             phone socket
+//   GET /.well-known/apple-app-site-association  iOS Universal Links: the app claims pairing URLs
+//   GET /.well-known/assetlinks.json       Android App Links: the Play signing key's fingerprint
 //   anything else                          the PWA: static assets (./dist, by build-web.ts), not this worker
 import { Room } from "./room.ts";
 import type { RoomCtx } from "./room.ts";
@@ -23,11 +25,52 @@ interface DoState {
 }
 interface DoStub { fetch(req: Request): Promise<Response> }
 interface DoNamespace { idFromName(name: string): unknown; get(id: unknown): DoStub }
-interface Env { ROOM: DoNamespace; ASSETS: { fetch(req: Request): Promise<Response> } }
+interface Env {
+  ROOM: DoNamespace;
+  ASSETS: { fetch(req: Request): Promise<Response> };
+  // Comma-separated SHA-256 fingerprints of the certificates Google Play signs the Android app with
+  // (wrangler.toml [vars]). Comma-separated because a debug build's certificate may be added too.
+  ANDROID_CERT_SHA256?: string;
+}
 declare const WebSocketPair: { new (): { 0: CfSocket; 1: CfSocket } };
 declare const WebSocketRequestResponsePair: { new (request: string, response: string): unknown };
 
 const SERVER_RE = /^[\w-]{16,64}$/;
+
+// ---- app links -----------------------------------------------------------------------------------
+// The pairing QR is https://<relay>/#pair=…; the fragment never reaches the server, so the path the
+// operating system matches is "/". Both files must be served over HTTPS as application/json with
+// status 200 and no redirect, or iOS and Android leave the link in the browser.
+
+const ANDROID_PACKAGE = "com.clauderipple.remote";
+
+const APPLE_APP_SITE_ASSOCIATION = JSON.stringify({
+  applinks: {
+    details: [{
+      appIDs: ["QL9967JLCR.com.clauderipple.remote"],
+      components: [{ "/": "/" }],
+    }],
+  },
+});
+
+function jsonFile(body: string, head: boolean): Response {
+  return new Response(head ? null : body, { status: 200, headers: { "content-type": "application/json" } });
+}
+
+function wellKnown(pathname: string, method: string, env: Env): Response | null {
+  if (pathname !== "/.well-known/apple-app-site-association" && pathname !== "/.well-known/assetlinks.json") return null;
+  if (method !== "GET" && method !== "HEAD") return new Response("method not allowed", { status: 405, headers: { allow: "GET, HEAD" } });
+  const head = method === "HEAD";
+  if (pathname === "/.well-known/apple-app-site-association") return jsonFile(APPLE_APP_SITE_ASSOCIATION, head);
+  const fingerprints = (env.ANDROID_CERT_SHA256 ?? "").split(",").map((s) => s.trim()).filter((s) => s !== "");
+  // An empty list would be an invalid file (Android rejects it, and a later fix would be delayed by
+  // the platform's cache), so say "no app" plainly until the Play signing key is filled in.
+  if (fingerprints.length === 0) return new Response("not configured", { status: 404 });
+  return jsonFile(JSON.stringify([{
+    relation: ["delegate_permission/common.handle_all_urls"],
+    target: { namespace: "android_app", package_name: ANDROID_PACKAGE, sha256_cert_fingerprints: fingerprints },
+  }]), head);
+}
 
 function upgrade(ctxAccept: (ws: CfSocket) => void): Response {
   const pair = new WebSocketPair();
@@ -94,8 +137,10 @@ export default {
       if (!SERVER_RE.test(server)) return new Response("bad server id", { status: 400 });
       return env.ROOM.get(env.ROOM.idFromName(server)).fetch(req);
     }
-    // Only /ws/* is routed here (wrangler.toml run_worker_first); the PWA is served as static assets
-    // with the headers in dist/_headers. Anything else that reaches the worker is handed to them.
+    // App-link files and the sockets run here. Everything else is routed to the static assets by
+    // wrangler.toml run_worker_first, and only reaches this worker when it must be handed on.
+    const appLink = wellKnown(url.pathname, req.method, env);
+    if (appLink) return appLink;
     return env.ASSETS.fetch(req);
   },
 };

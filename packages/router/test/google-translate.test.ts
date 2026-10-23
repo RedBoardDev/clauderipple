@@ -64,6 +64,18 @@ test("effort maps to thinkingLevel for Gemini 3 and thinkingBudget for 2.5", () 
   assert.equal(config("gemini-1.5-pro", "high"), undefined);
 });
 
+test("Gemini 4 Argon sends its documented low/medium/high thinking levels, never token budgets", () => {
+  for (const model of ["gemini-4-argon", "gemini-4-argon-contributor"]) {
+    for (const [effort, level] of [["none", "low"], ["minimal", "low"], ["low", "low"], ["medium", "medium"], ["high", "high"], ["xhigh", "high"], ["max", "high"], ["ultra", "high"]] as const) {
+      const out = toGeminiRequest(request, { model, effort });
+      assert.deepEqual(out.generationConfig?.thinkingConfig, { thinkingLevel: level }, `${model}@${effort}`);
+    }
+    assert.equal(toGeminiRequest(request, { model }).generationConfig?.thinkingConfig, undefined);
+    assert.equal(toGeminiRequest(request, { model, effort: "bogus" }).generationConfig?.thinkingConfig, undefined);
+  }
+  assert.equal(toGeminiRequest(request, { model: "gemini-5-unknown", effort: "high" }).generationConfig?.thinkingConfig, undefined);
+});
+
 test("a capped ladder clamps the effort the model is told and sent", () => {
   const levels = ["low", "medium", "high"];
   const out = toGeminiRequest({ ...request, output_config: { effort: "xhigh" }, tools: [] }, { model: "gemini-3-pro", effort: "xhigh", caps: { effortLevels: levels } });
@@ -217,4 +229,65 @@ test("MAX_TOKENS maps to a max_tokens stop reason and an inline error maps to a 
   const failed = new GoogleStreamMapper("gemini-3-pro");
   const events = failed.feed({ error: { status: "RESOURCE_EXHAUSTED", message: "quota" } } as never);
   assert.equal(((events.at(-1)!.data.error) as { type: string }).type, "rate_limit_error");
+});
+
+test("a paired tool result retains the user's accompanying text and image", () => {
+  const out = toGeminiRequest({ model: "m", messages: [
+    { role: "assistant", content: [{ type: "tool_use", id: "a", name: "Read", input: {} }] },
+    { role: "user", content: [
+      { type: "tool_result", tool_use_id: "a", content: "result" },
+      { type: "text", text: "also inspect this" },
+      { type: "image", source: { type: "base64", media_type: "image/png", data: "AAAA" } },
+    ] },
+  ] }, { model: "gemini-3-pro" });
+  assert.deepEqual(out.contents.at(-1)?.parts, [
+    { functionResponse: { name: "Read", response: { result: "result" }, id: "a" } },
+    { text: "also inspect this" }, { inlineData: { mimeType: "image/png", data: "AAAA" } },
+  ]);
+});
+
+test("MAX_TOKENS takes precedence over a Gemini function call", () => {
+  const mapper = new GoogleStreamMapper("gemini-3-pro");
+  mapper.feed({ candidates: [{ content: { parts: [{ functionCall: { name: "Read", args: { path: "a" } } }] }, finishReason: "MAX_TOKENS" }] });
+  const events = mapper.finish();
+  assert.equal((events.find((event) => event.event === "message_delta")!.data.delta as { stop_reason: string }).stop_reason, "max_tokens");
+  assert.equal(mapper.message().stop_reason, "max_tokens");
+});
+
+test("paired tool-result images survive, including image-only results, after all function responses", () => {
+  const image = { type: "image", source: { type: "base64", media_type: "image/png", data: "AAAA" } };
+  const out = toGeminiRequest({ model: "m", messages: [
+    { role: "assistant", content: ["a", "b"].map((id) => ({ type: "tool_use", id, name: "Read", input: {} })) },
+    { role: "user", content: [
+      { type: "tool_result", tool_use_id: "a", content: [{ type: "text", text: "screenshot" }, image] },
+      { type: "tool_result", tool_use_id: "b", content: [image] },
+    ] },
+  ] }, { model: "gemini-3-pro" });
+  const parts = out.contents.at(-1)!.parts;
+  assert.deepEqual(parts.map((part) => part.functionResponse?.id ?? "image"), ["a", "b", "image", "image"]);
+  assert.equal(parts[0]!.functionResponse?.response.result, "screenshot");
+  assert.notEqual(parts[1]!.functionResponse?.response.result, "(empty tool output)");
+  assert.deepEqual(parts.slice(2), [{ inlineData: { mimeType: "image/png", data: "AAAA" } }, { inlineData: { mimeType: "image/png", data: "AAAA" } }]);
+});
+
+test("a plain-string assistant turn is retained as a model turn", () => {
+  const out = toGeminiRequest({ model: "m", messages: [
+    { role: "user", content: "question" }, { role: "assistant", content: "answer" }, { role: "user", content: "follow-up" },
+  ] }, { model: "gemini-3-pro" });
+  assert.deepEqual(out.contents, [
+    { role: "user", parts: [{ text: "question" }] }, { role: "model", parts: [{ text: "answer" }] }, { role: "user", parts: [{ text: "follow-up" }] },
+  ]);
+});
+
+test("Gemini receives text documents, content blocks, PDF bytes and unsupported-source notes", () => {
+  const out = toGeminiRequest({ model: "m", messages: [{ role: "user", content: [
+    { type: "document", source: { type: "text", data: "text document" } },
+    { type: "document", source: { type: "content", content: [{ type: "text", text: "block document" }] } },
+    { type: "document", source: { type: "base64", media_type: "application/pdf", data: "UERG" } },
+    { type: "document", source: { type: "url", url: "https://example.com/doc.pdf" } },
+  ] }] }, { model: "gemini-3-pro" });
+  assert.deepEqual(out.contents[0]!.parts.slice(0, 3), [
+    { text: "text document" }, { text: "block document" }, { inlineData: { mimeType: "application/pdf", data: "UERG" } },
+  ]);
+  assert.match(out.contents[0]!.parts[3]!.text!, /문서.*전달하지 못했습니다/);
 });

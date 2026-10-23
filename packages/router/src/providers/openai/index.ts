@@ -19,7 +19,12 @@ import type { AnthropicRequest } from "../chatgpt/translate.ts";
 
 const PING_MS = 15_000;
 
-export type OpenAiOutcome = { status: number; bytes: number; note?: string; usage?: RequestUsage; stopReason?: string; messageId?: string; servedTier?: string; exhaustion?: ProviderExhaustion | undefined };
+export type OpenAiCredential = {
+  headers: Record<string, string>;
+  next?: (status: number, retryAfterMs: number | undefined, body: string) => Record<string, string> | null;
+};
+
+export type OpenAiOutcome = { upstreamStatus?: number; retryAfterMs?: number | undefined; errorBody?: string; status: number; bytes: number; note?: string; usage?: RequestUsage; stopReason?: string; messageId?: string; servedTier?: string; exhaustion?: ProviderExhaustion | undefined };
 
 function anthropicError(status: number, type: string, message: string): { status: number; body: string } {
   return { status, body: JSON.stringify({ type: "error", error: { type, message } }) };
@@ -130,7 +135,7 @@ export class OpenAiCompatibleAdapter {
   }
 
   /** Handle a fully-read Messages request. Model/effort have already been resolved by routing. */
-  async handle(req: http.IncomingMessage, res: http.ServerResponse, path: string, json: AnthropicRequest, model: string, effort: string | undefined): Promise<OpenAiOutcome> {
+  async handle(req: http.IncomingMessage, res: http.ServerResponse, path: string, json: AnthropicRequest, model: string, effort: string | undefined, credential?: OpenAiCredential): Promise<OpenAiOutcome> {
     if (path.startsWith("/v1/messages/count_tokens")) {
       const body = JSON.stringify({ input_tokens: estimateTokens(json) });
       res.writeHead(200, { "content-type": "application/json", "content-length": String(Buffer.byteLength(body)) }).end(body);
@@ -177,11 +182,12 @@ export class OpenAiCompatibleAdapter {
       ? { [this.cfg.sessionHeader]: conversationKey(json) }
       : {};
     const label = this.hooks.label ?? "OpenAI-compatible provider";
+    let credentialHeaders = credential?.headers;
     const headersNow = async (): Promise<Record<string, string>> => ({
       "content-type": "application/json",
       accept: "text/event-stream",
       ...sessionHeader,
-      ...(this.cfg.headers ?? {}),
+      ...(credentialHeaders ?? this.cfg.headers ?? {}),
       ...(this.hooks.headers ? await this.hooks.headers(model) : {}),
     });
     let upstreamHeaders: Record<string, string> = {};
@@ -224,12 +230,20 @@ export class OpenAiCompatibleAdapter {
           upstream = new Response(refusal, { status: 401 });
         }
       }
+      while (!upstream.ok && !res.headersSent && !controller.signal.aborted && credential?.next) {
+        const text = await upstream.clone().text();
+        const next = credential.next(upstream.status, retryAfterMs(Object.fromEntries(upstream.headers)), text);
+        if (!next) break;
+        await upstream.body?.cancel();
+        credentialHeaders = next;
+        upstream = await ask();
+      }
       // A 4xx that names reasoning is this vendor refusing the reasoning the conversation carried
       // back — a field it does not take, or a value from another model. The turn goes again without
       // it: replaying is an optimisation the user's turn must never depend on (reasoning.ts).
-      if (carried.replayed > 0 && refusesReplayedReasoning(upstream.status, await upstream.clone().text().catch(() => ""))) {
+      if (carried.replayed > 0 && upstream.status >= 400 && upstream.status < 500 && refusesReplayedReasoning(upstream.status, await upstream.clone().text().catch(() => ""))) {
         const refusal = await upstream.text().catch(() => "");
-        this.log.warn(`${this.tag} ${this.name}: upstream ${upstream.status} refused ${carried.replayed} replayed reasoning turn(s) for ${model}; asking again without them: ${refusal.replace(/\s+/g, " ").slice(0, 200)}`);
+        this.log.warn(`${this.tag} ${this.name}: upstream ${upstream.status} refused ${carried.replayed} replayed reasoning turn(s) for ${model}; asking again without them: ${redact(refusal).replace(/\s+/g, " ").slice(0, 200)}`);
         carried.replayed = 0;
         carried.undecodable = 0;
         requestBody = JSON.stringify(translate(false));
@@ -256,7 +270,7 @@ export class OpenAiCompatibleAdapter {
       this.log.warn(`${this.tag} ${this.name}: upstream ${upstream.status} for ${model}: ${safeText.slice(0, 400)}`);
       res.off("close", onClose);
       res.writeHead(out.status, { "content-type": "application/json", "content-length": String(Buffer.byteLength(out.body)) }).end(out.body);
-      return { status: out.status, bytes: Buffer.byteLength(out.body), note: `upstream ${upstream.status}`, exhaustion: providerExhaustion(upstream.status, text, retryAfterMs(Object.fromEntries(upstream.headers))) };
+      return { upstreamStatus: upstream.status, retryAfterMs: retryAfterMs(Object.fromEntries(upstream.headers)), errorBody: safeText, status: out.status, bytes: Buffer.byteLength(out.body), note: `upstream ${upstream.status}`, exhaustion: providerExhaustion(upstream.status, text, retryAfterMs(Object.fromEntries(upstream.headers))) };
     }
 
     const wantStream = json.stream === true;

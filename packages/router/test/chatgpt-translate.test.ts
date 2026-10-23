@@ -470,3 +470,104 @@ test("replay: false carries nothing and asks for nothing", () => {
   assert.equal(out.include, undefined);
   assert.equal(JSON.stringify(out.input).includes("encrypted_content"), false);
 });
+
+// gpt-6.1-sol sent four parallel calls with no argument deltas at all (2026-10-23); each reached
+// Claude Code as `{}` and failed "required parameter file_path". Whole arguments must still stream.
+test("a call whose arguments arrive only whole streams them once, on .done or on the completed item", () => {
+  const partial = (events: Record<string, unknown>[]) => {
+    const m = new StreamMapper("gpt-6.1-sol");
+    const out = events.flatMap((e) => m.feed(e));
+    const json = new Map<number, string>();
+    for (const e of out) {
+      if (e.event !== "content_block_delta") continue;
+      const d = e.data as { index: number; delta: { type: string; partial_json?: string } };
+      if (d.delta.type === "input_json_delta") json.set(d.index, (json.get(d.index) ?? "") + d.delta.partial_json);
+    }
+    return [...json.values()];
+  };
+  const added = (id: string) => ({ type: "response.output_item.added", item: { type: "function_call", call_id: `call_${id}`, id, name: "Read", arguments: "" } });
+  // Arguments only on function_call_arguments.done.
+  assert.deepEqual(partial([
+    added("fc_1"), { type: "response.function_call_arguments.done", arguments: '{"file_path":"/a"}', item_id: "fc_1" }, { type: "response.output_item.done", item: { type: "function_call", id: "fc_1", arguments: '{"file_path":"/a"}' } },
+    added("fc_2"), { type: "response.function_call_arguments.done", arguments: '{"file_path":"/b"}', item_id: "fc_2" }, { type: "response.output_item.done", item: { type: "function_call", id: "fc_2", arguments: '{"file_path":"/b"}' } },
+  ]), ['{"file_path":"/a"}', '{"file_path":"/b"}']);
+  // Arguments only on the completed item.
+  assert.deepEqual(partial([added("fc_1"), { type: "response.output_item.done", item: { type: "function_call", id: "fc_1", arguments: '{"command":"ls"}' } }]), ['{"command":"ls"}']);
+  // Deltas and a .done that repeats them: sent once, not twice.
+  assert.deepEqual(partial([
+    added("fc_1"),
+    { type: "response.function_call_arguments.delta", delta: '{"file_path"', item_id: "fc_1" },
+    { type: "response.function_call_arguments.delta", delta: ':"/a"}', item_id: "fc_1" },
+    { type: "response.function_call_arguments.done", arguments: '{"file_path":"/a"}', item_id: "fc_1" },
+    { type: "response.output_item.done", item: { type: "function_call", id: "fc_1", arguments: '{"file_path":"/a"}' } },
+  ]), ['{"file_path":"/a"}']);
+});
+
+test("parallel calls keep deltas and whole-only arguments on their own live block", () => {
+  for (const byIndex of [false, true]) {
+    const mapper = new StreamMapper("test");
+    const address = (id: string, index: number) => byIndex ? { output_index: index } : { item_id: id };
+    const events = [
+      ...["a", "b", "c"].map((id, output_index) => ({ type: "response.output_item.added", output_index, item: { type: "function_call", id, call_id: `call_${id}`, name: "Read" } })),
+      { type: "response.function_call_arguments.delta", ...address("a", 0), delta: '{"path":' },
+      { type: "response.function_call_arguments.done", ...address("b", 1), arguments: '{"path":"b"}' },
+      { type: "response.output_item.done", ...address("b", 1), item: { type: "function_call", ...(byIndex ? {} : { id: "b" }), arguments: '{"path":"b"}' } },
+      { type: "response.function_call_arguments.delta", ...address("a", 0), delta: '"a"}' },
+      { type: "response.function_call_arguments.done", ...address("a", 0), arguments: '{"path":"a"}' },
+      { type: "response.output_item.done", ...address("a", 0), item: { type: "function_call", ...(byIndex ? {} : { id: "a" }), arguments: '{"path":"a"}' } },
+      { type: "response.output_item.done", ...address("c", 2), item: { type: "function_call", ...(byIndex ? {} : { id: "c" }), arguments: '{"path":"c"}' } },
+      { type: "response.completed" },
+    ].flatMap((event) => mapper.feed(event));
+    const blocks = new Map<number, { id: string; json: string; closed: boolean }>();
+    for (const event of events) {
+      const index = event.data.index as number;
+      if (event.event === "content_block_start") {
+        assert.equal(blocks.has(index), false);
+        blocks.set(index, { id: (event.data.content_block as { id: string }).id, json: "", closed: false });
+      } else if (event.event === "content_block_delta") {
+        const block = blocks.get(index)!;
+        assert.equal(block.closed, false, "arguments cannot arrive after block_stop");
+        block.json += (event.data.delta as { partial_json: string }).partial_json;
+      } else if (event.event === "content_block_stop") {
+        assert.equal(blocks.get(index)!.closed, false);
+        blocks.get(index)!.closed = true;
+      }
+    }
+    assert.deepEqual([...blocks.values()].map((block) => [block.id, JSON.parse(block.json), block.closed]), [
+      ["call_a", { path: "a" }, true], ["call_b", { path: "b" }, true], ["call_c", { path: "c" }, true],
+    ]);
+    assert.deepEqual((mapper.message().content as { input: unknown }[]).map((block) => block.input), [{ path: "a" }, { path: "b" }, { path: "c" }]);
+  }
+});
+
+test("a truncated tool call ends with max_tokens rather than tool_use", () => {
+  const mapper = new StreamMapper("test");
+  mapper.feed({ type: "response.output_item.added", item: { type: "function_call", id: "a", name: "Read" } });
+  mapper.feed({ type: "response.function_call_arguments.delta", item_id: "a", delta: '{"path":' });
+  const events = mapper.feed({ type: "response.incomplete", response: { incomplete_details: { reason: "max_output_tokens" } } });
+  assert.equal((events.find((event) => event.event === "message_delta")!.data.delta as { stop_reason: string }).stop_reason, "max_tokens");
+  assert.equal(mapper.message().stop_reason, "max_tokens");
+});
+
+test("documents preserve text and content sources, send PDF bytes, and explain unsupported sources", () => {
+  const out = toResponsesRequest({ model: "m", messages: [{ role: "user", content: [
+    { type: "document", source: { type: "text", data: "text document" } },
+    { type: "document", source: { type: "content", content: [{ type: "text", text: "block document" }] } },
+    { type: "document", source: { type: "base64", media_type: "application/pdf", data: "UERG" } },
+    { type: "document", source: { type: "url", url: "https://example.com/doc.pdf" } },
+  ] }] }, opts);
+  assert.deepEqual((out.input[0] as { content: unknown[] }).content.slice(0, 3), [
+    { type: "input_text", text: "text document" }, { type: "input_text", text: "block document" },
+    { type: "input_file", filename: "document.pdf", file_data: "data:application/pdf;base64,UERG" },
+  ]);
+  assert.match(((out.input[0] as { content: { text: string }[] }).content[3]!).text, /문서.*전달하지 못했습니다/);
+});
+
+test("schema literals under const, enum, default and examples are not scrubbed", () => {
+  const data = { pattern: "^(?!literal)$", nested: { pattern: "(a)\\1" } };
+  const schema = { type: "object", properties: { value: { pattern: "^(?!schema)$", const: data, enum: [data], default: data, examples: [data] } } };
+  const before = structuredClone(schema);
+  const out = normalizeSchema(schema) as { properties: { value: Record<string, unknown> } };
+  assert.deepEqual(out.properties.value, { const: data, enum: [data], default: data, examples: [data] });
+  assert.deepEqual(schema, before);
+});

@@ -40,6 +40,74 @@ test("expired Claude Code credential returns a clear client-safe error", () => {
   assert.match(result.message, /Claude Code login expired — open Claude Code once to refresh/);
 });
 
+test("describeSource checks injected keychain, credentials file, token file, then nothing", t => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "cr-claude-source-"));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const now = 10_000;
+  const credential = (accessToken: string, expiresAt = now + 1_000) => JSON.stringify({ claudeAiOauth: { accessToken, expiresAt } });
+
+  const keychain = new ClaudeCodeAuthStore(undefined, {
+    home,
+    env: {},
+    now: () => now,
+    credentialReaders: { keychain: () => credential("keychain-token"), credentialsFile: () => credential("file-token") },
+  });
+  assert.equal(keychain.describeSource(), "keychain");
+
+  const credentialsFile = new ClaudeCodeAuthStore(undefined, {
+    home,
+    env: {},
+    now: () => now,
+    credentialReaders: { keychain: () => null, credentialsFile: () => credential("file-token") },
+  });
+  assert.equal(credentialsFile.describeSource(), "credentials-file");
+
+  saveClaudeAuthFile(home, "token-file-token", "2026-09-13T00:00:00.000Z");
+  const tokenFile = new ClaudeCodeAuthStore(undefined, {
+    home,
+    env: {},
+    now: () => now,
+    credentialReaders: { keychain: () => credential("expired", now), credentialsFile: () => null },
+  });
+  assert.equal(tokenFile.describeSource(), "token-file");
+
+  fs.unlinkSync(path.join(home, "claude-auth.json"));
+  const missing = new ClaudeCodeAuthStore(undefined, {
+    home,
+    env: {},
+    now: () => now,
+    credentialReaders: { keychain: () => null, credentialsFile: () => null },
+  });
+  assert.equal(missing.describeSource(), null);
+});
+
+test("get reads the injected keychain before the credentials file", t => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "cr-claude-get-"));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  let keychainReads = 0;
+  let credentialsFileReads = 0;
+  const store = new ClaudeCodeAuthStore(undefined, {
+    home,
+    env: {},
+    now: () => 10_000,
+    credentialReaders: {
+      keychain: () => {
+        keychainReads++;
+        return JSON.stringify({ claudeAiOauth: { accessToken: "keychain-token", expiresAt: Number.MAX_SAFE_INTEGER } });
+      },
+      credentialsFile: () => {
+        credentialsFileReads++;
+        return JSON.stringify({ claudeAiOauth: { accessToken: "file-token", expiresAt: Number.MAX_SAFE_INTEGER } });
+      },
+    },
+  });
+  const result = store.get();
+  if (result instanceof Error || result.source !== "stored") throw new Error("expected stored auth");
+  assert.equal(result.credentials.accessToken, "keychain-token");
+  assert.equal(keychainReads, 1);
+  assert.equal(credentialsFileReads, 0);
+});
+
 test("OAuth native headers and custom tool names follow Claude Code wire requirements", () => {
   const headers = nativeAnthropicHeaders({ type: "anthropic", auth: "claude-code" }, { accessToken: "secret", expiresAt: Date.now() + 1_000 });
   assert.equal(headers.authorization, "Bearer secret");

@@ -262,11 +262,14 @@ export class EventLog {
   blob(id: string): string | null {
     this.assertOpen();
     if (!UUID.test(id)) return null;
-    try { return readFileSync(join(this.dir, "blobs", `${id}.txt`), "utf8"); }
-    catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
-      throw error;
+    const dirs = [this.dir, ...readdirSync(this.dir, { withFileTypes: true })
+      .filter(entry => entry.isDirectory() && /^sub-[\w-]{1,80}$/.test(entry.name))
+      .map(entry => join(this.dir, entry.name))];
+    for (const dir of dirs) {
+      try { return readFileSync(join(dir, "blobs", `${id}.txt`), "utf8"); }
+      catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
     }
+    return null;
   }
 
   close(): void {

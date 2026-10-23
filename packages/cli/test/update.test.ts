@@ -3,8 +3,55 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { dropPowerShellShim, installKind, isNewer } from "../src/update.ts";
+import { dropPowerShellShim, installKind, isNewer, runUpdate } from "../src/update.ts";
+import { writePaths } from "../src/registration.ts";
+import { runtime } from "../src/runtime.ts";
 import { posixPaths } from "../../../test/capabilities.ts";
+
+test("a failed installer download fails the update and never starts a shell", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "cr-download-"));
+  const original = process.env.CLAUDERIPPLE_INSTALLER;
+  delete process.env.CLAUDERIPPLE_INSTALLER;
+  try {
+    const calls: string[] = [];
+    const result = runUpdate({ kind: "script", prefix: root }, { node: process.execPath, env: {}, cli: path.join(root, "unused.js") }, "clauderipple@test", {
+      platform: "darwin", tempDir: root,
+      run: (program) => { calls.push(program); return { status: 22 }; },
+    });
+    assert.equal(result.ok, false);
+    assert.deepEqual(calls, ["curl"]);
+    assert.deepEqual(fs.readdirSync(root), [], "the download directory is cleaned on failure");
+  } finally {
+    if (original === undefined) delete process.env.CLAUDERIPPLE_INSTALLER;
+    else process.env.CLAUDERIPPLE_INSTALLER = original;
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("a one-off script prefix is remembered without its original environment", { skip: !posixPaths }, () => {
+  const prefix = fs.mkdtempSync(path.join(os.tmpdir(), "cr-prefix-"));
+  const repo = path.join(prefix, "lib", "node_modules", "clauderipple");
+  const rt = { ...runtime(), packaged: false, repo, cli: path.join(repo, "dist", "cli", "src", "index.js") };
+  try {
+    fs.writeFileSync(path.join(prefix, "clauderipple-install.json"), JSON.stringify({ kind: "script", prefix }));
+    const target = installKind(rt, { platform: "darwin", env: {}, home: path.join(prefix, "unrelated-home") });
+    assert.deepEqual(target, { kind: "script", prefix });
+    const recorded = JSON.parse(fs.readFileSync(writePaths(rt, path.join(prefix, "state")), "utf8"));
+    assert.deepEqual(recorded.install, target);
+    fs.rmSync(path.join(prefix, "clauderipple-install.json"));
+    assert.deepEqual(installKind(rt, { env: {}, stateHome: path.join(prefix, "state") }), target, "paths.json also retains the install method");
+    const calls: string[] = [];
+    if (target.kind !== "script") assert.fail("a pinned-Node wrapper must never be updated by npm");
+    runUpdate(target, rt, "clauderipple@test", { platform: "darwin", tempDir: prefix, run: (program, _args, opts) => {
+      calls.push(program);
+      assert.equal(opts.env.CLAUDERIPPLE_PREFIX, prefix);
+      return { status: 22 };
+    } });
+    assert.deepEqual(calls, ["curl"], "takes the installer path, never npm");
+  } finally {
+    fs.rmSync(prefix, { recursive: true, force: true });
+  }
+});
 
 test("versions compare by number, not as text", () => {
   assert.equal(isNewer("0.6.0", "0.5.1"), true);

@@ -17,10 +17,13 @@ import { certsExist, certPaths, generateCerts } from "./certs.ts";
 import { applyProxyEnv, checkProxyEnv, currentProxyEnv, removeProxyEnv, settingsPath } from "./settings.ts";
 import { agentDefinitionPath, agentState, installAgent, isLinux, isSupported, isWindows, removeAgent, restartAgent, startAgent, stopAgent, supervisorName } from "./supervisor.ts";
 import { removeBundle, writeBundle } from "./bundle.ts";
+import { installTrayAgent, removeTrayAgent, trayLoginItemDecision, trayPlistPath } from "./launchd.ts";
 import { nativeSupervisor, registration, writePaths } from "./registration.ts";
 import { installLauncher, uninstallLauncher } from "./launcher.ts";
 import type { RecoveryDeps } from "./doctor.ts";
 import { applyAppProxy, caTrusted, currentAppProxy, nssDb, removeAppProxy, trustCa, untrustCa } from "./picker.ts";
+import { removeClientIntegrations, setPickerEnabled } from "./integrations.ts";
+import { withCommandHelp } from "./help-gate.ts";
 import { runtime } from "./runtime.ts";
 import { codexOff, codexOn } from "./codex.ts";
 import { ingressModels } from "../../router/src/ingress/models.ts";
@@ -30,13 +33,6 @@ import { openBrowser } from "./browser.ts";
 import { electronPath, installTrayRuntime, startTray } from "./tray.ts";
 import { dropPowerShellShim, installKind, isNewer, latestVersion, PACKAGE, runUpdate } from "./update.ts";
 import { ClaudeOAuthSession } from "../../router/src/providers/claude-oauth.ts";
-
-function setPickerEnabled(enabled: boolean): void {
-  const file = configPath();
-  const raw = JSON.parse(fs.readFileSync(file, "utf8")) as Record<string, unknown>;
-  raw.picker = { ...((raw.picker as Record<string, unknown> | undefined) ?? {}), enabled };
-  fs.writeFileSync(file, JSON.stringify(raw, null, 2) + "\n");
-}
 
 async function pickerOn(): Promise<void> {
   const home = homeDir();
@@ -67,10 +63,16 @@ async function pickerOn(): Promise<void> {
   console.log("Then open the Code tab picker: entries from cli.extraModels should be there. `clauderipple status` shows the last injection.");
 }
 
+/** After a direct start: `repair` fixes the entry but leaves a router that answers alone (doctor.ts),
+ * so it is the restart afterwards that puts the router back under its supervisor (checked on
+ * Windows 11, 2026-10-23). */
+const resupervise = (): string => `Run \`clauderipple repair\`, then \`clauderipple restart\` to put it back under the ${supervisorName()}.`;
+
 function describeRestart(r: ReturnType<typeof restartAgent>): string {
   if (r === "drained") return "✓ router restarted (in-flight model calls were allowed to finish)";
   if (r === "kickstarted") return "✓ router restarted (hard restart: it did not exit on its own in time)";
-  return "  router not restarted (not installed?) — run `clauderipple install`";
+  if (r === "direct") return `! router restarted outside the ${supervisorName()}: its start did not bring one up. ${resupervise()}`;
+  return "✗ router not restarted — run `clauderipple repair` (or `clauderipple install`)";
 }
 
 function pickerOff(): void {
@@ -214,7 +216,8 @@ async function install(): Promise<void> {
   // settings.json is written last, after the probe: from that write on, every new Claude Code
   // session sends everything to this router, so it must not point at one that never came up.
   // A foreign proxy is still refused here, before anything is registered.
-  checkProxyEnv({ proxyUrl, force: flag("force") });
+  const direct = fs.existsSync(path.join(home, "direct.json"));
+  if (!direct) checkProxyEnv({ proxyUrl, force: flag("force") });
 
   // Persist the single execution contract so the GUI, admin API, hooks, and supervisor all use
   // this installation's runtime rather than any Node installation on the user's PATH.
@@ -233,9 +236,14 @@ async function install(): Promise<void> {
   console.log(`✓ ${supervisorName()} registered: ${plist}${isLinux || reg.bundle ? "" : ' (shows as "ClaudeRipple" in Login Items)'}`);
 
   // launchd starts the agent the moment it is bootstrapped (RunAtLoad); a scheduled task waits for
-  // its logon trigger, so the router would only appear after the next sign-in. Start it either way.
-  const started = startAgent();
-  console.log(started === "failed" ? `✗ could not start the router (${supervisorName()})` : `✓ router ${started === "already-running" ? "already running" : "started"}`);
+  // its logon trigger, so the router would only appear after the next sign-in. Start it either way,
+  // and believe it only once the router's process exists (supervisor.startRouter).
+  const started = startAgent({ onProgress: (m) => console.log(`  ${m}`) });
+  console.log(
+    started === "failed" ? `✗ could not start the router (${supervisorName()})`
+    : started === "started-directly" ? `! router started without the ${supervisorName()}. ${resupervise()}`
+    : `✓ router ${started === "already-running" ? "already running" : "started"}`,
+  );
   // Running the installer again is how an update arrives, and it replaces files, not the process:
   // a router left alone keeps serving the old code until the next login. Restart one that
   // answers with another version.
@@ -243,7 +251,16 @@ async function install(): Promise<void> {
     const running = await runningVersion(adminPort(cfg));
     if (running && running !== VERSION) {
       console.log(`  the running router is ${running}; restarting it on ${VERSION}`);
-      console.log(describeRestart(restartAgent({ onProgress: (m) => console.log(`  ${m}`) })));
+      const restarted = restartAgent({ onProgress: (m) => console.log(`  ${m}`) });
+      console.log(describeRestart(restarted));
+      if (restarted === "failed") {
+        // The old router may still be answering, so the probe below would pass and the installer
+        // would report a version it never switched to — what the tray showed as "updated" while
+        // the version stayed old until `repair` (#62, #80).
+        process.exitCode = 1;
+        console.log(`${settingsPath()} was left as it was: the router was not switched to ${VERSION}. Run \`clauderipple restart\`, then install again.`);
+        return;
+      }
     }
   }
 
@@ -254,7 +271,7 @@ async function install(): Promise<void> {
     console.log(`${settingsPath()} was left as it was, so Claude Code does not depend on a router that is not answering. Fix the router, then run install again.`);
     return;
   }
-  const edit = applyProxyEnv({ proxyUrl, caPath, force: flag("force"), ...(maxCtx ? { maxContextTokens: Number(maxCtx) } : {}), models: cfg.cli.models ?? {} });
+  const edit = applyProxyEnv({ proxyUrl, caPath, force: flag("force"), ...(maxCtx ? { maxContextTokens: Number(maxCtx) } : {}), models: cfg.cli.models ?? {}, respectDirect: true });
   console.log(edit.changed ? `✓ ${settingsPath()} updated (backup: ${edit.backup ?? "none"})` : `✓ ${settingsPath()} already correct`);
   for (const n of edit.notes) console.log(`  note: ${n}`);
   // Something to double-click for the menu-bar app, which is what offers repair when the router is
@@ -273,7 +290,7 @@ async function install(): Promise<void> {
   } catch {
     console.log("  the phone host was not restarted; if you use it, run: clauderipple remote install");
   }
-  console.log("\nDone. New Claude Desktop Code sessions go through ClaudeRipple. Existing sessions pick up settings.json env changes on their next request.");
+  console.log(direct ? "\nDone. Claude stays on its default connection (direct on); run \"clauderipple direct off\" to go through ClaudeRipple." : "\nDone. New Claude Desktop Code sessions go through ClaudeRipple. Existing sessions pick up settings.json env changes on their next request.");
 }
 
 async function uninstall(): Promise<void> {
@@ -288,6 +305,7 @@ async function uninstall(): Promise<void> {
   await releaseHeldSleep("uninstalled");
   const removed = removeAgent();
   console.log(removed ? `✓ ${supervisorName()} removed (${agentDefinitionPath()})` : `✓ no ${supervisorName()} registered`);
+  if (process.platform === "darwin") removeTrayAgent();
   removeBundle(home);
   try {
     const app = uninstallLauncher({ rt: installedRuntime, home, version: VERSION });
@@ -295,7 +313,8 @@ async function uninstall(): Promise<void> {
   } catch (e) {
     console.log(`  could not remove the menu-bar app launcher: ${(e as Error).message}`);
   }
-  const edit = removeProxyEnv({ proxyUrl: proxyUrlFor(cfg.listen.port), caPath: certPaths(home).caPem });
+  removeClientIntegrations(home);
+  const edit = removeProxyEnv({ proxyUrl: proxyUrlFor(cfg.listen.port), caPath: certPaths(home).caPem, ...(cfg.cli.models ? { models: cfg.cli.models } : {}) });
   console.log(edit.changed ? `✓ ${settingsPath()} restored (backup: ${edit.backup ?? "none"})` : `✓ ${settingsPath()} had no ClaudeRipple keys`);
   for (const n of edit.notes) console.log(`  note: ${n}`);
   if (flag("purge")) {
@@ -608,7 +627,7 @@ function help(): void {
 Home directory: ${homeDir()}  (override with CLAUDERIPPLE_HOME)`);
 }
 
-try {
+async function dispatchCommand(): Promise<void> {
   switch (cmd) {
     case "remote": {
       const sub = args[1];
@@ -658,13 +677,22 @@ try {
       await recovery();
       break;
     case "start": {
-      const r = startAgent();
-      console.log(r === "already-running" ? "already running" : r === "started" ? "started" : "start failed (is it installed?)");
+      const r = startAgent({ onProgress: (m) => console.log(`  ${m}`) });
+      console.log(
+        r === "already-running" ? "already running"
+        : r === "started" ? "started"
+        : r === "started-directly" ? `started without the ${supervisorName()}. ${resupervise()}`
+        : "start failed (is it installed?)",
+      );
+      if (r === "failed") process.exitCode = 1;
       break;
     }
-    case "restart":
-      console.log(describeRestart(restartAgent({ onProgress: (m) => console.log(`  ${m}`) })));
+    case "restart": {
+      const r = restartAgent({ onProgress: (m) => console.log(`  ${m}`) });
+      console.log(describeRestart(r));
+      if (r === "failed") process.exitCode = 1;
       break;
+    }
     case "stop":
       console.log(stopAgent() ? "stopped (run `clauderipple start` or `install` to bring it back)" : "stop failed (not loaded?)");
       await releaseHeldSleep("router stopped");
@@ -823,9 +851,19 @@ try {
       await update();
       break;
     case "tray": {
+      // Internal app bridge: only plist I/O, never launchctl or Electron runtime installation.
+      const login = opt("login");
+      if (login !== undefined) {
+        const decision = trayLoginItemDecision({ platform: process.platform, packaged: installedRuntime.packaged, initialized: flag("initialized"), electronOpenAtLogin: flag("electron-login") });
+        if (!decision || !["on", "off", "init"].includes(login)) throw new Error("tray --login requires on|off|init on an unpackaged macOS installation");
+        if (login === "on" || (login === "init" && decision.enableAgent)) installTrayAgent(homeDir());
+        else if (login === "off") removeTrayAgent();
+        console.log(JSON.stringify({ on: fs.existsSync(trayPlistPath()), removeElectronItem: login === "init" && decision.removeElectronItem }));
+        break;
+      }
       // --ensure is what the app launcher runs: fetch Electron once if it is missing, then start.
       const ensured = args.includes("--ensure") && !installedRuntime.packaged ? installTrayRuntime() : null;
-      const result = args.includes("--install") ? installTrayRuntime() : ensured && !ensured.ok ? ensured : await startTray();
+      const result = args.includes("--install") ? installTrayRuntime() : ensured && !ensured.ok ? ensured : await startTray({ atLogin: flag("at-login") });
       console.log(result.message);
       if (!result.ok) process.exit(1);
       break;
@@ -833,6 +871,10 @@ try {
     default:
       help();
   }
+}
+
+try {
+  await withCommandHelp(args, dispatchCommand, help);
 } catch (e) {
   console.error(`error: ${(e as Error).message}`);
   process.exit(1);

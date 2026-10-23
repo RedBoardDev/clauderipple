@@ -4,7 +4,7 @@
 
 import crypto from "node:crypto";
 import { clampEffort } from "../../compat.ts";
-import { conversationKey, estimateTokens, normalizeSchema, serverToolNames, systemWithDroppedToolNote, toolNameForResponses, type AnthropicBlock, type AnthropicRequest, type AnthropicTool } from "../chatgpt/translate.ts";
+import { conversationKey, documentFile, documentResponsePart, documentText, estimateTokens, normalizeSchema, serverToolNames, systemWithDroppedToolNote, toolNameForResponses, type AnthropicBlock, type AnthropicRequest, type AnthropicTool, type ResponsesContentPart } from "../chatgpt/translate.ts";
 import { identityPrefix, instructionsSuffix } from "../../identity.ts";
 import { encodeEnvelope, envelopeFor, replayableReasoning, type Envelope, type ReplayedReasoning } from "../../reasoning.ts";
 
@@ -47,9 +47,18 @@ export type OpenAiTranslateOptions = {
 
 type ChatTextPart = { type: "text"; text: string };
 type ChatImagePart = { type: "image_url"; image_url: { url: string } };
+type ChatFilePart = { type: "file"; file: { filename: string; file_data: string } };
+type ChatPart = ChatTextPart | ChatImagePart | ChatFilePart;
+
+function documentChatPart(block: AnthropicBlock): ChatTextPart | ChatFilePart {
+  const file = documentFile(block);
+  return file
+    ? { type: "file", file: { filename: file.filename, file_data: `data:${file.mimeType};base64,${file.data}` } }
+    : { type: "text", text: documentText(block) };
+}
 type ChatMessage = {
   role: "system" | "user" | "assistant" | "tool";
-  content: string | (ChatTextPart | ChatImagePart)[] | null;
+  content: string | ChatPart[] | null;
   tool_calls?: { id: string; type: "function"; function: { name: string; arguments: string } }[];
   tool_call_id?: string;
   /**
@@ -69,7 +78,7 @@ function bump(opts: OpenAiTranslateOptions | undefined, kind: "replayed" | "unde
 }
 
 type ResponseInput =
-  | { type: "message"; role: "user" | "assistant"; content: ({ type: "input_text" | "output_text"; text: string } | { type: "input_image"; image_url: string })[] }
+  | { type: "message"; role: "user" | "assistant"; content: ResponsesContentPart[] }
   | { type: "function_call"; call_id: string; name: string; arguments: string }
   | { type: "function_call_output"; call_id: string; output: string }
   | ReplayedReasoning;
@@ -212,6 +221,7 @@ export function toChatMessages(req: AnthropicRequest, opts?: OpenAiTranslateOpti
       let carriedHere = 0;
       for (const block of message.content) {
         if (block.type === "text") text.push(String((block as { text?: unknown }).text ?? ""));
+        if (block.type === "document") text.push(documentText(block));
         if (block.type === "tool_use") {
           const call = block as { id: string; name: string; input: unknown };
           knownCalls.add(call.id);
@@ -241,7 +251,7 @@ export function toChatMessages(req: AnthropicRequest, opts?: OpenAiTranslateOpti
       continue;
     }
 
-    let parts: (ChatTextPart | ChatImagePart)[] = [];
+    let parts: ChatPart[] = [];
     const flush = (): void => {
       if (!parts.length) return;
       const onlyText = parts.every((part) => part.type === "text");
@@ -251,7 +261,7 @@ export function toChatMessages(req: AnthropicRequest, opts?: OpenAiTranslateOpti
     // A tool result's images (and the fallback text of an unknown call) wait until the run of tool
     // results ends: every `tool` message must follow the assistant's tool_calls directly, and a user
     // message between parallel results is refused (DeepSeek: "insufficient tool messages", #64).
-    let deferred: (ChatTextPart | ChatImagePart)[] = [];
+    let deferred: ChatPart[] = [];
     const release = (): void => {
       parts.push(...deferred);
       deferred = [];
@@ -261,6 +271,9 @@ export function toChatMessages(req: AnthropicRequest, opts?: OpenAiTranslateOpti
         release();
         const text = String((block as { text?: unknown }).text ?? "");
         if (text) parts.push({ type: "text", text });
+      } else if (block.type === "document") {
+        release();
+        parts.push(documentChatPart(block));
       } else if (block.type === "image") {
         release();
         const url = imageUrl(block);
@@ -275,6 +288,7 @@ export function toChatMessages(req: AnthropicRequest, opts?: OpenAiTranslateOpti
         if (knownCalls.has(result.tool_use_id)) messages.push({ role: "tool", tool_call_id: result.tool_use_id, content: output });
         else deferred.push({ type: "text", text: `[Tool result]\n${output}` });
         for (const url of images) deferred.push({ type: "image_url", image_url: { url } });
+        if (Array.isArray(result.content)) for (const doc of result.content) if (doc.type === "document") deferred.push(documentChatPart(doc));
       }
     }
     release();
@@ -301,7 +315,7 @@ export function toResponsesInput(req: AnthropicRequest, opts?: OpenAiTranslateOp
       continue;
     }
     if (!Array.isArray(message.content)) continue;
-    let parts: ({ type: "input_text" | "output_text"; text: string } | { type: "input_image"; image_url: string })[] = [];
+    let parts: ResponsesContentPart[] = [];
     const flush = (): void => {
       if (parts.length) input.push({ type: "message", role, content: parts });
       parts = [];
@@ -328,6 +342,8 @@ export function toResponsesInput(req: AnthropicRequest, opts?: OpenAiTranslateOp
       if (block.type === "text") {
         const text = String((block as { text?: unknown }).text ?? "");
         if (text) parts.push({ type: role === "user" ? "input_text" : "output_text", text });
+      } else if (block.type === "document") {
+        parts.push(documentResponsePart(block, role));
       } else if (block.type === "image" && role === "user") {
         const url = imageUrl(block);
         if (url) parts.push({ type: "input_image", image_url: url });
@@ -347,6 +363,7 @@ export function toResponsesInput(req: AnthropicRequest, opts?: OpenAiTranslateOp
         if (knownCalls.has(result.tool_use_id)) input.push({ type: "function_call_output", call_id: result.tool_use_id, output });
         else parts.push({ type: "input_text", text: `[Tool result]\n${output}` });
         for (const image_url of images) parts.push({ type: "input_image", image_url });
+        if (Array.isArray(result.content)) for (const doc of result.content) if (doc.type === "document") parts.push(documentResponsePart(doc, "user"));
       }
     }
     flush();
@@ -445,6 +462,7 @@ export class OpenAiStreamMapper {
   private finishReason: string | undefined;
   private readonly responseItems: ResponseItem[] = [];
   private readonly responseItemsById = new Map<string, ResponseItem>();
+  private readonly responseItemsByOutput = new Map<number, ResponseItem>();
   /** Reasoning items of a Responses stream, by item id, until the item that carries one is done. */
   private readonly reasoningItems = new Map<string, ReasoningItem>();
   /** The item id of the most recent function_call, which is what a following reasoning describes. */
@@ -612,12 +630,10 @@ export class OpenAiStreamMapper {
           const call = raw as { index?: unknown; id?: unknown; function?: { name?: unknown; arguments?: unknown } };
           const index = typeof call.index === "number" ? call.index : 0;
           const tool = this.toolFor(index, call);
-          if (!this.open || this.open.kind !== "tool" || this.open.toolIndex !== index) out.push(...this.openBlock("tool", { type: "tool_use", id: tool.id, name: tool.name, input: {} }, index));
+          // Chat has no per-call completion event. Hold arguments by index until the turn ends,
+          // then emit each call once instead of reopening A/B/A/B as broken JSON blocks.
           const args = call.function?.arguments;
-          if (typeof args === "string" && args) {
-            tool.args += args;
-            out.push({ event: "content_block_delta", data: { type: "content_block_delta", index: this.open!.index, delta: { type: "input_json_delta", partial_json: args } } });
-          }
+          if (typeof args === "string" && args) tool.args += args;
         }
       }
       if (typeof choice.finish_reason === "string" && choice.finish_reason) {
@@ -665,11 +681,22 @@ export class OpenAiStreamMapper {
 
   private responseItem(id: unknown, kind?: ResponseItem["kind"]): ResponseItem | undefined {
     if (typeof id === "string") return this.responseItemsById.get(id);
+    if (typeof id === "number") return this.responseItemsByOutput.get(id);
     // Standard Responses SSE includes item_id. A few compatible servers omit it for
     // a single in-flight item; support only the unambiguous form, never guess across
     // parallel calls.
     const candidates = this.responseItems.filter((item) => !item.done && (!kind || item.kind === kind));
     return candidates.length === 1 ? candidates[0] : undefined;
+  }
+
+  private completeResponseArguments(item: ResponseItem | undefined, value: unknown): AnthropicEvent[] {
+    if (item?.kind !== "tool" || typeof value !== "string") return [];
+    const tool = item.block as ToolOutputBlock;
+    tool.args = value;
+    if (!item.emitted || item.closed || this.open?.toolIndex !== tool.index) return [];
+    const text = value.slice(item.emittedText);
+    item.emittedText = value.length;
+    return text ? [{ event: "content_block_delta", data: { type: "content_block_delta", index: this.open.index, delta: { type: "input_json_delta", partial_json: text } } }] : [];
   }
 
   private flushResponses(): AnthropicEvent[] {
@@ -729,8 +756,8 @@ export class OpenAiStreamMapper {
     const out = [...this.start()];
     const type = typeof ev.type === "string" ? ev.type : "";
     if (type === "response.output_item.added") {
-      const item = ev.item as { type?: unknown; id?: unknown; call_id?: unknown; name?: unknown; encrypted_content?: unknown; summary?: unknown } | undefined;
-      const id = typeof item?.id === "string" ? item.id : undefined;
+      const item = ev.item as { type?: unknown; id?: unknown; call_id?: unknown; name?: unknown; arguments?: unknown; encrypted_content?: unknown; summary?: unknown } | undefined;
+      const id = typeof item?.id === "string" ? item.id : typeof ev.output_index === "number" ? `output_${ev.output_index}` : undefined;
       if (id && item?.type === "message") {
         const block: TextOutputBlock = { type: "text", text: "" };
         this.content.push(block);
@@ -741,6 +768,7 @@ export class OpenAiStreamMapper {
         this.lastCallId = item.call_id === undefined || item.call_id === null ? id : String(item.call_id);
         const index = this.content.filter((block) => block.type === "tool_use").length;
         const tool = this.toolFor(index, { id: item.call_id ?? item.id, function: { name: item.name } });
+        if (typeof item.arguments === "string") tool.args = item.arguments;
         const responseItem: ResponseItem = { id, kind: "tool", block: tool, done: false, emitted: false, closed: false, emittedText: 0 };
         this.responseItems.push(responseItem);
         this.responseItemsById.set(id, responseItem);
@@ -759,9 +787,11 @@ export class OpenAiStreamMapper {
         this.responseItems.push(responseItem);
         this.responseItemsById.set(id, responseItem);
       }
+      const added = id ? this.responseItemsById.get(id) : undefined;
+      if (added && typeof ev.output_index === "number") this.responseItemsByOutput.set(ev.output_index, added);
     } else if (type === "response.output_text.delta") {
       const text = typeof ev.delta === "string" ? ev.delta : "";
-      const item = this.responseItem(ev.item_id, "text");
+      const item = this.responseItem(ev.item_id ?? ev.output_index, "text");
       if (item?.kind === "text" && text) {
         const block = item.block as TextOutputBlock;
         block.text += text;
@@ -772,7 +802,7 @@ export class OpenAiStreamMapper {
       }
     } else if (type === "response.function_call_arguments.delta") {
       const text = typeof ev.delta === "string" ? ev.delta : "";
-      const item = this.responseItem(ev.item_id, "tool");
+      const item = this.responseItem(ev.item_id ?? ev.output_index, "tool");
       if (item?.kind === "tool" && text) {
         const tool = item.block as ToolOutputBlock;
         tool.args += text;
@@ -781,11 +811,13 @@ export class OpenAiStreamMapper {
           item.emittedText += text.length;
         }
       }
+    } else if (type === "response.function_call_arguments.done") {
+      out.push(...this.completeResponseArguments(this.responseItem(ev.item_id ?? ev.output_index, "tool"), ev.arguments));
     } else if (type === "response.reasoning_summary_text.delta" || type === "response.reasoning_text.delta") {
       // The summary, shown as the thinking block's text. When there is none — which is the usual
       // shape — nothing arrives and the block stays empty, exactly as the item was measured.
       const text = typeof ev.delta === "string" ? ev.delta : "";
-      const item = this.responseItem(ev.item_id, "reasoning");
+      const item = this.responseItem(ev.item_id ?? ev.output_index, "reasoning");
       if (item?.kind === "reasoning" && text) {
         const block = item.block as ThinkingOutputBlock;
         block.thinking += text;
@@ -796,8 +828,9 @@ export class OpenAiStreamMapper {
         }
       }
     } else if (type === "response.output_item.done") {
-      const done = ev.item as { id?: unknown; type?: unknown; encrypted_content?: unknown; summary?: unknown } | undefined;
-      const item = this.responseItem(ev.item_id ?? done?.id);
+      const done = ev.item as { id?: unknown; type?: unknown; arguments?: unknown; encrypted_content?: unknown; summary?: unknown } | undefined;
+      const item = this.responseItem(ev.item_id ?? done?.id ?? ev.output_index);
+      out.push(...this.completeResponseArguments(item, done?.arguments));
       if (done?.encrypted_content !== undefined || done?.summary !== undefined) {
         // The backend may seal the reasoning only when the item completes; take it from there too.
         const held = this.reasoningItems.get(typeof (ev.item_id ?? done?.id) === "string" ? String(ev.item_id ?? done?.id) : "");
@@ -839,8 +872,18 @@ export class OpenAiStreamMapper {
   finish(): AnthropicEvent[] {
     if (this.finished) return [];
     this.finished = true;
-    this.stopReason = this.sawTool || this.finishReason === "tool_calls" ? "tool_use" : this.finishReason === "length" || this.finishReason === "max_output_tokens" ? "max_tokens" : "end_turn";
-    return [...this.start(), ...this.closeBlock(), { event: "message_delta", data: { type: "message_delta", delta: { stop_reason: this.stopReason, stop_sequence: null }, usage: this.usage } }, { event: "message_stop", data: { type: "message_stop" } }];
+    this.stopReason = this.finishReason === "length" || this.finishReason === "max_output_tokens" ? "max_tokens" : this.sawTool || this.finishReason === "tool_calls" ? "tool_use" : "end_turn";
+    const out = [...this.start(), ...this.closeBlock()];
+    if (this.wire === "chat") {
+      for (const tool of this.content) {
+        if (tool.type !== "tool_use") continue;
+        out.push(...this.openBlock("tool", { type: "tool_use", id: tool.id, name: tool.name, input: {} }, tool.index));
+        if (tool.args) out.push({ event: "content_block_delta", data: { type: "content_block_delta", index: this.open!.index, delta: { type: "input_json_delta", partial_json: tool.args } } });
+        out.push(...this.closeBlock());
+      }
+    }
+    out.push({ event: "message_delta", data: { type: "message_delta", delta: { stop_reason: this.stopReason, stop_sequence: null }, usage: this.usage } }, { event: "message_stop", data: { type: "message_stop" } });
+    return out;
   }
 
   fail(rawMessage: string, code?: string): AnthropicEvent[] {

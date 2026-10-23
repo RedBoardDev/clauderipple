@@ -57,8 +57,10 @@ export type Isolation = "local" | "worktree";
 /**
  * Why a session wants the person's eye. The phone clears it when it opens that session, except
  * `permission`, which clears only when the approval itself is answered (a phone can look and leave).
+ * `question` is a Claude app turn that stopped on its wrap_up's question and waits for the answer;
+ * a client that does not know it must read it as an attention it can clear, never fail on it.
  */
-export type AttentionReason = "permission" | "failed" | "finished";
+export type AttentionReason = "permission" | "failed" | "finished" | "question";
 export interface Attention { reason: AttentionReason; at: number }
 
 /** A string moved out of an event (INLINE_CAP); the client fetches `/api/blob/<session>/<id>`. */
@@ -100,11 +102,15 @@ export type NoticeCode = "host_restarted" | "interrupted" | "api_retry" | "route
 export type SessionEvent = EventBody & { seq: number; at: number };
 
 /**
- * A push-worthy moment on a Mac session the host is not tailing: a turn finished (ok/failed) or an
- * approval is waiting. It goes to the pushes only, never into a session log, so it carries just
- * what they read — a bridged session's own result/permission events carry the rest.
+ * A push-worthy moment on a Mac session the host is not tailing: a turn finished (ok/failed), a turn
+ * closed on a question the person must answer, or an approval is waiting. It goes to the pushes only,
+ * never into a session log, so it carries just what they read — a bridged session's own
+ * result/permission events carry the rest.
  */
-export type AlertBody = { kind: "permission" } | { kind: "result"; ok: boolean };
+export type AlertBody = { kind: "permission" } | { kind: "result"; ok: boolean }
+  /** A Claude app turn that closed on its wrap_up: `ask` is the question, and `blocked` says the
+   * session does not go on until the person answers it. */
+  | { kind: "question"; ask: string; blocked: boolean };
 /** What a push reads: a real log event, or an alert for a Mac session the host does not tail. */
 export type PushEvent = EventBody | AlertBody;
 
@@ -180,13 +186,25 @@ export interface SessionSummary {
   turnStartedAt?: number | null;
   /** What those background tasks are, oldest first; absent on older hosts. */
   taskList?: BackgroundTask[];
+  /** The Code tab's task list for the running turn (its update_plan tool), in order; empty when the
+   * turn has none or the session is not working. Absent on older hosts. */
+  plan?: PlanStep[];
   /** The main turn is idle but background work (subagents, shells) still runs: the app's dark blink. */
   background?: boolean;
   /** open permission requests */
   pending: number;
+  /** Messages the phone queued, oldest first; the host sends each when the turn before it ends.
+   * Absent when empty and on older hosts (HostInfo.queue says the host keeps them). */
+  queue?: QueuedMessage[];
+  /** The phone's Stop paused the queue (or its head failed): nothing goes until a send or resume. */
+  queueHeld?: boolean;
   /** The host's archive flag: an archived session leaves the default list but is never deleted
    * (transcripts and files stay). Absent on older hosts. */
   archived?: boolean;
+  /** The Claude app's own sidebar line for this session: the first sentence of the last wrap_up's
+   * recap (≤200 characters). Cleared when the person sends a new message, since the next turn is
+   * already under way. Claude app sessions only; absent on older hosts and for host sessions. */
+  status?: string;
   /** The session wants the person's eye; the phone's `seen` clears all but a permission request.
    * Absent on older hosts; null means nothing is waiting. */
   attention?: Attention | null;
@@ -196,7 +214,11 @@ export interface SessionSummary {
   epoch: string;
 }
 
-export interface BackgroundTask { id: string; kind: "agent" | "shell"; label: string; startedAt: number | null }
+export interface BackgroundTask { id: string; kind: "agent" | "shell"; label: string; startedAt: number | null; /** an agent's own log for `op: "sub"`; absent on older hosts */ sub?: string }
+export interface PlanStep { text: string; status: "pending" | "in_progress" | "completed" }
+
+/** One queued message as the phone shows it; `id` is the phone's clientMsgId. */
+export interface QueuedMessage { id: string; text: string; attachments: number; at: number; /** why sending it failed; the queue is held */ error?: string }
 
 export interface ModelOption { model: string; name: string; provider: string; efforts: Effort[]; usable: boolean }
 export interface ProviderGroup { provider: string; label: string; usable: boolean; models: ModelOption[] }
@@ -208,6 +230,8 @@ export interface FolderEntry { path: string; name: string; lastUsed?: number; mo
  * right now — this Mac's Claude login, in the host's words — absent when they can.
  */
 export interface HostInfo { name: string; version: string; routerOk: boolean; routerProblem?: string; desktopProblem?: string;
+  /** The host keeps queued messages (ReqOp enqueue/queue_*); an older host leaves the queue to the phone. */
+  queue?: boolean;
   /** the mod's mode, effort range and provider limits; absent on older hosts or when the router is down */
   ripple?: RippleStatus }
 
@@ -248,8 +272,20 @@ export type ReqOp =
   | { op: "git"; path: string }
   | { op: "blob"; session: string; id: string; offset?: number }
   | { op: "sub"; session: string; sub: string; afterSeq?: number }
+  /** What changed in this session's own folder; the host reads the folder from the session, never
+   * from the phone. Read-only: a scope, a base branch, and one patch per file (see DiffView). */
+  | { op: "diff"; session: string }
   /** Slash command names (no "/") the session accepts, for the composer's "/" menu. */
   | { op: "commands"; session: string }
+  /** Queue a message for when the running turn ends; attachments are uploads, as for `send`. A
+   * session that is not busy takes it at once. Answers `{ queued: true }`; a resent id is a no-op. */
+  | { op: "enqueue"; session: string; clientMsgId: string; text: string; attachments?: Attachment[] }
+  /** Take a queued message out: returns { text, attachments: Attachment[] } for editing. */
+  | { op: "queue_remove"; session: string; id: string }
+  /** Send a queued message now, into the running turn like a steer; un-holds the queue. */
+  | { op: "queue_send"; session: string; id: string }
+  /** Let a held queue go on by itself again. */
+  | { op: "queue_resume"; session: string }
   /** The host's VAPID public key (base64url), for PushManager.subscribe's applicationServerKey. */
   | { op: "push_key" }
   | { op: "push_subscribe"; subscription: PushSubscriptionJSON; lang: "ko" | "en" }
@@ -266,6 +302,48 @@ export interface BrowseResult { path: string; parent: string | null; home: strin
 export interface GitInfo { isRepo: boolean; root: string | null; branch: string | null; branches: string[] }
 export interface BlobChunk { text: string; offset: number; next: number | null; bytes: number }
 export interface SubPage { events: SessionEvent[]; more: boolean }
+
+/**
+ * The session folder's changes, for the phone's diff pane (the official app's diff view). The answer
+ * to `op: "diff"`: which question the folder is asking (uncommitted work, or a branch ahead of its
+ * base), what the base branch is, and one unified patch per changed file. A phone shows it as a
+ * file list with each file's patch beneath; nothing here is fetched, checked out or written.
+ */
+export interface DiffView {
+  /** `uncommitted`: the folder has work that is not committed — staged and unstaged changes against
+   * HEAD plus untracked files, shown first so a mid-session thought is never hidden by a branch.
+   * `branch`: the folder is clean and its current branch is ahead of the base branch, so the view
+   * is merge-base..HEAD. `clean`: neither — the folder holds no change this session made. */
+  scope: "uncommitted" | "branch" | "clean";
+  /** The branch a `branch` view is measured against (`origin/main`, else `main`, else `master`);
+   * null in every other scope. */
+  base: string | null;
+  /** The folder's current branch; null when it is not on one (detached HEAD). */
+  branch: string | null;
+  /** Changed files in git's order, untracked ones last; cut to the size limits below. */
+  files: DiffFile[];
+  /** Something was left out: more than 300 files, a patch past 200 KB, 2 MB of patches in all, or
+   * more than one frame can carry. Counts in `files` are still complete. */
+  truncated: boolean;
+}
+
+/** One changed file. `added`/`removed` come from git's numstat, before any truncation, so a cut
+ * patch still says how big the change was. */
+export interface DiffFile {
+  /** path from the repository root, as git prints it */
+  path: string;
+  /** where the file was, for a rename */
+  oldPath?: string;
+  /** how it changed; `binary` is a file whose content cannot be a patch (a new binary is `binary`
+   * rather than `untracked`, since there is nothing to show) */
+  status: "added" | "modified" | "deleted" | "renamed" | "untracked" | "binary";
+  /** lines added */
+  added: number;
+  /** lines removed */
+  removed: number;
+  /** the unified diff text; empty for binary files and for a file the limits cut away */
+  patch: string;
+}
 
 // ---- host → client --------------------------------------------------------------------
 

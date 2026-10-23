@@ -12,10 +12,27 @@ import { cacheTone, providerColor, textTone } from './theme'
 import type { Frame, LogActions, LogView } from './view'
 import { cachePercent, clockTime, effortLabel, modelOf, promptTokens, seconds } from './view'
 
+/**
+ * The router's answer to a thread continue on a model without server-side threads: answered here at
+ * once, never sent upstream, and the CLI goes on stateless. Every worker of a Workflow does it once,
+ * and drawn as three lines like a failure it read as dozens of errors (2026-10-23).
+ */
+const STATELESS_SWITCH = /^(?:thread continue refused|continue of a translated turn refused)/
+
 function entry(el: Els, frame: Frame, record: StatusRequest, mineOnly: boolean): RenderNode {
   const { Box, Text } = el
   const tone = textTone(frame.appearance)
   const cache = cachePercent(record.usage)
+  if (record.resent && STATELESS_SWITCH.test(record.note ?? '')) {
+    return (
+      <Box key={record.at + '-' + record.target} flexDirection="row" flexWrap="wrap" columnGap={1}>
+        {mineOnly ? null : <Text dimColor>{record.mine ? '●' : '○'}</Text>}
+        <Text dimColor>{clockTime(record.at)}</Text>
+        <Text dimColor wrap="wrap">{modelOf(record)}</Text>
+        <Text dimColor>{t(frame.lang, 'log.statelessSwitch')}</Text>
+      </Box>
+    )
+  }
   return (
     <Box key={record.at + '-' + record.target} flexDirection="column">
       <Box flexDirection="row" flexWrap="wrap" columnGap={1}>

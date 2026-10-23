@@ -1,15 +1,15 @@
 // Engine wiring lives here: imported logic and drawings never receive the engine interface.
 // Timers own background work; hooks only admit/rewrite a request and record its result.
 import { atom, read, update } from 'claude-code'
-import type { AgentSpawnInput, EngineInterface, ModelCompleteResult, ModelForkResult, Register, RenderElement, RenderInput, SessionCompactResult, SessionRateLimit, ToolCallInput, TurnStepInput, TurnUsage } from 'claude-code'
+import type { AgentSpawnInput, EngineInterface, ModelCompleteResult, ModelForkResult, Register, RenderElement, RenderInput, RenderNode, SessionCompactResult, SessionRateLimit, ToolCallInput, TurnStepInput, TurnUsage } from 'claude-code'
 import type { AgentRec, Effort, JudgeAttempt, JudgeInput, JudgeKind, JudgeRun, JudgeTarget, LimitItem, ModSettingsSnapshot, Pick, Settings, StatusRequest, TierTarget, Verdict, WorkerCandidate, WorkerPick, WorkerVerdict } from '../types'
 import { MOD_SETTINGS_SCHEMA_VERSION, RUNG_EFFORT, applySettingsChanges, normalizeSettings, settingsChanges } from './settings'
 import { rungOf } from './ladder'
 import { debugText, langFrom, t } from './i18n'
 import type { Lang } from './i18n'
 import { EFFORT_JUDGE_SYSTEM, finalEffort, isCacheSafeModel, isShortFollowUp, jevEffortRequest, jevFailure, jevUsage, jevWorkerRequest, judgeContext, parseEffortVerdict, parseJevEffort, parseJevKey, parseJevWorker, shouldJudge } from './judge'
-import { AUTO_DESCRIPTION, WORKER_JUDGE_SYSTEM, agentProvider, candidateUsable, chatgptUsable, claudeCandidates, domainVerdict, ladderOptionsFrom, ladderPick, parseWorkerVerdict, readMarker, routerModelOptions, spawnModel, spawnTitle, takesOver, TIER_MARKERS, tierOf, workerJudgeInput, workerRule, zenJev } from './workers'
-import { MARKER, agentModel, fixSpawn } from './worker'
+import { AUTO_DESCRIPTION, WORKER_JUDGE_SYSTEM, agentProvider, candidateUsable, chatgptUsable, claudeCandidates, ladderOptionsFrom, markerDomain, ladderPick, parseWorkerVerdict, readMarker, routerModelOptions, spawnModel, spawnTitle, takesOver, TIER_MARKERS, tierOf, workerJudgeInput, workerRule, zenJev } from './workers'
+import { MARKER, agentModel, fixSpawn, rivalProviders, userNamed } from './worker'
 import { activeModeOf, chatgptProviders, claudeWindow, eagerNote, gptLimitsFrom, modeKey, modeOver, quotaWindows, resetProvider, routingSettings } from './modes'
 import type { QuotaWindow } from './modes'
 import type { Spawn, WorkerFix } from './worker'
@@ -21,15 +21,17 @@ import { ADVICE_SYSTEM, FULL_PROMPT, QUICK_PROMPT, adviceDue, adviceInput, parse
 import { addAgentStep, addJudge, addPrompt, addRequest, addWarm, addWorker, emptyStats, formatStats, judgeOutcome, sentEffort } from './stats'
 import { besideBand, renderBand, renderFooter } from './ui/band'
 import { renderAlert } from './ui/alerts'
+import { PHONE_QUEUE_ROWS, renderPhoneQueue } from './ui/queue'
 import { renderSettings } from './ui/settings'
 import { renderSetup } from './ui/setup'
-import { renderAgents, talkOf } from './ui/agents'
+import { renderAgents, renderAgentsFallback, talkOf } from './ui/agents'
 import { toolDetail } from './ui/tools'
 import { renderLog } from './ui/log'
 import { EFFORTS, modelName, nextMinuteChange, routeOf, targetLabel } from './ui/view'
 import type { AgentTalk, AgentsActions, AlertActions, AlertView, BandActions, DashboardView, Frame, SettingsActions, SettingsView, SetupActions } from './ui/view'
 
 const line = atom({ plugin: 'ripple', key: 'line' } as const, null)
+const phoneQueue = atom({ plugin: 'ripple', key: 'phoneQueue' } as const, null)
 const last = atom({ plugin: 'ripple', key: 'last' } as const, null)
 const requests = atom({ plugin: 'ripple', key: 'requests' } as const, [])
 const logOpen = atom({ plugin: 'ripple', key: 'logOpen' } as const, false)
@@ -92,6 +94,12 @@ const agentsShowDone = atom({ plugin: 'ripple', key: 'agentsShowDone' } as const
 const agentOpen = atom({ plugin: 'ripple', key: 'agentOpen' } as const, null)
 const agentRunsOpen = atom({ plugin: 'ripple', key: 'agentRunsOpen' } as const, [])
 const agentsTick = atom({ plugin: 'ripple', key: 'agentsTick' } as const, 0)
+/**
+ * The person's last few prompts as submitted. One typed while a turn runs is absorbed into that turn
+ * and never becomes a user message in `$.session.messages()`, so "솔한테 돌려" said mid-turn was not
+ * heard and the worker went by tier (2026-10-23). userNamed reads these beside the transcript.
+ */
+const heardPrompts = atom({ plugin: 'ripple', key: 'heardPrompts' } as const, [] as string[])
 const jev = atom({ plugin: 'ripple', key: 'jev' } as const, { source: null, test: { state: 'idle' } })
 const routerModels = atom({ plugin: 'ripple', key: 'routerModels' } as const, [])
 const ladderOptions = atom({ plugin: 'ripple', key: 'ladderOptions' } as const, null)
@@ -172,6 +180,26 @@ async function persistWorkerPick($: EngineInterface, entry: Record<string, unkno
   // A reporting failure must not poison the queue or undo the selected spawn either.
   workerLogWork = work.catch(() => undefined)
   await workerLogWork
+}
+/**
+ * What the phone queued for this chat. The host keeps the queue (packages/remote/src/queue.ts) and
+ * sends it when the turn ends; the Claude app never sees it, so the band says it is there. Keyed by
+ * the phone's session id, which for a Claude app session is this one, or by `desktopId`.
+ */
+export function phoneQueueOf(text: string | undefined, session: string): { count: number; first: string } | null {
+  if (!text) return null
+  for (const [key, value] of Object.entries(object(JSON.parse(text)))) {
+    const entry = object(value)
+    if (key !== session && entry.desktopId !== session) continue
+    const items = Array.isArray(entry.items) ? entry.items.map(object) : []
+    return items.length ? { count: items.length, first: typeof items[0]!.text === 'string' ? items[0]!.text : '' } : null
+  }
+  return null
+}
+async function refreshPhoneQueue($: EngineInterface, session: string): Promise<void> {
+  const path = `${await rippleHome($)}/remote/queue.json`
+  const next = await $.fs.exists(path) ? phoneQueueOf(await optionalFile($, path), session) : null
+  if (JSON.stringify(next) !== JSON.stringify(await read($, phoneQueue))) await update($, phoneQueue, () => next)
 }
 async function claudeHome($: EngineInterface): Promise<string> {
   return (await $.env.get('CLAUDE_CONFIG_DIR')) ?? `${await userHome($)}/.claude`
@@ -415,9 +443,11 @@ async function refreshRouter($: EngineInterface): Promise<void> {
     const admin = await adminUrl($)
     await settingsTask(() => syncSettings($, admin))
     await endModeIfOver($)
+    const session = await $.session.id()
+    // Read even with the band hidden: the strip shows over whatever is above the prompt.
+    await refreshPhoneQueue($, session)
     const open = await isLogUp($)
     if (!open && await read($, bandHidden)) { await update($, line, () => null); return }
-    const session = await $.session.id()
     const own = await $.http.fetch(`${admin}/api/requests?kind=messages&n=${open ? 60 : 1}&session=${encodeURIComponent(session)}`)
     if (!own.ok) throw new Error(t(language, 'commands.routerHttp', { status: own.status }))
     const mine = (object(JSON.parse(own.text)).requests ?? []) as StatusRequest[]
@@ -465,6 +495,29 @@ async function spawnProvider($: EngineInterface, subagentType: string, model: st
   const id = model.replace(/@[^@]*$/, '')
   if (/^(?:sonnet|opus|haiku|fable|mythos|claude-)/.test(id)) return 'anthropic'
   return (await read($, routerModels)).find(m => m.value === id)?.provider
+}
+/**
+ * The model the main chat chose by name outside ripple:auto, or null: a worker agent called
+ * directly, general-purpose given a model, or a model marker on any other agent (the router obeys
+ * it wherever it sits at the top). ripple:auto's own marker is checked in requestPick.
+ */
+async function sessionPickedModel($: EngineInterface, e: AgentSpawnInput): Promise<string | null> {
+  if (['ripple:auto', 'auto'].includes(e.subagentType)) return null
+  if ((await workerFiles($)).has(e.subagentType)) return e.subagentType
+  if (e.subagentType === 'general-purpose' && e.model && e.model !== 'inherit') return e.model
+  const marker = readMarker(e.prompt)
+  return marker && !tierOf(marker) && !['auto', 'ripple'].includes(marker.name) ? marker.name : null
+}
+/** Check the user's model/source choice using the generated file, not a guess from its id. */
+async function userNamedPick($: EngineInterface, name: string, files: ReadonlyMap<string, string>): Promise<boolean> {
+  const id = name.replace(/@[^@]*$/, '').toLowerCase()
+  const file = files.get(id) ?? [...files.values()].find(f => agentModel(f)?.replace(/@[^@]*$/, '').toLowerCase() === id)
+  const models = await read($, routerModels)
+  const provider = file ? agentProvider(file) : /^(?:sonnet|opus|haiku|fable|mythos|claude-)/.test(id) ? 'anthropic' : models.find(m => m.value.toLowerCase() === id)?.provider
+  const model = file ? agentModel(file)! : name
+  const sources = [...files.values()].flatMap(f => { const m = agentModel(f), p = agentProvider(f); return m && p ? [{ model: m, provider: p }] : [] }).concat(models.map(m => ({ model: m.value, provider: m.provider })))
+  const providers = rivalProviders(model, sources)
+  return userNamed(model, await $.session.messages(), await read($, heardPrompts), { ...(provider ? { provider } : {}), providers })
 }
 async function workerFix($: EngineInterface, spawn: Spawn): Promise<WorkerFix | null> {
   const text = await optionalFile($, `${await rippleHome($)}/generated-agents.json`)
@@ -741,14 +794,22 @@ async function testJudge($: EngineInterface): Promise<void> {
   }
 }
 
-async function requestPick($: EngineInterface, e: AgentSpawnInput, s: Settings): Promise<{ input: AgentSpawnInput; pick: WorkerPick } | { deny: string }> {
+/** `dropped`: a model the main chat named that the user did not, already taken off the prompt. */
+async function requestPick($: EngineInterface, e: AgentSpawnInput, s: Settings, dropped?: string): Promise<{ input: AgentSpawnInput; pick: WorkerPick } | { deny: string }> {
   const language = await read($, lang)
   const files = await workerFiles($)
   try { await refreshModels($) } catch (error) { await report($, 'worker catalogue', error) }
   // Claude's own models are candidates as well: general-purpose on the model, effort by turn.step.
   const pinnedCandidates = [...[...files].flatMap(([agent, file]) => { const model = agentModel(file)?.replace(/@[^@]*$/, ''); const provider = agentProvider(file); return model && provider ? [{ target: { agent }, model, provider }] : [] }), ...claudeCandidates()]
   const usable = await availability($)
-  const marker = readMarker(e.prompt)
+  let marker = readMarker(e.prompt)
+  // A model the user did not name is not the main chat's to pick: the marker goes, and the tier
+  // decides as if it had never been written (worker.ts userNamed).
+  if (marker && !tierOf(marker) && !['auto', 'ripple'].includes(marker.name) && !await userNamedPick($, marker.name, files)) {
+    dropped = marker.name
+    e = { ...e, prompt: e.prompt.replace(MARKER, '').replace(/^\s*\n/, '') }
+    marker = readMarker(e.prompt)
+  }
   const tier = tierOf(marker)
   const explicit = marker && !tier && !['auto', 'ripple'].includes(marker.name) ? marker : null
   const id = (await $.clock.now()).toString(36) + Math.random().toString(36).slice(2, 8)
@@ -768,22 +829,13 @@ async function requestPick($: EngineInterface, e: AgentSpawnInput, s: Settings):
     verdict = { domain: 'general', level: 'standard', effort: effortOf(explicit.level) ?? 'high', why: t(language, 'toasts.explicitMarker') }
     by = 'marker'
   } else if (tier) {
-    // A marker owns the tier. Only a set with domain ladders needs the shadow judge's domain
-    // before dispatch; otherwise leave the existing unawaited path (and latency) unchanged.
+    // The marker owns the tier and its domain word the ladder; the judge is not asked. It used to
+    // rate the brief beside the pick (the "shadow" log rows): over 362 delegations (2026-10-15..22)
+    // it agreed on the rung 76% of the time, the disagreements went both ways and failed no more,
+    // and with domain ladders on, every spawn waited ~0.6 s for its domain guess.
     const named = TIER_MARKERS[tier]!
-    verdict = { domain: 'general', ...named, effort: RUNG_EFFORT[rungOf(named)], why: t(language, 'toasts.sessionTier', { tier }) }
+    verdict = { domain: markerDomain(marker!.domain), ...named, effort: RUNG_EFFORT[rungOf(named)], why: t(language, 'toasts.sessionTier', { tier }) }
     by = 'session'
-    const shadow = shadowJudge($, s, id, { description: e.description, prompt: e.prompt })
-    if (routing.domainRules?.ui || routing.domainRules?.backend) {
-      const judged = await shadow
-      if (judged?.verdict && 'domain' in judged.verdict) {
-        rawVerdict = judged.verdict
-        verdict.domain = judged.verdict.domain
-      }
-      ms = judged?.ms ?? 0
-      judgeError = judged?.error
-      judgeAttempts = judged?.attempts
-    }
   } else {
     const judged = await judge($, s, { description: e.description, prompt: e.prompt }, true)
     if (judged.verdict && 'domain' in judged.verdict) { rawVerdict = judged.verdict; verdict = judged.verdict; by = judged.by }
@@ -799,15 +851,12 @@ async function requestPick($: EngineInterface, e: AgentSpawnInput, s: Settings):
   const providers = options && options.until > now ? Object.fromEntries(Object.entries(options.providers ?? {}).filter(([, p]) => p.exhaustedUntil === undefined || p.exhaustedUntil > now)) : {}
   const explicitCandidate = target ? pinnedCandidates.find(c => c.target.agent === target!.agent) ?? (target.agent === 'general-purpose' ? { target, model: target.model ?? 'sonnet', provider: (await read($, routerModels)).find(m => m.value.toLowerCase() === target!.model)?.provider ?? 'anthropic' } : undefined) : undefined
   if (explicitCandidate && s.providers[explicitCandidate.provider] === false) return { deny: t(language, 'workers.disabled', { provider: explicitCandidate.provider }) }
-  // An active mode replaces the whole set; an explicit marker still names its own model. Design under
-  // the ui ladder takes the heavy level even past a tier marker: the main chat tiers by difficulty,
-  // and a design task is "standard" by that measure while its result depends on the model's taste.
+  // An active mode replaces the whole set; an explicit marker still names its own model.
   const { rule, ladder } = workerRule(verdict.domain, routing)
   const explicitUsable = !!explicitCandidate && candidateUsable(explicitCandidate, s, usable, providers)
-  const domained: ReturnType<typeof domainVerdict> = explicitUsable ? { verdict } : domainVerdict(verdict, rule)
   const resolved = explicitUsable
     ? { target: target!, effort: verdict.effort }
-    : ladderPick(domained.verdict, ladder, routing, pinnedCandidates, usable, language, routing.allow, providers, routing.allowKnown)
+    : ladderPick(verdict, ladder, routing, pinnedCandidates, usable, language, routing.allow, providers, routing.allowKnown)
   const selected = resolved.target
   if (!selected) return { deny: t(language, 'workers.none') }
   const fallbackReason = resolved.fallbackReason
@@ -818,30 +867,24 @@ async function requestPick($: EngineInterface, e: AgentSpawnInput, s: Settings):
   const value: WorkerPick = { ...verdict, ...resolved, rule, target: selected, by, ms, id, ...(fallbackReason ? { fallbackReason } : {}) }
   // The verdict behind a pick is otherwise only in the agents panel; one debug line per pick keeps
   // it checkable: what the judge said, the rung it landed on and what ran.
-  const entry = { task: e.description.slice(0, 200), domain: value.domain, level: value.level, kind: value.kind ?? 'do', sure: value.sure, rule: value.rule, ...(domained.raised ? { raised: domained.raised } : {}), rung: value.rung, position: value.position, skipped: value.skipped, target: value.target, model: model ?? null, effort: value.effort, by, ...(mode ? { mode: mode.name } : {}), ...(fallbackReason ? { fallbackReason } : {}) }
+  const entry = { task: e.description.slice(0, 200), domain: value.domain, level: value.level, kind: value.kind ?? 'do', sure: value.sure, rule: value.rule, rung: value.rung, position: value.position, skipped: value.skipped, target: value.target, model: model ?? null, effort: value.effort, by, ...(mode ? { mode: mode.name } : {}), ...(fallbackReason ? { fallbackReason } : {}) }
   await $.ui.log('ClaudeRipple worker pick: ' + JSON.stringify(entry), { to: 'debug' })
   // The brief itself is never logged (it can hold anything); its length is. To re-judge a pick,
   // its brief is in the session's own transcript under the same description.
   const named = by === 'marker' || by === 'default' || by === 'session'
   await persistWorkerPick($, { type: 'pick', id, ...entry, at: new Date(now).toISOString(), verdict: rawVerdict, by: named ? by : 'judge', judge: named ? null : by, ...(tier ? { tier } : {}), ms, ...(judgeError ? { error: judgeError } : {}), ...(judgeAttempts ? { attempts: judgeAttempts } : {}), promptChars: e.prompt.length })
   if (fallbackReason) await $.ui.toast(t(language, 'toasts.workerFallback', { reason: fallbackReason, name: targetLabel(selected, language) }))
+  // Said once the tier has picked, and only when it picked something else: "not named, so by
+  // tier" ahead of a tier pick that landed on that very model read as a refusal of it (2026-10-23).
+  if (dropped) {
+    const name = dropped.toLowerCase()
+    const droppedModel = (files.get(name) ? agentModel(files.get(name)!) : name)?.replace(/@[^@]*$/, '')
+    const same = selected.agent === name || model?.replace(/@[^@]*$/, '') === droppedModel
+    if (!same) await $.ui.toast(t(language, 'toasts.unnamedModel', { model: dropped, name: targetLabel(selected, language) }))
+  }
   await update($, lastSpawn, () => value)
   await update($, stats, current => addWorker(current, verdict.level))
   return { input: { ...e, subagentType: selected.agent, model, prompt }, pick: value }
-}
-
-/**
- * What the judge would have said of a brief the main chat already tiered: logged beside the pick
- * (same `id`). With domain ladders the spawn awaits this same result for its domain only; without
- * them it never waits or acts on it. The marker's tier always stands.
- */
-async function shadowJudge($: EngineInterface, s: Settings, id: string, input: { description: string; prompt: string }): Promise<Judged | undefined> {
-  try {
-    const judged = await judge($, s, input, true)
-    const verdict = judged.verdict && 'domain' in judged.verdict ? judged.verdict : null
-    await persistWorkerPick($, { type: 'shadow', pick: id, at: new Date(await $.clock.now()).toISOString(), verdict, rung: verdict ? rungOf(verdict) : null, judge: judged.by, ms: judged.ms, attempts: judged.attempts, ...(judged.error ? { error: judged.error } : {}) })
-    return judged
-  } catch (error) { await report($, 'shadow judge', error); return undefined }
 }
 
 async function toggleAuto($: EngineInterface): Promise<void> {
@@ -1466,6 +1509,11 @@ async function prepareStep($: EngineInterface, e: TurnStepInput): Promise<TurnSt
   return { ...e, effort: saving && EFFORTS.indexOf(p.effort) > EFFORTS.indexOf('medium') ? 'medium' : p.effort }
 }
 
+async function agentsRenderFailure($: EngineInterface, e: RenderInput, error: unknown): Promise<RenderElement> {
+  await report($, 'agents render', error)
+  return renderAgentsFallback($.ui.resolve(e), await frameOf($, e), await read($, agents), reason(error), { ...agentsActions($), close: () => $.ui.close({ id: AGENTS_PANE }) }, await read($, agentOpen) !== null) as RenderElement
+}
+
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     const result = await next(e)
@@ -1546,6 +1594,7 @@ export const register: Register = on => {
       }
       const human = ['composer', 'bridge', 'sdk'].includes(e.origin.kind)
       if (human && !hostCommand) {
+        if (e.text.trim()) await update($, heardPrompts, list => [...list, e.text].slice(-2))
         await markSeen($)
         await endModeIfOver($)
         const noted = await read($, modeNoted)
@@ -1657,11 +1706,39 @@ export const register: Register = on => {
       const teammate = 'isTeammate' in e && !!e.isTeammate
       if (e.parentAgentId && !e.fork && !workflow && !teammate) return { deny: t(await read($, lang), 'workers.nested') }
       const s = await currentSettings($)
-      if (!workflow && !teammate && takesOver(e, s)) {
+      const picked = !workflow && !teammate && !e.fork && s.agentAuto !== 'off' ? await sessionPickedModel($, e) : null
+      if (picked && !await userNamedPick($, picked, await workerFiles($))) {
+        // A worker or model the main chat picked by name, the user never having named it, goes
+        // through the ladder like any delegation (userNamed in worker.ts says why).
+        const marker = readMarker(e.prompt)
+        const { model: _model, ...rest } = e
+        const prompt = marker && !tierOf(marker) ? e.prompt.replace(MARKER, '').replace(/^\s*\n/, '') : e.prompt
+        const routed = await requestPick($, { ...rest, subagentType: 'ripple:auto', prompt }, s, picked)
+        if ('deny' in routed) return routed
+        input = routed.input
+        chosen = routed.pick
+      } else if (!workflow && !teammate && takesOver(e, s)) {
         const routed = await requestPick($, e, s)
         if ('deny' in routed) return routed
         input = routed.input
         chosen = routed.pick
+      } else if (workflow && ['ripple:auto', 'auto'].includes(e.subagentType)) {
+        // A Workflow's agent() is the engine's to schedule, but a ripple:auto there whose marker
+        // names a worker ran under the session's name — the task list said Opus 5.5 for 31 Sol
+        // workers (2026-10-23) — and its later turns lost the marker the router routes by. The
+        // engine keeps a workflow agent's type and description ("do not apply to a workflow
+        // agent") but takes its model: on the worker's model it shows that model and every turn
+        // routes by it. A tier marker or none leaves the agent as the script wrote it.
+        const marker = readMarker(e.prompt)
+        if (marker && !tierOf(marker) && !['auto', 'ripple'].includes(marker.name)) {
+          const files = await workerFiles($)
+          const name = files.has(marker.name) ? marker.name : [...files].find(([, f]) => agentModel(f)?.replace(/@[^@]*$/, '').toLowerCase() === marker.name)?.[0]
+          const fileModel = name ? agentModel(files.get(name)!) : undefined
+          if (name && fileModel) {
+            const fix = fixSpawn({ subagentType: name, prompt: e.prompt }, fileModel)
+            input = { ...e, prompt: fix?.prompt ?? e.prompt, model: fix?.model ?? fileModel }
+          }
+        }
       } else if (!e.fork && !workflow) {
         const files = await workerFiles($)
         try { await refreshModels($) } catch (error) { await report($, 'explicit worker catalogue', error) }
@@ -1687,7 +1764,7 @@ export const register: Register = on => {
     } catch (error) { input = e; await report($, 'agent.spawn prepare', error) }
     try {
       // The title names what really runs: the model set above, else the worker file's, else the parent's.
-      if (!e.fork && input.description?.trim()) {
+      if (!e.fork && !('workflow' in e && e.workflow) && input.description?.trim()) {
         const file = (await workerFiles($)).get(input.subagentType)
         const model = input.model ?? (file ? agentModel(file) : undefined) ?? e.parentModel
         const effort = chosen?.effort ?? /@([a-z]+)$/.exec(model)?.[1]
@@ -1810,21 +1887,27 @@ export const register: Register = on => {
       if (which === 'setup') {
         return renderSetup(el, frame, { draft: normalizeSettings(await read($, settingsDraft) ?? await read($, settings)), jev: await read($, jev), step: await read($, setupStep), models: await read($, routerModels) }, setupActions($)) as RenderElement
       }
-      if (await read($, bandHidden)) return next(e)
-      const alert = await alertView($, frame.now)
-      if (alert) return renderAlert(el, frame, alert, alertActions($, alert)) as RenderElement
-      const s = await currentSettings($)
-      if (s.layout === 'minimal') return next(e)
       const { Box, Button, Text } = el
+      // What the phone queued floats over whatever is here, only while something waits (ui/queue.tsx).
+      const queued = await read($, phoneQueue)
+      const over = (node: RenderNode): RenderElement => (queued
+        ? <Box flexDirection="column" rowGap={0.5} width="100%" minWidth={0}>{renderPhoneQueue(el, frame, queued)}{node}</Box>
+        : node) as RenderElement
+      const below = queued ? { ...frame, maxRows: Math.max(1, frame.maxRows - PHONE_QUEUE_ROWS) } : frame
+      if (await read($, bandHidden)) return over(await next(e))
+      const alert = await alertView($, frame.now)
+      if (alert) return over(renderAlert(el, below, alert, alertActions($, alert)))
+      const s = await currentSettings($)
+      if (s.layout === 'minimal') return over(await next(e))
       const actions = bandActions($, e.surface)
       // The desktop draws the band as one surface with its × inside; the terminal keeps the row
       // of facts and controls with the close control (and its effort button) after it.
       if ((e.surface === 'desktop' || e.surface === 'vscode') && 'Svg' in el) {
-        return renderBand(el, frame, await dashboard($, e.props.isWorking), { ...actions, hide: () => { void toggleBar($) } }) as RenderElement
+        return over(renderBand(el, below, await dashboard($, e.props.isWorking), { ...actions, hide: () => { void toggleBar($) } }))
       }
-      return (
+      return over(
         <Box flexDirection="row" alignItems={e.surface === 'terminal' || e.surface === 'mobile' ? 'flex-start' : 'center'} columnGap={2}>
-          <Box flexDirection="column" flexGrow={1} flexShrink={1} minWidth={0}>{renderBand(el, { ...frame, columns: frame.columns - besideBand(frame) }, await dashboard($, e.props.isWorking), actions)}</Box>
+          <Box flexDirection="column" flexGrow={1} flexShrink={1} minWidth={0}>{renderBand(el, { ...below, columns: frame.columns - besideBand(frame) }, await dashboard($, e.props.isWorking), actions)}</Box>
           <Box flexDirection="row" columnGap={2} flexShrink={0}>
             {e.surface === 'terminal' || e.surface === 'mobile' ? <Button key="effort" plain hotkey="e" label={t(language, 'band.effort')} onPress={actions.toggleEffortMenu} /> : null}
             <Button key="hide" plain role="dismiss" label="×" onPress={() => toggleBar($)} />
@@ -1847,7 +1930,7 @@ export const register: Register = on => {
       return renderLog($.ui.resolve(e), await frameOf($, e), { rows: await read($, requests), mineOnly: await read($, onlySession), judges: await read($, judgeRuns) }, { toggleScope: async () => { await update($, onlySession, value => !value); await refreshRouter($) } }) as RenderElement
     } catch (error) { await report($, 'log render', error); return next(e) }
   })
-  on('ui.render', { component: 'Pane', requestId: AGENTS_PANE }, async ($, e, next) => {
+  on('ui.render', { component: 'Pane', requestId: AGENTS_PANE }, async ($, e) => {
     try {
       startTimers($)
       const frame = await frameOf($, e)
@@ -1855,7 +1938,8 @@ export const register: Register = on => {
       await read($, agentsTick)
       const id = await read($, agentOpen)
       const open = id === null ? undefined : { id, talk: await agentTalk($, id), runsOpen: await read($, agentRunsOpen) }
+      if (open && 'deny' in open.talk) throw new Error(open.talk.deny)
       return renderAgents($.ui.resolve(e), frame, { agents: await read($, agents), now: frame.now, showDone: await read($, agentsShowDone), ...(open ? { open } : {}) }, agentsActions($)) as RenderElement
-    } catch (error) { await report($, 'agents render', error); return next(e) }
-  })
+    } catch (error) { return agentsRenderFailure($, e, error) }
+  }).catch(($, e, next) => agentsRenderFailure($, e, next.error.message ?? next.error.kind))
 }

@@ -5,7 +5,7 @@
 // plugin's may not). The engine validates every tree against the surface's element table, and
 // presses reach the callbacks below, so these check both the trees and their wiring.
 
-import { expect, test } from 'claude-code/testing'
+import { expect, mock, test } from 'claude-code/testing'
 import type { Engine } from 'claude-code/testing'
 import type { On, RenderElement, RenderPropsOf } from 'claude-code'
 
@@ -17,7 +17,10 @@ import { chOf, displayWidth } from '../hooks/ui/theme'
 import { commandLine, runSummary, shortPath, toolDetail } from '../hooks/ui/tools'
 import { renderAlert } from '../hooks/ui/alerts'
 import { BAND_RIPPLE, CREST_CELLS, bandMood, besideBand, modeLabel, renderBand, renderFooter } from '../hooks/ui/band'
+import { renderPhoneQueue } from '../hooks/ui/queue'
 import { rippleSource } from '../hooks/ui/parts'
+import { pic } from '../hooks/ui/kit'
+import { SVG_MAX_PX, svg } from '../hooks/ui/art'
 import { renderLog } from '../hooks/ui/log'
 import { renderSettings } from '../hooks/ui/settings'
 import { renderSetup } from '../hooks/ui/setup'
@@ -102,7 +105,7 @@ function drawPane(on: On, id: string, draw: Draw) {
   on('ui.render', { component: 'Pane', requestId: id }, ($, e) => draw($.ui.resolve(e), e.surface) as RenderElement)
 }
 
-function mount($: Engine, id: string, surface: (typeof SURFACES)[number], columns = 140) {
+function mount<S extends Surface>($: Engine, id: string, surface: S, columns = 140) {
   return $.ui.mount({ plugin: PRESSER, surface, component: 'Pane', requestId: id, props: paneProps(columns), viewport: { columns, rows: 40 } })
 }
 
@@ -520,6 +523,33 @@ test('every skin draws the band, the quick settings and a card on the desktop; f
   }
 })
 
+test('band, settings and log pictures stay within the SVG limit on every surface and theme', async ($, on) => {
+  const cases: { id: string; columns: number }[] = []
+  const logRows: StatusRequest[] = Array.from({ length: 40 }, (_, i) => ({ at: new Date(NOW - i * 1000).toISOString(), source: 'gpt-6.1-sol', target: 'gpt-6.1-sol', provider: 'chatgpt', status: 200, ok: true, ms: 100 }))
+  for (const skin of SKINS) for (const appearance of ['light', 'dark'] as const) for (const columns of [40, 600]) {
+    const frame = (surface: Surface): Frame => ({ ...frameOf(surface, columns, 12, skin), appearance })
+    const variants: [string, Draw][] = [
+      ['band', (el, surface) => renderBand(el, frame(surface), { ...DASH, effortMenu: true }, BAND_ACTIONS)],
+      ['settings', (el, surface) => renderSettings(el, frame(surface), { settings: SETTINGS, jev: { source: null, test: { state: 'idle' } } }, QUICK_ACTIONS)],
+      ['log', (el, surface) => renderLog(el, frame(surface), { rows: logRows, mineOnly: false }, { toggleScope: () => undefined })],
+    ]
+    for (const [name, draw] of variants) {
+      const id = [name, skin, appearance, columns].join('-')
+      drawPane(on, id, draw)
+      cases.push({ id, columns })
+    }
+  }
+  for (const { id, columns } of cases) for (const surface of ['terminal', 'desktop', 'vscode', 'mobile'] as const) {
+    const ui = await mount($, id, surface, columns)
+    expect((await ui.findAll({ type: 'Text' })).length > 0, id + ' ' + surface).toBe(true)
+    for (const picture of await ui.findAll({ type: 'Svg' })) {
+      expect(Number(picture.props.width) <= SVG_MAX_PX, id + ' width').toBe(true)
+      expect(Number(picture.props.height) <= SVG_MAX_PX, id + ' height').toBe(true)
+    }
+    await ui.unmount()
+  }
+})
+
 test('Jev key and Test row appear when Jev is anywhere in the chain, for TypeSafe with no known key', async ($, on) => {
   const sources: JevState['source'][] = [null, 'zen', 'env', 'file', 'pasted']
   const chains: Record<string, Settings['judges']> = {
@@ -754,6 +784,141 @@ test('the Agents pane draws live, finished and empty', async ($, on) => {
     expect(await empty.find({ type: 'Text', text: 'No agents yet' }), "empty { type: 'Text', text: 'No agents yet' } " + surface).toBeDefined()
   }
   expect(calls).toEqual([])
+})
+
+test('the Agents pane draws forty agents at once, and a record missing its title or type', async ($, on) => {
+  // 2026-10-23: a session of dozens of workers left the pane on the engine's "Nothing to show yet":
+  // the list's capsule asked for a sea taller than the 4096 px an Svg may be, and the engine refused
+  // the whole tree. The store keeps the latest 40.
+  const forty: AgentRec[] = Array.from({ length: 40 }, (_, i): AgentRec => ({ ...AGENTS[0]!, id: 'w' + i, description: 'cheongju:송수아 ' + i, ...(i < 31 ? {} : { state: 'done', endedAt: NOW - i * 1000, now: undefined, toolSince: undefined }) }))
+  // A record as an older mod or the engine may leave it: no description, no type, no model.
+  const bare: AgentRec = { id: 'bare', state: 'done', startedAt: NOW - 5000, endedAt: NOW - 1000, cost: 0 }
+  const cases: { id: string; columns: number }[] = []
+  for (const skin of SKINS) for (const appearance of ['light', 'dark'] as const) for (const columns of [40, 64]) {
+    const id = [skin, appearance, columns].join('-')
+    const frame = (surface: Surface) => ({ ...frameOf(surface, columns, 12, skin), appearance })
+    drawPane(on, 'forty-' + id, (el, surface) => renderAgents(el, frame(surface), { agents: forty, now: NOW, showDone: true }, AGENT_NOOP))
+    drawPane(on, 'bare-' + id, (el, surface) => renderAgents(el, frame(surface), { agents: [AGENTS[0]!, bare], now: NOW, showDone: true }, AGENT_NOOP))
+    cases.push({ id, columns })
+  }
+  for (const { id, columns } of cases) {
+    for (const surface of ['terminal', 'desktop', 'vscode', 'mobile'] as const) {
+      const ui = await mount($, 'forty-' + id, surface, columns)
+      for (const i of [0, 30, 31, 39]) expect(await ui.find({ type: 'Text', text: 'cheongju:송수아 ' + i }), surface + ' ' + id + ' ' + i).toBeDefined()
+      const pictures = await ui.findAll({ type: 'Svg' })
+      if (surface === 'terminal' || surface === 'mobile') expect(pictures).toHaveLength(0)
+      else {
+        const tiles = pictures.filter(p => String(p.props.source).includes('viewBox="0 4096 '))
+        expect(tiles.length > 0, surface + ' ' + id + ' continuation').toBe(true)
+        for (const picture of pictures) {
+          expect(Number(picture.props.width) <= SVG_MAX_PX).toBe(true)
+          expect(Number(picture.props.height) <= SVG_MAX_PX).toBe(true)
+        }
+      }
+      await ui.unmount()
+      const one = await mount($, 'bare-' + id, surface, columns)
+      expect(await one.find({ type: 'Text', text: 'Port the request log renderer' }), surface + ' ' + id).toBeDefined()
+      expect(await one.find({ type: 'Text', text: 'bare' }), surface + ' ' + id).toBeDefined()
+      await one.unmount()
+    }
+  }
+})
+
+test('the Agents pane draws forty mixed real-world records on every surface, skin and theme', async ($, on) => {
+  const by = ['marker', 'session', 'judge', 'haiku', 'jev', 'model', 'default', 'tier'] as const
+  const states = ['running', 'waiting', 'done', 'failed', 'killed'] as const
+  const mixed: AgentRec[] = Array.from({ length: 40 }, (_, i): AgentRec => ({
+    ...AGENTS[0]!, id: 'mixed-' + i, description: '에이전트 표시 오류 수정 ' + i,
+    state: states[i % states.length]!,
+    model: i % 3 === 0 ? 'gemini-3.8-flash@high' : i % 3 === 1 ? 'gpt-6.1-sol@medium' : undefined,
+    type: i % 3 === 0 ? 'ripple:auto' : i % 3 === 1 ? 'general-purpose' : undefined,
+    answeredBy: undefined, provider: i % 3 === 0 ? undefined : 'chatgpt', effort: i % 3 === 0 ? undefined : 'high',
+    pick: i % 3 === 0 ? undefined : { ...AGENTS[0]!.pick!, by: by[i % by.length]!, target: i % 2 ? { agent: 'general-purpose', model: 'opus' } : { agent: 'gpt-6-1-sol' }, fallbackReason: i % 5 === 0 ? '요청한 모델의 사용 한도를 초과했습니다.' : undefined },
+    now: 'Bash ' + '아주 긴 도구 실행 명령어 '.repeat(1000),
+    usage: { input: 1_234_567, cached: 9_876_543, cacheWrite: 100_000, output: 50_000 }, tools: 150,
+    endedAt: NOW - i * 1000,
+  }))
+  // Exercise the real register.tsx boundary too: text the engine's FINAL validation refuses must
+  // be caught before the tree leaves us, and an unreadable conversation must return to the list.
+  mock.clock(on, { now: NOW })
+  let broken: string | null = null
+  let selected: string | null = null
+  let closes = 0
+  const errors: string[] = []
+  on('state.get', { plugin: 'ripple', key: 'settings' }, () => ({ value: { value: SETTINGS, version: 0 } }))
+  on('state.get', { plugin: 'ripple', key: 'lang' }, () => ({ value: { value: 'ko', version: 0 } }))
+  on('state.get', { plugin: 'ripple', key: 'agents' }, () => ({ value: { value: broken === null ? mixed : [{ ...mixed[0]!, description: broken }, ...mixed.slice(1)], version: 0 } }))
+  on('state.get', { plugin: 'ripple', key: 'agentOpen' }, async ($, e, next) => {
+    const held = await next(e)
+    return { value: { value: selected, version: held.value?.version ?? 0 } }
+  })
+  on('state.set', { plugin: 'ripple', key: 'agentOpen' }, async ($, e, next) => { selected = typeof e.value === 'string' ? e.value : null; return next(e) })
+  on('session.messages', () => ({ value: { deny: '대화 기록을 읽을 수 없습니다.' } }))
+  on('ui.log', ($, e) => { errors.push(e.text); return { value: undefined } })
+  on('ui.close', () => { closes++; return { value: undefined } })
+  for (const skin of SKINS) for (const appearance of ['light', 'dark'] as const) {
+    const id = ['mixed', skin, appearance].join('-')
+    drawPane(on, id, (el, surface) => renderAgents(el, { ...frameOf(surface, 40, 12, skin), appearance, lang: 'ko' }, { agents: mixed, now: NOW, showDone: true }, AGENT_NOOP))
+  }
+  for (const skin of SKINS) for (const appearance of ['light', 'dark'] as const) {
+    const id = ['mixed', skin, appearance].join('-')
+    for (const surface of ['desktop', 'terminal', 'vscode', 'mobile'] as const) {
+      const ui = await mount($, id, surface, 40)
+      expect(await ui.find({ type: 'Text', text: '에이전트 표시 오류 수정 0' }), id + ' ' + surface).toBeDefined()
+      expect(await ui.find({ type: 'Text', text: '에이전트 표시 오류 수정 39' }), id + ' ' + surface).toBeDefined()
+      await ui.unmount()
+    }
+  }
+  for (const surface of ['terminal', 'desktop', 'vscode', 'mobile'] as const) {
+    for (const description of ['표시 오류 \u001b[31m\u0085\u{10eeee}\u{2800}\u{0305}', '\u{0305}표시 오류', '\u{2800}\u{0305}표시 오류']) {
+      broken = description
+      selected = null
+      const fallback = await $.ui.mount({ plugin: 'ripple', surface, component: 'Pane', requestId: 'ripple-agents', props: paneProps(40), viewport: { columns: 40, rows: 40 } })
+      expect(await fallback.find({ type: 'Text', text: /제어 문자|결합 문자/ }), surface + ' validation reason').toBeDefined()
+      expect(await fallback.find({ type: 'Text', text: '에이전트 표시 오류 수정 39' }), surface + ' fallback list').toBeDefined()
+      expect(await fallback.findAll({ type: 'Svg' })).toHaveLength(0)
+      expect(await fallback.find({ key: 'back' })).toBeUndefined()
+      await fallback.press({ key: 'close' })
+      await fallback.unmount()
+    }
+    broken = null
+    selected = 'mixed-0'
+    const denied = await $.ui.mount({ plugin: 'ripple', surface, component: 'Pane', requestId: 'ripple-agents', props: paneProps(40), viewport: { columns: 40, rows: 40 } })
+    expect(await denied.find({ type: 'Text', text: '대화 기록을 읽을 수 없습니다.' }), surface + ' conversation reason').toBeDefined()
+    expect(await denied.find({ type: 'Text', text: '에이전트 표시 오류 수정 39' }), surface + ' returned to list').toBeDefined()
+    await denied.press({ key: 'back' })
+    expect(selected).toBe(null)
+    await denied.unmount()
+  }
+  expect(closes).toBe(12)
+  expect(errors.some(error => error.includes('제어 문자'))).toBe(true)
+})
+
+test('pictures tile at the SVG side limit without rescaling or restarting their artwork', async ($, on) => {
+  for (const size of [4095, 4096, 4097, 8200]) {
+    const source = svg(size, size, '<rect width="' + size + '" height="' + size + '" fill="#262523"/>')
+    drawPane(on, 'tiles-' + size, el => pic(el, 'tiles', source, 'whole', size, size))
+  }
+  for (const size of [4095, 4096, 4097, 8200]) {
+    const source = svg(size, size, '<rect width="' + size + '" height="' + size + '" fill="#262523"/>')
+    for (const surface of ['desktop', 'vscode', 'mobile'] as const) {
+      const ui = await mount($, 'tiles-' + size, surface)
+      const pictures = await ui.findAll({ type: 'Svg' })
+      const across = Math.ceil(size / SVG_MAX_PX)
+      expect(pictures).toHaveLength(across * across)
+      for (const [i, picture] of pictures.entries()) {
+        const x = (i % across) * SVG_MAX_PX
+        const y = Math.floor(i / across) * SVG_MAX_PX
+        const width = Math.min(SVG_MAX_PX, size - x)
+        const height = Math.min(SVG_MAX_PX, size - y)
+        expect(picture.props.width).toBe(width)
+        expect(picture.props.height).toBe(height)
+        expect(String(picture.props.source)).toContain('viewBox="' + [x, y, width, height].join(' ') + '"')
+        expect(String(picture.props.source).slice(String(picture.props.source).indexOf('><style>'))).toBe(source.slice(source.indexOf('><style>')))
+      }
+      await ui.unmount()
+    }
+  }
 })
 
 test('the Agents pane shows the latest finished agents and the rest behind more; a card opens its conversation', async ($, on) => {
@@ -1094,6 +1259,18 @@ function layoutOf(tree: unknown): Record<string, unknown> {
   })
   return out
 }
+
+// The host sends what the phone queued when the turn ends; the Claude app never sees it, so a strip
+// over the band says it is there, on both surfaces, its first message on one line (2026-10-22).
+test('the phone queue strip draws on both surfaces with its count, first message and when', async ($, on) => {
+  for (const surface of SURFACES) drawPane(on, 'queue-' + surface, el => renderPhoneQueue(el, frameOf(surface), { count: 2, first: 'fix the\nheader' }))
+  for (const surface of SURFACES) {
+    const drawn = JSON.stringify(await (await mount($, 'queue-' + surface, surface)).drawn())
+    expect(drawn).toContain('Phone queue 2')
+    expect(drawn).toContain('fix the header')
+    expect(drawn).toContain('goes when this turn ends')
+  }
+})
 
 test('no value moves a neighbour: every slot keeps its width whatever it shows', async ($, on) => {
   const levels: DashboardView['effort'][] = [

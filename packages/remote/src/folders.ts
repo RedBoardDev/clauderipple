@@ -26,9 +26,10 @@ export const MAC_CONSENT_DENIED = "macOS가 이 폴더 접근을 막았습니다
 
 /** Where macOS asks the person before a process first reads: Desktop, Documents, Downloads, iCloud Drive, other volumes. */
 export function macProtected(p: string, home = os.homedir()): boolean {
-  const abs = path.resolve(p);
-  const under = (root: string): boolean => abs === root || abs.startsWith(root + path.sep);
-  return ["Desktop", "Documents", "Downloads", path.join("Library", "Mobile Documents")].some(d => under(path.join(home, d))) || under("/Volumes");
+  // macOS paths, so POSIX rules on every host; on a Mac this is the same `path`.
+  const abs = path.posix.resolve(p);
+  const under = (root: string): boolean => abs === root || abs.startsWith(root + "/");
+  return ["Desktop", "Documents", "Downloads", "Library/Mobile Documents"].some(d => under(path.posix.join(home, d))) || under("/Volumes");
 }
 
 /**

@@ -562,3 +562,103 @@ test("sealedReasoning asks for the sealed item and a summary from the first turn
   assert.equal(retry.include, undefined);
   assert.deepEqual(retry.reasoning, { effort: "high" });
 });
+
+/** Reassemble the client's tool inputs and reject reopened blocks or deltas after block_stop. */
+function streamedTools(events: { event: string; data: Record<string, unknown> }[]): { id: string; input: unknown }[] {
+  const blocks = new Map<number, { id: string; json: string; closed: boolean }>();
+  for (const event of events) {
+    const index = event.data.index as number;
+    if (event.event === "content_block_start") {
+      const block = event.data.content_block as { type: string; id: string };
+      if (block.type !== "tool_use") continue;
+      assert.equal(blocks.has(index), false);
+      blocks.set(index, { id: block.id, json: "", closed: false });
+    } else if (event.event === "content_block_delta" && (event.data.delta as { type: string }).type === "input_json_delta") {
+      const block = blocks.get(index)!;
+      assert.equal(block.closed, false);
+      block.json += (event.data.delta as { partial_json: string }).partial_json;
+    } else if (event.event === "content_block_stop" && blocks.has(index)) {
+      assert.equal(blocks.get(index)!.closed, false);
+      blocks.get(index)!.closed = true;
+    }
+  }
+  return [...blocks.values()].map((block) => {
+    assert.equal(block.closed, true);
+    return { id: block.id, input: JSON.parse(block.json) as unknown };
+  });
+}
+
+test("Responses whole-only arguments are routed by item_id or output_index and streamed once", () => {
+  for (const byIndex of [false, true]) {
+    const mapper = new OpenAiStreamMapper("test");
+    const address = (id: string, output_index: number) => byIndex ? { output_index } : { item_id: id };
+    const events = [
+      ...["a", "b", "c"].map((id, output_index) => ({ type: "response.output_item.added", output_index, item: { type: "function_call", id, call_id: `call_${id}`, name: "Read" } })),
+      { type: "response.function_call_arguments.done", ...address("b", 1), arguments: '{"path":"b"}' },
+      { type: "response.output_item.done", ...address("b", 1), item: { type: "function_call", ...(byIndex ? {} : { id: "b" }) } },
+      { type: "response.function_call_arguments.delta", ...address("c", 2), delta: '{"path":"c"}' },
+      { type: "response.function_call_arguments.done", ...address("c", 2), arguments: '{"path":"c"}' },
+      { type: "response.output_item.done", ...address("c", 2), item: { type: "function_call", ...(byIndex ? {} : { id: "c" }), arguments: '{"path":"c"}' } },
+      { type: "response.output_item.done", ...address("a", 0), item: { type: "function_call", ...(byIndex ? {} : { id: "a" }), arguments: '{"path":"a"}' } },
+      { type: "response.output_item.added", output_index: 3, item: { type: "function_call", id: "d", call_id: "call_d", name: "Read" } },
+      { type: "response.function_call_arguments.done", ...address("d", 3), arguments: '{"path":"d"}' },
+      { type: "response.output_item.done", ...address("d", 3), item: { type: "function_call", ...(byIndex ? {} : { id: "d" }), arguments: '{"path":"d"}' } },
+      { type: "response.completed" },
+    ].flatMap((event) => mapper.feed(event, "responses"));
+    const expected = ["a", "b", "c", "d"].map((id) => ({ id: `call_${id}`, input: { path: id } }));
+    assert.deepEqual(streamedTools([...events, ...mapper.finish()]), expected);
+    assert.deepEqual((mapper.message().content as { id: string; input: unknown }[]).map(({ id, input }) => ({ id, input })), expected);
+  }
+});
+
+test("Chat interleaved parallel call fragments emit one complete block per index", () => {
+  const mapper = new OpenAiStreamMapper("grok");
+  const events = [
+    { index: 0, id: "a", function: { name: "Read", arguments: '{"path":' } },
+    { index: 1, id: "b", function: { name: "Read", arguments: '{"path":' } },
+    { index: 0, function: { arguments: '"a"}' } },
+    { index: 1, function: { arguments: '"b"}' } },
+  ].flatMap((call) => mapper.feed({ choices: [{ delta: { tool_calls: [call] } }] }, "chat"));
+  events.push(...mapper.feed({ choices: [{ finish_reason: "tool_calls" }] }, "chat"), ...mapper.finish());
+  const expected = [{ id: "a", input: { path: "a" } }, { id: "b", input: { path: "b" } }];
+  assert.deepEqual(streamedTools(events), expected);
+  assert.deepEqual((mapper.message().content as { id: string; input: unknown }[]).map(({ id, input }) => ({ id, input })), expected);
+});
+
+test("token-limited tool calls finish as max_tokens on both OpenAI wires", () => {
+  for (const wire of ["chat", "responses"] as const) {
+    const mapper = new OpenAiStreamMapper("test");
+    if (wire === "chat") mapper.feed({ choices: [{ delta: { tool_calls: [{ index: 0, id: "a", function: { name: "Read", arguments: '{"path":' } }] }, finish_reason: "length" }] }, wire);
+    else {
+      mapper.feed({ type: "response.output_item.added", item: { type: "function_call", id: "a", name: "Read" } }, wire);
+      mapper.feed({ type: "response.incomplete", response: { incomplete_details: { reason: "max_output_tokens" } } }, wire);
+    }
+    const events = mapper.finish();
+    assert.equal((events.find((event) => event.event === "message_delta")!.data.delta as { stop_reason: string }).stop_reason, "max_tokens");
+    assert.equal(mapper.message().stop_reason, "max_tokens");
+  }
+});
+
+test("documents reach both OpenAI wires as text, native PDF files or an unsupported-source note", () => {
+  const req: AnthropicRequest = { model: "m", messages: [{ role: "user", content: [
+    { type: "document", source: { type: "text", data: "text document" } },
+    { type: "document", source: { type: "content", content: [{ type: "text", text: "block document" }] } },
+    { type: "document", source: { type: "base64", media_type: "application/pdf", data: "UERG" } },
+    { type: "document", source: { type: "url", url: "https://example.com/doc.pdf" } },
+  ] }] };
+  const chat = toOpenAiRequest(req, { model: "m", wire: "chat", identity: false }) as ChatRequest;
+  assert.ok(Array.isArray(chat.messages[0]!.content));
+  const parts = chat.messages[0]!.content;
+  assert.deepEqual(parts.slice(0, 3), [
+    { type: "text", text: "text document" }, { type: "text", text: "block document" },
+    { type: "file", file: { filename: "document.pdf", file_data: "data:application/pdf;base64,UERG" } },
+  ]);
+  assert.match((parts[3] as { text: string }).text, /문서.*전달하지 못했습니다/);
+  const responses = toOpenAiRequest(req, { model: "m", wire: "responses" }) as ResponsesRequest;
+  const content = (responses.input[0] as { content: { text?: string }[] }).content;
+  assert.deepEqual(content.slice(0, 3), [
+    { type: "input_text", text: "text document" }, { type: "input_text", text: "block document" },
+    { type: "input_file", filename: "document.pdf", file_data: "data:application/pdf;base64,UERG" },
+  ]);
+  assert.match(content[3]!.text!, /문서.*전달하지 못했습니다/);
+});

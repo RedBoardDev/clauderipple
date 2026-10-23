@@ -265,6 +265,33 @@ test("room: a replaced host socket that never answers its close is never sent a 
   host.stop();
 });
 
+test("replacing a data socket keeps the phone and its new peer alive when the old close arrives", () => {
+  const net = new Net();
+  const control = new Wire(net);
+  net.room.hostControl(control.sock);
+  const phone = new Wire(net);
+  const frames: Data[] = [];
+  phone.client = { deliver: data => frames.push(data), closedByServer() {} };
+  net.room.client(phone.sock);
+  const conn = phone.sock.tags.find(tag => tag.startsWith("c:"))!.slice(2);
+  const old = new Wire(net), replacement = new Wire(net);
+  net.room.hostData(old.sock, conn);
+  net.room.hostData(replacement.sock, conn);
+  assert.equal(old.sock.closeCode, RELAY_CLOSE.replaced);
+  net.clock.advance(50);
+  assert.equal(old.sock.gone, true);
+  // A fresh room (hibernation) has no in-memory replacement map to rely on.
+  new Room(net.room["ctx"]).closed(old.sock);
+  assert.equal(phone.sock.closeCode, null);
+  assert.equal(replacement.sock.closeCode, null);
+  net.room.message(replacement.sock, "still connected");
+  net.clock.advance(10);
+  assert.ok(frames.includes("still connected"));
+  phone.clientClosed();
+  net.clock.advance(20);
+  assert.equal(replacement.sock.closeCode, 1000, "the current phone's real close still closes its peer");
+});
+
 test("a host restart while a dead socket is still listed: the new host gets the phones", () => {
   const { net, phoneReaches, makeHost, controls } = setup();
   const before = makeHost();

@@ -9,7 +9,8 @@ registerHooks({ resolve(specifier, context, next) {
   return next(source && /^\.\.?\//.test(specifier) && !/\.[a-z]+$/.test(specifier) ? `${specifier}.ts` : specifier, context)
 } })
 const { WORKER_JUDGE_SYSTEM, workerJudgeInput, parseWorkerVerdict, readMarker, agentProvider, chatgptUsable,
-  ladderPick, domainVerdict, workerRule, routerModelOptions, zenJev, spawnModel, takesOver, claudeCandidates, allowed } = await import('../../packages/mod/hooks/workers.ts')
+  ladderPick, markerDomain, workerRule, routerModelOptions, zenJev, spawnModel, takesOver, claudeCandidates, allowed } = await import('../../packages/mod/hooks/workers.ts')
+const { rivalProviders, userNamed } = await import('../../packages/mod/hooks/worker.ts')
 const candidates: WorkerCandidate[] = [
   { target: { agent: 'deepseek-v4-1-flash' }, model: 'deepseek-v4.1-flash', provider: 'deepseek' },
   { target: { agent: 'gpt-6-1-sol' }, model: 'gpt-6.1-sol', provider: 'chatgpt' },
@@ -82,33 +83,100 @@ test('domain ladders select UI for design/frontend, backend separately, otherwis
   assert.deepEqual(blocked.target, { agent: 'general-purpose' })
 })
 
-test('design under the ui ladder takes the heavy level whatever its difficulty; nothing else is raised', () => {
+test('under a domain ladder only light work takes the light row; ordinary work takes the heavy one', () => {
   const s = normalizeSettings({ domainRules: {
-    ui: { mode: 'ladder', rungs: { standard: [{ target: { agent: 'deepseek-v4-1-flash' }, effort: 'low' }], plan: [{ target: { agent: 'gpt-6-astra' }, effort: 'high' }] } },
+    ui: { mode: 'ladder', rungs: { light: [{ target: { agent: 'deepseek-v4-1-flash' }, effort: 'low' }], plan: [{ target: { agent: 'gpt-6-astra' }, effort: 'high' }] } },
   } })
-  const design: WorkerVerdict = { ...verdict, domain: 'design' }
-  const levels: [Partial<WorkerVerdict>, boolean][] = [
-    [{ level: 'light' }, true], [{ level: 'standard' }, true], [{ level: 'standard', kind: 'plan' }, false],
-    [{ level: 'deep' }, false], [{ level: 'deep', kind: 'plan' }, false],
-    // An unsure light verdict (standard rung) is raised too; an unsure standard one is already hard.
-    [{ level: 'light', sure: 0.2 }, true], [{ level: 'standard', sure: 0.2 }, false],
+  for (const domain of ['design', 'frontend'] as const) {
+    const at = (change: Partial<WorkerVerdict>) => ladderPick({ ...verdict, domain, ...change }, s.domainRules!.ui!, s, candidates, true, 'en').target?.agent
+    assert.equal(at({ level: 'light' }), 'deepseek-v4-1-flash')
+    for (const change of [{ level: 'standard' }, { level: 'deep' }, { level: 'deep', kind: 'plan' }] as const) assert.equal(at(change), 'gpt-6-astra')
+  }
+})
+
+test('a tier marker\'s domain word picks the ladder; no word is general', () => {
+  assert.deepEqual(readMarker('[[ripple: standard ui]]\nWork.'), { name: 'standard', domain: 'ui' })
+  assert.deepEqual(readMarker('[[ripple: hard  backend ]]\nWork.'), { name: 'hard', domain: 'backend' })
+  assert.deepEqual(readMarker('[[ripple: gemini-3-8-flash@high]]'), { name: 'gemini-3-8-flash', level: 'high' })
+  for (const [word, domain] of [['ui', 'frontend'], ['frontend', 'frontend'], ['design', 'design'], ['backend', 'backend'], ['server', 'backend'], [undefined, 'general'], ['docs', 'general']] as const) {
+    assert.equal(markerDomain(word), domain)
+    assert.equal(workerRule(markerDomain(word), normalizeSettings({ domainRules: { ui: DEFAULTS.rules.general, backend: DEFAULTS.rules.general } })).rule, domain === 'frontend' || domain === 'design' ? 'ui' : domain)
+  }
+})
+
+test('a model counts as named only when the user said it lately, in English or Korean', () => {
+  const user = (text: string) => ({ role: 'user' as const, text })
+  const said = (...texts: string[]) => texts.map(user)
+  assert.equal(userNamed('gemini-3-8-flash', said('제미나이한테 교정안 받아 와')), true)
+  assert.equal(userNamed('gemini-3-8-flash', said('ask Gemini for a review')), true)
+  assert.equal(userNamed('gpt-6-1-sol', said('솔한테 맡겨')), true)
+  assert.equal(userNamed('gpt-6-1-sol', said('솔직히 이건 어려운 일이야')), false, 'a word that only starts with the name')
+  assert.equal(userNamed('gpt-6-1-sol', said('GPT로 돌려')), true)
+  assert.equal(userNamed('sonnet', said('소넷이 낫겠다')), true)
+  assert.equal(userNamed('claude-opus-5-5', said('오푸스로 해')), true)
+  assert.equal(userNamed('deepseek-v4.1-flash', said('flash 모델로')), false, 'a generic word names nothing')
+  // Only the last two messages from the user: an older request does not cover later work.
+  assert.equal(userNamed('gemini-3-8-flash', said('제미나이한테 시켜', '반영해', '이제 서버 고쳐')), false)
+  // Tool results, notices and summaries are not the user.
+  assert.equal(userNamed('gemini-3-8-flash', [user('일 해'), { role: 'user', text: 'gemini output', toolResults: [{}] }, user('<task-notification>gemini done</task-notification>')]), false)
+  assert.equal(userNamed('gemini-3-8-flash', said('일 해', '<local-command-stdout>gemini</local-command-stdout>', 'This session is being continued … gemini')), false)
+  // A reply the app quotes is the user's: it opens on an HTML comment, not a tag.
+  assert.equal(userNamed('gemini-3-8-flash', said('<!-- reply 1 -->\n> 어느 모델로 할까요?\n\n제미나이로 해')), true)
+  assert.equal(userNamed('gemini-3-8-flash', said('제미나이로 해', '<!-- reply 1 -->\n> 진행할까요?\n\n아니 그건 됐고 다른 거 해')), true, 'the quoted reply is one of the last two, the earlier message still counts')
+  // A prompt typed while a turn ran is absorbed into that turn and never a user message: the prompts
+  // as submitted are heard too (2026-10-23: "솔한테 돌려" mid-turn went by tier).
+  assert.equal(userNamed('gpt-6-1-sol', said('에이전트 창이 비어', '버그 고쳐'), ['솔한테 버그탐지 돌려']), true)
+  assert.equal(userNamed('gpt-6-1-sol', said('에이전트 창이 비어'), ['이것도 고쳐']), false)
+  // A short "go" approves the answer it replies to.
+  const proposal = [user('정리해'), { role: 'assistant' as const, text: '제미나이에게 맡기겠습니다. 진행할까요?' }, user('ㄱㄱ')]
+  assert.equal(userNamed('gemini-3-8-flash', proposal), true)
+  assert.equal(userNamed('gemini-3-8-flash', [...proposal.slice(0, 2), user('아니 다른 걸로 해 줘 이번엔')]), false)
+})
+
+test('Korean Argon and provider names preserve an explicit worker without authorizing its other provider', () => {
+  const providers = ['google-gemini', 'opencode-go', 'chatgpt']
+  const named = (model: string, provider: string, text: string, prompts: string[] = []) => userNamed(model, [{ role: 'user', text }], prompts, { provider, providers })
+  for (const model of ['gemini-4-argon', 'gemini-4-argon-contributor']) {
+    assert.equal(named(model, model.endsWith('contributor') ? 'opencode-go' : 'google-gemini', '아르곤한테 맡겨'), true)
+  }
+  for (const text of ['아르곤 api 지금 한도 꽉 차서 안될걸? 오픈코드쪽으로 써', '아르곤 API 대신 오픈코드', 'use OpenCode for Argon', 'opencode-go로 해', '오픈코드로 해']) {
+    assert.equal(named('gemini-4-argon-contributor', 'opencode-go', text), true, text)
+    assert.equal(named('gemini-4-argon', 'google-gemini', text), false, text)
+  }
+  for (const text of ['구글로 아르곤 돌려', 'google-gemini로 해']) {
+    assert.equal(named('gemini-4-argon', 'google-gemini', text), true, text)
+    assert.equal(named('gemini-4-argon-contributor', 'opencode-go', text), false, text)
+  }
+  assert.equal(named('gemini-4-argon-contributor', 'opencode-go', '버그 고쳐', ['오픈코드쪽으로 써']), true)
+  assert.equal(named('gemini-4-argon', 'google-gemini', '버그 고쳐', ['오픈코드쪽으로 써']), false)
+  assert.equal(named('gemini-4-argon', 'google-gemini', '아르곤처럼 생겼네'), false)
+  assert.equal(named('gemini-4-argon-contributor', 'opencode-go', 'opencoded example'), false)
+  assert.equal(userNamed('gemini-4-argon-contributor', [{ role: 'user', text: '<task-notification>오픈코드</task-notification>' }], [], { provider: 'opencode-go', providers }), false)
+})
+
+test('a model name shared with a provider is not a source restriction on other explicitly named models', () => {
+  const source = { provider: 'chatgpt', providers: ['chatgpt', 'deepseek', 'google-gemini', 'opencode-go'] }
+  assert.equal(userNamed('gpt-6.1-sol', [{ role: 'user', text: 'Use Sol, Astra or DeepSeek for this.' }], [], source), true)
+  assert.equal(userNamed('gpt-6.1-sol', [{ role: 'user', text: '솔과 제미나이에게 각각 검토시켜' }], [], source), true)
+  for (const provider of ['google-gemini', 'opencode-go']) {
+    assert.equal(userNamed('gemini-4-argon', [{ role: 'user', text: '제미나이로 해' }], [], { ...source, provider }), true)
+  }
+})
+
+test('only a rival source is chosen by naming a provider, and only in the user\'s own words', () => {
+  const sources = [
+    { model: 'gemini-4-argon', provider: 'google-gemini' }, { model: 'gemini-4-argon-contributor', provider: 'opencode-go' },
+    { model: 'gpt-6.1-sol', provider: 'chatgpt' }, { model: 'deepseek-v4.1-flash', provider: 'opencode-go' },
   ]
-  for (const [change, raise] of levels) {
-    const given = { ...design, ...change }
-    const out = domainVerdict(given, 'ui')
-    if (!raise) { assert.equal(out.verdict, given); assert.equal(out.raised, undefined); continue }
-    const { sure: _sure, ...rest } = given
-    assert.deepEqual(out, { verdict: { ...rest, level: 'deep', kind: 'do' }, raised: 'design' })
-    assert.equal(rungOf(out.verdict), 'hard')
-    assert.equal(ladderPick(out.verdict, s.domainRules!.ui!, s, candidates, true, 'en').target?.agent, 'gpt-6-astra')
-  }
-  // The same light design verdict, unraised, would have run the light pair.
-  assert.equal(ladderPick(design, s.domainRules!.ui!, s, candidates, true, 'en').target?.agent, 'deepseek-v4-1-flash')
-  // frontend, backend and the general ladder keep the verdict's own level.
-  for (const [domain, rule] of [['frontend', 'ui'], ['backend', 'backend'], ['design', 'general'], ['docs', 'general']] as const) {
-    const given: WorkerVerdict = { ...verdict, domain, level: 'light' }
-    assert.deepEqual(domainVerdict(given, rule), { verdict: given })
-  }
+  assert.deepEqual(rivalProviders('gemini-4-argon', sources).sort(), ['google-gemini', 'opencode-go'])
+  assert.deepEqual(rivalProviders('gpt-6.1-sol', sources), ['chatgpt'])
+  // Naming OpenCode for DeepSeek says nothing about which source runs Sol.
+  const sol = { provider: 'chatgpt', providers: rivalProviders('gpt-6.1-sol', sources) }
+  assert.equal(userNamed('gpt-6.1-sol', [{ role: 'user', text: '솔은 구현, 딥시크는 오픈코드로' }], [], sol), true)
+  // The answer a short "go" replies to mentions a provider in passing; that is not the user's choice.
+  const argon = { provider: 'google-gemini', providers: rivalProviders('gemini-4-argon', sources) }
+  const answer = [{ role: 'user' as const, text: '아르곤으로 해' }, { role: 'assistant' as const, text: 'OpenCode 쪽 한도도 확인했습니다. 아르곤으로 진행할까요?' }, { role: 'user' as const, text: 'ㄱㄱ' }]
+  assert.equal(userNamed('gemini-4-argon', answer, [], argon), true)
 })
 
 test('quota/off never chooses the blocked provider: the ladder moves up, then to the session model', () => {

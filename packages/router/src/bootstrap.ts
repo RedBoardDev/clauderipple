@@ -10,6 +10,7 @@ import type { Config } from "./config.ts";
 import { agentAliases } from "./agents.ts";
 import { isJudgeOnlyModel } from "./model-policy.ts";
 import { chatPickerModels, providerModelWindow } from "./picker.ts";
+import { chatgptModelWindow } from "./providers/chatgpt/windows.ts";
 
 export const BOOTSTRAP_PATH = "/api/claude_cli/bootstrap";
 
@@ -61,14 +62,18 @@ export function injectBootstrap(body: Buffer, cfg: Config, agentDirs?: string[])
       const [base, effort] = id.split("@");
       const named = cfg.cli.extraModels.find((m) => m.model === base);
       // An "<model>@<effort>" entry is the same model with a different effort, so it has the same window.
-      const window = named?.contextWindow ?? providerModelWindow({ ...cfg, aliases }, base ?? id);
+      // The live catalogue wins over both a saved entry and the provider's stored value (§4, 2026-10-23).
+      const window = chatgptModelWindow({ ...cfg, aliases }, base ?? id) ?? named?.contextWindow ?? providerModelWindow({ ...cfg, aliases }, base ?? id);
       return { model: id, name: `${named?.name ?? base}${effort ? ` · ${effort}` : ""}`, ...(window ? { contextWindow: window } : {}) };
     });
   const extra = chatPickerModels({ ...cfg, aliases, cli: { ...cfg.cli, extraModels: [...cfg.cli.extraModels, ...fromAgents] } });
   const win = cfg.cli.autoCompactWindow;
+  // A slot's own window is the user's word; after it, a ChatGPT target follows the live catalogue
+  // (windows.ts) before the global value — 6.1 Sol runs 475000, not the 258400 copied into config.
+  const routeWindows = Object.entries(cfg.routes).map(([alias, route]) => [alias, route.contextWindow ?? chatgptModelWindow(cfg, alias) ?? win] as const);
   // Routed models do not share a context window; the global value is only the fallback for entries
   // that do not name their own, so a per-entry window alone is reason enough to write the map.
-  const anyWindow = win !== undefined || extra.some((m) => m.contextWindow) || Object.values(cfg.routes).some((r) => r.contextWindow);
+  const anyWindow = win !== undefined || extra.some((m) => m.contextWindow) || routeWindows.some(([, w]) => w);
   if (extra.length === 0 && !anyWindow) return body;
   let j: Record<string, unknown>;
   try {
@@ -78,7 +83,8 @@ export function injectBootstrap(body: Buffer, cfg: Config, agentDirs?: string[])
   }
   if (extra.length > 0) {
     const existing = Array.isArray(j.additional_model_options) ? (j.additional_model_options as unknown[]) : [];
-    j.additional_model_options = [...existing, ...extra];
+    // The CLI requires a description even when the config or an agent-derived entry omits it.
+    j.additional_model_options = [...existing, ...extra.map((m) => ({ ...m, description: m.description ?? m.name ?? m.model }))];
   }
   if (anyWindow) {
     const acw = { ...((j.auto_compact_windows as Record<string, number> | undefined) ?? {}) };
@@ -86,8 +92,7 @@ export function injectBootstrap(body: Buffer, cfg: Config, agentDirs?: string[])
       const w = m.contextWindow ?? win;
       if (w) acw[m.model] = w;
     }
-    for (const [alias, route] of Object.entries(cfg.routes)) {
-      const w = route.contextWindow ?? win;
+    for (const [alias, w] of routeWindows) {
       if (w) acw[alias] = w;
     }
     j.auto_compact_windows = acw;

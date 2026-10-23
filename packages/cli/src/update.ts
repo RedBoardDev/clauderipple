@@ -49,7 +49,7 @@ export function scriptPrefix(env: NodeJS.ProcessEnv = process.env, home = os.hom
  * How the running copy was installed, read from where its files are. A global npm package lives
  * at <prefix>/lib/node_modules/<name> on macOS and Linux and <prefix>\node_modules\<name> on Windows.
  */
-export function installKind(rt: Pick<Runtime, "packaged" | "cli" | "repo">, opts: { platform?: NodeJS.Platform; env?: NodeJS.ProcessEnv; home?: string } = {}): InstallKind {
+export function installKind(rt: Pick<Runtime, "packaged" | "cli" | "repo">, opts: { platform?: NodeJS.Platform; env?: NodeJS.ProcessEnv; home?: string; stateHome?: string } = {}): InstallKind {
   if (rt.packaged) return { kind: "packaged" };
   if (rt.cli.endsWith(".ts")) return { kind: "checkout" };
   const p = (opts.platform ?? process.platform) === "win32" ? path.win32 : path.posix;
@@ -60,6 +60,21 @@ export function installKind(rt: Pick<Runtime, "packaged" | "cli" | "repo">, opts
   const prefix = (opts.platform ?? process.platform) === "win32" ? parent : p.basename(parent) === "lib" ? p.dirname(parent) : null;
   if (!prefix) return { kind: "unknown", root };
   const same = (a: string, b: string) => (opts.platform ?? process.platform) === "win32" ? p.resolve(a).toLowerCase() === p.resolve(b).toLowerCase() : p.resolve(a) === p.resolve(b);
+  const record = p.join(prefix, "clauderipple-install.json");
+  if (fs.existsSync(record)) {
+    const installed = JSON.parse(fs.readFileSync(record, "utf8")) as { kind?: string; prefix?: string };
+    if ((installed.kind === "script" || installed.kind === "npm") && installed.prefix && same(installed.prefix, prefix)) {
+      return { kind: installed.kind, prefix };
+    }
+  }
+  const stateHome = opts.stateHome ?? (opts.env ?? process.env).CLAUDERIPPLE_HOME ?? p.join(opts.home ?? os.homedir(), ".clauderipple");
+  const pathsFile = p.join(stateHome, "paths.json");
+  if (fs.existsSync(pathsFile)) {
+    const saved = JSON.parse(fs.readFileSync(pathsFile, "utf8")) as { repo?: string; install?: { kind?: string; prefix?: string } };
+    if (saved.repo && same(saved.repo, root) && saved.install?.prefix && same(saved.install.prefix, prefix) && (saved.install.kind === "script" || saved.install.kind === "npm")) {
+      return { kind: saved.install.kind, prefix };
+    }
+  }
   return same(prefix, scriptPrefix(opts.env, opts.home)) ? { kind: "script", prefix } : { kind: "npm", prefix };
 }
 
@@ -104,16 +119,31 @@ function npmCli(): string | null {
  * Installs `spec` over this installation and runs `install` from the new files. Output goes to
  * our stdout as it happens, so the tray's dialog and a terminal show the installer's own lines.
  */
-export function runUpdate(target: InstallKind & { kind: "script" | "npm" }, rt: Pick<Runtime, "node" | "env" | "cli">, spec: string): { ok: boolean; message: string } {
+type UpdateRunner = (program: string, args: string[], opts: { env: NodeJS.ProcessEnv; stdio: "inherit"; windowsHide?: boolean }) => { status: number | null; signal?: NodeJS.Signals | null };
+
+export function runUpdate(target: InstallKind & { kind: "script" | "npm" }, rt: Pick<Runtime, "node" | "env" | "cli">, spec: string, opts: { run?: UpdateRunner; platform?: NodeJS.Platform; tempDir?: string } = {}): { ok: boolean; message: string } {
+  const run = opts.run ?? spawnSync;
   const env = { ...process.env, CLAUDERIPPLE_PREFIX: target.prefix, CLAUDERIPPLE_PACKAGE: spec };
   if (target.kind === "script") {
     // A local path stands in for the published script when checking an update before release.
     const script = process.env.CLAUDERIPPLE_INSTALLER;
-    const result = process.platform === "win32"
-      ? spawnSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script ? `& ${psQuote(script)}` : `irm ${SCRIPT_BASE}/install.ps1 | iex`], { env: { ...windowsPowerShellEnv(), ...env }, stdio: "inherit", windowsHide: true })
-      : spawnSync("sh", ["-c", script ? `sh ${shQuote(script)}` : `curl -fsSL ${SCRIPT_BASE}/install.sh | sh`], { env, stdio: "inherit" });
-    // The script ends by running `install` itself.
-    return result.status === 0 ? { ok: true, message: "✓ updated" } : { ok: false, message: `the installer exited with ${result.status ?? result.signal}` };
+    if ((opts.platform ?? process.platform) === "win32") {
+      const result = run("powershell.exe", ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", `$ErrorActionPreference = 'Stop'; ${script ? `& ${psQuote(script)}` : `irm ${SCRIPT_BASE}/install.ps1 | iex`}`], { env: { ...windowsPowerShellEnv(), ...env }, stdio: "inherit", windowsHide: true });
+      return result.status === 0 ? { ok: true, message: "✓ updated" } : { ok: false, message: `the installer exited with ${result.status ?? result.signal}` };
+    }
+    const temp = script ? null : fs.mkdtempSync(path.join(opts.tempDir ?? os.tmpdir(), "clauderipple-update-"));
+    const installer = script ?? path.join(temp!, "install.sh");
+    try {
+      if (!script) {
+        const downloaded = run("curl", ["-fsSL", `${SCRIPT_BASE}/install.sh`, "-o", installer], { env, stdio: "inherit" });
+        if (downloaded.status !== 0) return { ok: false, message: `the installer download failed (${downloaded.status ?? downloaded.signal})` };
+      }
+      const result = run("sh", [installer], { env, stdio: "inherit" });
+      // The script ends by running `install` itself; a failed download never reaches this step.
+      return result.status === 0 ? { ok: true, message: "✓ updated" } : { ok: false, message: `the installer exited with ${result.status ?? result.signal}` };
+    } finally {
+      if (temp) fs.rmSync(temp, { recursive: true, force: true });
+    }
   }
   const npm = npmCli();
   if (!npm) return { ok: false, message: `found no npm next to ${process.execPath}; update with: npm install -g ${PACKAGE}@latest` };
@@ -125,8 +155,4 @@ export function runUpdate(target: InstallKind & { kind: "script" | "npm" }, rt: 
 
 function psQuote(value: string): string {
   return `'${value.replace(/'/g, "''")}'`;
-}
-
-function shQuote(value: string): string {
-  return `'${value.replace(/'/g, `'\\''`)}'`;
 }

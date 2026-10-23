@@ -39,6 +39,9 @@ export const validExpoToken = (token: string): boolean => /^(ExponentPushToken|E
 
 export function expoBody(event: PushEvent, lang: "ko" | "en"): string | null {
   if (event.kind === "permission") return lang === "ko" ? "승인을 기다립니다" : "Waiting for approval";
+  // Fixed words only: this body travels in the clear beside the encrypted content (iOS `body`, the
+  // Android fallback), and the question itself is the model's text — it goes only inside `e`.
+  if (event.kind === "question") return lang === "ko" ? "답변이 필요합니다" : "Answer needed";
   if (event.kind !== "result") return null;
   if (event.ok) return lang === "ko" ? "작업을 마쳤습니다" : "Work finished";
   return lang === "ko" ? "작업이 실패했습니다" : "Work failed";
@@ -105,7 +108,7 @@ export class ExpoNotifier {
       const body = expoBody(event, stored.lang);
       if (!body) return;
       try {
-        let payload: ExpoPayload = { to: stored.token, title: "Ripple Remote", body, data: { session }, sound: "default", ttl: event.kind === "permission" ? 3600 : 86400 };
+        let payload: ExpoPayload = { to: stored.token, title: "Ripple Remote", body, data: { session }, sound: "default", ttl: event.kind === "permission" || event.kind === "question" ? 3600 : 86400 };
         if (stored.key) {
           try {
             context ??= Promise.resolve(this.opts.context?.(session, event) ?? {});

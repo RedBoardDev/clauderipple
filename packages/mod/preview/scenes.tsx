@@ -9,6 +9,7 @@ import { normalizeSettings } from '../hooks/settings'
 import { renderAgents, talkOf } from '../hooks/ui/agents'
 import { renderAlert } from '../hooks/ui/alerts'
 import { renderBand } from '../hooks/ui/band'
+import { renderPhoneQueue } from '../hooks/ui/queue'
 import { renderLog } from '../hooks/ui/log'
 import { renderSettings } from '../hooks/ui/settings'
 import { renderSetup } from '../hooks/ui/setup'
@@ -187,8 +188,17 @@ type Scene = { name: string; columns?: number; skin?: Skin; draw: (el: Els, fram
 
 const alert = (a: AlertView) => (el: Els, frame: Frame) => renderAlert(el, frame, a, noop)
 
+/** The band with the phone queue's strip over it, as register.tsx stacks them. */
+function queued(el: Els, frame: Frame, view: DashboardView, first: string): RenderElement {
+  const { Box } = el
+  return (<Box flexDirection="column" rowGap={0.5} width="100%" minWidth={0}>{renderPhoneQueue(el, frame, { count: 2, first })}{renderBand(el, frame, view, noop)}</Box>) as RenderElement
+}
+
 const SCENES: Scene[] = [
   { name: 'band', draw: (el, f) => site(el, f, DASH) },
+  { name: 'band-phone-queue', draw: (el, f) => queued(el, f, { ...DASH, isWorking: true }, '홈 카드 제목이랑 점수 알약도 같이 정리해 줘') },
+  { name: 'band-phone-queue-long', columns: 70, draw: (el, f) => queued(el, f, { ...DASH, isWorking: true }, '이 날의 흐름 이것도 한국어가 좀 어색한데 사람마다 달라지는 리포트 같은 건 빼고 모든 한국어를 정리해서 자연스럽게') },
+  { name: 'band-phone-queue-flat', skin: 'flat', draw: (el, f) => queued(el, f, { ...DASH, isWorking: true }, '홈 카드 제목이랑 점수 알약도 같이 정리해 줘') },
   { name: 'band-deciding', draw: (el, f) => site(el, f, { ...DASH, effort: { level: null, mode: 'deciding', since: NOW - 500 } }) },
   { name: 'band-working-handoff', draw: (el, f) => site(el, f, { ...DASH, isWorking: true, handoff: 'advised', warm: { on: true, pings: 2, cost: 9000 }, agents: { live: 2, total: 3 }, context: { percent: 64, tokens: 128_000, window: 200_000 }, mode: 'GPT 우선' }) },
   { name: 'band-compacted', draw: (el, f) => site(el, f, { ...DASH, agents: { live: 1, total: 1 }, compactions: 3 }) },
@@ -244,6 +254,13 @@ const SCENES: Scene[] = [
   { name: 'agents-live-narrow', columns: PANE_NARROW, draw: (el, f) => renderAgents(el, f, { agents: AGENTS, now: NOW, showDone: false }, AGENT_ACTIONS) },
   { name: 'agents-idle', columns: PANE, draw: (el, f) => renderAgents(el, f, { agents: AGENTS.slice(2), now: NOW, showDone: false }, AGENT_ACTIONS) },
   { name: 'agents-many', columns: PANE, draw: (el, f) => renderAgents(el, f, { agents: MANY, now: NOW, showDone: false }, AGENT_ACTIONS) },
+  ...(['deep', 'flat'] as const).map(skin => ({
+    name: 'agents-forty-' + skin, columns: PANE_NARROW, skin,
+    draw: (el: Els, f: Frame) => renderAgents(el, f, {
+      agents: Array.from({ length: 40 }, (_, i): AgentRec => ({ ...AGENTS[0]!, id: 'w' + i, description: '작업 진행 상황과 테스트 결과를 확인하고 변경 사항 정리하기 ' + i })),
+      now: NOW, showDone: true,
+    }, AGENT_ACTIONS),
+  })),
   { name: 'agents-talk', columns: PANE, draw: (el, f) => renderAgents(el, f, { agents: AGENTS, now: NOW, showDone: false, open: { id: 'g1', talk: { entries: TALK }, earlier: 0 } }, AGENT_ACTIONS) },
   { name: 'agents-talk-narrow', columns: PANE_NARROW, draw: (el, f) => renderAgents(el, f, { agents: AGENTS, now: NOW, showDone: false, open: { id: 'g1', talk: { entries: TALK }, earlier: 0 } }, AGENT_ACTIONS) },
   { name: 'agents-talk-done', columns: PANE, draw: (el, f) => renderAgents(el, f, { agents: AGENTS, now: NOW, showDone: false, open: { id: 'e1', talk: { entries: TALK_DONE }, earlier: 0 } }, AGENT_ACTIONS) },

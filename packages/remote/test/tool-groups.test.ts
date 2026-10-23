@@ -48,6 +48,29 @@ test("active run shows latest summary and spinner, previous turns stay completed
   assert.equal(rows[2].latest, "Bash summary");
 });
 
+test("the Code tab's own tools: the closing box waits for the turn's end, chapters divide, the task list stays in the dock", () => {
+  const call = (key: string, name: string, input: unknown, text = ""): Item => ({ type: "assistant", key, ver: key, text, streaming: false, tools: [{ id: `${key}-0`, name, summary: "", input: JSON.stringify(input) }], model: "test", at: 1 });
+  const result: Item = { type: "result", key: "r", ver: "1", ok: true, ms: 1, model: "test", effort: null };
+  const user: Item = { type: "user", key: "u", ver: "1", text: "Yes, fix it", at: 2 };
+  const wrap = call("w", "mcp__ccd_turn__wrap_up", { recap: "Found the leak.", ask: "Fix it now?", blocked: true, actions: [{ action: "commit" }, { label: "Yes, fix it", message: "Fix the leak." }, { label: "Not now" }, { label: "Third" }] });
+  const rows = timelineItems({ state: "idle", items: [
+    call("p", "mcp__ccd_turn__update_plan", { items: [{ content: "Look", status: "in_progress" }], scope: "first_task" }),
+    call("c", "mcp__ccd_session__mark_chapter", { title: "Fix the leak", summary: "From finding it to the fix" }),
+    assistant("a"), wrap, assistant("closing", "Here is what I found", []), result,
+  ] });
+  assert.deepEqual(rows.map(r => r.type), ["chapter", "toolGroup", "assistant", "wrapUp", "result"]);
+  const box = rows[3];
+  assert.ok(box?.type === "wrapUp");
+  assert.deepEqual([box.recap, box.ask, box.blocked, box.answered], ["Found the leak.", "Fix it now?", true, false]);
+  assert.deepEqual(box.replies, [{ label: "Yes, fix it", message: "Fix the leak." }, { label: "Not now", message: "Not now" }], "app buttons stay on the Mac; at most two replies");
+  const later = timelineItems({ state: "idle", items: [wrap, result, user] });
+  assert.ok(later[0]?.type === "wrapUp" && later[0].answered);
+  const recapOnly = timelineItems({ state: "idle", items: [call("x", "mcp__ccd_turn__wrap_up", { recap: "Done." }), assistant("y", "All set", [])] });
+  assert.deepEqual(recapOnly.map(r => r.type), ["assistant"], "a box without a question is not drawn");
+  const unreadable = timelineItems({ state: "idle", items: [{ ...call("z", "mcp__ccd_turn__wrap_up", {}), tools: [{ id: "z-0", name: "mcp__ccd_turn__wrap_up", summary: "", input: { preview: "{", blob: "b" } }] } as Item] });
+  assert.deepEqual(unreadable.map(r => r.type), ["toolGroup"], "an input that cannot be read stays a tool row");
+});
+
 test("group keeps individual input/output and localizes counts", () => {
   const group = timelineItems({ state: "idle", items: [assistant("a", "", ["Read", "Bash"])] })[0]!;
   assert.ok(group.type === "toolGroup");

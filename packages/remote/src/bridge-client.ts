@@ -214,29 +214,49 @@ export class BridgeClient {
    * cursor instead — otherwise an approval requested before the stream connected never cards.
    * A request followed by its control_response (answered from another client) or
    * control_cancel_request (withdrawn) is not open and is left out.
+   * Null when the answer carried no event list: that is not "nothing is open", and a caller
+   * must not close pending cards on it.
    */
-  async openRequests(id: string): Promise<{ requestId: string; tool: string; input: Record<string, unknown>; toolUseId: string }[]> {
+  async openRequests(id: string): Promise<{ requestId: string; tool: string; input: Record<string, unknown>; toolUseId: string }[] | null> {
+    return (await this.requests(id))?.open ?? null;
+  }
+  /**
+   * The open requests, and the ids this read saw answered or withdrawn. A request merely missing
+   * from the list proves nothing (the list may not reach that far), so only `closed` may close a
+   * card the phone still shows.
+   */
+  async requests(id: string): Promise<{ open: { requestId: string; tool: string; input: Record<string, unknown>; toolUseId: string }[]; closed: Set<string> } | null> {
     const list = (await this.events(id)).data;
+    if (!Array.isArray(list)) return null;
     const open = new Map<string, { requestId: string; tool: string; input: Record<string, unknown>; toolUseId: string }>();
-    for (const value of Array.isArray(list) ? list : []) {
+    const closed = new Set<string>();
+    for (const value of list) {
       const item = object(value);
       const payload = object(item?.payload);
-      if (!payload || typeof payload.request_id !== "string") continue;
-      // Stored prompts carry the same source as stream frames; accept a missing one, never a foreign one.
-      const source = (item as { source?: unknown } | null)?.source;
-      if (source !== undefined && source !== "worker") continue;
-      const requestId = payload.request_id;
+      if (!payload) continue;
+      // A control_request names its request at the top; a control_response posted by this host (or
+      // by the desktop app) carries it under `response`. Reading only the top-level id left every
+      // answered request listed as open, so a replay an hour later carded it again (issue #82).
+      const nested = object(payload.response)?.request_id;
+      const requestId = typeof payload.request_id === "string" ? payload.request_id : typeof nested === "string" ? nested : "";
+      if (!requestId) continue;
       if (payload.type === "control_request") {
+        // Stored prompts carry the same source as stream frames; accept a missing one, never a foreign one.
+        const source = (item as { source?: unknown } | null)?.source;
+        if (source !== undefined && source !== "worker") continue;
         const request = object(payload.request);
         const input = object(request?.input);
         if (request?.subtype === "can_use_tool" && typeof request.tool_name === "string" && input && typeof request.tool_use_id === "string") {
           open.set(requestId, { requestId, tool: request.tool_name, input, toolUseId: request.tool_use_id });
         }
       } else if (payload.type === "control_response" || payload.type === "control_cancel_request") {
+        // Any client's answer or withdrawal closes it: this host's own answer is stored with the
+        // posting client's source, and it must still count as answered (issue #82).
         open.delete(requestId);
+        closed.add(requestId);
       }
     }
-    return [...open.values()];
+    return { open: [...open.values()], closed };
   }
   /** The newest durable event's number; the stream starts there instead of replaying the whole session. */
   private async latest(id: string, signal: AbortSignal): Promise<number> {

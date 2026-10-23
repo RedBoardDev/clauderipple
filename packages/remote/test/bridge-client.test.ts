@@ -106,7 +106,8 @@ test("openRequests replays from the start cursor, skipping answered and withdraw
     requested("r1", { command: "a" }),
     { payload: { type: "system", subtype: "init" } },
     requested("r2", { command: "b" }),
-    { payload: { type: "control_response", request_id: "r1", response: { subtype: "success" } } },
+    // This host's own answer is stored under the posting client's source, with the id nested.
+    { source: "client", payload: { type: "control_response", response: { subtype: "success", request_id: "r1" } } },
     requested("r3", { command: "c" }),
     { payload: { type: "control_cancel_request", request_id: "r3" } },
     { source: "client", payload: { type: "control_request", request_id: "r4", request: { subtype: "can_use_tool", tool_name: "Bash", tool_use_id: "t-r4", input: { command: "d" } } } },

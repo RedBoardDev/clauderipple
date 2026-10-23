@@ -24,6 +24,9 @@ export function pushContent(event: PushEvent, lang: "ko" | "en", context: PushCo
     const summary = "summary" in event ? event.summary : context.summary;
     const detail = [tool, summary].filter(Boolean).join(": ");
     if (detail) body = `${lang === "ko" ? "승인 필요" : "Needs approval"} · ${detail}`;
+  } else if (event.kind === "question") {
+    // The closing box's own question is what the person answers; the fixed line says what it is.
+    body = `${lang === "ko" ? "답변이 필요합니다" : "Answer needed"} · ${pushLine(event.ask, 140)}`;
   } else if (event.kind === "result") {
     if (event.ok) body = pushLine(context.text ?? "", 180) || fallback;
     else {

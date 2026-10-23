@@ -175,16 +175,19 @@ function ladderRungs(raw: unknown): Rule['rungs'] {
   return rungs
 }
 /**
- * A domain ladder folded into two levels: light and standard hold one list, hard and plan another.
- * The upper rung of each pair wins (standard's list for the light pair, plan's for the heavy one);
- * an empty upper rung falls back to the lower. The general ladder keeps its four rungs.
+ * A domain ladder folded into two levels: light work is the light rung alone, heavy work is
+ * standard, hard and plan. "Easy design on Sonnet, ordinary to hard on Opus" is what the owner set
+ * the two rows for; folding standard into the light row sent ordinary design to Sonnet, and a
+ * design-only raise patched that for one domain (2026-10-21/22). Light reads its own rung, else
+ * standard's; heavy reads plan, else hard, else standard, else light, so one filled row still runs
+ * everything. The general ladder keeps its four rungs.
  */
 export function twoLevelRungs(rungs: Rule['rungs']): Rule['rungs'] {
   const out: Rule['rungs'] = {}
-  const light = rungs.standard?.length ? rungs.standard : rungs.light
-  const heavy = rungs.plan?.length ? rungs.plan : rungs.hard
-  if (light?.length) { out.light = copy(light); out.standard = copy(light) }
-  if (heavy?.length) { out.hard = copy(heavy); out.plan = copy(heavy) }
+  const light = rungs.light?.length ? rungs.light : rungs.standard
+  const heavy = [rungs.plan, rungs.hard, rungs.standard, rungs.light].find(list => list?.length)
+  if (light?.length) out.light = copy(light)
+  if (heavy?.length) { out.standard = copy(heavy); out.hard = copy(heavy); out.plan = copy(heavy) }
   return out
 }
 /**

@@ -38,6 +38,17 @@ test("a relay reporting a broken upstream is retried, and the turn is answered",
   } finally { await s.close(); }
 });
 
+test("regression: a relay's 402 endpoint failure is retried within the turn", async () => {
+  const relay = JSON.stringify({ error: { type: "server_error", message: "Upstream request failed: Endpoint is unavailable" } });
+  const s = await server([{ status: 402, body: relay }, { status: 200, body: '{"answer":"recovered"}' }]);
+  try {
+    const res = await fetchWithRetry(s.url, { method: "POST", body: "{}" }, opts);
+    assert.equal(res.status, 200);
+    assert.equal(await res.text(), '{"answer":"recovered"}');
+    assert.equal(s.calls(), 2);
+  } finally { await s.close(); }
+});
+
 test("a 5xx is retried, a connect failure is retried", async () => {
   const s = await server([{ status: 503 }, { status: 500 }, { status: 200 }]);
   try {

@@ -17,6 +17,7 @@ import { providerExhaustion, type ProviderExhaustion } from "../../health.ts";
 import type { SearchBackend, SearchHit, WebSearchQuery } from "../../websearch.ts";
 import { credentialHeaderValues, redactErrorText } from "../../redact.ts";
 import { codexClientVersion, latestCodexVersion, parseCodexCatalog } from "./catalog.ts";
+import { noteChatgptModelWindows } from "./windows.ts";
 import fs from "node:fs";
 import path from "node:path";
 import { homeDir, fastSwitches } from "../../config.ts";
@@ -263,6 +264,7 @@ export type ChatGptAccountStatus = ChatGptAccountSummary & {
   cooldownSeconds?: number;
   quota: Record<string, unknown> | null;
   active: boolean;
+  inUse: boolean;
 };
 
 export class ChatGptAdapter {
@@ -337,13 +339,14 @@ export class ChatGptAdapter {
         ...(report?.cooldownSeconds ? { cooldownSeconds: report.cooldownSeconds } : {}),
         quota: this.rateLimitsByAccount.get(summary.id) ?? null,
         active: summary.id === this.activeOwner,
+        inUse: report?.inUse === true,
       };
     });
   }
 
   /** Put a cooling account back into rotation now (dashboard action). */
   clearCooldown(ownerId: string): void {
-    for (const c of this.accounts.peekCredentials()) if (c.ownerId === ownerId) this.pool.clear(this.name, c.id);
+    this.pool.clear(this.name, ownerId);
   }
 
   /**
@@ -711,6 +714,8 @@ export class ChatGptAdapter {
       return null;
     }
     this.modelsCache = { at: Date.now(), models };
+    // The windows ClaudeRipple reports to Claude Code follow the catalogue from here (windows.ts).
+    noteChatgptModelWindows(models);
     return models;
   }
 

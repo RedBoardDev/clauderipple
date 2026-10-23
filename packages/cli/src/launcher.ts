@@ -65,7 +65,7 @@ function launchEnv(rt: Runtime, home: string): Record<string, string> {
 }
 
 /** The app icon (icon.icns / icon.png / icon.ico), committed in the app's assets and shipped in the npm package beside the tray. */
-function findIcon(rt: Runtime, file: string): string | null {
+export function findIcon(rt: Pick<Runtime, "repo">, file: string): string | null {
   for (const dir of [path.join(rt.repo, "packages", "app", "assets"), path.join(rt.repo, "dist", "app", "assets")]) {
     const p = path.join(dir, file);
     if (fs.existsSync(p)) return p;
@@ -122,7 +122,8 @@ export function desktopEntry(rt: Runtime, home: string): string {
 
 export function windowsTrayLauncher(rt: Runtime, home: string): string {
   const log = path.join(home, "logs", "launcher.log");
-  return [
+  // -File is read by Windows PowerShell 5.1, which needs a BOM to recognise UTF-8.
+  return String.fromCharCode(0xFEFF) + [
     ...Object.entries(launchEnv(rt, home)).map(([k, v]) => `$env:${k} = ${ps(v)}`),
     `New-Item -ItemType Directory -Force -Path ${ps(path.dirname(log))} | Out-Null`,
     `& ${ps(rt.node)} ${ps(rt.cli)} tray --ensure *>> ${ps(log)}`,

@@ -549,6 +549,24 @@ must preserve **Data: Artificial Analysis (artificialanalysis.ai)** attribution.
     unknown to the backend answer `400 "… model is not supported when using
     Codex with a ChatGPT account"` before any quota check, so a `429` for
     gpt-6-sol/luna that day confirmed the ids without spending quota.
+  - **Windows follow the live catalogue (2026-10-23).** A model's `context_window`
+    is not the window Codex runs with: Codex multiplies it by the entry's
+    `effective_context_window_percent`, and gpt-6.1-sol measured
+    `500000 × 95% = 475000` while `config.json` still said 272000 (and compacted
+    at 258400). The backend itself leaves the percent out (same day, asked as
+    0.163.0 and 0.164.0: `context_window: 500000` alone, which ClaudeRipple then
+    reported as 500000); Codex's own `models_cache.json` records 95 for every
+    model, so Codex supplies it, and a missing percent is taken as 95 here too.
+    `parseCodexCatalog` therefore records the effective window, the
+    adapter publishes the last-read list process-wide (`providers/chatgpt/
+    windows.ts`), and one resolver (`chatgptModelWindow`) hands it to bootstrap's
+    `auto_compact_windows`, the picker's `context_window_by_model` and
+    `providerModelWindow` — ahead of any stored `contextWindow` and of
+    `cli.autoCompactWindow`, for models served by a `chatgpt` provider (by id,
+    alias, prefix rule or as a route's target). An explicit
+    `route.contextWindow` still wins; every non-chatgpt provider keeps the old
+    fallback. The catalogue is now read at router start and every two hours, not
+    only when the dashboard asks.
   - Model self-introduction is not evidence of routing. Verify by upstream
     usage records.
   - **Implemented 2026-09-11** in `packages/router/src/providers/chatgpt/`.
@@ -960,6 +978,25 @@ from, to}` at hour granularity — buckets whose hour start is in `[from, to)`. 
   The narrowly classified Antigravity prompt refusal (§4d-ii) additionally permits one same-turn
   route fallback after the upstream rejects the request but **before any response reaches the
   client**; it does not mark a usable account as exhausted.
+  - **OpenAI-compatible pools (2026-10-23).** `openai-compatible` shares the same CredentialPool,
+    conversation stickiness and in-turn failover as `anthropic-compatible`, before any response is
+    written. One key stays in `headers`; several use complete `credentials` entries with `headers`
+    mirroring the first, retaining id `default` when converting a single key. OpenCode Go usage is
+    fetched and cached separately per credential and exposed in configured order, with optional labels.
+  - **Shared operator controls (2026-10-23).** ChatGPT, Claude OAuth, Google CCA and compatible
+    API-key pools share `preferred`, `paused`, `clearCooldown` and `inUse`. At most one stored
+    account/key is preferred: only new conversations try it first while usable; existing healthy
+    affinity keeps its prompt cache, and new conversations return to the preferred account after
+    its cooldown resets. Paused entries are excluded even from the compatible adapters' all-cooling
+    first-key fallback; all paused means no upstream request. `inUse` identifies the next usable
+    account for a new conversation (one or none), not `active`, which remains the last responder.
+    Login account PATCH bodies accept boolean `preferred`/`paused` and `clearCooldown: true`;
+    Claude's existing PUT preference API remains supported. External Codex/current-Claude logins
+    retain their existing ownership restrictions. Compatible credentials persist boolean flags on
+    their `config.json` entries via PUT `/api/config` (validated, at most one preferred per provider);
+    `/api/status.credentials[name]` reports each entry's flags and selection, including a declared
+    single key. POST `/api/credentials/clear-cooldown` with `{provider, id}` clears one key's runtime
+    health. Cooldown clearing also works while an entry is paused, without resuming it.
   - Four things an independent review found, each of which had made it past the unit tests because
     each lived in the wiring rather than the state machine: the pool never heard about the ChatGPT
     or openai-compatible adapters, so those providers looked healthy forever and a slot pointing at
@@ -1688,6 +1725,8 @@ plan unless marked otherwise.
 | Android hotspot never recognised (2026-10-20, found by reading the code for an owner with Windows laptops and Android phones in mind): "on the hotspot" was the iPhone range 172.20.10.0/28 alone, on macOS and Windows. An Android hotspot hands out 192.168.43.x (≤ Android 10) or a random /24 (Android 11+; 192.168/16, 172.16/12, 10/8 by Android 14), so after our own failover `join()` saw no hotspot address and reported `join-failed`/`hotspot-not-visible`, while on the phone the controller read Wi-Fi and never planned the way back, and a by-hand join was never recognised | The product does not assume an iPhone. After our own join of the configured SSID is accepted by the OS, a new, non-link-local address within the settle time is the join, and its subnet (address + netmask from `os.networkInterfaces()`: no Location, no elevation) is kept in `<home>/tether.json` for that hotspot name; "on the hotspot" = iPhone range OR that network (§8). Only our own join replaces it, and a subnet equal to the Wi-Fi watched before is not remembered (logged as ambiguous) so home Wi-Fi is never read as the hotspot. Hints name both phones where the step differs. Not yet run with a real Android phone. |
 | An expired Claude login on the Mac wrote `[desktop state] …로그인이 만료되었습니다…` every few seconds per Claude app session and read the keychain (a synchronous child process) for every request, while phones learned of it only by a failed send (2026-10-15) | A login problem is one host state: logged when it starts and ends, sent to phones as `HostInfo.desktopProblem` (a banner), and the keychain is reread at most every 30 s while expired or after a 401. Per-session Remote Control errors log once per change. The host never refreshes the login itself. |
 | OpenCode Go answered **402** for `minimax-m3.1-flash-free` while that model's endpoint was down (`server_error … Upstream request failed: Endpoint is unavailable`); read as billing exhaustion, it parked the whole `opencode-go` account for 30 minutes, DeepSeek with it, and delegated work fell back to Opus while the account had credit (2026-10-22) | A relay's refusal whose body says its upstream failed (`RELAY_UPSTREAM_FAILED`, `pool.ts`) is transient whatever status it carries — 402 as well as 403 — and never a provider exhaustion (`health.ts`). A plain 402 or a body naming balance, billing or quota still is. |
+| A Workflow script sent eight agents with `[[ripple: gemini-3-8-flash@high]]` as the prompt's first line (and `subagent_type`, which `agent()` does not take — its option is `agentType`); all eight ran on the session's Opus. CLI 2.1.308 frames a workflow agent's prompt: a relayed user request, then a `[Workflow harness — computed task] … follows:` header line, then the script's text indented — so no user message started with the marker (2026-10-22) | A text block that starts with that header is read from the line after it: the script's first line is the prompt's top, as a spawned subagent's is (`routing.ts`, `WORKFLOW_TASK`). Only a block that *starts* with the header counts — the harness indents everything inside, so a header quoted lower down is prose. |
+| A new worker could not be spawned in a session that was open when it was added: the router wrote `zai-org-glm-5-3-flash.md` at 10:51:45, the MAMBO session (idle since 10:47) got its next message 26 s later, and the Agent tool answered "not found" at 10:52 and 11:12; after a `/clear` the mod rewrote `ripple:auto` to the worker and the CLI refused that too (11:24). The ClaudeRipple session, in use at the time, listed it by 10:55 (2026-10-23). CLI 2.1.308 polls `~/.claude/agents` every 2 s in use and 30 s after a minute idle; going back to 2 s rebuilds the watcher from the directory as it then is, and the catch-up compares only skills and commands, so a write in the last 30 s of idling is never read, and `/clear` keeps the process's list | Every sync that writes or removes a generated agent touches the generated files again `RETOUCH_AFTER_MS` (45 s) later (`agents.ts` `retouchLater`): any agent file's change makes a session reread all of them, and 45 s is past the idle poll. A session that already missed one is fixed the same way, by touching any file in `~/.claude/agents`. Tests: `agents.test.ts`. |
 
 ### Router-owned automatic updates (2026-10-21)
 

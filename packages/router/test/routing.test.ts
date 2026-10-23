@@ -4,7 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { DEFAULTS, type Config } from "../src/config.ts";
-import { markerOverride, resolve, rewriteBody, unroutableReason } from "../src/routing.ts";
+import { continuesTranslatedTurn, markerOverride, resolve, rewriteBody, unroutableReason } from "../src/routing.ts";
 import { injectBootstrap } from "../src/bootstrap.ts";
 import { withAgentAliases } from "../src/agents.ts";
 
@@ -25,7 +25,7 @@ const body = (text: string) => ({ messages: [{ role: "user", content: text }] })
 test("Auto mode classifier overrides only its own system request and ignores conversation markers", () => {
   const configured: Config = { ...cfg, autoModeClassifier: { provider: "chatgpt", model: "gpt-6-luna", effort: "low" } };
   const system = "You are a security monitor for autonomous AI coding agents.\n\nEvaluate the action.";
-  const request = { system: [{ type: "text", text: "x-anthropic-billing-header: test" }, { type: "text", text: system }], ...body("[[ripple: sol]] quoted by a monitored agent") };
+  const request = { system: [{ type: "text", text: "x-anthropic-billing-header: test" }, { type: "text", text: system }], ...body("Quoted by a monitored agent: [[ripple: sol]]") };
   assert.equal(resolve("claude-sonnet-5[1m]", request, configured)?.model, "gpt-6-luna");
   assert.equal(resolve("claude-sonnet-5[1m]", request, configured)?.effort, "low");
   assert.equal(resolve("claude-sonnet-5[1m]", request, cfg), null, "no opt-in preserves native inference");
@@ -63,6 +63,14 @@ test("direct prefix keeps model, parses @effort", () => {
   const r = resolve("gpt-5.6-sol@medium", body("hi"), cfg)!;
   assert.equal(r.model, "gpt-5.6-sol");
   assert.equal(r.effort, "medium");
+});
+
+test("regression: a Claude marker reaches an undeclared target through its direct prefix", () => {
+  const configured: Config = { ...cfg, aliases: { sol: "gpt-6.1-sol" } };
+  assert.deepEqual(resolve("claude-sonnet-5-5", body("[[ripple: sol@high]] do it"), configured), {
+    provider: "chatgpt", model: "gpt-6.1-sol", effort: "high",
+    tag: "claude-sonnet-5-5->gpt-6.1-sol (marker)",
+  });
 });
 
 test("marker overrides direct models only, ignores system-reminder blocks", () => {
@@ -162,6 +170,30 @@ test("bootstrap injection adds CLI models and compaction windows", () => {
   assert.equal(injectBootstrap(raw, cfg), raw);
 });
 
+test("bootstrap supplies missing descriptions without changing existing options or config", () => {
+  const configured: Config = {
+    ...cfg,
+    cli: {
+      extraModels: [
+        { model: "gpt-default", name: "Default description", contextWindow: 400_000 },
+        { model: "gpt-described", name: "Display name", description: "Explicit description" },
+        { model: "gpt-empty", name: "Empty description", description: "" },
+      ],
+    },
+  };
+  const before = structuredClone(configured);
+  const existing = [{ model: "native", name: "Native", description: "Upstream description", disabled_reason: "Unavailable" }];
+  const out = JSON.parse(injectBootstrap(Buffer.from(JSON.stringify({ additional_model_options: existing })), configured, []).toString());
+  assert.deepEqual(out.additional_model_options, [
+    ...existing,
+    { model: "gpt-default", name: "Default description", contextWindow: 400_000, description: "Default description" },
+    { model: "gpt-described", name: "Display name", description: "Explicit description" },
+    { model: "gpt-empty", name: "Empty description", description: "" },
+  ]);
+  assert.equal(out.auto_compact_windows["gpt-default"], 400_000);
+  assert.deepEqual(configured, before, "bootstrap normalization does not mutate the config");
+});
+
 test("each routed model and slot keeps its own compaction window; the global value is only the fallback", () => {
   const perModel: Config = {
     ...cfg,
@@ -221,9 +253,10 @@ test("bootstrap injects agent-file model ids (with @effort) when their base is r
   fs.writeFileSync(path.join(dir, "gpt.md"), "---\nname: gpt\nmodel: gpt-5.6-terra@high\n---\n");
   fs.writeFileSync(path.join(dir, "other.md"), "---\nname: o\nmodel: sonnet\n---\n");
   const cfg = { ...DEFAULTS, providers: {}, routes: {}, aliases: {}, direct: [{ prefix: "gpt-", provider: "chatgpt" }], cli: { extraModels: [{ model: "gpt-5.6-terra", name: "GPT-5.6 Terra" }] } } as unknown as Config;
-  const out = JSON.parse(injectBootstrap(Buffer.from("{}"), cfg, [dir]).toString()) as { additional_model_options: { model: string; name: string }[] };
+  const out = JSON.parse(injectBootstrap(Buffer.from("{}"), cfg, [dir]).toString()) as { additional_model_options: { model: string; name: string; description: string }[] };
   assert.deepEqual(out.additional_model_options.map((m) => m.model), ["gpt-5.6-terra", "gpt-5.6-terra@high"]);
   assert.equal(out.additional_model_options[1]!.name, "GPT-5.6 Terra · high");
+  assert.deepEqual(out.additional_model_options.map((m) => m.description), ["GPT-5.6 Terra", "GPT-5.6 Terra · high"]);
 });
 
 test("a dated model id matches its undated mapping", () => {
@@ -367,4 +400,27 @@ test("a marker counts only at the top of a user message; a quoted one is prose",
   assert.equal(resolve("gpt-6-astra", body(summary), cfg)!.model, "gpt-6-astra");
   assert.equal(markerOverride(body("  \n[[ripple: luna@low]]\n\ntask"), cfg.aliases)?.model, "gpt-5.6-luna", "leading whitespace is fine");
   assert.equal(markerOverride(body("<system-reminder>x</system-reminder>[[ripple: luna]] task"), cfg.aliases)?.model, "gpt-5.6-luna", "a stripped reminder does not push it off the top");
+});
+
+// The frame as CLI 2.1.308 sent it to a Workflow agent on 2026-10-22 (relayed request shortened).
+test("a Workflow agent's marker is the top of the script's text, under the harness frame", () => {
+  const request = "[Workflow harness — user request] The harness relays, verbatim and indented below, the user request that triggered this workflow run. …\n  병렬로 여러개 돌려서 나눠서 시켜";
+  const task = "[Workflow harness — computed task] The task text below was computed at runtime by a workflow script. … The computed task text follows:\n  [[ripple: luna@high]]\n  역할: 한국어 교정자.";
+  const two = { messages: [{ role: "user", content: request }, { role: "user", content: task }] };
+  assert.deepEqual(markerOverride(two, cfg.aliases), { model: "gpt-5.6-luna", effort: "high" });
+  const merged = { messages: [{ role: "user", content: [{ type: "text", text: request }, { type: "text", text: task }] }] };
+  assert.deepEqual(markerOverride(merged, cfg.aliases), { model: "gpt-5.6-luna", effort: "high" }, "the two turns sent as one message");
+  assert.equal(resolve("claude-opus-5-5", two, declared)?.model, "gpt-5.6-luna");
+  const quoted = task.replace("[[ripple: luna@high]]\n  역할", "역할: [[ripple: luna@high]]");
+  assert.equal(markerOverride(body(quoted), cfg.aliases), null, "inside the script's text, below its top, it is prose");
+  assert.equal(markerOverride(body(`Summary: …\n${task}`), cfg.aliases), null, "a frame quoted below the top is not a frame");
+});
+
+// A workflow worker's continue carries no marker; when the turn before it was translated, Anthropic
+// has no such thread (404 on every turn, 2026-10-23), so it is recognised by the id we minted.
+test("a continue of a turn this router minted is recognised; Anthropic's own ids and creates are not", () => {
+  assert.equal(continuesTranslatedTurn({ thread: { type: "continue", previous_message_id: "msg_8f46eee3c1a01d63c54f683e" } }), true);
+  assert.equal(continuesTranslatedTurn({ thread: { type: "continue", previous_message_id: "msg_011CgJN1qQSD73cvPhge2Cri" } }), false);
+  assert.equal(continuesTranslatedTurn({ thread: { type: "create" } }), false);
+  assert.equal(continuesTranslatedTurn({}), false);
 });

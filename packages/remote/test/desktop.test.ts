@@ -13,6 +13,7 @@ import { fileSymlinks } from "../../../test/capabilities.ts";
 
 const id = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
 const other = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
+const linked = "dddddddd-dddd-dddd-dddd-dddddddddddd";
 const line = (value: unknown): string => JSON.stringify(value) + "\n";
 const user = { type: "user", uuid: "u1", cwd: "/synthetic/project", timestamp: "2026-10-12T01:00:00Z", message: { content: "First prompt" } };
 const assistant = { type: "assistant", uuid: "a1", message: { id: "m1", model: "test-model", content: [{ type: "text", text: "Answer" }, { type: "tool_use", id: "t1", name: "Read", input: { file_path: "/synthetic/project/file.ts" } }] } };
@@ -36,9 +37,37 @@ test("background task list carries the launch description, command fallback and 
   tasks.accept(line({ type: "assistant", message: { content: [{ type: "tool_use", name: "Bash", id: "b", input: { command: "npm test", run_in_background: true } }] } }));
   tasks.accept(line({ type: "user", toolUseResult: { backgroundTaskId: "s1" }, message: { content: [{ type: "tool_result", tool_use_id: "b", content: "started" }] } }));
   assert.deepEqual(tasks.list, [
-    { id: "w1", kind: "agent", label: "Review diff", startedAt: Date.parse("2026-10-13T01:00:00.000Z") },
+    { id: "w1", kind: "agent", label: "Review diff", startedAt: Date.parse("2026-10-13T01:00:00.000Z"), sub: "sub-a" },
     { id: "s1", kind: "shell", label: "npm test", startedAt: null },
   ]);
+});
+
+test("the turn's task list follows update_plan as the app applies it, and the next message clears it", () => {
+  const tasks = new BackgroundTasks();
+  let n = 0;
+  const plan = (input: Record<string, unknown>, error = false) => {
+    const id = `p${++n}`;
+    tasks.accept(line({ type: "assistant", message: { content: [{ type: "tool_use", name: "mcp__ccd_turn__update_plan", id, input }] } }));
+    tasks.accept(line({ type: "user", message: { content: [{ type: "tool_result", tool_use_id: id, ...(error ? { is_error: true } : {}), content: "Plan shown" }] } }));
+  };
+  const statuses = () => tasks.plan.map(step => step.status[0]).join("");
+  assert.deepEqual(tasks.plan, []);
+  plan({ advance: true });
+  assert.deepEqual(tasks.plan, [], "an advance with no list changes nothing");
+  plan({ scope: "first_task", items: [{ content: " Read the code ", status: "in_progress" }, { content: "", status: "pending" }, { content: "Fix it", status: "bogus" }, { content: "Test it", status: "pending" }] });
+  assert.deepEqual(tasks.plan, [{ text: "Read the code", status: "in_progress" }, { text: "Fix it", status: "pending" }, { text: "Test it", status: "pending" }]);
+  plan({ advance: true });
+  assert.equal(statuses(), "cip");
+  plan({ done: [2, 9], start: 3 }, true);
+  assert.equal(statuses(), "cip", "a refused call changes nothing");
+  plan({ done: [2], start: 3 });
+  assert.equal(statuses(), "cci");
+  plan({ advance: "true" });
+  assert.equal(statuses(), "ccc");
+  plan({ items: Array.from({ length: 15 }, (_, i) => ({ content: `step ${i}`, status: "pending" })), scope: "continuation" });
+  assert.equal(tasks.plan.length, 12);
+  tasks.accept(line({ type: "user", timestamp: "2026-10-23T01:00:00.000Z", origin: { kind: "human" }, message: { content: "next" } }));
+  assert.deepEqual(tasks.plan, []);
 });
 
 test("the main turn starts at the person's message, not a compaction summary or task notification", () => {
@@ -213,7 +242,10 @@ test("only recent top-level UUID files, no symlinks, host transcripts or travers
   const outside = path.join(f.root, "outside.jsonl");
   fs.writeFileSync(outside, line(user));
   if (fileSymlinks) fs.symlinkSync(outside, path.join(f.project, "cccccccc-cccc-cccc-cccc-cccccccccccc.jsonl"));
-  fs.symlinkSync(f.project, path.join(f.projects, "linked-project"), "junction");
+  const linkedProject = path.join(f.root, "linked-project-target");
+  fs.mkdirSync(linkedProject);
+  fs.writeFileSync(path.join(linkedProject, `${linked}.jsonl`), line(user));
+  fs.symlinkSync(linkedProject, path.join(f.projects, "linked-project"), "junction");
   assert.deepEqual(f.desktop.list().map(s => s.id), [id]);
   assert.equal(f.desktop.has("../../outside"), false);
   assert.throws(() => f.desktop.log("../../outside"), /no such session/);
@@ -457,6 +489,34 @@ test("a Mac session's worker status follows its result, its notification, a queu
   const sync = (tid: string, error = false) => line({ type: "user", toolUseResult: { agentId: "w" }, message: { content: [{ type: "tool_result", tool_use_id: tid, is_error: error, content: "answer" }] } });
   assert.deepEqual(run([toolUse("d"), sync("d")]), [["d", "running"], ["d", "done"]], "a synchronous worker ends at its result");
   assert.deepEqual(run([toolUse("e"), sync("e", true)]), [["e", "running"], ["e", "failed"]]);
+});
+
+test("a running worker with a known model emits progress as only its own transcript grows", t => {
+  const f = fixture(t);
+  const worker = "toolu_progress";
+  subagent(f.project, "progress", { toolUseId: worker, model: "sol@high" }, [
+    assistantTurn("sol", "tool_use", [{ type: "tool_use", id: "read", name: "Read", input: {} }]),
+  ]);
+  const file = path.join(f.project, `${id}.jsonl`);
+  fs.writeFileSync(file, line(user) + line({ type: "assistant", message: { content: [{ type: "tool_use", id: worker, name: "Agent", input: { run_in_background: true } }] } }) +
+    line({ type: "user", toolUseResult: { isAsync: true, agentId: "progress" }, message: { content: [{ type: "tool_result", tool_use_id: worker, content: "launched asynchronously" }] } }));
+  f.desktop.list();
+  const events: import("../src/protocol.ts").EventBody[] = [];
+  const imported = f.desktop.importInto(id, path.join(f.root, "opened-timeline"), Date.now);
+  assert.equal(imported.tail().events.find(e => e.kind === "subagent")?.model, "sol");
+  imported.close();
+  const offset = fs.statSync(file).size;
+  const workerFile = path.join(f.project, id, "subagents", "agent-progress.jsonl");
+  fs.appendFileSync(workerFile, line({ isSidechain: true, type: "user", message: { content: [{ type: "tool_result", tool_use_id: "read", content: "read output" }] } }));
+  assert.equal(f.desktop.tail(id, offset, body => events.push(body)), offset, "the parent transcript did not grow");
+  assert.deepEqual(events.map(e => e.kind === "subagent" ? [e.model, e.steps, e.status] : e.kind), [["sol", 1, "running"]]);
+  events.length = 0;
+  f.desktop.tail(id, offset, body => events.push(body));
+  assert.equal(events.length, 0, "an unchanged worker emits nothing");
+  fs.appendFileSync(workerFile, assistantTurn("sol", "end_turn", [{ type: "text", text: "finished" }]));
+  f.desktop.tail(id, offset, body => events.push(body));
+  assert.deepEqual(events.map(e => e.kind === "subagent" ? [e.model, e.steps, e.status] : e.kind), [["sol", 2, "done"]]);
+  assert.equal(f.desktop.subLog(id, `sub-${worker}`)?.tail().events.at(-1)?.kind, "assistant");
 });
 
 test("a Mac session's worker log is readable and grows with its transcript", t => {

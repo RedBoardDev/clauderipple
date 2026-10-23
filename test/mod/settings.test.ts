@@ -163,22 +163,31 @@ test('stored settings that still held Auto or a field rule say so, once; the des
   assert.equal(hadRetiredRouting(normalizeSettings({ rules: { general: { mode: 'auto', allow: [] }, backend: { mode: 'auto', allow: [] } } })), false)
 })
 
-test('a domain ladder folds into two levels: the upper rung of each pair wins, an empty upper falls back to the lower', () => {
+test('a domain ladder folds into two levels: light work is the light rung, heavy work standard to plan', () => {
   const light: Step[] = [{ target: { agent: 'light' }, effort: 'low' }]
   const standard: Step[] = [{ target: { agent: 'standard' }, effort: 'medium' }]
   const hard: Step[] = [{ target: { agent: 'hard' }, effort: 'high' }]
   const plan: Step[] = [{ target: { agent: 'plan' }, effort: 'high' }]
-  // The upper rung of each pair wins: standard for the light pair, plan for the heavy one.
-  assert.deepEqual(twoLevelRungs({ light, standard, hard, plan }), { light: standard, standard, hard: plan, plan })
-  // An empty upper rung falls back to the lower one.
-  assert.deepEqual(twoLevelRungs({ light, hard }), { light, standard: light, hard, plan: hard })
-  // A pair with nothing in it stays empty.
+  // Light keeps its own list; plan's list is heavy work's, ordinary (standard) work included.
+  assert.deepEqual(twoLevelRungs({ light, standard, hard, plan }), { light, standard: plan, hard: plan, plan })
+  // Heavy falls back plan → hard → standard → light; light falls back to standard.
+  assert.deepEqual(twoLevelRungs({ light, hard }), { light, standard: hard, hard, plan: hard })
+  assert.deepEqual(twoLevelRungs({ standard }), { light: standard, standard, hard: standard, plan: standard })
+  assert.deepEqual(twoLevelRungs({ light }), { light, standard: light, hard: light, plan: light })
   assert.deepEqual(twoLevelRungs({}), {})
-  assert.deepEqual(twoLevelRungs({ light, standard }), { light: standard, standard })
-  // The lists are copies, not aliases: editing one pair never touches the other.
+  // The two-row settings stored before 2026-10-22 (light = standard = Sonnet, hard = plan = Opus) now
+  // send ordinary work to Opus, as the owner meant them.
+  const sonnet: Step[] = [{ target: { agent: 'general-purpose', model: 'sonnet' }, effort: 'high' }]
+  const opus: Step[] = [{ target: { agent: 'general-purpose', model: 'opus' }, effort: 'high' }]
+  assert.deepEqual(twoLevelRungs({ light: sonnet, standard: sonnet, hard: opus, plan: opus }), { light: sonnet, standard: opus, hard: opus, plan: opus })
+  // Folding twice changes nothing.
+  const once = twoLevelRungs({ light, standard, hard, plan })
+  assert.deepEqual(twoLevelRungs(once), once)
+  // The lists are copies, not aliases: editing one rung never touches another.
   const folded = twoLevelRungs({ light, standard })
-  folded.light![0]!.target.agent = 'changed'
-  assert.equal(folded.standard![0]!.target.agent, 'standard')
+  folded.standard![0]!.target.agent = 'changed'
+  assert.equal(folded.hard![0]!.target.agent, 'standard')
+  assert.equal(standard[0]!.target.agent, 'standard')
 })
 
 test('optional domain ladders normalize independently, round-trip and never count as retired routing', () => {
@@ -186,9 +195,10 @@ test('optional domain ladders normalize independently, round-trip and never coun
     ui: { mode: 'ladder', rungs: { light: [{ target: { agent: ' ui ' }, effort: 'bad' }, null, { effort: 'high' }], standard: { target: { agent: 'second' }, effort: 'high' } } },
     backend: { mode: 'ladder', rungs: {} }, docs: { mode: 'ladder', rungs: {} },
   } })
-  // The domain ladder is folded on the way in: standard's list is the light pair's.
+  // The domain ladder is folded on the way in: light keeps its own list, standard's is heavy work's.
+  const second = [{ target: { agent: 'second' }, effort: 'high' }]
   assert.deepEqual(s.domainRules, {
-    ui: { mode: 'ladder', rungs: { light: [{ target: { agent: 'second' }, effort: 'high' }], standard: [{ target: { agent: 'second' }, effort: 'high' }] } },
+    ui: { mode: 'ladder', rungs: { light: [{ target: { agent: 'ui' }, effort: 'low' }], standard: second, hard: second, plan: second } },
     backend: { mode: 'ladder', rungs: {} },
   })
   assert.deepEqual(normalizeSettings(JSON.parse(JSON.stringify(s))), s)
@@ -200,7 +210,7 @@ test('optional domain ladders normalize independently, round-trip and never coun
   assert.deepEqual(applySettingsChanges(s, settingsChanges(s, removed)), removed)
   const copy = normalizeSettings(s)
   copy.domainRules!.ui!.rungs.light![0]!.target.agent = 'changed'
-  assert.equal(s.domainRules!.ui!.rungs.light![0]!.target.agent, 'second')
+  assert.equal(s.domainRules!.ui!.rungs.light![0]!.target.agent, 'ui')
 })
 
 test('normalization folds the domain ladders only: the general ladder keeps its four rungs', () => {
@@ -215,8 +225,9 @@ test('normalization folds the domain ladders only: the general ladder keeps its 
     light: [{ target: { agent: 'l' }, effort: 'low' }], standard: [{ target: { agent: 's' }, effort: 'medium' }],
     hard: [{ target: { agent: 'h' }, effort: 'high' }], plan: [{ target: { agent: 'p' }, effort: 'high' }],
   })
-  // The domain ladder's light pair holds one list, the empty lower rung takes the upper one's.
-  assert.deepEqual(s.domainRules!.ui!.rungs, { light: [{ target: { agent: 'u' }, effort: 'low' }], standard: [{ target: { agent: 'u' }, effort: 'low' }] })
+  // One filled row runs every rung of the domain ladder.
+  const u = [{ target: { agent: 'u' }, effort: 'low' }]
+  assert.deepEqual(s.domainRules!.ui!.rungs, { light: u, standard: u, hard: u, plan: u })
 })
 
 test('the heavy-context band and optional chips are off unless switched on', () => {

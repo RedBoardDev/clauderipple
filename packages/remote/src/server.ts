@@ -10,6 +10,7 @@ import { tokenMatches } from "./config.ts";
 import type { Phone } from "./local-control.ts";
 import { browse, macConsent, makeFolder, recentFolders } from "./folders.ts";
 import type { RecentSource } from "./folders.ts";
+import { diffView } from "./diff.ts";
 import { gitInfo } from "./worktree.ts";
 import { ATTACHMENT_CAP, FRAME_CAP, PING_MS, STALE_MS } from "./protocol.ts";
 import type { BlobChunk, ClientMsg, HostInfo, HostMsg, ProviderGroup, ReqOp, RippleStatus } from "./protocol.ts";
@@ -39,6 +40,7 @@ const require = module.createRequire(import.meta.url);
 export const SHARED: Record<string, (pkgDir: string) => string> = {
   "src/protocol.ts": (pkg) => path.join(pkg, "src", "protocol.ts"),
   "src/tool-details.ts": (pkg) => path.join(pkg, "src", "tool-details.ts"),
+  "src/wrap-up.ts": (pkg) => path.join(pkg, "src", "wrap-up.ts"),
   "src/e2ee.ts": (pkg) => path.join(pkg, "src", "e2ee.ts"),
   "vendor/nacl-fast.min.js": () => require.resolve("tweetnacl/nacl-fast.min.js"),
 };
@@ -118,6 +120,7 @@ export class HostServer {
       c.ws.terminate();
       this.clients.delete(c);
     }
+    this.syncWatches();
     this.uploads.clear();
     this.seenAt.clear();
     this.lastSeen.clear();
@@ -139,7 +142,7 @@ export class HostServer {
   constructor(opts: ServerOptions) {
     this.opts = opts;
     const desktopProblem = opts.sessions.desktopProblem?.();
-    this.hostInfo = { name: opts.hostName, version: opts.version, routerOk: true, ...(desktopProblem ? { desktopProblem } : {}) };
+    this.hostInfo = { name: opts.hostName, version: opts.version, routerOk: true, queue: true, ...(desktopProblem ? { desktopProblem } : {}) };
     this.http = http.createServer((req, res) => this.serve(req, res));
     this.wss = new WebSocketServer({ noServer: true, maxPayload: FRAME_CAP });
     this.http.on("upgrade", (req, socket, head) => {
@@ -176,6 +179,12 @@ export class HostServer {
     }
   }
 
+  private syncWatches(): void {
+    const ids = new Set<string>();
+    for (const c of this.clients) if (c.authed && c.ws.readyState === c.ws.OPEN) for (const id of c.attached.keys()) ids.add(id);
+    this.opts.sessions.watchAttached(ids);
+  }
+
   private now(): number { return (this.opts.now ?? Date.now)(); }
 
   private desktopTicks = 0;
@@ -183,9 +192,11 @@ export class HostServer {
   private pollDesktop(): void {
     // The desktop poll runs on its own timer even with no phone connected, so a Mac session that
     // finishes while nobody watches still appends its result — and the push for it goes out. Each
-    // tick also asks Remote Control for every live Mac session's state over the network, so with no
-    // phone looking it runs every fifth tick (15 s) rather than every 3 s, around the clock.
-    if (!this.someoneLooking() && this.desktopTicks++ % 5 !== 0) return;
+    // tick also asks Remote Control for every live Mac session's state over the network. Only
+    // when no phone is looking AND none is attached may it slow to every fifth tick (15 s).
+    // Hidden attached timelines still need the 3 s fallback when file notifications are lost.
+    const attached = [...this.clients].some(c => c.authed && c.ws.readyState === c.ws.OPEN && c.attached.size > 0);
+    if (!attached && !this.someoneLooking() && this.desktopTicks++ % 5 !== 0) return;
     void this.opts.sessions.pollDesktop().catch(error => {
       this.opts.log?.(`desktop poll failed: ${error instanceof Error ? error.message : String(error)}`);
     });
@@ -199,6 +210,7 @@ export class HostServer {
         this.timers.push(setInterval(() => this.reapStale(), PING_MS));
         this.timers.push(setInterval(() => void this.checkRouter(), 15_000));
         this.timers.push(setInterval(() => this.pollDesktop(), 3000));
+        this.timers.push(setInterval(() => this.opts.sessions.pollQueued(), 1000));
         void this.checkRouter();
         resolve();
       });
@@ -227,7 +239,8 @@ export class HostServer {
     for (const t of this.timers) clearInterval(t);
     if (this.sessionsTimer) clearTimeout(this.sessionsTimer);
     this.sessionsTimer = null;
-    for (const c of this.clients) c.ws.terminate();
+    for (const c of this.clients) { c.attached.clear(); c.ws.terminate(); }
+    this.syncWatches();
     return Promise.all([this.http, this.localHttp].filter((server): server is http.Server => server !== null)
       .map(server => new Promise<void>(resolve => server.close(() => resolve())))).then(() => {});
   }
@@ -238,7 +251,12 @@ export class HostServer {
 
   /** Called for every appended event: push it to every client attached to that session. */
   onEvent(session: string): void {
-    for (const c of this.clients) if (c.authed && c.attached.has(session)) this.pump(c, session);
+    const snapshot = this.opts.sessions.summaryOf(session)?.origin === "desktop";
+    for (const c of this.clients) {
+      if (!c.authed || !c.attached.has(session)) continue;
+      if (snapshot) this.attach(c, session, undefined, undefined);
+      else this.pump(c, session);
+    }
   }
 
   /** Session list changed (state, pending count, a new one). Coalesced; lists are small but frequent. */
@@ -285,6 +303,8 @@ export class HostServer {
       this.opts.log?.(`bridge sync failed: ${error instanceof Error ? error.message : String(error)}`);
     });
     const log = this.opts.sessions.log(session);
+    c.attached.set(session, c.attached.get(session) ?? 0);
+    this.syncWatches();
     if (epoch === log.epoch && afterSeq !== undefined && afterSeq > 0 && afterSeq <= log.lastSeq) {
       // Resume by seq, unless the gap is so large that replaying it would be slower than starting from the tail.
       let cursor = afterSeq;
@@ -322,6 +342,7 @@ export class HostServer {
       clearTimeout(helloTimer);
       if (c.authed && c.clientId) this.lastSeen.set(c.clientId, c.lastRx);
       this.clients.delete(c);
+      this.syncWatches();
     });
     ws.on("error", () => { /* close follows */ });
   }
@@ -366,7 +387,7 @@ export class HostServer {
     switch (msg.t) {
       case "hello": return;
       case "attach": this.attach(c, msg.session, msg.epoch, msg.afterSeq); return;
-      case "detach": c.attached.delete(msg.session); return;
+      case "detach": c.attached.delete(msg.session); this.syncWatches(); return;
       case "seen": if (s.has(msg.session)) s.markSeen(msg.session); return;
       case "archive":
         try { s.setArchived(msg.session, msg.archived === true); }
@@ -398,6 +419,8 @@ export class HostServer {
         try {
           const desktop = s.list().some(session => session.id === msg.session && session.origin === "desktop");
           const id = await s.send(msg.session, msg.clientMsgId, msg.text, msg.attachments, msg.behavior);
+          // A message the person sends after a Stop is them carrying on: the queue goes on after it.
+          s.resumeQueue(msg.session);
           this.send(c, { t: "ack", clientMsgId: msg.clientMsgId, session: id });
           if (desktop && id === msg.session) this.attach(c, id, undefined, undefined);
         } catch (e) {
@@ -429,7 +452,8 @@ export class HostServer {
       case "interrupt":
       case "set_model":
         try {
-          if (msg.t === "interrupt") await s.interrupt(msg.session);
+          // Stop from the phone also pauses what it queued: the person decides what goes next.
+          if (msg.t === "interrupt") { s.holdQueue(msg.session); await s.interrupt(msg.session); }
           else await s.setModel(msg.session, msg.model, msg.effort);
           if (msg.reqId) this.send(c, { t: "res", reqId: msg.reqId, ok: true, data: null });
         } catch (e) {
@@ -477,9 +501,13 @@ export class HostServer {
       case "mkdir": return { path: await makeFolder(op.parent, op.name) };
       case "git": return macConsent(op.path, () => gitInfo(op.path));
       case "commands": return s.commands(op.session);
+      case "enqueue": s.enqueue(op.session, op.clientMsgId, op.text, op.attachments ?? []); return { queued: true };
+      case "queue_remove": return s.removeQueued(op.session, op.id);
+      case "queue_send": return { session: await s.sendQueued(op.session, op.id) };
+      case "queue_resume": s.resumeQueue(op.session); return null;
       case "blob": {
         if (!s.has(op.session)) throw new Error("no such session");
-        const text = s.log(op.session).blob(op.id);
+        const text = s.blob(op.session, op.id);
         if (text === null) throw new Error("no such blob");
         const offset = Math.max(0, op.offset ?? 0);
         const end = Math.min(text.length, offset + BLOB_CHUNK_CHARS);
@@ -490,6 +518,13 @@ export class HostServer {
         const log = s.subLog(op.session, op.sub);
         if (!log) throw new Error("no such subagent");
         return log.readAfter(op.afterSeq ?? 0);
+      }
+      /** The folder comes from the session (its record's cwd; a Claude app session's summary),
+       * never from the phone, so one connection can only ever read sessions it can already see. */
+      case "diff": {
+        const summary = s.summaryOf(op.session);
+        if (!summary) throw new Error("no such session");
+        return diffView(summary.cwd);
       }
       case "expo_push_subscribe":
         if (!this.opts.expoPush) throw new Error("native push is off on this host");

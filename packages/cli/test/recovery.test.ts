@@ -46,12 +46,16 @@ process.on("exit", () => {
 
 const { renderPlist, plistPath } = await import("../src/launchd.ts");
 const { renderUnit } = await import("../src/systemd.ts");
-const { renderLauncher } = await import("../src/schtasks.ts");
+const { renderLauncher, writeLauncher } = await import("../src/schtasks.ts");
+const { removeClientIntegrations } = await import("../src/integrations.ts");
+const { withCommandHelp } = await import("../src/help-gate.ts");
+const { codexOn, codexEnabled } = await import("../src/codex.ts");
 const { launchdSupervisor, launcherProgram, plistProgramArguments, registration, targetsExist, unitExecStart } = await import("../src/registration.ts");
 const { classifyMode, cliProxyState, desktopProxyState, doctor, repair } = await import("../src/doctor.ts");
 const { directOn, directOff, directStatePath } = await import("../src/direct.ts");
 const { applyAppProxy, configLibraryDir, currentAppProxy } = await import("../src/picker.ts");
 const { installLauncher, uninstallLauncher, LAUNCHER_BUNDLE_ID } = await import("../src/launcher.ts");
+const { writeBundle } = await import("../src/bundle.ts");
 type SupervisorOps = import("../src/registration.ts").SupervisorOps;
 type SupervisorView = import("../src/registration.ts").SupervisorView;
 type Runtime = import("../src/runtime.ts").Runtime;
@@ -124,6 +128,51 @@ function fakeSupervisor(view: Partial<SupervisorView>, opts: { start?: "already-
 const answering = (version = "9.9.9") => async () => ({ version });
 const silent = async () => null;
 const noSleep = async () => {};
+
+test("--help and -h prevent dispatch for every command, including destructive arguments", async (t) => {
+  const print = t.mock.method(console, "log", () => {});
+  const usage = () => console.log("usage");
+  const commands = ["install", "uninstall", "status", "doctor", "repair", "direct", "app", "start", "stop", "restart", "logs", "remote", "config", "ui", "tray", "update", "login", "logout", "claude-login", "claude-logout", "google-login", "google-logout", "image", "picker", "codex", "agent-title", "mod", "awake", "tether", "power"];
+  let dispatched = 0;
+  for (const command of commands) {
+    for (const help of ["--help", "-h"]) {
+      const before = print.mock.callCount();
+      await withCommandHelp([command, "on", "--purge", help], async () => { dispatched++; }, usage);
+      assert.ok(print.mock.callCount() > before, `${command} prints usage`);
+    }
+  }
+  assert.equal(dispatched, 0);
+  await withCommandHelp(["status"], async () => { dispatched++; }, usage);
+  assert.equal(dispatched, 1, "ordinary commands still dispatch");
+});
+
+test("uninstall clears picker and Codex settings before purge, even if trust removal fails", () => {
+  const ctx = scratch();
+  const oldHome = process.env.CLAUDERIPPLE_HOME;
+  const oldCodex = process.env.CODEX_HOME;
+  process.env.CLAUDERIPPLE_HOME = ctx.home;
+  process.env.CODEX_HOME = path.join(ctx.home, "codex");
+  applyAppProxy(ctx.proxyUrl);
+  codexOn(18793);
+  try {
+    let untrusted = false;
+    removeClientIntegrations(ctx.home, (ca) => {
+      assert.equal(ca, ctx.ca);
+      untrusted = true;
+      throw new Error("confirmation declined");
+    });
+    assert.equal(currentAppProxy().egressProxyUrl, null);
+    assert.equal(codexEnabled(), false);
+    assert.equal(fs.existsSync(path.join(process.env.CODEX_HOME, "clauderipple.config.toml")), false);
+    assert.equal(JSON.parse(fs.readFileSync(path.join(ctx.home, "config.json"), "utf8")).picker.enabled, false);
+    assert.equal(untrusted, true);
+  } finally {
+    if (oldHome === undefined) delete process.env.CLAUDERIPPLE_HOME;
+    else process.env.CLAUDERIPPLE_HOME = oldHome;
+    if (oldCodex === undefined) delete process.env.CODEX_HOME;
+    else process.env.CODEX_HOME = oldCodex;
+  }
+});
 
 // ---- parsing and classification --------------------------------------------------------
 
@@ -273,6 +322,27 @@ test("repair re-registers a plist whose program is gone, starts it and waits for
   assert.ok(lc.calls.slice(before).every((c) => c[0] === "print"));
 });
 
+test("doctor and repair accept the shared router/tray launcher after a package version update", async () => {
+  const { home } = scratch();
+  const rt = { ...fakeRuntime(path.join(root, "rt-shared-bundle")), packaged: false };
+  const reg = registration(rt, home, "1.0.0", "darwin", null);
+  assert.ok(reg.bundle);
+  let signed = 0;
+  writeBundle({ home, ...reg.bundle }, () => { signed++; });
+  fs.mkdirSync(path.dirname(plistPath()), { recursive: true });
+  fs.writeFileSync(plistPath(), renderPlist({ ...reg, home, stdoutLog: path.join(home, "logs", "launchd.log") }));
+  const lc = fakeLaunchctl({ loaded: true, running: true });
+  const updated = registration(rt, home, "2.0.0", "darwin", null);
+  const supervisor = launchdSupervisor(updated, home, lc.run);
+  assert.equal(supervisor.inspect().current, true);
+  assert.equal(supervisor.inspect().programExists, true);
+  const result = await repair({ home, version: "2.0.0", supervisor, routerStatus: answering("2.0.0"), sleep: noSleep, remoteHostInstalled: () => false });
+  assert.equal(result.ok, true);
+  assert.equal(result.steps[0]!.detail, "already registered for this installation");
+  assert.ok(lc.calls.every(call => call[0] === "print"));
+  assert.equal(signed, 1);
+});
+
 test("repair leaves a router that answers alone even when its entry names another installation", async () => {
   const { home } = scratch();
   const { ops, calls } = fakeSupervisor({ current: false, program: process.execPath });
@@ -378,6 +448,22 @@ test("direct on then off: only our values leave, other keys stay, and everything
   assert.equal(fs.existsSync(directStatePath(ctx.home)), false);
 });
 
+test("direct off restores the current configured port, not the saved port", async () => {
+  const ctx = directSetup();
+  directOn(ctx.home);
+  const file = path.join(ctx.home, "config.json");
+  const cfg = JSON.parse(fs.readFileSync(file, "utf8"));
+  cfg.listen.port = 19991;
+  fs.writeFileSync(file, JSON.stringify(cfg));
+  const { ops } = fakeSupervisor({});
+  const checked: string[] = [];
+  const result = await directOff({ home: ctx.home, version: "1.0.0", supervisor: ops, routerStatus: async (url) => { checked.push(url); return { version: "1.0.0" }; } });
+  assert.equal(result.ok, true, result.detail);
+  assert.deepEqual(checked, ["http://127.0.0.1:19992"]);
+  assert.equal(JSON.parse(fs.readFileSync(ctx.settings, "utf8")).env.HTTPS_PROXY, "http://127.0.0.1:19991");
+  assert.equal(currentAppProxy().egressProxyUrl, "http://127.0.0.1:19991");
+});
+
 test("direct off refuses a proxy set in the meantime unless forced", async () => {
   const ctx = directSetup();
   directOn(ctx.home);
@@ -428,6 +514,18 @@ test("direct off repairs a router that is down first, and changes nothing when i
   assert.equal(r2.ok, true, r2.detail);
   assert.match(r2.detail, /repaired it first/);
   assert.deepEqual(JSON.parse(fs.readFileSync(ctx.settings, "utf8")), ctx.settingsObj);
+});
+
+test("Windows PowerShell launcher files carry a UTF-8 BOM and preserve Korean paths", () => {
+  const { home } = scratch();
+  const rt = { ...fakeRuntime(path.join(root, "홍길동", "runtime")), packaged: false };
+  const router = writeLauncher({ home, program: rt.node, args: [rt.router] });
+  installLauncher({ rt, home, version: "1", platform: "win32", powershell: () => "" });
+  for (const file of [router, path.join(home, "clauderipple-tray.ps1")]) {
+    const bytes = fs.readFileSync(file);
+    assert.deepEqual([...bytes.subarray(0, 3)], [0xef, 0xbb, 0xbf]);
+    assert.ok(bytes.subarray(3).toString("utf8").includes("홍길동"));
+  }
 });
 
 // ---- app launcher ------------------------------------------------------------------------

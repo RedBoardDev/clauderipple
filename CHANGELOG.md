@@ -12,7 +12,184 @@
   explicit lists have no hidden judge. Shared settings use schema v2 so an older writer cannot
   erase the chain; update the router and mod together before editing these settings.
 
-## 0.12.7 - 2026-10-22
+## 0.12.13 — 2026-10-23
+
+### Added
+
+- **A provider can hold more than one API key.** OpenAI-compatible providers such as OpenCode Go now
+  rotate keys the way Anthropic-compatible ones do: a conversation stays on its key while it works,
+  so its prompt cache holds, and a 429, 402 or rejected key is retried on the next one before
+  anything reaches the client. The dashboard gains an accounts tab on these providers to add a key
+  with a name, see each key's state and OpenCode Go usage, and rename, replace or remove it. Keys
+  are shown masked.
+- **Every account pool takes the same controls.** Claude, ChatGPT, Google and API-key accounts can
+  each be made first, paused or resumed, have their cooldown cleared, and show which one a new
+  conversation gets now. A conversation already on an account stays there, so its prompt cache
+  stays. The dashboard offers those controls on every panel, and a first-choice change on API keys
+  clears the others in the same save.
+- **The dashboard knows which Claude account is signed in.** It asks Claude once per token and marks
+  a stored copy of the same person, so someone with one account no longer sees two, or a stale row
+  asking to sign in again. Providers also take a display name now: renaming one keeps its key and
+  changes only the label shown in the list, status, mappings and logs.
+- **A pairing QR opens the app instead of a browser.** The relay can answer the app-link files that
+  let the phone claim its link, once it is deployed with the Play signing key's fingerprint
+  configured. Until then the Android file answers 404, so a phone does not cache "no app".
+
+### Fixed
+
+- **Windows: a phone session hands off again** (#83). Windows had no desktop handoff runner, so a
+  session driven from the phone stayed pending after its writer exited. The handoff now uses the OS
+  headless console and waits for the real SDK process before opening another writer, stores the
+  error, and retries at most three later idle turns. `--desktop` is supported on x64 Windows only.
+- **Gemini 4 Argon sends the thinking level you ask for** (#85). The Google translator recognized
+  only Gemini 3 and 2.5, so `@high` was silently dropped on both AI Studio and OpenCode Go.
+- **Google's monthly spending cap counts as billing exhaustion** (#85). A project past its cap
+  stayed usable, so each new delegation picked the same exhausted API. A plain rate limit, a bare
+  `RESOURCE_EXHAUSTED` and a relay's own failure are still not billing.
+- **A provider named in Korean keeps the worker you named** (#85). A model or provider named in
+  Korean was not recognized, and naming OpenCode could not tell its worker from the Google API
+  worker. The generated agent's provider is read in both the spawn and marker checks, a source name
+  is honored, and a model-only request stays valid on either source.
+- **A GPT model's context window is the one Codex runs with.** The router, the dashboard picker and
+  `/api/context-windows` now share Codex's own catalogue: 6.1 Sol is 475000, and a window Codex
+  reports without a percentage takes Codex's 95%. The dashboard shows such a window read-only with a
+  note, since an edit there would be a number the router ignores.
+- **Two dashboard windows no longer overwrite each other.** Nine saving defects from today's review
+  are fixed: a provider saved without a new key keeps its auth header and first key, a model map
+  keeps each slot's fallbacks and context window, and a save that conflicts re-applies only its own
+  changes onto the newer config. A change made while a save is in flight is saved after it, late
+  model lists no longer undo ticks, and removing a provider drops only its own picks. The admin API
+  also requires a loopback `Host` on every request, so a DNS-rebinding page cannot read your keys.
+- **Translated routes deliver tool calls, images and documents intact.** Ten wire defects fixed:
+  parallel tool calls are tracked per call instead of all landing on the last, calls whose arguments
+  arrive whole reach Claude Code with their input instead of `{}`, interleaved Chat Completions
+  calls no longer break their JSON, and Gemini user text, attachments and images in tool results are
+  passed. Text and base64 documents survive every translated wire, a token-limit ending with a tool
+  call reports `max_tokens`, and schema normalisation no longer strips `pattern`. A later turn of a
+  translated worker is refused here rather than sent on as a 404, and the mod draws it as one quiet
+  line.
+- **A retry, a continue and a relay's refusal are judged by what happened.** A credential retry
+  after a 403 resets its error state, so the second answer is not wrapped in the first error. A
+  continue after a vendor's own message id is refused and resent stateless instead of drawing a
+  404 every turn, a marker naming a target reachable only by a `direct` rule applies that target's
+  rules, and a relay's transient 402 is read from its body rather than taken for billing. A
+  replaced key drops the old key's quarantine, and stickiness is kept per provider and
+  conversation, so one turn elsewhere no longer costs the cache.
+- **Install and the CLI no longer break your setup.** `--help` anywhere prints usage and runs
+  nothing (before, `uninstall --purge --help` ran the uninstall), CA trust is checked by
+  fingerprint so a reinstalled certificate is trusted, and uninstall takes off the Desktop proxy,
+  picker flag, Codex provider and CA trust each on its own. Install and update keep `direct on`,
+  direct off restores the port configured now, and an update fails when its download fails.
+  Windows launchers handle a non-ASCII folder. Generated worker agent files also come back after
+  `uninstall --purge` and a reinstall instead of counting as hand-written.
+- **A phone session keeps its messages.** A queued message goes as soon as the registry says the
+  session is idle, Stop holds the queue before interrupting, and a message taken back keeps its
+  attachments. Messages the SDK already read survive a restart, an archived session reaches the
+  phone's archive, a plan approval that loses to cancellation rolls the permission mode back, and a
+  bridged session picks up a model change. The host also survives a second instance that fails to
+  bind and one unreadable session log.
+- **macOS starts the tray at login.** `Open at Login` registered Electron.app itself, so every login
+  opened a bare Electron window and no tray. A LaunchAgent now runs the router's own ClaudeRipple
+  bundle, the old login item is removed and an existing start-at-login moves over, and the
+  background bundle no longer changes on each install, so macOS stops announcing a new item.
+  Uninstall removes it.
+- **The mods' Agents pane draws every agent.** A 31-agent Workflow asked for a picture taller than
+  the 4096 px an Svg may be, and the engine refused the whole tree. A picture past the limit is now
+  tiled, a record missing a description, type or model renders by its id, and a judge pick without
+  a label no longer throws. If drawing still fails, the pane shows a plain list of the last 40
+  agents with the reason instead of the engine's blank page.
+- **A Workflow agent shows the model it actually runs on.** One Workflow ran 31 Sol workers while
+  the task list said Opus 5.5 for all of them, and every later turn lost the marker it was routed
+  by. The spawn hook now gives such an agent the worker's model, so it shows as Sol and routes by
+  model name each turn; `ripple:auto`'s Workflow note says the model goes in `agentType`.
+- **A model named while a turn runs counts, and the notice waits.** A prompt typed mid-turn is
+  absorbed into the running turn, so a model named in it was read as unnamed and the marker was
+  dropped. The mod now keeps the last two submitted prompts. The "not the model you named" notice
+  also used to appear before the tier picked, sometimes naming the very model that then ran; it now
+  waits for the pick and stays silent when they match.
+- **Small labels say what they do.** The model picker's effort tag read as a button that sets the
+  effort, and it now says the model accepts a reasoning-effort setting. The Google accounts button
+  says it adds an account, as the other panels do.
+
+## 0.12.12 — 2026-10-23
+
+### Fixed
+
+- **A worker added while a session sat idle can be spawned there.** Claude Code missed an agent
+  file written in the last 30 s of a session's idle polling, and `/clear` kept the old list, so
+  the session answered "Agent type not found" for good. The router touches the generated agent
+  files again 45 s after it writes or removes one, which makes every session reread them.
+- **A Claude app session cleared with `/clear` lists once on the phone.** The conversation before
+  the clear no longer shows beside the live one.
+
+## 0.12.11 — 2026-10-23
+
+### Added
+
+- **The Code tab's own panels reach the phone.** A Claude app session's task list shows above the
+  phone's composer, its closing box shows the recap, the question and reply buttons that answer
+  it, and its chapters divide the conversation. Needs Ripple Remote 1.0.4.
+- **A question waits for you.** When a Claude app turn ends on a question, the push says an answer
+  is needed (the question itself stays in the encrypted part), and the session moves to "needs
+  input". Sessions also carry the Claude app's own status line.
+- **A session's changes from the phone.** The host answers what changed in a session's folder:
+  uncommitted work, or the branch against its base. Read-only git; no configured program runs.
+- **Background workers open from the dock.** A background agent's task names its log, so the
+  phone can open its conversation.
+
+### Fixed
+
+- **Windows: an update no longer leaves Claude without a router** (#80, #62). A start counts only
+  once the router's process is up; when the scheduled task brings none, the router is started
+  directly and the CLI says so. `install.ps1`/`install.sh` exit non-zero over a failed setup, and
+  the tray's Electron fetch finds the Node running it.
+- **Remote Control questions are questions** (#82). AskUserQuestion and plan approvals from a
+  Claude app session card as they do for the host's own sessions, the answers go back, and a
+  request already answered never cards again.
+- **The phone sees a Claude app turn sooner.** A send shows the session running at once, and the
+  transcript is read on file change rather than every 3 s.
+
+## 0.12.10 — 2026-10-23
+
+### Added
+
+- **The phone's queue lives on your computer.** A message queued on the phone while a turn runs is
+  handed to the host, which sends it when the turn ends, even with the phone locked in a pocket.
+  Before, the app held it and sent nothing until it was opened again. Needs Ripple Remote 1.0.3.
+- **The Claude app shows what the phone queued.** While a chat has queued messages, a slim strip
+  over the ClaudeRipple band shows how many, the first one, and that they go when the turn ends.
+
+### Fixed
+
+- **A model named in a quoted reply counts.** The Claude app sends a reply that quotes a message
+  with a `<!-- reply -->` comment first; that message was read as a notice, so a model named in it
+  was ignored.
+
+## 0.12.9 — 2026-10-22
+
+### Fixed
+
+- **A session can no longer pick a model you didn't ask for.** Naming a model on `ripple:auto`,
+  calling a worker agent directly or giving `general-purpose` a model now counts only when you named
+  that model in your last messages (or approved an answer that did). Otherwise ClaudeRipple says so
+  and sends the task by its tier.
+- **The domain comes from the session, not a guess.** A tier marker can say `ui` or `backend`
+  (`[[ripple: standard ui]]`); without it the task uses the general ladder. The judge no longer
+  rates tiered tasks in the background, so they start without waiting for it.
+- **A domain ladder's "light work" row is for easy work only.** Ordinary work now takes the
+  "heavy work" row with the hard work, so "easy design on Sonnet, the rest on Opus" does what it
+  says. Saved settings carry over.
+
+## 0.12.8 — 2026-10-22
+
+### Fixed
+
+- **A Workflow script's agents go to the worker their marker names.** Claude Code wraps a workflow
+  agent's prompt in a harness frame, so a `[[ripple: gemini-3-8-flash@high]]` on the script's first
+  line was no longer at the top of a message and every agent ran on the session's model. The router
+  now reads the marker from the first line under that frame.
+
+## 0.12.7 — 2026-10-22
 
 ### Fixed
 

@@ -7,6 +7,34 @@ import path from "node:path";
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cr-settings-"));
 process.env.CLAUDE_SETTINGS_PATH = path.join(dir, "settings.json");
 const { applyProxyEnv, checkProxyEnv, removeProxyEnv, currentProxyEnv, syncModelSlots } = await import("../src/settings.ts");
+process.on("exit", () => fs.rmSync(dir, { recursive: true, force: true }));
+
+test("uninstall removes only model values recorded as ours, preserving user changes", () => {
+  const file = process.env.CLAUDE_SETTINGS_PATH!;
+  fs.writeFileSync(file, JSON.stringify({ env: { ANTHROPIC_MODEL: "user-main" } }));
+  applyProxyEnv({ proxyUrl: "http://127.0.0.1:8791", caPath: path.join(dir, "ca.pem"), force: false, models: { main: "user-main", smallFast: "ours", subagent: "ours-worker" } });
+  const settings = JSON.parse(fs.readFileSync(file, "utf8"));
+  settings.env.CLAUDE_CODE_SUBAGENT_MODEL = "user-worker";
+  fs.writeFileSync(file, JSON.stringify(settings));
+  removeProxyEnv({ proxyUrl: "http://127.0.0.1:8791", caPath: path.join(dir, "ca.pem") });
+  assert.deepEqual(JSON.parse(fs.readFileSync(file, "utf8")).env, { ANTHROPIC_MODEL: "user-main", CLAUDE_CODE_SUBAGENT_MODEL: "user-worker" });
+});
+
+test("install/update preserves direct.json and does not rewrite settings", () => {
+  const file = process.env.CLAUDE_SETTINGS_PATH!;
+  const original = JSON.stringify({ env: { KEEP: "1" } });
+  fs.writeFileSync(file, original);
+  const saved = path.join(dir, "direct.json");
+  fs.writeFileSync(saved, JSON.stringify({ at: "now", cli: {}, desktop: null }));
+  try {
+    const edit = applyProxyEnv({ proxyUrl: "http://127.0.0.1:8791", caPath: path.join(dir, "ca.pem"), force: false, models: { main: "routed" }, respectDirect: true });
+    assert.equal(edit.changed, false);
+    assert.equal(fs.readFileSync(file, "utf8"), original);
+    assert.ok(fs.existsSync(saved));
+  } finally {
+    fs.rmSync(saved);
+  }
+});
 
 test("applyProxyEnv adds keys, backs up, preserves other settings; remove restores", () => {
   const file = process.env.CLAUDE_SETTINGS_PATH!;

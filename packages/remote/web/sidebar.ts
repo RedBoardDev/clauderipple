@@ -50,12 +50,13 @@ export type SessionGroup = "input" | "failed" | "review" | "working" | "done";
 export const GROUP_ORDER: readonly SessionGroup[] = ["input", "failed", "review", "working", "done"];
 
 /**
- * The bucket a session belongs to. A permission request (open or waiting) outranks everything; the
- * last turn's error outranks a lingering finished flag; a turn that finished and nobody has looked
- * at yet (its `attention`) is 검토 대기; running/starting/background is 작업 중; the rest is 완료.
+ * The bucket a session belongs to. A permission request (open or waiting) or a Claude app turn that
+ * stopped on a question outranks everything — both need the person's input; the last turn's error
+ * outranks a lingering finished flag; a turn that finished and nobody has looked at yet (its
+ * `attention`) is 검토 대기; running/starting/background is 작업 중; the rest is 완료.
  */
 export function sessionGroup(s: SessionSummary): SessionGroup {
-  if (s.pending > 0 || s.state === "waiting") return "input";
+  if (s.pending > 0 || s.state === "waiting" || s.attention?.reason === "question") return "input";
   if (s.state === "error") return "failed";
   if (s.attention?.reason === "finished") return "review";
   if (s.state === "running" || s.state === "starting" || s.background) return "working";

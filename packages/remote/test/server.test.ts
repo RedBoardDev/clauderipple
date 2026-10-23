@@ -17,6 +17,7 @@ import type { ServerOptions } from "../src/server.ts";
 import { VISIBLE_MS } from "../src/push.ts";
 import { Sessions } from "../src/sessions.ts";
 import type { QueryFn, SdkUserMessage } from "../src/sessions.ts";
+import { bridgeFixture, bridgeId, tick } from "./bridge-fixture.ts";
 
 const webDir = fileURLToPath(new URL("../web", import.meta.url));
 const token = "remote-test-token-not-a-real-pairing-token";
@@ -115,7 +116,7 @@ class Peer {
   }
 }
 
-async function fixture(t: TestContext, extra: Partial<ServerOptions> = {}, desktopProjects?: string, desktopProcesses?: () => string) {
+async function fixture(t: TestContext, extra: Partial<ServerOptions> = {}, desktopProjects?: string, desktopProcesses?: () => string, queryFn?: QueryFn) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ripple-server-"));
   const cwd = path.join(dir, "project");
   fs.mkdirSync(cwd);
@@ -125,7 +126,7 @@ async function fixture(t: TestContext, extra: Partial<ServerOptions> = {}, deskt
   const diagnostics: string[] = [];
   let server: HostServer | undefined;
   let closing = false;
-  const sessions = new Sessions({ dir, router, permissions, queryFn: fake.queryFn, coalesceMs: 5, ...(desktopProjects ? { desktopProjects, desktopProcesses: desktopProcesses ?? (() => ""), ...(extra.now ? { now: extra.now } : {}) } : {}),
+  const sessions = new Sessions({ dir, router, permissions, queryFn: queryFn ?? fake.queryFn, coalesceMs: 5, ...(desktopProjects ? { desktopProjects, desktopProcesses: desktopProcesses ?? (() => ""), ...(extra.now ? { now: extra.now } : {}) } : {}),
     onEvent: session => { if (!closing) server?.onEvent(session); },
     onSessions: () => { if (!closing) server?.onSessions(); },
   });
@@ -183,6 +184,88 @@ test("attachment upload is chunked, checks offsets, and sends image blocks", asy
   assert.deepEqual(f.fake.users[1]!.message.content, [{ type: 'text', text: 'look' }, { type: 'image', source: { type: 'base64', media_type: 'image/png', data } }]);
 });
 
+test("Stop holds the queue before the result arrives and its late control reply cannot stop a newer query", async t => {
+  const endTurn = Promise.withResolvers<void>();
+  const interruptReply = Promise.withResolvers<void>();
+  const secondTurn = Promise.withResolvers<void>();
+  const users: string[] = [];
+  const closed: number[] = [];
+  let queries = 0;
+  const queryFn: QueryFn = params => {
+    const generation = ++queries;
+    return {
+      async *[Symbol.asyncIterator]() {
+        for await (const user of params.prompt) {
+          users.push(String(user.message.content));
+          yield { type: "system", subtype: "init", session_id: "sdk-stop" };
+          await (generation === 1 ? endTurn.promise : secondTurn.promise);
+          yield { type: "result", subtype: "success" };
+        }
+      },
+      interrupt: async () => { endTurn.resolve(); await interruptReply.promise; },
+      setModel: async () => {}, setPermissionMode: async () => {},
+      close: () => { closed.push(generation); },
+    };
+  };
+  const f = await fixture(t, {}, undefined, undefined, queryFn);
+  const id = await f.sessions.create({ clientMsgId: "stop-create", cwd: f.cwd, model: "test", effort: null, text: "first" });
+  await waitFor(() => users.length === 1);
+  f.sessions.enqueue(id, "queued-after-stop", "must remain queued");
+  const peer = await f.auth();
+  peer.send({ t: "interrupt", session: id, reqId: "stop" });
+  await waitFor(() => f.sessions.summaryOf(id)?.state === "idle");
+  assert.equal(f.sessions.summaryOf(id)?.queueHeld, true, "the result could not drain the queue before the interrupt reply");
+  assert.deepEqual(users, ["first"]);
+  peer.send({ t: "send", session: id, clientMsgId: "new-query", text: "replacement" });
+  await peer.take("ack", m => m.clientMsgId === "new-query");
+  await waitFor(() => users.length === 2);
+  interruptReply.resolve();
+  assert.equal((await peer.take("res", m => m.reqId === "stop")).msg.ok, true);
+  assert.deepEqual(closed, [1], "the late completion never closes generation two");
+  assert.equal(f.sessions.summaryOf(id)?.state, "running");
+  assert.deepEqual(users, ["first", "replacement"]);
+  f.sessions.holdQueue(id);
+  secondTurn.resolve();
+  await waitFor(() => f.sessions.summaryOf(id)?.state === "idle");
+});
+
+test("worker text and images use the existing session-scoped blob operation for host and desktop logs", async t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "worker-blob-wire-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const project = path.join(root, "project");
+  const desktopId = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+  const workers = path.join(project, desktopId, "subagents");
+  fs.mkdirSync(workers, { recursive: true });
+  const text = "worker body ".repeat(4000);
+  const image = Buffer.from("worker image").toString("base64");
+  fs.writeFileSync(path.join(project, `${desktopId}.jsonl`), JSON.stringify({ type: "user", cwd: project, message: { content: "parent" } }) + "\n");
+  fs.writeFileSync(path.join(workers, "agent-worker.meta.json"), JSON.stringify({ toolUseId: "tool-worker" }));
+  fs.writeFileSync(path.join(workers, "agent-worker.jsonl"), JSON.stringify({ type: "assistant", isSidechain: true, message: { model: "worker", content: [
+    { type: "text", text }, { type: "image", source: { type: "base64", media_type: "image/png", data: image } },
+  ] } }) + "\n");
+  const f = await fixture(t, {}, root);
+  const hostId = await f.create();
+  const hostWorker = f.sessions.subLog(hostId, "sub-tool-worker")!;
+  hostWorker.append({ kind: "assistant", msg: "host-worker", model: "worker", text, tools: [], images: [{ type: "image", blob: hostWorker.image(image), mediaType: "image/png" }] });
+  const peer = await f.auth();
+  for (const session of [hostId, desktopId]) {
+    peer.send({ t: "req", reqId: `sub-${session}`, op: { op: "sub", session, sub: "sub-tool-worker" } });
+    const page = (await peer.take("res", m => m.reqId === `sub-${session}`)).msg;
+    assert.ok(page.ok);
+    const event = (page.data as { events: SessionEvent[] }).events.find(e => e.kind === "assistant");
+    assert.ok(event?.kind === "assistant" && typeof event.text !== "string");
+    for (const [blob, expected] of [[event.text.blob, text], [event.images![0]!.blob!, image]]) {
+      peer.send({ t: "req", reqId: blob!, op: { op: "blob", session, id: blob! } });
+      const response = (await peer.take("res", m => m.reqId === blob)).msg;
+      assert.ok(response.ok);
+      assert.equal((response.data as BlobChunk).text, expected);
+    }
+    const foreign = session === hostId ? desktopId : hostId;
+    peer.send({ t: "req", reqId: `foreign-${session}`, op: { op: "blob", session: foreign, id: event.text.blob } });
+    assert.equal((await peer.take("res", m => m.reqId === `foreign-${session}`)).msg.ok, false, "another session's worker is not searched");
+  }
+});
+
 test("set_mode returns correlated success/error and broadcasts the mode event", async t => {
   const f = await fixture(t);
   const id = await f.create();
@@ -194,6 +277,38 @@ test("set_mode returns correlated success/error and broadcasts the mode event", 
   await peer.take('events', m => m.events.some(e => e.kind === 'mode' && e.mode === 'plan'));
   peer.send({ t: 'set_mode', reqId: 'mode-error', sessionId: 'missing', mode: 'auto' });
   assert.equal((await peer.take('res', m => m.reqId === 'mode-error')).msg.ok, false);
+});
+
+test("queued desktop sends catch a one-second idle gap with no phone and no full or network poll", async t => {
+  t.mock.timers.enable({ apis: ["setInterval"] });
+  const f = bridgeFixture(t);
+  f.registry.get(bridgeId)!.status = "busy";
+  f.status("running");
+  await f.sessions.pollDesktop();
+  f.sessions.enqueue(bridgeId, "short-idle", "send in the idle gap");
+  f.sessions.enqueue(bridgeId, "next-idle", "wait for my own turn too");
+  const reads = f.stateReads();
+  const server = new HostServer({ listen: "127.0.0.1", port: 0, token, webDir, sessions: f.sessions, router,
+    hostName: "fixture", version: "fixture", recentCli: async () => [],
+  });
+  await server.listen();
+  t.after(() => server.close());
+  t.mock.timers.tick(1000);
+  await tick();
+  assert.equal(f.posts.length, 0);
+  f.registry.get(bridgeId)!.status = "idle";
+  // Still "running" in the Remote Control cache: only the local registry sees this brief gap.
+  t.mock.timers.tick(1000);
+  await tick(); await tick();
+  assert.equal(f.posts.length, 1, "the queued send did not wait for a phone or a 3/15-second poll");
+  assert.equal(f.stateReads(), reads, "the queue tick made no Remote Control state request");
+  assert.equal(f.sessions.summaryOf(bridgeId)?.queue?.[0]?.id, "next-idle");
+  assert.ok(f.posts[0] && JSON.stringify(f.posts[0]).includes("send in the idle gap"));
+  assert.equal(f.sessions.summaryOf(bridgeId)?.state, "running");
+  // A stale idle registry cannot immediately send the next queued item before this turn answers.
+  f.sessions.pollQueued();
+  await tick();
+  assert.equal(f.posts.length, 1);
 });
 
 test("desktop polling runs on its own timer with no phone connected, so completion is detected", { timeout: 15_000 }, async t => {
@@ -323,7 +438,8 @@ test("hello denies and closes a wrong token, and returns ready with sessions for
   const right = await f.connect();
   right.send({ t: "hello", token, clientId: "right-client" });
   const ready = (await right.take("ready")).msg;
-  assert.deepEqual(ready.host, { name: "test-host", version: "test-version", routerOk: true });
+  // `queue`: this host keeps what the phone queues, so the app hands it over instead of holding it.
+  assert.deepEqual(ready.host, { name: "test-host", version: "test-version", routerOk: true, queue: true });
   assert.deepEqual(ready.sessions, f.sessions.list());
   assert.equal(ready.sessions[0]?.id, id);
 });

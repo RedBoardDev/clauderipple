@@ -7,7 +7,8 @@ import path from "node:path";
 import { EventLog } from "./eventlog.ts";
 import { creationDateToFileTime, parseFileTime, processCommands, processSnapshot, sameFileTime, type ProcessSnapshot } from "./processes.ts";
 import { messageContent, sendUserFileImages, type ImageSink } from "./images.ts";
-import { PERMISSION_MODES, type BackgroundTask, type EventBody, type Figures, type PermissionMode, type SessionSummary, type ToolCall } from "./protocol.ts";
+import { PERMISSION_MODES, type BackgroundTask, type EventBody, type Figures, type PermissionMode, type PlanStep, type SessionSummary, type ToolCall } from "./protocol.ts";
+import { WRAP_TOOL, wrapUpFields, type WrapUpFields } from "./wrap-up.ts";
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const WINDOW = 256 * 1024;
@@ -16,7 +17,7 @@ type RecordValue = Record<string, unknown>;
 type Summarize = (tool: string, input: RecordValue, cwd: string) => string;
 interface Source { file: string; size: number; mtime: number; unfinished: boolean; summary: SessionSummary }
 interface Imported { size: number; mtime: number; log: EventLog; dir: string }
-export interface DesktopProcess { sessionId: string; pid: number; status: "busy" | "shell" | "idle" | "waiting"; bridgeSessionId?: string }
+export interface DesktopProcess { sessionId: string; pid: number; status: "busy" | "shell" | "idle" | "waiting"; bridgeSessionId?: string; /** The folder the app's worker runs in, as its registry records it. */ cwd?: string }
 
 /**
  * pid → the start time `ps` reported for it. A pid's start time never changes while it lives, and
@@ -90,7 +91,7 @@ export function liveDesktopProcesses(dir: string, maxAgeMs = 1000, platform = pr
     if (!value || value.entrypoint !== "claude-desktop" || typeof value.sessionId !== "string" || !UUID.test(value.sessionId) || pid <= 1 || (value.pid !== undefined && value.pid !== pid)) continue;
     if (!["busy", "shell", "idle", "waiting"].includes(str(value.status))) continue;
     const status = value.status as DesktopProcess["status"];
-    candidates.push({ pid, procStart: value.procStart, entry: { sessionId: value.sessionId, pid, status, ...(typeof value.bridgeSessionId === "string" ? { bridgeSessionId: value.bridgeSessionId } : {}) } });
+    candidates.push({ pid, procStart: value.procStart, entry: { sessionId: value.sessionId, pid, status, ...(typeof value.bridgeSessionId === "string" ? { bridgeSessionId: value.bridgeSessionId } : {}), ...(typeof value.cwd === "string" && value.cwd ? { cwd: value.cwd } : {}) } });
   }
   if (!candidates.length) return result;
   const alive = platform === "win32" ? windowsAlive(processes) : darwinAlive();
@@ -148,11 +149,17 @@ function prompt(r: RecordValue): string {
   // CLI-generated command/context messages are not the person's first prompt.
   return /^(<local-command-|<command-name>|<system-reminder>|\[Request interrupted)/.test(body) ? "" : body;
 }
+/** A message the person themselves typed: a tool result, a task notification and the CLI's own
+ * housekeeping lines are not one, so they cannot close a turn's question or its recap. */
+function humanPrompt(r: RecordValue): string {
+  const body = prompt(r);
+  return body && !/^<task-notification>/.test(body) ? body : "";
+}
 function title(value: string): string { return value.trim().replace(/\s+/g, " ").slice(0, 160); }
 
 /** A subagent's running state while its parent transcript is converted; `input` lets a terminal
  * event re-resolve its model once its own transcript has written one. */
-export interface SubagentState { description: string; model: string | null; steps: number; input: RecordValue }
+export interface SubagentState { description: string; model: string | null; steps: number; bytes: number; input: RecordValue }
 /** How to convert one transcript. Omitting it is the top-level session: sidechain records are skipped
  * and no subagent events are produced. The sub pass reads a subagent's own transcript instead. */
 export interface SubagentContext {
@@ -162,7 +169,7 @@ export interface SubagentContext {
   state?: Map<string, SubagentState>;
   /** What a subagent's own transcript reports: the model that answered, its steps, its description
    * (meta.json), and whether it stopped on its own answer (`ended`). */
-  resolve?: (toolUseId: string, input: RecordValue) => { model: string | null; steps: number; description: string; ended: boolean };
+  resolve?: (toolUseId: string, input: RecordValue) => { model: string | null; steps: number; description: string; ended: boolean; bytes?: number };
 }
 
 /** Unknown records and malformed block shapes never become events. */
@@ -234,7 +241,7 @@ export function transcriptEvents(line: string, cwd: string, summarize: Summarize
       // Only a top-level worker opens its own log; sidechain records never carry their own subagent event.
       if (worker && !sidechain && state && resolve) {
         const info = resolve(b.id, input);
-        const running: SubagentState = { description: info.description || summary || str(input.subagent_type) || b.name, model: info.model, steps: info.steps, input };
+        const running: SubagentState = { description: info.description || summary || str(input.subagent_type) || b.name, model: info.model, steps: info.steps, bytes: info.bytes ?? 0, input };
         state.set(b.id, running);
         bodies.push({ kind: "subagent", toolUseId: b.id, sub: `sub-${b.id}`, description: running.description, model: running.model, status: "running", steps: running.steps });
       }
@@ -320,15 +327,53 @@ function withoutEffort(model: string): string {
   return model.replace(/@[^@]*$/, "");
 }
 
+/** The Code tab's own task-list tool; the app shows the list it keeps above the composer. */
+const PLAN_TOOL = "mcp__ccd_turn__update_plan";
+const PLAN_STEPS = 12;
+const PLAN_TEXT = 160;
+
+/** The task list after one accepted update_plan call, as the Claude app applies it (read from its
+ * bundle, 2026-10-23): `items` replaces the whole list; otherwise `done` and `start` (1-based) mark
+ * steps, and `advance` completes the step in progress and starts the next pending one. */
+export function nextPlan(steps: PlanStep[] | null, input: RecordValue): PlanStep[] | null {
+  if (Array.isArray(input.items)) {
+    const list = input.items.flatMap((value): PlanStep[] => {
+      const item = object(value);
+      const words = str(item?.content).trim().slice(0, PLAN_TEXT);
+      return words ? [{ text: words, status: item?.status === "completed" || item?.status === "in_progress" ? item.status : "pending" }] : [];
+    }).slice(0, PLAN_STEPS);
+    return list.length ? list : steps;
+  }
+  if (!steps) return null;
+  const next = steps.map(step => ({ ...step }));
+  const step = (n: unknown) => typeof n === "number" && Number.isInteger(n) && n >= 1 && n <= next.length ? next[n - 1] : undefined;
+  for (const n of Array.isArray(input.done) ? input.done : []) { const done = step(n); if (done) done.status = "completed"; }
+  const start = step(input.start);
+  if (start) start.status = "in_progress";
+  if (input.advance === true || input.advance === "true") {
+    const at = next.findIndex(s => s.status === "in_progress");
+    const current = next[at];
+    if (current) current.status = "completed";
+    const following = next.find((s, i) => i > at && s.status === "pending") ?? next.find(s => s.status === "pending");
+    if (following) following.status = "in_progress";
+  }
+  return next;
+}
+
 /** Top-level task lifecycle only; synchronous workers and nested subagents are not background tasks.
  * Also the main turn's start as the app counts it: the person's last message (origin "human"; compaction
- * summaries and task notifications are not), until the model ends its turn or the person interrupts. */
+ * summaries and task notifications are not), until the model ends its turn or the person interrupts,
+ * and that turn's task list, which the person's next message clears. */
 export class BackgroundTasks {
   private tools = new Map<string, { name: string; background: boolean; label: string }>();
   private active = new Map<string, BackgroundTask>();
   private terminal = new Set<string>();
+  /** update_plan calls waiting for their result: the app refuses a malformed one, which changes nothing. */
+  private planCalls = new Map<string, RecordValue>();
+  private steps: PlanStep[] | null = null;
   get count(): number { return this.active.size; }
   get list(): BackgroundTask[] { return Array.from(this.active.values()); }
+  get plan(): PlanStep[] { return this.steps ?? []; }
   turnStartedAt: number | null = null;
 
   accept(line: string): void {
@@ -336,7 +381,7 @@ export class BackgroundTasks {
     if (!r || r.isSidechain === true) return;
     const content = object(r.message)?.content;
     const at = typeof r.timestamp === "string" ? Date.parse(r.timestamp) : NaN;
-    if (r.type === "user" && object(r.origin)?.kind === "human" && Number.isFinite(at)) this.turnStartedAt = at;
+    if (r.type === "user" && object(r.origin)?.kind === "human" && Number.isFinite(at)) { this.turnStartedAt = at; this.steps = null; }
     else if (r.type === "user" && typeof content === "string" && /^\[Request interrupted/.test(content)) this.turnStartedAt = null;
     else if (r.type === "assistant" && Array.isArray(content) && !content.some(b => object(b)?.type === "tool_use") &&
       ["end_turn", "stop_sequence"].includes(str(object(r.message)?.stop_reason))) this.turnStartedAt = null;
@@ -357,6 +402,14 @@ export class BackgroundTasks {
         if (["Agent", "Task", "Bash"].includes(name)) this.tools.set(b.id, { name, background: input?.run_in_background === true, label: str(input?.description) || str(input?.command) || name });
         // A task stopped with TaskStop gets no notification at all (seen 2026-10-16: a shell "running" four hours).
         if (name === "TaskStop") this.tools.set(b.id, { name, background: false, label: str(input?.task_id) || str(input?.shell_id) });
+        if (name === PLAN_TOOL && input) this.planCalls.set(b.id, input);
+      }
+      const planCall = r.type === "user" && b?.type === "tool_result" ? str(b.tool_use_id) : "";
+      const plan = this.planCalls.get(planCall);
+      if (plan) {
+        this.planCalls.delete(planCall);
+        if (b?.is_error !== true) this.steps = nextPlan(this.steps, plan);
+        continue;
       }
       if (r.type !== "user" || b?.type !== "tool_result" || b.is_error === true) continue;
       const tool = this.tools.get(str(b.tool_use_id));
@@ -374,7 +427,7 @@ export class BackgroundTasks {
       } else if (result?.isAsync === true || /(?:launched asynchronously|async(?: agent)? launched)/i.test(body)) {
         id = str(result?.agentId) || str(result?.taskId) || /(?:agentId|task[_ -]?id):\s*([\w-]+)/i.exec(body)?.[1] || "";
       }
-      if (id && !this.terminal.has(id)) this.active.set(id, { id, kind: tool.name === "Bash" ? "shell" : "agent", label: tool.label, startedAt: Number.isFinite(at) ? at : null });
+      if (id && !this.terminal.has(id)) this.active.set(id, { id, kind: tool.name === "Bash" ? "shell" : "agent", label: tool.label, startedAt: Number.isFinite(at) ? at : null, ...(tool.name === "Bash" ? {} : { sub: `sub-${str(b.tool_use_id)}` }) });
       this.tools.delete(str(b.tool_use_id));
     }
   }
@@ -384,6 +437,9 @@ export class BackgroundTasks {
     this.terminal.add(id);
   }
 }
+
+/** A turn's wrap_up with its tool_use id, so one question is raised once however often it is read. */
+export interface TurnWrapUp extends WrapUpFields { key: string }
 
 export class DesktopSessions {
   private opts: DesktopOptions;
@@ -416,7 +472,7 @@ export class DesktopSessions {
       if (live?.bridgeSessionId) {
         const working = live.status === "busy" || live.status === "shell";
         const taskList = working ? this.backgroundTaskList(s.summary.id) : [];
-        s.summary = { ...s.summary, tasks: taskList.length, taskList, turnStartedAt: working ? this.turnStartedAt(s.summary.id) : null };
+        s.summary = { ...s.summary, tasks: taskList.length, taskList, turnStartedAt: working ? this.turnStartedAt(s.summary.id) : null, plan: working ? this.plan(s.summary.id) : [] };
       }
       const cached = this.imported.get(s.summary.id);
       return cached && cached.size === s.size && cached.mtime === s.mtime
@@ -427,7 +483,7 @@ export class DesktopSessions {
   poll(): boolean {
     const fingerprint = () => JSON.stringify(Array.from(this.sources.values())
       .filter(s => !this.opts.excluded().has(s.summary.id))
-      .map(s => [s.summary.id, s.summary.state, s.summary.updatedAt, s.summary.title, s.summary.tasks, s.summary.taskList?.map(t => t.id).join(), s.summary.turnStartedAt]));
+      .map(s => [s.summary.id, s.summary.state, s.summary.updatedAt, s.summary.title, s.summary.tasks, s.summary.taskList?.map(t => t.id).join(), s.summary.turnStartedAt, s.summary.plan]));
     const before = fingerprint();
     this.list();
     return before !== fingerprint();
@@ -447,6 +503,33 @@ export class DesktopSessions {
     return !!this.liveProcess(id) || processHasSession(this.opts.processes?.() ?? processCommands(), id);
   }
 
+  /** Watch the parent, not the inode: Desktop may replace the transcript. Reads still pass open()'s
+   * containment checks. Watch failure is optional acceleration only; callers keep polling. */
+  watch(id: string, changed: () => void, failed: (error: unknown) => void): (() => void) | null {
+    const source = this.sources.get(id);
+    if (!source) return null;
+    let watcher: fs.FSWatcher;
+    try {
+      watcher = fs.watch(path.dirname(source.file), { persistent: false }, (_event, filename) => {
+        if (filename === null || filename.toString() === path.basename(source.file)) changed();
+      });
+    } catch (error) { failed(error); return null; }
+    watcher.on("error", error => { watcher.close(); failed(error); });
+    return () => watcher.close();
+  }
+
+  /** Registry directory notifications are an optional queue wake-up, never a network poll. */
+  watchRegistry(changed: () => void, failed: (error: unknown) => void): (() => void) | null {
+    let watcher: fs.FSWatcher;
+    try {
+      watcher = fs.watch(path.join(path.dirname(this.projects), "sessions"), { persistent: false }, (_event, filename) => {
+        if (filename === null || /^\d+\.json$/.test(filename.toString())) changed();
+      });
+    } catch (error) { if (!missing(error)) failed(error); return null; }
+    watcher.on("error", error => { watcher.close(); failed(error); });
+    return () => watcher.close();
+  }
+
   /** Tail complete transcript lines into an existing host log; never write the transcript. */
   tail(id: string, offset: number, visit: (body: EventBody) => void, sink?: ImageSink): number {
     const source = this.sources.get(id);
@@ -461,14 +544,16 @@ export class DesktopSessions {
       const next = scanLines(fd, size, line => {
         for (const body of transcriptEvents(line, source.summary.cwd, this.opts.summarize, sink, { state, resolve }).bodies) visit(body);
       }, offset);
-      // A worker's meta file, which names its model, is often written just after the line that
-      // started it: say the model once it is known instead of only when the worker ends.
+      // Worker transcripts grow independently of the parent, even once their model is known.
       for (const [toolUseId, running] of state) {
-        if (running.model) continue;
         const info = resolve(toolUseId, running.input);
-        if (!info.model || info.ended) continue;
-        running.model = info.model;
-        visit({ kind: "subagent", toolUseId, sub: `sub-${toolUseId}`, description: running.description, model: running.model, status: "running", steps: info.steps });
+        const model = info.model ?? running.model;
+        if (model === running.model && info.steps === running.steps && (info.bytes ?? 0) === running.bytes && !info.ended) continue;
+        running.model = model;
+        running.steps = info.steps;
+        running.bytes = info.bytes ?? 0;
+        visit({ kind: "subagent", toolUseId, sub: `sub-${toolUseId}`, description: running.description, model, status: info.ended ? "done" : "running", steps: info.steps });
+        if (info.ended) state.delete(toolUseId);
       }
       return next;
     } finally { fs.closeSync(fd); }
@@ -486,6 +571,7 @@ export class DesktopSessions {
     return list.filter(task => task.kind !== "agent" || !agentEnded(path.join(dir, `agent-${task.id}.jsonl`)));
   }
   turnStartedAt(id: string): number | null { return this.scan(id)?.turnStartedAt ?? null; }
+  plan(id: string): PlanStep[] { return this.scan(id)?.plan ?? []; }
 
   /** A subagent transcript lives beside its session file: `<projects>/<proj>/<id>/subagents/agent-<agentId>.jsonl`. */
   private subagentsDir(source: Source): string {
@@ -517,10 +603,10 @@ export class DesktopSessions {
   }
 
   /** What a worker's own transcript reports, for its parent's subagent events. */
-  private subInfo(id: string, toolUseId: string, input: RecordValue): { model: string | null; steps: number; description: string; ended: boolean } {
+  private subInfo(id: string, toolUseId: string, input: RecordValue): { model: string | null; steps: number; description: string; ended: boolean; bytes?: number } {
     const source = this.sources.get(id);
     const agentId = source ? this.agentMap(id).get(toolUseId) : undefined;
-    let model = "", steps = 0, ended = false, description = "";
+    let model = "", steps = 0, ended = false, description = "", bytes = 0;
     if (source && agentId) {
       const dir = this.subagentsDir(source);
       const meta = record(safeRead(path.join(dir, `agent-${agentId}.meta.json`)));
@@ -532,18 +618,19 @@ export class DesktopSessions {
       model = read.model || model;
       steps = read.steps;
       ended = read.ended;
+      bytes = read.bytes;
     }
-    return { model: model || str(input.model) || null, steps, description, ended };
+    return { model: model || str(input.model) || null, steps, description, ended, bytes };
   }
 
   /** The model that answered (its last assistant record) and how far it got. Tail-bounded read. */
-  private readSubTranscript(file: string): { model: string; steps: number; ended: boolean } {
+  private readSubTranscript(file: string): { model: string; steps: number; ended: boolean; bytes: number } {
     let fd: number;
-    try { fd = this.openUnder(file); } catch { return { model: "", steps: 0, ended: false }; }
+    try { fd = this.openUnder(file); } catch { return { model: "", steps: 0, ended: false, bytes: 0 }; }
     try {
       let model = "", steps = 0;
       let last: RecordValue | null = null;
-      scanLines(fd, fs.fstatSync(fd).size, line => {
+      const bytes = scanLines(fd, fs.fstatSync(fd).size, line => {
         const r = record(line);
         if (!r) return;
         last = r;
@@ -558,7 +645,7 @@ export class DesktopSessions {
       const content = message?.content;
       const ended = ending?.type === "assistant" && ["end_turn", "stop_sequence"].includes(str(message?.stop_reason)) &&
         !(Array.isArray(content) && content.some(b => object(b)?.type === "tool_use"));
-      return { model, steps, ended };
+      return { model, steps, ended, bytes };
     } finally { fs.closeSync(fd); }
   }
 
@@ -584,6 +671,16 @@ export class DesktopSessions {
     const log = this.importSub(id, file, dir);
     this.subImports.set(key, { size: stat.size, mtime: stat.mtimeMs, log, dir });
     return log;
+  }
+
+  /** Blob ids in an opened worker page belong to that cached worker log, not the parent. */
+  workerBlob(id: string, blob: string): string | null {
+    for (const [key, cached] of this.subImports) {
+      if (!key.startsWith(`${id}::`)) continue;
+      const data = cached.log.blob(blob);
+      if (data !== null) return data;
+    }
+    return null;
   }
 
   private importSub(id: string, file: string, dir: string): EventLog {
@@ -641,6 +738,33 @@ export class DesktopSessions {
     } finally { fs.closeSync(fd); }
   }
 
+  /** The wrap_up a Claude app turn closed with, from the tail window: the last one the model made
+   * after the person's own last message. Null when that turn left none (or the window holds none),
+   * which is also what a window holding only the person's new message reads as. */
+  wrapUp(id: string): TurnWrapUp | null {
+    const source = this.sources.get(id);
+    if (!source) return null;
+    let fd: number;
+    try { fd = this.open(source.file); } catch (error) { if (missing(error)) return null; throw error; }
+    try {
+      let found: TurnWrapUp | null = null;
+      for (const line of windowLines(fd, fs.fstatSync(fd).size, true)) {
+        const r = record(line);
+        if (!r || r.isSidechain === true || r.isMeta === true) continue;
+        if (humanPrompt(r)) { found = null; continue; }
+        const content = object(r.message)?.content;
+        const blocks = Array.isArray(content) ? content : [];
+        for (const value of blocks) {
+          const block = object(value);
+          if (block?.type !== "tool_use" || block.name !== WRAP_TOOL) continue;
+          const input = object(block.input);
+          if (input) found = { ...wrapUpFields(input), key: str(block.id) || str(r.uuid) };
+        }
+      }
+      return found;
+    } finally { fs.closeSync(fd); }
+  }
+
   /** Private notification context from a bounded, read-only tail; never imports a session log. */
   pushContext(id: string): { text: string; error: string } {
     const source = this.sources.get(id);
@@ -670,13 +794,14 @@ export class DesktopSessions {
   permissionMode(id: string): PermissionMode | undefined { return this.sources.get(id)?.summary.permissionMode; }
 
   /** The transcript's current title (a Mac rename lands as a custom-title line), without liveness checks. Read-only. */
-  titleOf(id: string): string | null {
+  metadataOf(id: string): Pick<SessionSummary, "title" | "model"> | null {
     const source = this.sources.get(id);
     if (!source) return null;
     let stat: fs.Stats;
     try { stat = fs.lstatSync(source.file); } catch (error) { if (!missing(error)) throw error; return null; }
     if (!stat.isFile()) return null;
-    return this.readSummary(id, source.file, stat)?.summary.title ?? null;
+    const summary = this.readSummary(id, source.file, stat)?.summary;
+    return summary ? { title: summary.title, model: summary.model } : null;
   }
 
   continuation(id: string): { summary: SessionSummary; open: boolean } {
@@ -711,8 +836,13 @@ export class DesktopSessions {
       // the parent, is done: without this it would read "running" for good.
       for (const [toolUseId, running] of state) {
         const info = resolve(toolUseId, running.input);
-        if (info.ended) log.append({ kind: "subagent", toolUseId, sub: `sub-${toolUseId}`, description: running.description, model: info.model ?? running.model, status: "done", steps: info.steps });
+        if (info.ended) {
+          log.append({ kind: "subagent", toolUseId, sub: `sub-${toolUseId}`, description: running.description, model: info.model ?? running.model, status: "done", steps: info.steps });
+          state.delete(toolUseId);
+        }
       }
+      // An attached timeline starts tailing after this import, not from the worker's launch line.
+      this.tailSubs.set(id, state);
       importing = false;
       const figures = this.opts.figures?.(id);
       if (figures) log.append({ kind: "figures", figures });

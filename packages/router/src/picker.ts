@@ -14,6 +14,7 @@ import type { CliModel, Config } from "./config.ts";
 import { resolve } from "./routing.ts";
 import { clampEffort } from "./compat.ts";
 import { isJudgeOnlyModel } from "./model-policy.ts";
+import { chatgptModelWindow } from "./providers/chatgpt/windows.ts";
 
 export const BOOTSTRAP_PATHS = ["/edge-api/bootstrap", "/api/bootstrap"];
 
@@ -66,6 +67,10 @@ export function chatPickerModels(cfg: Config): CliModel[] {
   return cfg.cli.extraModels
     .filter(entry => !isJudgeOnlyModel(entry.model) && !isJudgeOnlyModel(resolve(entry.model, {}, cfg)?.model ?? cfg.aliases[entry.model.split("@")[0]!] ?? ""))
     .map(entry => {
+      // A ChatGPT-subscription model's window follows the live catalogue even over a value saved on
+      // the entry: config carried 272000 for 6.1 Sol while Codex runs 475000 (§4, 2026-10-23).
+      const live = chatgptModelWindow(cfg, entry.model);
+      if (live) return { ...entry, contextWindow: live };
       if (entry.contextWindow) return entry;
       const window = providerModelWindow(cfg, entry.model);
       return window ? { ...entry, contextWindow: window } : entry;
@@ -76,9 +81,12 @@ export function chatPickerModels(cfg: Config): CliModel[] {
  * The window a provider declared for `model` (its `/models` context length, or one set by hand),
  * by id without an `@effort` suffix or through an alias. A picker entry saved without a window of
  * its own used to fall to `cli.autoCompactWindow` although its provider knew better: a 1M MiniMax
- * subagent compacted twice at ~240K (2026-10-21).
+ * subagent compacted twice at ~240K (2026-10-21). A ChatGPT-subscription model answers from the
+ * live catalogue first, whatever its saved entries say (`chatgptModelWindow`, §4 2026-10-23).
  */
 export function providerModelWindow(cfg: Config, model: string): number | undefined {
+  const live = chatgptModelWindow(cfg, model);
+  if (live) return live;
   const base = model.split("@")[0]!;
   const ids = new Set([base, cfg.aliases[base] ?? base]);
   for (const provider of Object.values(cfg.providers)) {

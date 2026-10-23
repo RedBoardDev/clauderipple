@@ -120,7 +120,7 @@ export async function directOff(deps: RecoveryDeps, opts: { force?: boolean } = 
   const saved = readState(home);
   // No direct.json (it was removed, or Claude was taken off by hand): what `install` and
   // `picker on` would have written is the closest thing to "exactly as before".
-  const cli: Record<string, string> = saved?.cli ?? {
+  const cli: Record<string, string> = saved ? { ...saved.cli, ...(saved.cli.HTTPS_PROXY ? { HTTPS_PROXY: proxyUrl } : {}) } : {
     HTTPS_PROXY: proxyUrl,
     NODE_EXTRA_CA_CERTS: certPaths(home).caPem,
     ...Object.fromEntries(Object.entries(MODEL_SLOT_ENV).flatMap(([slot, name]) => {
@@ -128,7 +128,7 @@ export async function directOff(deps: RecoveryDeps, opts: { force?: boolean } = 
       return model ? [[name, model]] : [];
     })),
   };
-  const desktopUrl = saved ? saved.desktop?.egressProxyUrl ?? null : cfg.picker?.enabled ? proxyUrl : null;
+  const desktopUrl = (saved ? saved.desktop : cfg.picker?.enabled) ? proxyUrl : null;
   const fail = (detail: string): DirectResult => ({ ok: false, mode: currentMode(home), restartClaude: true, detail });
 
   // Something set since `direct on` is someone else's choice, and replacing it needs saying so.

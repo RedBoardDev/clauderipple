@@ -20,6 +20,8 @@ import { chOf } from './theme.ts'
 export const CELL_PX = 7.917
 /** One desktop row (the host's line height), px. */
 export const ROW_PX = 19
+/** The most an Svg may be a side, px: past it the engine refuses the whole tree and draws its own. */
+export const SVG_MAX_PX = 4096
 
 // ---- Colours ------------------------------------------------------------------------------------
 

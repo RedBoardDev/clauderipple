@@ -24,7 +24,7 @@ import type { RenderNode } from 'claude-code'
 import type { Els } from './parts'
 import type { Face } from './ripple'
 import type { Frame } from './view'
-import { CELL_PX, CLOSE_PX, CONTROL_PX, ROW_PX, SWITCH_H, SWITCH_W, WELL_PX, labelPx } from './art'
+import { CELL_PX, CLOSE_PX, CONTROL_PX, ROW_PX, SVG_MAX_PX, SWITCH_H, SWITCH_W, WELL_PX, labelPx } from './art'
 import type { Glyph, PillLook, Sea, Tone } from './art'
 import { lookOf } from './look'
 import { chOf } from './theme'
@@ -86,6 +86,29 @@ export function lift(el: Els): RenderNode {
 export function pic(el: Els, key: string, source: string, alt: string, width: number, height: number): RenderNode {
   if (!('Svg' in el)) return ''
   const { Box, Svg } = el
+  if (width > SVG_MAX_PX || height > SVG_MAX_PX) {
+    // Crop the same drawing, not separately generated seas: gradients, corners and motion retain
+    // their original coordinates on either side of every join, in either skin and theme.
+    const root = /^<svg\b[^>]*>/.exec(source)?.[0]
+    const view = root && /viewBox="([^"]+)"/.exec(root)?.[1]?.trim().split(/\s+/).map(Number)
+    if (!root || !view || view.length !== 4 || !view.every(Number.isFinite)) throw new Error('A tiled picture needs an SVG viewBox')
+    const [vx, vy, vw, vh] = view as [number, number, number, number]
+    const rows: RenderNode[] = []
+    for (let y = 0; y < height; y += SVG_MAX_PX) {
+      const tileHeight = Math.min(SVG_MAX_PX, height - y)
+      const tiles: RenderNode[] = []
+      for (let x = 0; x < width; x += SVG_MAX_PX) {
+        const w = Math.min(SVG_MAX_PX, width - x)
+        const cropped = root.replace(/\bwidth="[^"]*"/, 'width="' + w + '"')
+          .replace(/\bheight="[^"]*"/, 'height="' + tileHeight + '"')
+          .replace(/viewBox="[^"]*"/, 'viewBox="' + [vx + x * vw / width, vy + y * vh / height, w * vw / width, tileHeight * vh / height].join(' ') + '"')
+        tiles.push(<Svg key={key + '-' + x + '-' + y} source={cropped + source.slice(root.length)} alt={x === 0 && y === 0 ? alt : ''} width={w} height={tileHeight} />)
+      }
+      rows.push(<Box key={'row-' + y} flexDirection="row" flexShrink={0} columnGap={0} alignItems="flex-start">{tiles}</Box>)
+    }
+    // Let images supply the pixel heights directly. Rounding a tile to host rows leaves seams.
+    return <Box key={'pic-' + key} flexDirection="column" flexShrink={0} rowGap={0} alignItems="flex-start">{rows}</Box>
+  }
   return (
     <Box key={'pic-' + key} flexShrink={0} alignItems="center">
       <Svg source={source} alt={alt} width={width} height={height} />

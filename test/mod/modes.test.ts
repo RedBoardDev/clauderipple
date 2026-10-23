@@ -111,8 +111,9 @@ test('modes replace domain ladders as a whole and never inherit Base overrides',
   assert.equal(Object.hasOwn(s.modes[0]!, 'domainRules'), false)
   assert.equal(routingSettings(s).domainRules, undefined)
   const own = routingSettings({ ...s, activeMode: 'own' })
-  // The mode's own domain ladder is folded like Base's: the light pair holds one list.
-  assert.deepEqual(own.domainRules, { backend: { mode: 'ladder', rungs: { light: [{ target: haiku, effort: 'low' }], standard: [{ target: haiku, effort: 'low' }] } } })
+  // The mode's own domain ladder is folded like Base's: its one filled row runs every rung.
+  const h = [{ target: haiku, effort: 'low' }]
+  assert.deepEqual(own.domainRules, { backend: { mode: 'ladder', rungs: { light: h, standard: h, hard: h, plan: h } } })
   assert.equal(own.domainRules?.ui, undefined)
   assert.equal(routingSettings({ ...s, activeMode: undefined }).domainRules, s.domainRules)
   assert.deepEqual(normalizeSettings(JSON.parse(JSON.stringify(s))), s)
@@ -134,7 +135,7 @@ test('a mode\'s domain ladders fold into two levels, the general ladder of the m
     hard: [{ target: { agent: 'h' }, effort: 'high' }], plan: [{ target: { agent: 'p' }, effort: 'high' }],
   })
   assert.deepEqual(mode.domainRules!.ui!.rungs, {
-    light: [{ target: { agent: 'u' }, effort: 'low' }], standard: [{ target: { agent: 'u' }, effort: 'low' }],
+    light: [{ target: { agent: 'u' }, effort: 'low' }], standard: [{ target: { agent: 'uh' }, effort: 'high' }],
     hard: [{ target: { agent: 'uh' }, effort: 'high' }], plan: [{ target: { agent: 'uh' }, effort: 'high' }],
   })
 })

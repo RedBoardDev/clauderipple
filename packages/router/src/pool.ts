@@ -114,7 +114,7 @@ export function retryAfterMs(headers: Record<string, string | string[] | undefin
 }
 
 /** A single usable credential. `id` keys runtime health; `ownerId` identifies its durable account. */
-export type Credential = { id: string; headers: Record<string, string>; label?: string; ownerId?: string };
+export type Credential = { id: string; headers: Record<string, string>; label?: string; ownerId?: string; preferred?: boolean; paused?: boolean };
 
 type Health = { cooldownUntil: number; quarantined: boolean; failures: number };
 
@@ -125,6 +125,9 @@ export type CredentialReport = {
   /** Seconds until this credential is usable again; absent when it is ready or quarantined. */
   cooldownSeconds?: number;
   failures: number;
+  paused: boolean;
+  preferred: boolean;
+  inUse: boolean;
 };
 
 /**
@@ -134,8 +137,8 @@ export type CredentialReport = {
  */
 export class CredentialPool {
   private readonly health = new Map<string, Health>();
-  /** conversation → durable owner id (or runtime id when there is no owner), preserving its cache across token refreshes. */
-  private readonly sticky = new Map<string, { provider: string; ownerId: string; at: number }>();
+  /** (provider, conversation) → durable owner id (or runtime id), preserving each provider's cache. */
+  private readonly sticky = new Map<string, { ownerId: string; at: number }>();
   private readonly now: () => number;
   /** How long an idle conversation keeps its claim on a credential. */
   private readonly stickyTtlMs: number;
@@ -167,19 +170,21 @@ export class CredentialPool {
   pick(provider: string, credentials: readonly Credential[], conversation?: string): Credential | null {
     if (credentials.length === 0) return null;
     this.expireSticky();
+    const stickyKey = JSON.stringify([provider, conversation]);
     if (conversation) {
-      const held = this.sticky.get(conversation);
-      if (held && held.provider === provider) {
+      const held = this.sticky.get(stickyKey);
+      if (held) {
         const current = credentials.find((c) => (c.ownerId ?? c.id) === held.ownerId);
-        if (current && this.usable(provider, current.id)) {
+        if (current && !current.paused && this.usable(provider, current.id)) {
           held.at = this.now();
           return current;
         }
       }
     }
-    const next = credentials.find((c) => this.usable(provider, c.id));
+    const usable = (c: Credential): boolean => !c.paused && this.usable(provider, c.id);
+    const next = credentials.find((c) => c.preferred && usable(c)) ?? credentials.find(usable);
     if (!next) return null;
-    if (conversation) this.sticky.set(conversation, { provider, ownerId: next.ownerId ?? next.id, at: this.now() });
+    if (conversation) this.sticky.set(stickyKey, { ownerId: next.ownerId ?? next.id, at: this.now() });
     return next;
   }
 
@@ -189,7 +194,7 @@ export class CredentialPool {
    * its fallback instead of failing once per request until the window resets.
    */
   hasUsable(provider: string, credentials: readonly Credential[]): boolean {
-    return credentials.some((c) => this.usable(provider, c.id));
+    return credentials.some((c) => !c.paused && this.usable(provider, c.id));
   }
 
   /** Record a failure. Returns the verdict so the caller can decide whether to try the next one. */
@@ -223,9 +228,16 @@ export class CredentialPool {
     for (const key of [...this.health.keys()]) if (key.startsWith(`${provider}/`)) this.health.delete(key);
   }
 
+  /** Clear every token generation of one durable login, including a paused or expired one. */
+  clearOwner(provider: string, ownerId: string): void {
+    const prefix = `${this.key(provider, ownerId)}:`;
+    for (const key of this.health.keys()) if (key.startsWith(prefix)) this.health.delete(key);
+  }
+
   /** For the Health screen: why a credential is not being used, and for how long. */
   report(provider: string, credentials: readonly Credential[]): CredentialReport[] {
     const now = this.now();
+    const inUse = this.pick(provider, credentials)?.id;
     return credentials.map((c) => {
       const h = this.healthOf(provider, c.id);
       const cooling = !h.quarantined && h.cooldownUntil > now;
@@ -235,6 +247,9 @@ export class CredentialPool {
         state: h.quarantined ? "quarantined" : cooling ? "cooling" : "ready",
         ...(cooling ? { cooldownSeconds: Math.ceil((h.cooldownUntil - now) / 1000) } : {}),
         failures: h.failures,
+        paused: c.paused === true,
+        preferred: c.preferred === true,
+        inUse: c.id === inUse,
       };
     });
   }

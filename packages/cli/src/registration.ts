@@ -12,6 +12,7 @@ import * as launchd from "./launchd.ts";
 import * as schtasks from "./schtasks.ts";
 import * as systemd from "./systemd.ts";
 import type { Runtime } from "./runtime.ts";
+import { installKind } from "./update.ts";
 import type { AgentState } from "./supervisor.ts";
 
 export type Registration = {
@@ -42,7 +43,7 @@ export function writePaths(rt: Runtime, home: string): string {
   fs.mkdirSync(home, { recursive: true });
   fs.writeFileSync(
     file,
-    JSON.stringify({ node: rt.node, env: rt.env, cli: rt.cli, router: rt.router, hookScript: rt.hookScript, repo: rt.repo }, null, 2) + "\n",
+    JSON.stringify({ node: rt.node, env: rt.env, cli: rt.cli, router: rt.router, hookScript: rt.hookScript, repo: rt.repo, install: installKind(rt, { stateHome: home }) }, null, 2) + "\n",
   );
   return file;
 }

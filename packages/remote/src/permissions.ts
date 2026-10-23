@@ -33,11 +33,22 @@ export class PermissionQueue {
     this.expiredOnOpen = structuredClone(expired);
   }
 
+  /** Construct without reading or rewriting another host's pending requests before bind. */
+  static deferred(file: string, now: () => number = Date.now): PermissionQueue {
+    return new PermissionQueue(file, now, []);
+  }
+
   static open(file: string, now: () => number = Date.now): PermissionQueue {
+    const queue = PermissionQueue.deferred(file, now);
+    queue.open();
+    return queue;
+  }
+
+  open(): void {
     // A JSON array is the complete snapshot; malformed state is never an empty queue.
-    const saved = readJson<PermissionRecord[]>(file) ?? [];
+    const saved = readJson<PermissionRecord[]>(this.file) ?? [];
     if (!Array.isArray(saved)) throw new Error("Invalid permission queue");
-    const at = now();
+    const at = this.now();
     const expired: PermissionRecord[] = [];
     const records = new Map<string, PermissionRecord>();
     for (const record of saved) {
@@ -50,9 +61,8 @@ export class PermissionQueue {
       }
       records.set(record.id, record);
     }
-    const queue = new PermissionQueue(file, now, expired);
-    queue.persist(records, at);
-    return queue;
+    this.persist(records, at);
+    this.expiredOnOpen.push(...structuredClone(expired));
   }
 
   private persist(records: Map<string, PermissionRecord>, at: number): void {

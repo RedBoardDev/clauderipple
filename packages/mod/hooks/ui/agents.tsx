@@ -25,7 +25,7 @@ import type { RenderNode, SessionMessage } from 'claude-code'
 
 import type { AgentRec, Effort } from '../../types'
 import { bareTitle } from '../workers'
-import { CELL_PX, CONTROL_PX, METER_H, METER_W } from './art'
+import { CELL_PX, CONTROL_PX, METER_H, METER_W, SVG_MAX_PX } from './art'
 import { blank, capsule, pic, pill, press, ripple, rowsOf } from './kit'
 import { lookOf } from './look'
 import type { Look } from './look'
@@ -39,7 +39,7 @@ import { cachePercent, compactNumber, effortIndex, effortLabel, elapsed, modelNa
 
 // Every `by` a pick can carry: a missing one handed t() no key, which threw and left the whole pane
 // undrawn ("Nothing to show yet") once a worker ran on the session's model (2026-10-16).
-const BY: Record<NonNullable<AgentRec['pick']>['by'] | 'tier', string> = { haiku: 'settings.haiku', jev: 'settings.jev', model: 'agents.routerModel', marker: 'agents.marker', default: 'agents.default', session: 'agents.session', tier: 'toasts.yourPick' }
+const BY: Record<NonNullable<AgentRec['pick']>['by'], string> = { haiku: 'settings.haiku', jev: 'settings.jev', model: 'agents.routerModel', judge: 'settings.judge', marker: 'agents.marker', default: 'agents.default', session: 'agents.session', tier: 'toasts.yourPick' }
 
 /** Finished agents the list shows before "more". */
 export const DONE_SHOWN = 4
@@ -60,7 +60,7 @@ function live(agent: AgentRec): boolean {
 
 /** A title without the model tag the spawn put in front of it: the card names the model itself. */
 function titleOf(agent: AgentRec): string {
-  return bareTitle(agent.description)
+  return bareTitle(agent.description ?? '').trim() || agent.id
 }
 
 /** A model id without its `@effort`. */
@@ -73,7 +73,7 @@ export function modelOf(agent: AgentRec, lang: Frame['lang']): string {
   // A hosted id's vendor path ("deepseek-ai/") goes, as in the agent's title (workers.ts titleName).
   if (agent.answeredBy) return modelName(base(agent.answeredBy)).replace(/^.*\//, '')
   if (agent.model && agent.model !== 'inherit') return modelName(base(agent.model)).replace(/^.*\//, '')
-  return agent.pick ? targetLabel(agent.pick.target, lang) : agent.type
+  return agent.pick ? targetLabel(agent.pick.target, lang) : agent.type ?? ''
 }
 
 /** The effort it ran at: what its last step was sent at, else the pick's, else its model id's `@effort`. */
@@ -947,8 +947,36 @@ function openText(el: Els, frame: Frame, view: AgentsView, actions: AgentsAction
 
 // ---- The pane ----------------------------------------------------------------------------------
 
+/** Diagnostic rows must themselves survive the text that caused the original tree to be refused. */
+function diagnostic(text: string, max: number): string {
+  return JSON.stringify(cut(text, max)).slice(1, -1).replace(/[\x7f-\x9f\u{2800}\u{10eeee}\p{M}]/gu, char => '\\u{' + char.codePointAt(0)!.toString(16).toUpperCase() + '}')
+}
+
+/** The render boundary's last resort: no artwork, model metadata or conversation to fail again. */
+export function renderAgentsFallback(el: Els, frame: Frame, records: readonly AgentRec[], error: string, actions: AgentsActions & { close: () => void }, wasOpen: boolean): RenderNode {
+  const { Box, Text, Button } = el
+  const L = frame.lang
+  return (
+    <Box flexDirection="column" rowGap={1} width="100%">
+      <Box flexDirection="row" columnGap={2}>
+        <Text bold>{t(L, 'agents.title')}</Text>
+        {wasOpen ? textButton(el, 'back', t(L, 'agents.back'), actions.back, 'b') : null}
+        <Button key="close" plain role="dismiss" label={t(L, 'settings.close')} onPress={actions.close} />
+      </Box>
+      <Text dimColor wrap="truncate-end">{diagnostic(error, 240)}</Text>
+      {records.slice(-40).map((agent, i) => (
+        <Box key={'fallback-' + i} flexDirection="row" columnGap={1}>
+          <Text>{agent.state === 'running' ? '●' : agent.state === 'waiting' ? '◐' : agent.state === 'done' ? '✓' : '✕'}</Text>
+          <Text wrap="wrap">{diagnostic(agent.description ?? agent.id, 160)}</Text>
+          {textButton(el, 'fallback-open-' + i, t(L, 'agents.open'), () => actions.open(agent.id))}
+        </Box>
+      ))}
+    </Box>
+  )
+}
+
 /** The Agents pane body: the list, or one agent's conversation. */
-export function renderAgents(el: Els, frame: Frame, view: AgentsView, actions: AgentsActions): RenderNode {
+function agentsTree(el: Els, frame: Frame, view: AgentsView, actions: AgentsActions): RenderNode {
   const drawn = canDraw(el, frame)
   if (view.open) {
     const agent = view.agents.find(a => a.id === view.open!.id)
@@ -959,4 +987,36 @@ export function renderAgents(el: Els, frame: Frame, view: AgentsView, actions: A
   const running = view.agents.filter(live).sort((a, b) => a.startedAt - b.startedAt)
   const done = view.agents.filter(a => !live(a)).sort((a, b) => (b.endedAt ?? 0) - (a.endedAt ?? 0))
   return drawn ? listDrawn(el, frame, view, actions, running, done) : listText(el, frame, view, actions, running, done)
+}
+
+/**
+ * Check the engine's data-dependent cuts before returning: its FINAL tree validation can bypass a
+ * hook's .catch. Keep an invalid agent/conversation on our error path, not the engine placeholder.
+ * The static element/prop shapes remain the engine harness's responsibility.
+ */
+export function renderAgents(el: Els, frame: Frame, view: AgentsView, actions: AgentsActions): RenderNode {
+  const tree = agentsTree(el, frame, view, actions)
+  let nodes = 0
+  const text = (value: string) => {
+    if (/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f\ud800-\udfff\u{10eeee}]/u.test(value)) throw new Error('에이전트 내용에 표시할 수 없는 제어 문자가 있습니다.')
+    // The engine reserves a subset of combining marks for image cells; fail safely for this shape.
+    if (/^\p{M}|\u{2800}\p{M}/u.test(value)) throw new Error('에이전트 내용에 이미지 표시와 충돌하는 결합 문자가 있습니다.')
+  }
+  const visit = (node: RenderNode, depth: number): void => {
+    if (++nodes > 20_000 || depth > 32) throw new Error('에이전트 화면이 노드 20,000개 또는 중첩 깊이 32단계 제한을 초과했습니다.')
+    if (typeof node === 'string') { text(node); return }
+    if (node.type === 'Svg') {
+      if (node.props.source.length > 131_072) throw new Error('에이전트 이미지가 SVG 소스 131,072자 제한을 초과했습니다.')
+      for (const side of [node.props.width, node.props.height]) if (side !== undefined && (!Number.isFinite(side) || side <= 0 || side > SVG_MAX_PX)) throw new Error('에이전트 이미지의 가로·세로 크기는 0보다 크고 4,096픽셀 이하여야 합니다.')
+      text(node.props.alt)
+    }
+    if (node.type === 'Button') text(node.props.label)
+    if (node.type === 'Markdown') {
+      text(node.props.text)
+      if ((node.props.key?.length ?? 0) > 10_000) throw new Error('에이전트 대화의 식별자가 10,000자 제한을 초과했습니다.')
+    }
+    if ('children' in node) for (const child of node.children ?? []) visit(child, depth + 1)
+  }
+  visit(tree, 0)
+  return tree
 }

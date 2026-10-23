@@ -61,4 +61,3 @@ export const fileSymlinks = probeFileSymlinks();
 
 export const needsPosixPaths = posixPaths ? false : "needs POSIX path separators";
 export const needsPosixModes = posixModes ? false : "needs POSIX permission bits";
-export const needsFileSymlinks = fileSymlinks ? false : "needs permission to create file symlinks";

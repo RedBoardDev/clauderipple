@@ -17,6 +17,7 @@ import { RequestLog } from "../src/requestlog.ts";
 import { DEFAULTS, type Config } from "../src/config.ts";
 
 process.env.CODEX_HOME = fs.mkdtempSync(path.join(os.tmpdir(), "cr-ingress-gpt-codex-"));
+const noClaudeCodeCredentialReaders = { keychain: () => null, credentialsFile: () => null };
 const log = new Logger(null, 1e9, 0, false);
 const home = fs.mkdtempSync(path.join(os.tmpdir(), "cr-ingress-gpt-"));
 const requests = new RequestLog(path.join(home, "requests.jsonl"));
@@ -57,7 +58,7 @@ saveChatGptAccount(home, { accessToken: "tok-1", refreshToken: "rt-1", accountId
 saveChatGptAccount(home, { accessToken: "tok-2", refreshToken: "rt-2", accountId: "ws-2", expiresAt: Date.now() + 3_600_000 });
 const config: Config = { ...DEFAULTS, providers: { chatgpt: { type: "chatgpt", auth: "own", url: backendUrl } }, listen: { host: "127.0.0.1", port: 0, openaiPort: 0 } };
 let adapter = new ChatGptAdapter("chatgpt", config.providers.chatgpt as never, home, log, new CredentialPool());
-const ingress = new OpenAiIngress({ config: () => config, log, requests, home, chatgpt: () => adapter });
+const ingress = new OpenAiIngress({ config: () => config, log, requests, home, claudeCodeCredentialReaders: noClaudeCodeCredentialReaders, chatgpt: () => adapter });
 const port = await ingress.listen();
 
 function codexCall(pathname: string, body: Record<string, unknown> | undefined, session = "sess-1", extra: Record<string, string> = {}): Promise<{ status: number; text: string; headers: http.IncomingHttpHeaders }> {

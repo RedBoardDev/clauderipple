@@ -13,7 +13,7 @@ import type { GoogleAccountStatus } from "../src/providers/google/index.ts";
 import { RequestLog } from "../src/requestlog.ts";
 import { PRESETS } from "../src/presets.ts";
 import { saveClaudeAuthFile, saveClaudeOAuthFile } from "../src/providers/anthropic-token-file.ts";
-import { listClaudeAccounts, readClaudeAccountsFile, saveClaudeOAuthAccount } from "../src/providers/anthropic-accounts.ts";
+import { listClaudeAccounts, markClaudeAccountNeedsReauth, readClaudeAccountsFile, saveClaudeOAuthAccount, subjectHash } from "../src/providers/anthropic-accounts.ts";
 import { ObservedClaudeCodeAuth } from "../src/providers/anthropic-observed.ts";
 import type { ModOptions } from "../src/admin.ts";
 import type { ModSettingsSnapshot } from "../src/mod-settings.ts";
@@ -32,6 +32,8 @@ async function withAdmin(
   extraDeps: {
     agentDir?: string;
     credentials?: NonNullable<AdminDeps["credentials"]>;
+    clearCredentialCooldown?: NonNullable<AdminDeps["clearCredentialCooldown"]>;
+    claudeClearCooldown?: NonNullable<AdminDeps["claudeClearCooldown"]>;
     providerHealth?: NonNullable<AdminDeps["providerHealth"]>;
     shutdown?: () => void;
     runCli?: (args: string[], timeout?: number) => Promise<{ ok: boolean; output: string }>;
@@ -47,6 +49,7 @@ async function withAdmin(
     google?: NonNullable<AdminDeps["google"]>;
     opencodeUsage?: NonNullable<AdminDeps["opencodeUsage"]>;
     claudeUsage?: NonNullable<AdminDeps["claudeUsage"]>;
+    claudeIdentity?: NonNullable<AdminDeps["claudeIdentity"]>;
     googleOAuthFetch?: (url: string, init?: RequestInit) => Promise<Response>;
     googleOAuthPort?: number;
   } = {},
@@ -90,6 +93,89 @@ async function withAdmin(
 
 const base = () => `http://127.0.0.1`;
 
+for (const kind of ["chatgpt", "claude", "google"]) {
+  test(`${kind} account HTTP controls validate, persist one preference, pause, resume and clear cooldown`, async () => {
+    const cleared: string[] = [];
+    await withAdmin(makeCfg(), async ({ port, home }) => {
+      const chatgpt = await import("../src/providers/chatgpt/accounts.ts");
+      const google = await import("../src/providers/google/accounts.ts");
+      const add = (name: string): string => {
+        const grant = { accessToken: `test-${name}`, refreshToken: `test-refresh-${name}`, expiresAt: Date.now() + 3_600_000, accountId: name };
+        if (kind === "chatgpt") return chatgpt.saveChatGptAccount(home, grant).id;
+        if (kind === "google") return google.saveGoogleAccount(home, { ...grant, projectId: name, email: `${name}@example.test` }).id;
+        return saveClaudeOAuthAccount(home, grant).id;
+      };
+      const a = add("a");
+      const b = add("b");
+      const endpoint = `${base()}:${port}/api/${kind}-accounts`;
+      const patch = (id: string, body: unknown) => fetch(`${endpoint}/${id}`, { method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+      const rows = async () => (await (await fetch(endpoint)).json() as { accounts: { id: string; paused: boolean; preferred: boolean; inUse: boolean; state: string }[] }).accounts;
+      assert.equal((await patch(b, { preferred: true })).status, 200);
+      assert.equal((await rows()).find((row) => row.id === b)?.inUse, true);
+      assert.equal((await patch(a, { preferred: true })).status, 200);
+      assert.deepEqual((await rows()).filter((row) => row.preferred).map((row) => row.id), [a]);
+      assert.equal((await patch(b, { preferred: false })).status, 200);
+      assert.equal((await rows()).find((row) => row.id === a)?.preferred, true);
+      assert.equal((await patch(a, { paused: true, clearCooldown: true })).status, 200);
+      assert.deepEqual(cleared, [a]);
+      const paused = (await rows()).find((row) => row.id === a)!;
+      assert.equal(paused.paused, true);
+      assert.equal(paused.inUse, false);
+      assert.equal(paused.state, "paused");
+      assert.equal((await rows()).find((row) => row.id === b)?.inUse, true);
+      for (const invalid of [null, { preferred: "true" }, { paused: 1 }, { clearCooldown: false }]) assert.equal((await patch(a, invalid)).status, 400);
+      assert.equal((await patch(a, { paused: false })).status, 200);
+      assert.equal((await rows()).find((row) => row.id === a)?.inUse, true);
+      assert.equal((await patch(a, { preferred: false })).status, 200);
+      assert.equal((await rows()).some((row) => row.preferred), false);
+      assert.equal((await patch("00000000-0000-4000-8000-000000000000", { clearCooldown: true })).status, 404);
+    }, {
+      claudeClearCooldown: (id) => { cleared.push(id); },
+      chatgpt: () => ({ quota: {}, auth: {}, clearCooldown: (id) => { cleared.push(id); } }),
+      google: () => ({ accounts: () => ({}), clearCooldown: (id) => { cleared.push(id); } }),
+    });
+  });
+}
+
+test("PUT /api/config persists credential control flags and refuses invalid or duplicate preferences", async () => {
+  const cfg = makeCfg({ providers: { p: { type: "anthropic-compatible", url: "http://127.0.0.1:1", credentials: [{ id: "a", headers: {}, preferred: true, paused: true }] } } });
+  await withAdmin(cfg, async ({ port, configFile }) => {
+    const put = (value: unknown) => fetch(`${base()}:${port}/api/config`, { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify(value) });
+    assert.equal((await put(cfg)).status, 200);
+    const saved = fs.readFileSync(configFile, "utf8");
+    assert.deepEqual((JSON.parse(saved) as Config).providers, cfg.providers);
+    for (const credentials of [
+      [{ id: "a", headers: {}, preferred: "yes" }],
+      [{ id: "a", headers: {}, paused: 1 }],
+      [{ id: "a", headers: {}, preferred: true }, { id: "b", headers: {}, preferred: true }],
+    ]) {
+      assert.equal((await put({ ...cfg, providers: { p: { type: "openai-compatible", url: "http://127.0.0.1:1", credentials } } })).status, 400);
+      assert.equal(fs.readFileSync(configFile, "utf8"), saved, "invalid edits leave the stored config unchanged");
+    }
+  });
+});
+
+test("credential cooldown HTTP endpoint clears one key and status exposes all three control flags", async () => {
+  const { CredentialPool } = await import("../src/pool.ts");
+  const entries = [{ id: "default", headers: {}, preferred: true, paused: false }, { id: "b", headers: {}, paused: true }];
+  const pool = new CredentialPool();
+  pool.penalise("p", "default", 429, 60_000);
+  pool.penalise("p", "b", 401);
+  await withAdmin(makeCfg({ providers: { p: { type: "openai-compatible", url: "http://127.0.0.1:1", credentials: entries } } }), async ({ port }) => {
+    const url = `${base()}:${port}`;
+    const post = (body: unknown) => fetch(`${url}/api/credentials/clear-cooldown`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+    const status = async () => (await (await fetch(`${url}/api/status`)).json() as { credentials: Record<string, ReturnType<typeof pool.report>> });
+    assert.equal((await post({ provider: "p", id: "default" })).status, 200);
+    assert.deepEqual(pool.report("p", entries).map((row) => [row.state, row.paused, row.preferred, row.inUse]), [["ready", false, true, true], ["quarantined", true, false, false]]);
+    const result = await status();
+    assert.deepEqual(result.credentials, { p: pool.report("p", entries) });
+    assert.equal((await post({ provider: "p", id: "missing" })).status, 404);
+    assert.equal((await post({ provider: "missing", id: "default" })).status, 404);
+    assert.equal((await post({ provider: true, id: "default" })).status, 400);
+    assert.equal((await post(null)).status, 400);
+  }, { credentials: () => ({ p: pool.report("p", entries) }), clearCredentialCooldown: (provider, id) => pool.clear(provider, id) });
+});
+
 test("mod options and status expose runtime provider exhaustion and clear it on recovery", async () => {
   const { ProviderHealth, providerExhaustion } = await import('../src/health.ts');
   const health = new ProviderHealth();
@@ -108,6 +194,31 @@ test("mod options and status expose runtime provider exhaustion and clear it on 
     assert.equal(recovered.providers[0]?.usable, true);
     assert.equal(recovered.providers[0]?.reason, undefined);
   }, { providerHealth: () => health.snapshot(), modelScoresFetch: async () => new Response('{}') });
+});
+
+test("mod options count a stored Claude account as signed in when Claude Code's own login is not seen", async () => {
+  const cfg = makeCfg({ providers: { native: { type: "anthropic", auth: "claude-code" } } });
+  await withAdmin(cfg, async ({ port, home }) => {
+    const usable = async () => ((await (await fetch(`${base()}:${port}/api/mod-options`)).json()) as ModOptions).providers.find((p) => p.name === "native")?.usable;
+    // An access token already past its expiry still counts: the pool refreshes it before the turn.
+    const account = saveClaudeOAuthAccount(home, { accessToken: "mod-access", refreshToken: "mod-refresh", expiresAt: Date.now() - 1, accountId: "mod-account", email: "mod@example.test" });
+    assert.equal(await usable(), true);
+    markClaudeAccountNeedsReauth(home, account.id, "mod-refresh");
+    assert.equal(await usable(), false, "an account that must sign in again serves nothing");
+  }, { modelScoresFetch: async () => new Response("{}") });
+});
+
+test("mod options with a Claude account pool still follow the pool's own state", async () => {
+  const cfg = makeCfg({ providers: { native: { type: "anthropic", auth: "claude-code", accountPool: true } } });
+  let row = { id: "a", state: "ready", failures: 0, paused: false };
+  await withAdmin(cfg, async ({ port, home }) => {
+    const usable = async () => ((await (await fetch(`${base()}:${port}/api/mod-options`)).json()) as ModOptions).providers.find((p) => p.name === "native")?.usable;
+    // Expired but refreshable: the pool reports it ready, so the mod keeps the worker.
+    saveClaudeOAuthAccount(home, { accessToken: "pool-access", refreshToken: "pool-refresh", expiresAt: Date.now() - 1, accountId: "pool-account", email: "pool@example.test" });
+    assert.equal(await usable(), true);
+    row = { ...row, paused: true };
+    assert.equal(await usable(), false, "a paused pool serves nothing even with a stored account");
+  }, { credentials: () => ({ native: [row] }), modelScoresFetch: async () => new Response("{}") });
 });
 
 const putModSettings = (port: number, body: unknown) => fetch(`${base()}:${port}/api/mod-settings`, {
@@ -343,8 +454,8 @@ test("admin fills Base and mode domain ladders even when every general rung is a
       for (const rule of Object.values(set.domainRules!)) {
         assert.deepEqual(Object.keys(rule.rungs).sort(), ['hard', 'light', 'plan', 'standard']);
         assert.ok(Object.values(rule.rungs).every(steps => steps.length > 0));
-        // A domain ladder has two levels: the fill leaves each pair holding one list.
-        assert.deepEqual(rule.rungs.light, rule.rungs.standard);
+        // A domain ladder has two levels: the fill leaves heavy work (standard to plan) one list.
+        assert.deepEqual(rule.rungs.standard, rule.rungs.hard);
         assert.deepEqual(rule.rungs.hard, rule.rungs.plan);
       }
     }
@@ -367,9 +478,9 @@ test("admin folds a domain ladder into two levels and leaves the general ladder'
     const saved = await (await putModSettings(port, { settings: input, revision: 0 })).json() as ModSettingsSnapshot;
     // The general ladder keeps its four rungs.
     assert.deepEqual(saved.settings.rules.general.rungs, { light, standard, hard, plan });
-    // The domain ladder's pairs hold one list each: standard's for the light pair, plan's for the heavy one.
-    assert.deepEqual(saved.settings.domainRules!.ui!.rungs.light, standard);
-    assert.deepEqual(saved.settings.domainRules!.ui!.rungs.standard, standard);
+    // Light work keeps light's list; plan's runs everything from standard up.
+    assert.deepEqual(saved.settings.domainRules!.ui!.rungs.light, light);
+    assert.deepEqual(saved.settings.domainRules!.ui!.rungs.standard, plan);
     assert.deepEqual(saved.settings.domainRules!.ui!.rungs.hard, plan);
     assert.deepEqual(saved.settings.domainRules!.ui!.rungs.plan, plan);
   });
@@ -529,8 +640,8 @@ test("admin mod-options offers owned workers, every provider model, judge candid
     }, {
       agentDir: agents,
       chatgpt: () => ({ quota: { codex: null }, auth: { codex: "ok" }, refresh: async () => { refreshed++; return { at: Date.now(), ...full }; }, accounts: () => ({ codex: [
-        { id: "ready", label: "Ready", expiresAt: Date.now() + 10000, needsReauth: false, paused: false, source: "own", state: "ready", quota: { ...full, ...(credit ? { credits: { has_credits: true } } : {}) }, active: true },
-        { id: "paused", label: "Paused", expiresAt: Date.now() + 10000, needsReauth: false, paused: true, source: "own", state: "paused", quota: null, active: false },
+        { id: "ready", label: "Ready", expiresAt: Date.now() + 10000, needsReauth: false, paused: false, preferred: false, inUse: true, source: "own", state: "ready", quota: { ...full, ...(credit ? { credits: { has_credits: true } } : {}) }, active: true },
+        { id: "paused", label: "Paused", expiresAt: Date.now() + 10000, needsReauth: false, paused: true, preferred: false, inUse: false, source: "own", state: "paused", quota: null, active: false },
       ] }) }),
       modelScoresFetch: async () => Response.json({ source: "https://artificialanalysis.ai", attribution: "Data: Artificial Analysis (artificialanalysis.ai)", generatedAt: "2026-10-10T00:00:00Z", models: [{ slug: "gpt-6-1-sol-high", base: "gpt-6-1-sol", effort: "high", intelligence: 50.24, costPerTask: 0.3191 }] }),
     });
@@ -639,7 +750,7 @@ test("Claude account admin endpoints expose no secrets and rename or remove only
     assert.equal(listed.status, 200);
     const body = await listed.json() as { current: unknown; accounts: { id: string; label: string }[] };
     assert.equal(body.current, null);
-    assert.deepEqual(body.accounts, [{ id: account.id, label: "person@example.test", email: "person@example.test", expiresAt: account.expiresAt, needsReauth: false, preferred: false }]);
+    assert.deepEqual(body.accounts, [{ id: account.id, label: "person@example.test", email: "person@example.test", expiresAt: account.expiresAt, needsReauth: false, preferred: false, paused: false, state: "ready", inUse: true }]);
     assert.doesNotMatch(JSON.stringify(body), /admin-access-secret|admin-refresh-secret|upstream-account-secret/);
 
     const renamed = await fetch(`${base()}:${port}/api/claude-accounts/${encodeURIComponent(account.id)}`, {
@@ -672,6 +783,63 @@ test("Claude account admin endpoints expose no secrets and rename or remove only
     const missing = await fetch(`${base()}:${port}/api/claude-accounts/${encodeURIComponent(account.id)}`, { method: "DELETE" });
     assert.equal(missing.status, 404);
   });
+});
+
+test("/api/claude-accounts marks a stored copy of the current Claude login, by subject hash or by email", async () => {
+  const uuid = "current-login-uuid";
+  await withAdmin(makeCfg(), async ({ port, home }) => {
+    saveClaudeAuthFile(home, "current-login-token", "2026-10-23T00:00:00.000Z");
+    const sameByHash = saveClaudeOAuthAccount(home, {
+      accessToken: "pool-token-1", refreshToken: "pool-refresh-1", expiresAt: Date.now() + 3_600_000,
+      accountId: uuid, email: "some-label@example.test",
+    });
+    const sameByEmail = saveClaudeOAuthAccount(home, {
+      accessToken: "pool-token-2", refreshToken: "pool-refresh-2", expiresAt: Date.now() + 3_600_000,
+      email: "PERSON@example.test",
+    });
+    const other = saveClaudeOAuthAccount(home, {
+      accessToken: "pool-token-3", refreshToken: "pool-refresh-3", expiresAt: Date.now() + 3_600_000,
+      accountId: "someone-else", email: "person@example.test",
+    });
+    const body = await (await fetch(`${base()}:${port}/api/claude-accounts`)).json() as {
+      current: { email?: string }; accounts: { id: string; sameAsCurrent?: boolean }[];
+    };
+    assert.equal(body.current.email, "Person@Example.Test");
+    const byId = new Map(body.accounts.map((account) => [account.id, account]));
+    assert.equal(byId.get(sameByHash.id)?.sameAsCurrent, true, "the same upstream account, whatever its label");
+    assert.equal(byId.get(sameByEmail.id)?.sameAsCurrent, true, "no subject hash: the email decides, case-insensitively");
+    assert.equal(byId.get(other.id)?.sameAsCurrent, undefined, "another upstream account stays separate even with the same email");
+    assert.doesNotMatch(JSON.stringify(body), new RegExp(subjectHash(uuid)!), "the subject hash itself never reaches the GUI");
+    assert.doesNotMatch(JSON.stringify(body), /pool-token|pool-refresh/, "no token material either");
+  }, { claudeIdentity: async () => ({ email: "Person@Example.Test", subjectHash: subjectHash(uuid)! }) });
+});
+
+test("an unknown current identity leaves /api/claude-accounts exactly as it was", async () => {
+  await withAdmin(makeCfg(), async ({ port, home }) => {
+    saveClaudeAuthFile(home, "current-login-token");
+    const stored = saveClaudeOAuthAccount(home, {
+      accessToken: "pool-token", refreshToken: "pool-refresh", expiresAt: Date.now() + 3_600_000,
+      email: "person@example.test",
+    });
+    const body = await (await fetch(`${base()}:${port}/api/claude-accounts`)).json() as {
+      current: unknown; accounts: unknown[];
+    };
+    assert.deepEqual(body.current, { id: "current", label: "Current Claude login", source: "token-file", external: true, paused: false, preferred: false, state: "ready", inUse: true });
+    assert.deepEqual(body.accounts, [{ id: stored.id, label: "person@example.test", email: "person@example.test", expiresAt: stored.expiresAt, needsReauth: false, preferred: false, paused: false, state: "ready", inUse: false }]);
+    assert.doesNotMatch(JSON.stringify(body), /sameAsCurrent/);
+  }, { claudeIdentity: async () => null });
+});
+
+test("a failed identity lookup does not break /api/claude-accounts", async () => {
+  await withAdmin(makeCfg(), async ({ port, home }) => {
+    saveClaudeAuthFile(home, "current-login-token");
+    const res = await fetch(`${base()}:${port}/api/claude-accounts`);
+    assert.equal(res.status, 200);
+    const body = await res.json() as { current: { source?: string; email?: string }; accounts: unknown[] };
+    assert.equal(body.current.source, "token-file");
+    assert.equal(body.current.email, undefined);
+    assert.deepEqual(body.accounts, []);
+  }, { claudeIdentity: async () => { throw new Error("profile endpoint down"); } });
 });
 
 test("/readyz separates readiness from liveness and names each problem", async () => {
@@ -726,7 +894,7 @@ test("HEAD answers a read-only route with its headers and no body", async () => 
     assert.equal(headCss.headers.get("content-length"), getCss.headers.get("content-length"), "the length of the body a GET would have sent");
     // The body is the part a HEAD must not carry, and `fetch` never exposes one — read the wire.
     const wire = await new Promise<string>((done, fail) => {
-      const sock = net.connect(port, "127.0.0.1", () => sock.write("HEAD /style.css HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n"));
+      const sock = net.connect(port, "127.0.0.1", () => sock.write(`HEAD /style.css HTTP/1.1\r\nHost: 127.0.0.1:${port}\r\nConnection: close\r\n\r\n`));
       let text = "";
       sock.on("data", (chunk: Buffer) => { text += chunk.toString("latin1"); });
       sock.on("close", () => done(text));
@@ -918,6 +1086,47 @@ test("PUT /api/config accepts a valid config and saves it atomically", async () 
     const dir = fs.readdirSync(path.dirname(configFile));
     assert.ok(!dir.some((f) => f.includes(".tmp-")));
     setCfg(next);
+  });
+});
+
+test("config revisions prevent concurrent lost updates and detect external edits while legacy saves still work", async () => {
+  await withAdmin(makeCfg(), async ({ port, configFile, setCfg }) => {
+    type Snapshot = Config & { configRevision: string };
+    const url = `${base()}:${port}/api/config`;
+    const get = async () => (await (await fetch(url)).json()) as Snapshot;
+    const put = (body: unknown) => fetch(url, { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+    const firstWindow = await get();
+    const secondWindow = await get();
+    assert.match(firstWindow.configRevision, /^[a-f0-9]{64}$/);
+    assert.deepEqual(secondWindow, firstWindow);
+    const responses = await Promise.all([put({ ...firstWindow, autoUpdate: true }), put({ ...secondWindow, autoUpdate: false })]);
+    assert.deepEqual(responses.map(response => response.status).sort(), [200, 409]);
+    const saved = JSON.parse(fs.readFileSync(configFile, "utf8")) as Config;
+    const success = await responses.find(response => response.status === 200)!.json() as { ok: boolean; configRevision: string };
+    assert.equal(success.ok, true);
+    assert.notEqual(success.configRevision, firstWindow.configRevision);
+    assert.equal("configRevision" in saved, false, "revision metadata must not be persisted");
+    assert.deepEqual(await responses.find(response => response.status === 409)!.json(), { error: "config revision conflict", config: saved, configRevision: success.configRevision });
+    setCfg(saved); // Production's ConfigStore reloads the file on get().
+    assert.deepEqual(await get(), { ...saved, configRevision: success.configRevision });
+    const before = fs.readFileSync(configFile, "utf8");
+    assert.equal((await put(firstWindow)).status, 409);
+    assert.equal(fs.readFileSync(configFile, "utf8"), before);
+    for (const configRevision of [null, 0, {}, "", "invalid"]) {
+      assert.equal((await put({ ...saved, configRevision })).status, 400);
+      assert.equal(fs.readFileSync(configFile, "utf8"), before);
+    }
+    const fresh = await put({ ...await get(), autoUpdate: !saved.autoUpdate });
+    assert.equal(fresh.status, 200);
+    const { configRevision } = await fresh.json() as { configRevision: string };
+    const external = { ...saved, providers: { external: { type: "anthropic-compatible", url: "http://127.0.0.1:9" } } } satisfies Config;
+    fs.writeFileSync(configFile, JSON.stringify(external));
+    const conflict = await put({ ...saved, configRevision });
+    assert.equal(conflict.status, 409);
+    const current = await conflict.json() as { config: Config; configRevision: string };
+    assert.deepEqual(current.config, external);
+    assert.notEqual(current.configRevision, configRevision);
+    assert.equal((await put(external)).status, 200, "old clients may save without a revision");
   });
 });
 
@@ -1546,6 +1755,43 @@ test("POST /api/shutdown reports 501 when the router supplied no drain hook", as
   });
 });
 
+test("admin rejects rebinding Hosts and foreign write Origins but accepts dashboard and tray requests", async () => {
+  const cfg = makeCfg({ providers: { p: { type: "anthropic-compatible", url: "http://127.0.0.1:9", headers: { "x-api-key": "test-secret" } } } });
+  await withAdmin(cfg, async ({ port, configFile }) => {
+    const request = (method: string, pathname: string, host?: string, origin?: string) => new Promise<{ status: number; body: string }>((resolve, reject) => {
+      const req = http.request({ hostname: "127.0.0.1", port, path: pathname, method, setHost: false,
+        headers: { ...(host === undefined ? {} : { host }), ...(origin === undefined ? {} : { origin }) } }, res => {
+        let body = "";
+        res.setEncoding("utf8");
+        res.on("data", (chunk: string) => { body += chunk; });
+        res.on("error", reject);
+        res.on("end", () => resolve({ status: res.statusCode!, body }));
+      });
+      req.on("error", reject);
+      req.end(method === "PUT" ? JSON.stringify(cfg) : undefined);
+    });
+    const before = fs.readFileSync(configFile, "utf8");
+    for (const host of [undefined, "evil.example", `evil.example:${port}`, "127.0.0.1", "localhost:1", "[::1]:1", `127.1:${port}`, `localhost.evil.example:${port}`]) {
+      for (const [method, pathname] of [["GET", "/api/config"], ["HEAD", "/api/config"], ["PUT", "/api/config"], ["GET", "/"]]) {
+        const response = await request(method!, pathname!, host);
+        assert.equal(response.status, host === undefined ? 400 : 403, `${method} ${pathname} Host=${host}`);
+        assert.doesNotMatch(response.body, /test-secret/);
+      }
+    }
+    for (const origin of ["https://evil.example", "null", "", "http://localhost:1", `https://localhost:${port}`, "ripple://app"]) {
+      const response = await request("PUT", "/api/config", `127.0.0.1:${port}`, origin);
+      assert.equal(response.status, 403, `Origin=${origin}`);
+    }
+    assert.equal(fs.readFileSync(configFile, "utf8"), before, "rejected requests cannot save");
+    for (const host of [`127.0.0.1:${port}`, `localhost:${port}`, `[::1]:${port}`]) {
+      assert.equal((await request("GET", "/api/config", host)).status, 200);
+      assert.equal((await request("PUT", "/api/config", host, `http://${host}`)).status, 200);
+    }
+    // ripple://app's main-process forwarder sends the loopback Host and strips Origin.
+    assert.equal((await request("PUT", "/api/config", `127.0.0.1:${port}`)).status, 200);
+  });
+});
+
 test("a POST carrying another site's Origin is refused", async () => {
   // Binding to loopback does not keep the browser out: a page the user visits can send a simple
   // POST here and CORS hides only the response, not the side effect.
@@ -1685,7 +1931,7 @@ test("POST /api/providers/probe[chatgpt] falls back to the measured list when th
       });
       const body = (await res.json()) as { models: { id: string }[]; modelsSource: string };
       assert.equal(body.modelsSource, "fallback");
-      assert.deepEqual(body.models.map((m) => m.id), ["gpt-5.6-terra", "gpt-5.6-sol", "gpt-5.6-luna", "gpt-6-astra", "gpt-6-sol", "gpt-6-luna"]);
+      assert.deepEqual(body.models.map((m) => m.id), ["gpt-5.6-terra", "gpt-5.6-sol", "gpt-5.6-luna", "gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "gpt-6.1-sol"]);
     },
     { chatgpt: () => ({ quota: { gpt: null }, auth: { gpt: "borrow-codex" }, models: () => Promise.resolve(null) }) },
   );
@@ -2022,6 +2268,25 @@ test("POST /api/providers/measure runs in the background and polling settles the
     // configuration in both directions, or a level the plan really offers stays out of reach.
     assert.deepEqual(onDisk.providers.oc?.models?.[0]?.effortLevels, ["none", "low", "medium", "high"]);
   }, { measureFetch });
+});
+
+test("measurement updates only its provider when another provider has the same model id", async () => {
+  const cfg = makeCfg({ providers: {
+    p: { type: "openai-compatible", url: "http://127.0.0.1:9/v1", caps: { reasoning: "effort", effortLevels: ["low"] }, models: [{ id: "shared", name: "P's model" }] },
+    q: { type: "openai-compatible", url: "http://127.0.0.1:10/v1", models: [{ id: "shared", name: "Q's model" }] },
+  } });
+  await withAdmin(cfg, async ({ port, configFile }) => {
+    const started = await fetch(`${base()}:${port}/api/providers/measure`, {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ provider: "p", models: ["shared"] }),
+    });
+    assert.equal(started.status, 202);
+    const job = await pollMeasure(port, ((await started.json()) as { jobId: string }).jobId);
+    assert.equal(job.state, "done");
+    const saved = JSON.parse(fs.readFileSync(configFile, "utf8")) as Config;
+    assert.equal(saved.providers.p?.models?.[0]?.wire, "chat");
+    assert.deepEqual(saved.providers.p?.models?.[0]?.effortLevels, ["low"]);
+    assert.deepEqual(saved.providers.q, cfg.providers.q, "a shared id does not share measured capabilities");
+  }, { measureFetch: stubFetch((_url, body) => body.reasoning_effort === undefined || body.reasoning_effort === "low" ? 200 : 400) });
 });
 
 test("measurement fills blank fields but never overwrites a wire or ladder the user already set", async () => {
@@ -2368,7 +2633,7 @@ test("google login: the API returns the terms warning and account endpoints expo
   };
   const google = () => ({
     accounts: () => ({ ag: [
-      { id: "acct-1", label: "g@example.test", email: "g@example.test", projectId: "proj-1", expiresAt: Date.now() + 3_600_000, needsReauth: false, paused: false, state: "ready" as const, active: true },
+      { id: "acct-1", label: "g@example.test", email: "g@example.test", projectId: "proj-1", expiresAt: Date.now() + 3_600_000, needsReauth: false, paused: false, preferred: false, inUse: true, state: "ready" as const, active: true },
     ] }),
     models: async () => [{ id: "gemini-3.8-flash" }],
     clearCooldown: () => {},
@@ -2446,7 +2711,7 @@ test("update: a check the CLI could not answer is an error, not a guess", () => 
 });
 
 test("an Antigravity provider reads as usable only when an account can answer", () => {
-  const account = (state: GoogleAccountStatus["state"]): GoogleAccountStatus => ({ id: state, label: state, projectId: "p", expiresAt: 0, needsReauth: false, paused: state === "paused", state, active: false });
+  const account = (state: GoogleAccountStatus["state"]): GoogleAccountStatus => ({ id: state, label: state, projectId: "p", expiresAt: 0, needsReauth: false, paused: state === "paused", preferred: false, inUse: state === "ready", state, active: false });
   assert.deepEqual(googleHealth([]), { needsLogin: true });
   assert.deepEqual(googleHealth([account("needs-login")]), { needsLogin: true });
   assert.deepEqual(googleHealth([account("needs-verification")]), { needsLogin: false, needsVerification: true });

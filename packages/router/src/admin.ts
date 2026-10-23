@@ -42,6 +42,8 @@ import { normalizeSettings, twoLevelRungs } from "../../mod/hooks/settings.ts";
 import type { Billing, DomainRules, Effort, LadderChoice, Settings } from "../../mod/types/index.d.ts";
 import { chatPickerModels } from "./picker.ts";
 import type { Logger } from "./log.ts";
+import { CredentialPool } from "./pool.ts";
+import { ClaudeAccountAuthPool } from "./providers/anthropic-account-pool.ts";
 import type { ProviderExhaustion } from "./health.ts";
 import type { Stats } from "./proxy.ts";
 import type { RequestLog } from "./requestlog.ts";
@@ -49,6 +51,7 @@ import { PRESETS, type ProviderPreset } from "./presets.ts";
 import { resolveCompatibleCaps } from "./compat.ts";
 import { redactErrorText } from "./redact.ts";
 import { CHATGPT_FALLBACK_MODELS } from "./providers/chatgpt/catalog.ts";
+import { chatgptModelWindow } from "./providers/chatgpt/windows.ts";
 import { measureModel, refusedByPlan, type Measured, type WireCandidate } from "./capabilities.ts";
 import { catalogEntry } from "./catalog.ts";
 import { ModelScoreCatalog, buildModelScores } from "./model-scores.ts";
@@ -63,7 +66,7 @@ import { desktopClaudeCodeDirs } from "../../cli/src/claude-auth.ts";
 import { statusModEnabled, syncModelSlots } from "../../cli/src/settings.ts";
 import { ClaudeOAuthSession, type ClaudeOAuthState } from "./providers/claude-oauth.ts";
 import { readClaudeAuthFile } from "./providers/anthropic-token-file.ts";
-import { listClaudeAccounts, removeClaudeAccount, renameClaudeAccount, setPreferredClaudeAccount } from "./providers/anthropic-accounts.ts";
+import { listClaudeAccounts, listClaudeAccountsWithSubject, removeClaudeAccount, updateClaudeAccount, setPreferredClaudeAccount } from "./providers/anthropic-accounts.ts";
 import { readChatGptAccounts, removeChatGptAccount, summarize as summarizeChatGptAccount, updateChatGptAccount } from "./providers/chatgpt/accounts.ts";
 import { exhaustedForMs, IMAGE_ASPECTS, IMAGE_BACKGROUNDS, IMAGE_FORMATS, type ChatGptAccountStatus, type ImageRequest, type ImageResult } from "./providers/chatgpt/index.ts";
 import type { GoogleAccountStatus } from "./providers/google/index.ts";
@@ -147,7 +150,9 @@ export type AdminDeps = {
    * Optional: per-credential cooldowns and quarantines, for providers that declare a pool. Ids and
    * labels only — never a header value.
    */
-  credentials?: () => Record<string, { id: string; label?: string; state: string; cooldownSeconds?: number; failures: number }[]>;
+  credentials?: () => Record<string, { id: string; label?: string; state: string; cooldownSeconds?: number; failures: number; paused?: boolean; preferred?: boolean; inUse?: boolean }[]>;
+  clearCredentialCooldown?: (provider: string, id: string) => void;
+  claudeClearCooldown?: (id: string) => void;
   /** Optional: picker-mode state and the last bootstrap injection. */
   picker?: () => { enabled: boolean; hosts: string[]; last: unknown };
   /** Optional: observed CLI credentials held by the live proxy, never serialized directly. */
@@ -184,10 +189,16 @@ export type AdminDeps = {
    * login, otherwise the account id `/api/claude-accounts` lists). Absent in tests.
    */
   claudeUsage?: () => Promise<Record<string, Record<string, unknown>>>;
+  /**
+   * The current Claude login's own account: its email and the pool's one-way subject hash, so a
+   * stored account that is the same person is not listed as a second one (`/api/claude-accounts`).
+   * Null when the login's identity is unknown. Absent in tests.
+   */
+  claudeIdentity?: () => Promise<{ email: string; subjectHash: string } | null>;
   /** The Claude models the signed-in account can use (`GET /v1/models`); null until one answer. Absent in tests. */
   claudeModels?: () => Promise<ClaudeModel[] | null>;
   /** An OpenCode Go provider's usage windows, for the status bar's limits row (`/api/limits`). Absent in tests. */
-  opencodeUsage?: (name: string) => Promise<OpenCodeWindow[]>;
+  opencodeUsage?: (name: string, credentialId?: string) => Promise<OpenCodeWindow[]>;
   /** A Grok provider's usage pool, for the status bar's limits row (`/api/limits`). Absent in tests. */
   grokUsage?: (name: string) => Promise<GrokWindow[]>;
   /**
@@ -198,6 +209,14 @@ export type AdminDeps = {
   /** Lid-closed awake and hotspot failover (`GET|PUT /api/power`). Absent: 501. */
   power?: PowerApi;
 };
+
+/** Without a configured adapter there is no runtime cooldown, but account previews still name the next choice. */
+function previewAccounts<T extends { id: string; paused: boolean; preferred: boolean; needsReauth: boolean; expiresAt: number }>(accounts: T[]): (T & { state: string; inUse: boolean })[] {
+  const credentials = accounts.filter((account) => !account.paused && !account.needsReauth && account.expiresAt > Date.now())
+    .map((account) => ({ id: account.id, preferred: account.preferred, headers: {} }));
+  const next = new CredentialPool().pick("preview", credentials)?.id;
+  return accounts.map((account) => ({ ...account, state: account.paused ? "paused" : credentials.some((credential) => credential.id === account.id) ? "ready" : "needs-login", inUse: account.id === next }));
+}
 
 /** Claude usage is looked up only where a Claude subscription provider is configured. */
 function hasClaudeSubscription(cfg: Config): boolean {
@@ -236,7 +255,7 @@ async function claudeAccountUsage(deps: AdminDeps): Promise<{ id: string; label:
 
 /** One window the limits row reads. `reset_at` is epoch seconds, as the other readers use. */
 export type LimitsWindow = { kind: "five_hour" | "seven_day" | "scoped" | "window"; label?: string; used_percent: number; window_minutes?: number; reset_at?: number };
-export type LimitsAccount = { account: number; windows: LimitsWindow[]; at: number };
+export type LimitsAccount = { account: number; label?: string; windows: LimitsWindow[]; at: number };
 export type LimitsProvider = { provider: string; type: string; title: string; accounts: LimitsAccount[] };
 
 /** A `{used_percent, window_minutes, reset_at}` snapshot window as `/api/limits` reads it, or null. */
@@ -350,8 +369,14 @@ async function buildLimits(deps: AdminDeps): Promise<{ providers: LimitsProvider
       const rows = await googleLimitAccounts(deps, name);
       if (rows.length) providers.push({ provider: name, type: "google", title: "Gemini", accounts: rows });
     } else if (p.type === "openai-compatible" && isOpenCodeGo(p)) {
-      const windows = (await deps.opencodeUsage?.(name)) ?? [];
-      if (windows.length) providers.push({ provider: name, type: "opencode-go", title: "Go", accounts: [{ account: 0, windows: windows.map((w) => ({ ...w })), at: Date.now() }] });
+      const credentials = p.credentials?.length ? p.credentials : [undefined];
+      const rows = await Promise.all(credentials.map(async (credential, account): Promise<LimitsAccount> => ({
+        account,
+        ...(credential?.label !== undefined ? { label: credential.label } : {}),
+        windows: ((await deps.opencodeUsage?.(name, credential?.id)) ?? []).map((w) => ({ ...w })),
+        at: Date.now(),
+      })));
+      if (rows.some((row) => row.windows.length)) providers.push({ provider: name, type: "opencode-go", title: "Go", accounts: rows });
     } else if (p.type === "grok") {
       const windows = (await deps.grokUsage?.(name)) ?? [];
       if (windows.length) providers.push({ provider: name, type: "grok", title: "Grok", accounts: [{ account: 0, windows: windows.map((w) => ({ ...w })), at: Date.now() }] });
@@ -647,9 +672,12 @@ async function modOptions(deps: AdminDeps, scores: ModelScoreCatalog): Promise<M
       usable = p.auth === "antigravity" ? (google[name] ?? []).some(a => a.state === "ready")
         : !!(p.apiKey || process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY);
     } else if (p.type === "anthropic") {
-      usable = p.auth === "api-key" ? !!(p.apiKey || process.env.ANTHROPIC_API_KEY) : claudeAuthStore(deps).describeSource() !== null;
+      // Stored accounts serve the turn when Claude Code's own login is not seen; the pool refreshes a
+      // due token before each turn, so only an account that must sign in again is out.
+      usable = p.auth === "api-key" ? !!(p.apiKey || process.env.ANTHROPIC_API_KEY)
+        : claudeAuthStore(deps).describeSource() !== null || listClaudeAccounts(homeDir()).some(a => !a.needsReauth);
     }
-    if (credentials[name]) usable = usable && credentials[name]!.some(c => c.state === "ready");
+    if (credentials[name]) usable = usable && credentials[name]!.some(c => c.state === "ready" && !c.paused);
     const exhausted = health[name];
     return { name, type: p.type, usable: usable && !exhausted, billing: billingOf(p as { type: string; auth?: string; preset?: string; url?: string }),
       ...(exhausted ? { reason: exhausted.reason, exhaustedAt: exhausted.at, exhaustedUntil: exhausted.until } : {}),
@@ -943,6 +971,17 @@ function writeConfigFile(configFile: string, config: Config): void {
   fs.mkdirSync(path.dirname(configFile), { recursive: true });
   fs.writeFileSync(tmp, JSON.stringify(config, null, 2) + "\n");
   fs.renameSync(tmp, configFile);
+}
+
+/** The disk fingerprint also detects CLI edits and background measurements, without persisting API metadata. */
+function configSnapshot(deps: AdminDeps): { config: Config; configRevision: string } {
+  let text: string;
+  try { text = fs.readFileSync(deps.configFile, "utf8"); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    text = JSON.stringify(deps.config());
+  }
+  return { config: JSON.parse(text) as Config, configRevision: crypto.createHash("sha256").update(text).digest("hex") };
 }
 
 function headerValue(headers: Record<string, string> | undefined): { name: string; value: string } | null {
@@ -1434,26 +1473,25 @@ function effortUndeclared(p: Provider): boolean {
  * left entirely alone. The result is validated with the same `validate` the GUI's save uses, so a
  * bad edit is refused rather than written.
  */
-function applyMeasurements(configFile: string, results: Measured[]): { applied: number } | { error: string } {
+function applyMeasurements(configFile: string, providerName: string, results: Measured[]): { applied: number } | { error: string } {
   let current: Config;
   try {
     current = JSON.parse(fs.readFileSync(configFile, "utf8")) as Config;
   } catch (e) {
     return { error: `could not re-read config: ${errorText(e)}` };
   }
+  const provider = current.providers[providerName];
+  if (!provider?.models) return { applied: 0 };
   let applied = 0;
   for (const result of results) {
     if (result.error || !result.wire) continue;
-    for (const provider of Object.values(current.providers)) {
-      if (!("models" in provider) || !provider.models) continue;
-      const model = provider.models.find((entry) => entry.id === result.id);
-      if (!model) continue;
-      const before = `${model.wire ?? ""}|${model.effortLevels ? model.effortLevels.join(",") : "∅"}|${model.contextWindow ?? "∅"}`;
-      if (model.wire === undefined) model.wire = result.wire;
-      if (model.effortLevels === undefined && result.effortLevels !== undefined) model.effortLevels = result.effortLevels;
-      if (model.contextWindow === undefined && result.contextWindow !== undefined) model.contextWindow = result.contextWindow;
-      if (`${model.wire ?? ""}|${model.effortLevels ? model.effortLevels.join(",") : "∅"}|${model.contextWindow ?? "∅"}` !== before) applied++;
-    }
+    const model = provider.models.find((entry) => entry.id === result.id);
+    if (!model) continue;
+    const before = `${model.wire ?? ""}|${model.effortLevels ? model.effortLevels.join(",") : "∅"}|${model.contextWindow ?? "∅"}`;
+    if (model.wire === undefined) model.wire = result.wire;
+    if (model.effortLevels === undefined && result.effortLevels !== undefined) model.effortLevels = result.effortLevels;
+    if (model.contextWindow === undefined && result.contextWindow !== undefined) model.contextWindow = result.contextWindow;
+    if (`${model.wire ?? ""}|${model.effortLevels ? model.effortLevels.join(",") : "∅"}|${model.contextWindow ?? "∅"}` !== before) applied++;
   }
   const errors = validate(current);
   if (errors.length > 0) return { error: `measured config did not validate: ${errors[0]}` };
@@ -1625,7 +1663,7 @@ async function runMeasureJob(jobId: string, providerName: string, models: string
     for (let id = queue.shift(); id !== undefined; id = queue.shift()) await measureOne(id);
   }));
   try {
-    const outcome = applyMeasurements(deps.configFile, job.results);
+    const outcome = applyMeasurements(deps.configFile, providerName, job.results);
     if ("error" in outcome) {
       MEASURE_JOBS.set(jobId, { ...job, state: "failed", error: outcome.error, finishedAt: Date.now() });
       deps.log.warn(`admin: measurement for ${providerName} was not applied: ${outcome.error}`);
@@ -1664,22 +1702,32 @@ async function pickerModels(deps: AdminDeps): Promise<{ models: { id: string; na
 }
 
 /**
- * Each model's context window, for a client that reads a session's context use without the CLI's own
- * figure (the phone, for a Claude app session). Claude's from Anthropic's catalog, the CLI's injected
- * models from their config (else `cli.autoCompactWindow`), providers' from theirs. Unknown is absent.
+ * Each model's context window for the phone and dashboard. ChatGPT-served models use the same
+ * effective catalogue window as bootstrap/picker; an explicit route window still wins. Without a
+ * catalogue window, the stored values retain their old precedence. Unknown is absent.
+ * `catalogWindows` identifies values the picker window editor must not offer to override.
  */
-async function contextWindows(deps: AdminDeps): Promise<{ windows: Record<string, number> }> {
+async function contextWindows(deps: AdminDeps): Promise<{ windows: Record<string, number>; catalogWindows: Record<string, number> }> {
   const cfg = deps.config();
   const windows: Record<string, number> = {};
-  const put = (id: string, value: number | undefined): void => {
-    if (typeof value === "number" && Number.isFinite(value) && value > 0 && windows[id] === undefined) windows[id] = Math.floor(value);
+  const catalogWindows: Record<string, number> = {};
+  const put = (id: string, fallback?: number): void => {
+    const base = id.split("@")[0]!;
+    const route = cfg.routes[base] ?? cfg.routes[base.replace(/-\d{8}$/, "")];
+    const live = chatgptModelWindow(cfg, id);
+    const value = route?.contextWindow ?? live ?? fallback;
+    if (typeof value !== "number" || !Number.isFinite(value) || value <= 0 || windows[id] !== undefined) return;
+    windows[id] = Math.floor(value);
+    if (live !== undefined && route?.contextWindow === undefined) catalogWindows[id] = live;
   };
   for (const model of await claudeModelList(deps)) put(model.id, model.contextWindow);
   for (const model of cfg.cli.extraModels) put(model.model, model.contextWindow ?? cfg.cli.autoCompactWindow);
   for (const provider of Object.values(cfg.providers)) {
     for (const model of ("models" in provider && provider.models) || []) put(model.id, model.contextWindow);
   }
-  return { windows };
+  for (const id of Object.keys(cfg.routes)) put(id);
+  for (const id of Object.keys(cfg.aliases)) put(id);
+  return { windows, catalogWindows };
 }
 
 function tailLines(file: string, n: number): string {
@@ -1756,20 +1804,16 @@ export function startAdmin(deps: AdminDeps): Promise<{ port: number; close(): vo
     void handle(req, res);
   });
 
-  /**
-   * Binding to 127.0.0.1 keeps other machines out, but not the browser on this one: any page the
-   * user visits can POST here, and a simple request (no custom header, no JSON content type) is
-   * not stopped by CORS — the response is unreadable, the side effect still happens. That is how
-   * a web page could turn the picker off, or shut the router down and take Claude Desktop with it.
-   *
-   * A browser always sends Origin on a cross-site POST, so requiring it to be our own origin is
-   * enough. Clients that are not browsers (the CLI, the tray app) send none and are let through.
-   */
-  function crossSitePost(req: http.IncomingMessage): boolean {
+  /** Binding to loopback alone does not stop DNS rebinding: check Host even on reads. */
+  function localHost(req: http.IncomingMessage): boolean {
+    return [`127.0.0.1:${boundPort}`, `localhost:${boundPort}`, `[::1]:${boundPort}`].includes(req.headers.host ?? "");
+  }
+
+  /** Cross-site browser writes still act despite CORS. CLI and tray forwarding send no Origin. */
+  function crossSiteOrigin(req: http.IncomingMessage): boolean {
     const origin = req.headers.origin;
-    if (!origin) return false;
-    const allowed = new Set([`http://127.0.0.1:${boundPort}`, `http://localhost:${boundPort}`]);
-    return !allowed.has(origin);
+    if (origin === undefined) return false;
+    return ![`http://127.0.0.1:${boundPort}`, `http://localhost:${boundPort}`, `http://[::1]:${boundPort}`].includes(origin);
   }
 
   async function handle(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
@@ -1781,16 +1825,20 @@ export function startAdmin(deps: AdminDeps): Promise<{ port: number; close(): vo
     const method = req.method === "HEAD" ? "GET" : (req.method ?? "GET");
     const pathname = url.split("?")[0] ?? "/";
     try {
-      if (method !== "GET" && crossSitePost(req)) {
+      if (!localHost(req)) {
+        deps.log.warn(`admin: refused ${method} ${pathname} with non-loopback Host`);
+        sendJson(res, 403, { error: "local admin host required" });
+        return;
+      }
+      if (method !== "GET" && crossSiteOrigin(req)) {
         deps.log.warn(`admin: refused ${method} ${pathname} from origin ${String(req.headers.origin)}`);
         sendJson(res, 403, { error: "cross-site request refused" });
         return;
       }
       if (pathname.startsWith("/api/phone/")) {
         res.setHeader("cache-control", "no-store");
-        // Pairing is a credential read: guard GETs too, including DNS-rebinding Host values.
-        if (crossSitePost(req) || req.headers["sec-fetch-site"] === "cross-site" ||
-          !new Set([`127.0.0.1:${boundPort}`, `localhost:${boundPort}`]).has(req.headers.host ?? "")) {
+        // Pairing is a credential read: guard cross-site GETs too. Host is checked above.
+        if (crossSiteOrigin(req) || req.headers["sec-fetch-site"] === "cross-site") {
           sendJson(res, 403, { error: "same-origin phone control required" });
           return;
         }
@@ -2074,7 +2122,9 @@ export function startAdmin(deps: AdminDeps): Promise<{ port: number; close(): vo
         return;
       }
       if (pathname === "/api/config" && method === "GET") {
-        sendJson(res, 200, deps.config());
+        res.setHeader("cache-control", "no-store");
+        const { configRevision } = configSnapshot(deps);
+        sendJson(res, 200, { ...deps.config(), configRevision });
         return;
       }
       if (pathname === "/api/config" && method === "PUT") {
@@ -2085,11 +2135,26 @@ export function startAdmin(deps: AdminDeps): Promise<{ port: number; close(): vo
           sendJson(res, 400, { error: (e as Error).message });
           return;
         }
-        let parsed: Config;
+        let input: unknown;
         try {
-          parsed = JSON.parse(body.toString("utf8")) as Config;
+          input = JSON.parse(body.toString("utf8"));
         } catch (e) {
           sendJson(res, 400, { errors: [`invalid JSON: ${(e as Error).message}`] });
+          return;
+        }
+        if (!input || typeof input !== "object" || Array.isArray(input)) {
+          sendJson(res, 400, { errors: ["config must be a JSON object"] });
+          return;
+        }
+        const { configRevision, ...parsed } = input as Config & { configRevision?: unknown };
+        if (configRevision !== undefined && (typeof configRevision !== "string" || !/^[a-f0-9]{64}$/.test(configRevision))) {
+          sendJson(res, 400, { errors: ["configRevision must be a SHA-256 hex string"] });
+          return;
+        }
+        // No await between comparison and atomic rename: two admin windows cannot both win.
+        const current = configSnapshot(deps);
+        if (configRevision !== undefined && configRevision !== current.configRevision) {
+          sendJson(res, 409, { error: "config revision conflict", ...current });
           return;
         }
         const errors = validate(parsed);
@@ -2097,13 +2162,14 @@ export function startAdmin(deps: AdminDeps): Promise<{ port: number; close(): vo
           sendJson(res, 400, { errors });
           return;
         }
+        if (configRevision === undefined) deps.log.warn("admin: accepting legacy PUT /api/config without configRevision; conflict protection unavailable");
         writeConfigFile(deps.configFile, parsed);
         deps.log.info(`admin: config saved via GUI (${Object.keys(parsed.routes).length} routes, ${Object.keys(parsed.providers).length} providers)`);
         // `cli.models` cannot take effect through the router at all: Claude Code reads the slots
         // before a request exists. So a GUI save has to write them to settings.json itself;
         // otherwise the Clients screen shows a choice that only a later `install` would honour.
         const slotWarning = syncModelSlotsForGui(parsed);
-        sendJson(res, 200, { ok: true, ...(slotWarning ? { warning: slotWarning } : {}) });
+        sendJson(res, 200, { ok: true, configRevision: configSnapshot(deps).configRevision, ...(slotWarning ? { warning: slotWarning } : {}) });
         return;
       }
       if (pathname === "/api/codex" && method === "GET") {
@@ -2134,11 +2200,36 @@ export function startAdmin(deps: AdminDeps): Promise<{ port: number; close(): vo
       }
       // Safe account metadata only: labels, emails, plan, rotation state and quota. Tokens and the
       // workspace id stay in the router.
+      if (pathname === "/api/credentials/clear-cooldown" && method === "POST") {
+        let change: { provider?: unknown; id?: unknown };
+        try {
+          change = JSON.parse((await readBody(req)).toString("utf8")) as typeof change;
+        } catch {
+          sendJson(res, 400, { error: "invalid JSON" });
+          return;
+        }
+        if (!change || typeof change.provider !== "string" || typeof change.id !== "string") {
+          sendJson(res, 400, { error: "expected {provider: string, id: string}" });
+          return;
+        }
+        const provider = deps.config().providers[change.provider];
+        if (!provider || !("credentials" in provider) || !provider.credentials?.some((credential) => credential.id === change.id)) {
+          sendJson(res, 404, { error: "credential not found" });
+          return;
+        }
+        if (!deps.clearCredentialCooldown) {
+          sendJson(res, 501, { error: "credential cooldown control unavailable" });
+          return;
+        }
+        deps.clearCredentialCooldown(change.provider, change.id);
+        sendJson(res, 200, { ok: true });
+        return;
+      }
       if (pathname === "/api/chatgpt-accounts" && method === "GET") {
         const all = deps.chatgpt?.().accounts?.() ?? {};
         const wanted = new URL(url, "http://127.0.0.1").searchParams.get("provider");
         const name = wanted && all[wanted] ? wanted : Object.keys(all)[0];
-        const accounts = name ? all[name]! : readChatGptAccounts(homeDir()).map(summarizeChatGptAccount);
+        const accounts = name ? all[name]! : previewAccounts(readChatGptAccounts(homeDir()).map(summarizeChatGptAccount));
         sendJson(res, 200, { provider: name ?? null, accounts });
         return;
       }
@@ -2168,28 +2259,32 @@ export function startAdmin(deps: AdminDeps): Promise<{ port: number; close(): vo
           sendJson(res, 200, { ok: true });
           return;
         }
-        let change: { label?: unknown; paused?: unknown; clearCooldown?: unknown };
+        let change: { label?: unknown; paused?: unknown; preferred?: unknown; clearCooldown?: unknown };
         try {
           change = JSON.parse((await readBody(req)).toString("utf8")) as typeof change;
         } catch {
           sendJson(res, 400, { error: "invalid JSON" });
           return;
         }
-        if ((change.label !== undefined && (typeof change.label !== "string" || !change.label.trim())) || (change.paused !== undefined && typeof change.paused !== "boolean")) {
-          sendJson(res, 400, { error: "expected {label?: non-empty string, paused?: boolean, clearCooldown?: true}" });
+        if (!change || (change.label !== undefined && (typeof change.label !== "string" || !change.label.trim())) || (change.paused !== undefined && typeof change.paused !== "boolean") || (change.preferred !== undefined && typeof change.preferred !== "boolean") || (change.clearCooldown !== undefined && change.clearCooldown !== true)) {
+          sendJson(res, 400, { error: "expected {label?: non-empty string, paused?: boolean, preferred?: boolean, clearCooldown?: true}" });
           return;
         }
-        if (change.clearCooldown === true) deps.chatgpt?.().clearCooldown?.(id);
-        if (change.label !== undefined || change.paused !== undefined) {
+        if (id !== "codex" && !readChatGptAccounts(homeDir()).some((account) => account.id === id)) {
+          sendJson(res, 404, { error: "ChatGPT account not found" });
+          return;
+        }
+        if (change.label !== undefined || change.paused !== undefined || change.preferred !== undefined) {
           if (id === "codex") {
             sendJson(res, 409, { error: "the Codex CLI's login cannot be renamed or paused here" });
             return;
           }
-          if (!updateChatGptAccount(homeDir(), id, { ...(typeof change.label === "string" ? { label: change.label } : {}), ...(typeof change.paused === "boolean" ? { paused: change.paused } : {}) })) {
+          if (!updateChatGptAccount(homeDir(), id, { ...(typeof change.label === "string" ? { label: change.label } : {}), ...(typeof change.paused === "boolean" ? { paused: change.paused } : {}), ...(typeof change.preferred === "boolean" ? { preferred: change.preferred } : {}) })) {
             sendJson(res, 404, { error: "ChatGPT account not found" });
             return;
           }
         }
+        if (change.clearCooldown === true) deps.chatgpt?.().clearCooldown?.(id);
         deps.log.info(`admin: updated ChatGPT account ${id.slice(0, 8)}`);
         sendJson(res, 200, { ok: true });
         return;
@@ -2220,9 +2315,45 @@ export function startAdmin(deps: AdminDeps): Promise<{ port: number; close(): vo
         const source = claudeAuthStore(deps).describeSource();
         let usage: Record<string, Record<string, unknown>> = {};
         if (hasClaudeSubscription(deps.config())) usage = (await deps.claudeUsage?.().catch(() => null)) ?? {};
+        // Only a known current login can point out a stored copy of itself; unknown adds nothing,
+        // so the response stays exactly what it was before there was an identity lookup.
+        const identity = source ? (await deps.claudeIdentity?.().catch(() => null)) ?? null : null;
+        const wanted = new URL(url, "http://127.0.0.1").searchParams.get("provider");
+        const providers = Object.entries(deps.config().providers).filter(([, provider]) => provider.type === "anthropic" && provider.auth === "claude-code");
+        const name = providers.find(([key]) => key === wanted)?.[0] ?? providers[0]?.[0];
+        const projection = new ClaudeAccountAuthPool({ home: homeDir(), current: claudeAuthStore(deps), log: deps.log }).peekCredentials();
+        const reports = (name ? deps.credentials?.()[name] : undefined)
+          ?? new CredentialPool().report(name ?? "claude", projection).map((row) => ({ ...row, id: projection.find((credential) => credential.id === row.id)!.ownerId! }));
+        const accounts = listClaudeAccountsWithSubject(homeDir()).map(({ subjectHash: hash, ...account }) => {
+          const same = identity !== null && (hash !== undefined
+            ? hash === identity.subjectHash
+            : account.email !== undefined && account.email.toLowerCase() === identity.email.toLowerCase());
+          const report = reports.find((row) => row.id === account.id);
+          return {
+            ...account,
+            state: account.paused ? "paused" : account.needsReauth || account.expiresAt <= Date.now() ? "needs-login" : report?.state ?? "ready",
+            inUse: report?.inUse === true,
+            ...(report?.cooldownSeconds !== undefined ? { cooldownSeconds: report.cooldownSeconds } : {}),
+            ...(usage[account.id] ? { quota: usage[account.id] } : {}),
+            ...(same ? { sameAsCurrent: true } : {}),
+          };
+        });
+        const currentReport = reports.find((row) => row.id === "current");
         sendJson(res, 200, {
-          current: source ? { id: "current", label: "Current Claude login", source, external: true, ...(usage.current ? { quota: usage.current } : {}) } : null,
-          accounts: listClaudeAccounts(homeDir()).map((account) => (usage[account.id] ? { ...account, quota: usage[account.id] } : account)),
+          current: source ? {
+            id: "current",
+            label: "Current Claude login",
+            source,
+            external: true,
+            paused: false,
+            preferred: false,
+            state: currentReport?.state ?? "needs-login",
+            inUse: currentReport?.inUse === true,
+            ...(currentReport?.cooldownSeconds !== undefined ? { cooldownSeconds: currentReport.cooldownSeconds } : {}),
+            ...(identity ? { email: identity.email } : {}),
+            ...(usage.current ? { quota: usage.current } : {}),
+          } : null,
+          accounts,
         });
         return;
       }
@@ -2270,22 +2401,27 @@ export function startAdmin(deps: AdminDeps): Promise<{ port: number; close(): vo
           sendJson(res, 200, { ok: true });
           return;
         }
-        let label: unknown;
+        let change: { label?: unknown; paused?: unknown; preferred?: unknown; clearCooldown?: unknown };
         try {
-          label = (JSON.parse((await readBody(req)).toString("utf8")) as { label?: unknown }).label;
+          change = JSON.parse((await readBody(req)).toString("utf8")) as typeof change;
         } catch {
           sendJson(res, 400, { error: "invalid JSON" });
           return;
         }
-        if (typeof label !== "string" || !label.trim()) {
-          sendJson(res, 400, { error: "expected {label: non-empty string}" });
+        if (!change || (change.label !== undefined && (typeof change.label !== "string" || !change.label.trim())) || (change.paused !== undefined && typeof change.paused !== "boolean") || (change.preferred !== undefined && typeof change.preferred !== "boolean") || (change.clearCooldown !== undefined && change.clearCooldown !== true)) {
+          sendJson(res, 400, { error: "expected {label?: non-empty string, paused?: boolean, preferred?: boolean, clearCooldown?: true}" });
           return;
         }
-        if (!renameClaudeAccount(homeDir(), id, label)) {
+        if (!updateClaudeAccount(homeDir(), id, {
+          ...(typeof change.label === "string" ? { label: change.label } : {}),
+          ...(typeof change.paused === "boolean" ? { paused: change.paused } : {}),
+          ...(typeof change.preferred === "boolean" ? { preferred: change.preferred } : {}),
+        })) {
           sendJson(res, 404, { error: "Claude account not found" });
           return;
         }
-        deps.log.info(`admin: renamed Claude account ${id.slice(0, 8)}`);
+        if (change.clearCooldown === true) deps.claudeClearCooldown?.(id);
+        deps.log.info(`admin: updated Claude account ${id.slice(0, 8)}`);
         sendJson(res, 200, { ok: true });
         return;
       }
@@ -2421,7 +2557,7 @@ export function startAdmin(deps: AdminDeps): Promise<{ port: number; close(): vo
         const all = deps.google?.().accounts?.() ?? {};
         const wanted = new URL(url, "http://127.0.0.1").searchParams.get("provider");
         const name = wanted && all[wanted] ? wanted : Object.keys(all)[0];
-        const accounts = name ? all[name]! : readGoogleAccounts(homeDir()).map(summarizeGoogleAccount);
+        const accounts = name ? all[name]! : previewAccounts(readGoogleAccounts(homeDir()).map(summarizeGoogleAccount));
         sendJson(res, 200, { provider: name ?? null, accounts });
         return;
       }
@@ -2446,15 +2582,19 @@ export function startAdmin(deps: AdminDeps): Promise<{ port: number; close(): vo
           sendJson(res, 200, { ok: true });
           return;
         }
-        let change: { label?: unknown; paused?: unknown; clearCooldown?: unknown; recheck?: unknown };
+        let change: { label?: unknown; paused?: unknown; preferred?: unknown; clearCooldown?: unknown; recheck?: unknown };
         try {
           change = JSON.parse((await readBody(req)).toString("utf8")) as typeof change;
         } catch {
           sendJson(res, 400, { error: "invalid JSON" });
           return;
         }
-        if ((change.label !== undefined && (typeof change.label !== "string" || !change.label.trim())) || (change.paused !== undefined && typeof change.paused !== "boolean")) {
-          sendJson(res, 400, { error: "expected {label?: non-empty string, paused?: boolean, clearCooldown?: true, recheck?: true}" });
+        if (!change || (change.label !== undefined && (typeof change.label !== "string" || !change.label.trim())) || (change.paused !== undefined && typeof change.paused !== "boolean") || (change.preferred !== undefined && typeof change.preferred !== "boolean") || (change.clearCooldown !== undefined && change.clearCooldown !== true)) {
+          sendJson(res, 400, { error: "expected {label?: non-empty string, paused?: boolean, preferred?: boolean, clearCooldown?: true, recheck?: true}" });
+          return;
+        }
+        if (!readGoogleAccounts(homeDir()).some((account) => account.id === id)) {
+          sendJson(res, 404, { error: "Google account not found" });
           return;
         }
         if (change.recheck === true) {
@@ -2464,8 +2604,8 @@ export function startAdmin(deps: AdminDeps): Promise<{ port: number; close(): vo
           return;
         }
         if (change.clearCooldown === true) deps.google?.().clearCooldown?.(id);
-        if (change.label !== undefined || change.paused !== undefined) {
-          if (!updateGoogleAccount(homeDir(), id, { ...(typeof change.label === "string" ? { label: change.label } : {}), ...(typeof change.paused === "boolean" ? { paused: change.paused } : {}) })) {
+        if (change.label !== undefined || change.paused !== undefined || change.preferred !== undefined) {
+          if (!updateGoogleAccount(homeDir(), id, { ...(typeof change.label === "string" ? { label: change.label } : {}), ...(typeof change.paused === "boolean" ? { paused: change.paused } : {}), ...(typeof change.preferred === "boolean" ? { preferred: change.preferred } : {}) })) {
             sendJson(res, 404, { error: "Google account not found" });
             return;
           }

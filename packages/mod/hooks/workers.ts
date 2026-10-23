@@ -16,8 +16,10 @@ export const AUTO_DESCRIPTION = 'Delegate any task here; ClaudeRipple picks the 
   'light = lookups, mechanical edits, one small fix; standard = carry out a designed change (even across several files), research, summarize, read-only review; ' +
   'hard = subtle debugging, security review, or work where a wrong call is costly; max = planning, design or architecture where the deliverable is the decision itself. ' +
   'Size, file count or the brief\'s warnings do not by themselves make a task hard. Leave the marker out when unsure, and ClaudeRipple judges it. ' +
-  'To run one particular model instead (the user asked for it, or a comparison needs it), name it on the first line: [[ripple: opus@high]] for a Claude model (opus, sonnet, haiku), or [[ripple: <worker agent name>@<effort>]]. ' +
-  'It runs as named, past every ClaudeRipple rule, and still shows in the agents panel; never start a model another way, such as claude -p, to get around the rules. ' +
+  'After the tier, add ui when the work is screens, visual design or UX, or backend when it is server, API or database work, as in [[ripple: standard ui]]; add nothing for anything else. ' +
+  'Name a model only when the user named it in this conversation: [[ripple: opus@high]] for a Claude model (opus, sonnet, haiku), or [[ripple: <worker agent name>@<effort>]]. ' +
+  'It then runs as named, past every ClaudeRipple rule. A model the user did not name is ignored and the task goes by tier, and so is calling a worker agent directly or giving general-purpose a model; never start a model another way, such as claude -p. ' +
+  'In a Workflow script ClaudeRipple does not pick for agent() and cannot retitle it, and the task list shows no model that is not Claude: start each agent()\'s description with the model\'s short name (e.g. \'Gemini · ilsan:김동혁\'), and name the model with a marker or with agentType: \'<worker agent name>\'. ' +
   'A brief states the scope, what must not be touched, the done criteria and how to verify them. Read the report for whether it did what was asked before using it. ' +
   'Continue a worker with SendMessage only within 5 minutes of its last reply; later its cache has lapsed, so start a new one with a summary of what is done and what is left.'
 
@@ -57,9 +59,17 @@ export function parseWorkerVerdict(text: string): WorkerVerdict | undefined {
   if (!verdict || !DOMAINS.includes(raw?.domain as Domain) || !LEVELS.includes(raw?.level as Level)) return undefined
   return { ...verdict, domain: raw!.domain as Domain, level: raw!.level as Level, kind: kindOf(raw!.kind) ?? 'do' }
 }
-export function readMarker(prompt: string): { name: string; level?: string } | null {
+export function readMarker(prompt: string): { name: string; level?: string; domain?: string } | null {
   const marker = MARKER.exec(prompt)
-  return marker ? { name: marker[1]!.toLowerCase(), ...(marker[2] ? { level: marker[2].toLowerCase() } : {}) } : null
+  return marker ? { name: marker[1]!.toLowerCase(), ...(marker[2] ? { level: marker[2].toLowerCase() } : {}), ...(marker[3] ? { domain: marker[3].toLowerCase() } : {}) } : null
+}
+/**
+ * The domain a tier marker names, as the verdict domain its ladder reads. The main chat names it
+ * because it knows the task: judged from the brief alone, a dictionary-and-server text cleanup
+ * read as frontend (sure 0.6) and ran on the design ladder's Sonnet (2026-10-22). No word: general.
+ */
+export function markerDomain(word: string | undefined): Domain {
+  return word === 'ui' || word === 'frontend' ? 'frontend' : word === 'design' ? 'design' : word === 'backend' || word === 'server' ? 'backend' : 'general'
 }
 export function agentProvider(agentFileText: string): string | undefined {
   const head = /^---\r?\n([\s\S]*?)\r?\n---/.exec(agentFileText)?.[1]
@@ -177,20 +187,6 @@ export function workerRule(domain: Domain, settings: Settings): { rule: WorkerPi
   const key = domain === 'design' || domain === 'frontend' ? 'ui' : domain === 'backend' ? 'backend' : 'general'
   const ladder = key === 'general' ? undefined : settings.domainRules?.[key]
   return ladder ? { rule: key, ladder } : { rule: 'general', ladder: settings.rules.general }
-}
-
-/**
- * Visual design depends on the model's taste, not on how hard the task is (2026-10-21: a store
- * screenshot redesign judged "design, standard" ran on the light pair). Under the ui ladder a design
- * verdict on the light or standard rung is raised to the hard rung; frontend, other ladders and
- * verdicts already on hard or plan are untouched.
- */
-export function domainVerdict(verdict: WorkerVerdict, rule: WorkerPick['rule']): { verdict: WorkerVerdict; raised?: 'design' } {
-  if (rule !== 'ui' || verdict.domain !== 'design') return { verdict }
-  const rung = rungOf(verdict)
-  if (rung !== 'light' && rung !== 'standard') return { verdict }
-  const { sure: _sure, ...rest } = verdict
-  return { verdict: { ...rest, ...TIER_MARKERS.hard! }, raised: 'design' }
 }
 
 export type Resolution = { target?: TierTarget; effort: Effort; rung?: Rung; position?: number; skipped?: { rung: Rung; position: number; model: string; reason: string }[]; fallbackReason?: string }

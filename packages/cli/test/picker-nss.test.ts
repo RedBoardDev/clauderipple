@@ -4,10 +4,45 @@ import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { nssNickname, nssTrust, nssTrusted, nssUntrust } from "../src/picker.ts";
+import { caTrusted, nssNickname, nssTrust, nssTrusted, nssUntrust } from "../src/picker.ts";
+import { X509Certificate } from "node:crypto";
 import { createCa } from "../../router/src/x509.ts";
 
 const onWindows = process.platform === "win32";
+
+test("macOS and Windows trust checks reject an old CA with the same subject", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "cr-ca-identity-"));
+  const file = path.join(root, "ca.pem");
+  const old = new X509Certificate(createCa({ cn: "ClaudeRipple local CA" }).certPem).fingerprint.replace(/:/g, "");
+  const current = createCa({ cn: "ClaudeRipple local CA" }).certPem;
+  const fingerprint = new X509Certificate(current).fingerprint.replace(/:/g, "");
+  fs.writeFileSync(file, current);
+  try {
+    for (const platform of ["darwin", "win32"] as const) {
+      let trusted = old;
+      let verified = false;
+      let verificationAllowed = true;
+      const run = (_command: string, args: string[]): string => {
+        if (platform === "win32") return args.join(" ").includes(`Thumbprint -eq '${trusted}'`) ? "1" : "0";
+        if (args[0] === "trust-settings-export") return `<plist><dict><key>trustList</key><dict><key>${trusted}</key><dict/></dict></dict></plist>`;
+        assert.deepEqual(args.slice(0, 3), ["verify-cert", "-c", file]);
+        verified = true;
+        if (!verificationAllowed) throw new Error("not trusted");
+        return "";
+      };
+      assert.equal(caTrusted(file, { platform, run }), false, platform);
+      trusted = fingerprint;
+      assert.equal(caTrusted(file, { platform, run }), true, platform);
+      if (platform === "darwin") {
+        assert.equal(verified, true, "trust, not mere presence, is verified");
+        verificationAllowed = false;
+        assert.equal(caTrusted(file, { platform, run }), false, "a matching but untrusted certificate is refused");
+      }
+    }
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
 
 function realCertutil(): boolean {
   try {

@@ -25,7 +25,7 @@ import type { Logger } from "./log.ts";
 import { ProviderHealth, providerExhaustion, UpstreamHealth } from "./health.ts";
 import type { HoldGate } from "./hold.ts";
 import { BOOTSTRAP_PATH, injectBootstrap } from "./bootstrap.ts";
-import { THREAD_UNSUPPORTED, effortOf, isAutoModeClassifier, resolve, rewriteBody, stripThreadFields, threadDecision, unroutableReason, type Resolved } from "./routing.ts";
+import { THREAD_UNSUPPORTED, continuesTranslatedTurn, effortOf, isAutoModeClassifier, resolve, rewriteBody, stripThreadFields, threadDecision, unroutableReason, type Resolved } from "./routing.ts";
 import { defaultAgentDir, imageLine, withAgentAliases } from "./agents.ts";
 import { forwardCompatibleHeader, resolveCompatibleCaps, sanitizeForCompatible } from "./compat.ts";
 import { applyIdentityToAnthropicBody } from "./identity.ts";
@@ -52,6 +52,7 @@ import type { ClaudeCodeCredentialReaders } from "./providers/anthropic.ts";
 import { ClaudeAccountAuthPool } from "./providers/anthropic-account-pool.ts";
 import { ClaudeModelCatalog } from "./providers/anthropic-models.ts";
 import { ClaudeUsage } from "./providers/anthropic-usage.ts";
+import { ClaudeCurrentIdentity } from "./providers/anthropic-identity.ts";
 import { dropForeignThinking } from "./thinking.ts";
 
 const MAX_BODY = 64 * 1024 * 1024;
@@ -249,6 +250,8 @@ export class Proxy {
   readonly claudeUsage: ClaudeUsage;
   /** The Claude models the signed-in account can use, from Anthropic's own list. */
   readonly claudeModels: ClaudeModelCatalog;
+  /** Who the current Claude login is (never a token), so admin can spot a stored copy of it. */
+  readonly claudeIdentity: ClaudeCurrentIdentity;
   /** Each OpenCode Go provider's usage windows, for the status bar's limits row (never a key). */
   private readonly opencodeUsage: OpenCodeUsage;
   private readonly deps: ProxyDeps;
@@ -258,6 +261,10 @@ export class Proxy {
    * its quarantine again on the first request.
    */
   private readonly pool = new CredentialPool();
+  /** Last configured implicit headers, not model-folded headers: changing wire must not reset health. */
+  private readonly implicitCredentialHeaders = new Map<string, string>();
+  /** Recent non-Anthropic answers whose vendor ids cannot identify the route by their shape. */
+  private readonly routedMessageIds = new Set<string>();
   readonly providerHealth = new ProviderHealth();
 
   /** Latest rate-limit snapshot reported by any chatgpt provider (for the admin GUI). */
@@ -293,6 +300,19 @@ export class Proxy {
   chatgptRefreshAll(): void {
     for (const [name, p] of Object.entries(this.deps.config().providers)) {
       if (p.type === "chatgpt") void this.chatgptFetchRateLimits(name);
+    }
+  }
+
+  /**
+   * Read every configured chatgpt provider's model catalogue now, in the background. Nothing else
+   * asks for it unless the dashboard is open, yet it is where a model's real window comes from
+   * (6.1 Sol: 500000 × 95% = 475000, ARCHITECTURE §4). The adapter keeps its own hour-long cache,
+   * so a caller may ask as often as it likes; the startup call and the periodic one in index.ts
+   * share that cache. Never throws.
+   */
+  chatgptRefreshCatalog(): void {
+    for (const [name, p] of Object.entries(this.deps.config().providers)) {
+      if (p.type === "chatgpt") void this.chatgptFetchModels(name).catch(() => {});
     }
   }
 
@@ -454,10 +474,12 @@ export class Proxy {
   }
 
   /** An OpenCode Go provider's usage windows, for the status bar's limits row. Empty otherwise. */
-  opencodeLimits(name: string): Promise<OpenCodeWindow[]> {
+  opencodeLimits(name: string, credentialId?: string): Promise<OpenCodeWindow[]> {
     const cfg = this.deps.config().providers[name];
     if (!cfg || cfg.type !== "openai-compatible" || !isOpenCodeGo(cfg)) return Promise.resolve([]);
-    return this.opencodeUsage.windows(name, cfg.url, cfg.headers ?? {});
+    const credential = credentialId === undefined ? undefined : cfg.credentials?.find((c) => c.id === credentialId);
+    if (credentialId !== undefined && !credential) return Promise.resolve([]);
+    return this.opencodeUsage.windows(credential ? `${name}/${credential.id}` : name, cfg.url, credential?.headers ?? cfg.headers ?? {});
   }
 
   /** Dashboard action: put one resting Google account back into rotation now. */
@@ -490,6 +512,10 @@ export class Proxy {
       warn: (message) => deps.log.warn(message),
     });
     this.claudeModels = new ClaudeModelCatalog(this.claudeAccounts, {
+      upstream: () => this.deps.config().upstream,
+      warn: (message) => deps.log.warn(message),
+    });
+    this.claudeIdentity = new ClaudeCurrentIdentity(this.claudeAccounts, {
       upstream: () => this.deps.config().upstream,
       warn: (message) => deps.log.warn(message),
     });
@@ -791,6 +817,16 @@ export class Proxy {
         if (extra?.servedTier !== undefined) completed.servedTier = extra.servedTier;
         if (extra?.upstreamCalled === false && !unwrittenSeen) completed.upstreamCalled = false;
         if (extra?.refusal !== undefined) completed.refusal = extra.refusal;
+        const provider = cfg.providers[completed.provider];
+        if (completed.ok && completed.kind === "messages" && completed.messageId && provider && provider.type !== "anthropic") {
+          this.routedMessageIds.delete(completed.messageId);
+          this.routedMessageIds.add(completed.messageId);
+          // In memory only, bounded independently of the persistent request log.
+          if (this.routedMessageIds.size > 10_000) {
+            const oldest = this.routedMessageIds.values().next().value;
+            if (oldest !== undefined) this.routedMessageIds.delete(oldest);
+          }
+        }
         this.deps.requests.add(completed);
       }
     };
@@ -920,6 +956,15 @@ export class Proxy {
           return;
         }
       }
+      // A continue of a turn a translated provider answered carries no marker to route by and would
+      // pass through to Anthropic, which has no such thread (404). Refused the way a translated route
+      // refuses it, so the CLI resends the whole conversation, marker included, and stays stateless.
+      if (!resolved && isApiHost && isMessages && json && continuesTranslatedTurn(json, this.routedMessageIds)) {
+        const out = JSON.stringify(THREAD_UNSUPPORTED);
+        res.writeHead(400, { "content-type": "application/json", "content-length": String(Buffer.byteLength(out)) }).end(out);
+        finish("400", out.length, "continue of a translated turn refused → CLI resends stateless", false, { resent: true, ...(!searchAttempted ? { upstreamCalled: false as const } : {}), refusal: "thread-continue" });
+        return;
+      }
       // A slot with fallbacks picks its provider before anything is sent, so a primary that is rate
       // limited for the next hour is skipped rather than rediscovered once per request. A distinct
       // prompt refusal can also select one fallback below, but only before any response is written.
@@ -1035,13 +1080,35 @@ export class Proxy {
             const routeEffort = effortOf(json);
             if (routeEffort) record.effort = routeEffort;
             tag = `OPENAI ${route.tag} wire=${provider.wire ?? "chat"} effort=${routeEffort ?? "-"}`;
+            const credentials = this.credentialsOf(route.provider, provider);
+            if (credentials.length === 0) {
+              const out = JSON.stringify({ type: "error", error: { type: "overloaded_error", message: "모든 API 키가 일시 중지되어 있습니다." } });
+              res.writeHead(503, { "content-type": "application/json" }).end(out);
+              finish("503", out.length, "all credentials paused", false, { upstreamCalled: false });
+              return;
+            }
+            const key = conversationKey(json as unknown as AnthropicRequest);
+            let using = this.pool.pick(route.provider, credentials, key) ?? credentials[0]!;
+            const tried = new Set([using.id]);
+            const poolName = route.provider;
+            const next = credentials.length > 1 ? (status: number, retryAfter: number | undefined, body: string): Record<string, string> | null => {
+              if (!classify(status, undefined, body).retryable) return null;
+              const candidate = this.pool.pick(poolName, credentials.filter((c) => !tried.has(c.id)), key);
+              if (!candidate) return null;
+              this.pool.penalise(poolName, using.id, status, retryAfter, body);
+              log.info(`RETRY ${poolName}: ${using.label ?? using.id} answered ${status}, trying ${candidate.label ?? candidate.id}`);
+              using = candidate;
+              tried.add(using.id);
+              return using.headers;
+            } : undefined;
             try {
-              const o = await this.openai(route.provider, provider).handle(req, res, path, json as unknown as AnthropicRequest, route.model, routeEffort);
-              this.recordOutcome(route.provider, o.status);
+              const o = await this.openai(route.provider, provider).handle(req, res, path, json as unknown as AnthropicRequest, route.model, routeEffort, { headers: using.headers, ...(next ? { next } : {}) });
+              if (o.status >= 400) this.pool.penalise(poolName, using.id, o.upstreamStatus ?? o.status, o.retryAfterMs, o.errorBody);
+              else if (o.status > 0) this.pool.succeed(poolName, using.id);
               if (!path.startsWith("/v1/messages/count_tokens")) this.providerHealth.observe(route.provider, o.status, o.exhaustion);
               finish(String(o.status), o.bytes, o.note, o.status >= 400, { ...o, ...(searchAttempted ? { upstreamCalled: undefined } : {}) });
             } catch (e) {
-              this.recordOutcome(route.provider, 0);
+              if (!res.destroyed && !req.aborted) this.pool.penalise(poolName, using.id, 0);
               finish("-", 0, `openai error ${(e as NodeJS.ErrnoException).code ?? ""} ${(e as Error).message}`);
               if (!res.headersSent) res.writeHead(502, { "content-type": "application/json" }).end(JSON.stringify({ type: "error", error: { type: "api_error", message: (e as Error).message } }));
               else res.destroy();
@@ -1197,6 +1264,12 @@ export class Proxy {
           // quarantined leaves `chosen` null, and the request goes out on the configured headers so the
           // provider — not us — gets to say no.
           const credentials = this.credentialsOf(route.provider, provider);
+          if (credentials.length === 0) {
+            const out = JSON.stringify({ type: "error", error: { type: "overloaded_error", message: "모든 API 키가 일시 중지되어 있습니다." } });
+            res.writeHead(503, { "content-type": "application/json" }).end(out);
+            finish("503", out.length, "all credentials paused", false, { upstreamCalled: false });
+            return;
+          }
           // The same key the prompt cache is keyed on. `metadata.user_id` alone is one value for every
           // conversation a user has, so using it raw would drag all of them onto one credential at once
           // — the opposite of what stickiness is for (see conversationKey and ARCHITECTURE §4).
@@ -1298,6 +1371,10 @@ export class Proxy {
       let lastAttemptHeaders: string[] = headers;
       let staleRetries = 0;
       const send = (attemptHeaders: string[]): void => {
+        // Buffered refusal bytes and truncation belong only to the response of this attempt.
+        headFilled = false;
+        errRaw = Buffer.alloc(0);
+        errTruncated = false;
         lastAttemptHeaders = attemptHeaders;
         upReq = lib.request({
           protocol: target.protocol,
@@ -1779,11 +1856,31 @@ export class Proxy {
    * A provider's credentials as a pool. A provider that declares none has exactly the one it always
    * had, under a fixed id so its health survives config edits that do not touch it.
    */
-  private credentialsOf(name: string, provider: Config["providers"][string]): Credential[] {
+  private credentialsOf(name: string, provider: Config["providers"][string], includePaused = false): Credential[] {
     const declared = (provider as { credentials?: Credential[] }).credentials;
-    if (declared && declared.length > 0) return declared;
+    if (declared && declared.length > 0) return includePaused ? declared : declared.filter((credential) => !credential.paused);
     const headers = ("headers" in provider && provider.headers) || {};
+    const configured = this.deps.config().providers[name] ?? provider;
+    const configuredHeaders = ("headers" in configured && configured.headers) || {};
+    const fingerprint = crypto.createHash("sha256").update(JSON.stringify(
+      Object.entries(configuredHeaders).map(([key, value]): [string, string] => [key.toLowerCase(), value]).sort(([a], [b]) => a.localeCompare(b)),
+    )).digest("hex");
+    const previous = this.implicitCredentialHeaders.get(name);
+    if (previous !== undefined && previous !== fingerprint) this.pool.clear(name, "default");
+    this.implicitCredentialHeaders.set(name, fingerprint);
     return [{ id: "default", headers }];
+  }
+
+  clearCredentialCooldown(provider: string, id: string): void {
+    this.pool.clear(provider, id);
+  }
+
+  claudeClearCooldown(ownerId: string): void {
+    const owners = this.claudeAccounts.cooldownOwners(ownerId);
+    for (const [name, provider] of Object.entries(this.deps.config().providers)) {
+      if (provider.type !== "anthropic" || provider.auth !== "claude-code") continue;
+      for (const owner of owners) this.pool.clearOwner(name, owner);
+    }
   }
 
   /** Health of every credential the config declares, for the dashboard. */
@@ -1793,8 +1890,8 @@ export class Proxy {
     for (const [name, provider] of Object.entries(cfg.providers)) {
       const creds = provider.type === "anthropic" && provider.accountPool
         ? this.claudeAccounts.peekCredentials()
-        : this.credentialsOf(name, provider);
-      if (creds.length === 0 || (creds.length === 1 && creds[0]!.id === "default")) continue; // nothing to report about a pool of one
+        : this.credentialsOf(name, provider, true);
+      if (!(provider.type === "anthropic" && provider.accountPool) && !("credentials" in provider && provider.credentials?.length)) continue;
       out[name] = this.pool.report(name, creds).map((report) => {
         const credential = creds.find((candidate) => candidate.id === report.id);
         return credential?.ownerId ? { ...report, id: credential.ownerId } : report;

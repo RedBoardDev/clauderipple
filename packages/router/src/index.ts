@@ -15,7 +15,7 @@ import { TetherController } from "./tether.ts";
 import { AutoUpdater } from "./autoupdate.ts";
 import { runCli, startCliDetached } from "./cli-control.ts";
 import { powerPlatform } from "./power.ts";
-import { defaultAgentDir, syncAgentFiles } from "./agents.ts";
+import { defaultAgentDir, retouchLater, syncAgentFiles } from "./agents.ts";
 import { CertStore } from "./certs.ts";
 import { Logger } from "./log.ts";
 import { UpstreamHealth, EXIT_UPSTREAM_UNREACHABLE, checkConnectivity } from "./health.ts";
@@ -55,9 +55,10 @@ const store = new ConfigStore(undefined, (c, errors) => {
     log?.warn(`codex catalog: ${(e as Error).message}`);
   }
   // One place for the truth: the agent files a worker's model comes from are derived from this
-  // config, so a model ticked here cannot disagree with the alias a marker resolves to.
+  // config, so a model ticked here cannot disagree with the alias a marker resolves to. A session
+  // idle when they change can miss the change; the second touch is for it (`RETOUCH_AFTER_MS`).
   try {
-    syncAgentFiles(c, defaultAgentDir(), log ?? console);
+    retouchLater(syncAgentFiles(c, defaultAgentDir(), log ?? console));
   } catch (e) {
     (log ?? console).warn(`agent files: ${(e as Error).message}`);
   }
@@ -238,6 +239,12 @@ proxy
     // Quota only arrives on GPT response headers, so a quiet day left the status 11 hours stale
     // (2026-09-20). Ask once now, after listen(), and never wait for the answer.
     proxy.chatgptRefreshAll();
+    // The model catalogue is where a GPT model's real window comes from (6.1 Sol runs 500000 × 95%
+    // = 475000), and until now only an open dashboard asked for it. Read it now and every two hours;
+    // the adapter's own hour-long cache makes the interval the refresh, not a poll (§4, 2026-10-23).
+    const catalogEvery = 2 * 60 * 60_000;
+    proxy.chatgptRefreshCatalog();
+    setInterval(() => proxy.chatgptRefreshCatalog(), catalogEvery).unref();
     const adminDeps: AdminDeps = {
       autoUpdater,
       config: () => store.get(),
@@ -264,11 +271,14 @@ proxy
         recheckVerification: (id: string) => proxy.googleRecheckVerification(id),
       }),
       credentials: () => proxy.credentialHealth(),
+      clearCredentialCooldown: (provider, id) => proxy.clearCredentialCooldown(provider, id),
+      claudeClearCooldown: (id) => proxy.claudeClearCooldown(id),
       picker: () => ({ enabled: !!store.get().picker?.enabled, hosts: terminateHosts(store.get()).slice(1), last: proxy.lastPickerInjection }),
       observedClaudeCodeAuth,
       claudeUsage: () => proxy.claudeUsage.snapshot(),
       claudeModels: () => proxy.claudeModels.list(),
-      opencodeUsage: (name: string) => proxy.opencodeLimits(name),
+      claudeIdentity: () => proxy.claudeIdentity.identify(),
+      opencodeUsage: (name, credentialId) => proxy.opencodeLimits(name, credentialId),
       grokUsage: (name: string) => proxy.grokLimits(name),
       image: (req, signal, meta) => proxy.generateImage(req, signal, meta),
       modelCatalog: () => loadModelCatalog(),

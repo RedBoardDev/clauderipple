@@ -312,8 +312,9 @@ export class ClaudeOAuthSession {
         redirect_uri: this.redirectUri,
         code_verifier: this.verifier,
       });
+      const grant = grantFrom(reply, (this.options.now ?? Date.now)());
       this.finish();
-      this.settle.resolve(grantFrom(reply, (this.options.now ?? Date.now)()));
+      this.settle.resolve(grant);
     } catch (error) {
       this.fail(error as Error);
     }

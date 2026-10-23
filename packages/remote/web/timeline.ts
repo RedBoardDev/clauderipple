@@ -1,5 +1,6 @@
 // Events → what the timeline shows. Pure, so the same reduction runs in tests and in the app.
 import type { PermissionContent, Effort, Figures, ImagePart, SessionEvent, SessionState, Text, ToolCall } from "../src/protocol.ts";
+import { WRAP_TOOL, wrapUpFields, type WrapUpReply } from "../src/wrap-up.ts";
 
 export interface ToolView extends ToolCall { result?: { ok: boolean; text: Text; images?: ImagePart[] } }
 
@@ -143,10 +144,40 @@ export interface ToolGroup {
   type: "toolGroup"; key: string; ver: string; rows: ActivityRow[];
   tools: number; workers: number; running: boolean; latest: string;
 }
-export type TimelineItem = Item | ToolGroup;
+/** A reply button in a turn's closing box: `label` on the button, `message` what a tap sends. */
+export type { WrapUpReply };
+/** The Code tab's closing box (its wrap_up tool): drawn only when the turn leaves the person a question. */
+export interface WrapUp { type: "wrapUp"; key: string; ver: string; recap: string; ask: string; replies: WrapUpReply[]; blocked: boolean; answered: boolean }
+/** The Code tab's chapter mark (its mark_chapter tool): a divider where the work moved to a new phase. */
+export interface Chapter { type: "chapter"; key: string; ver: string; title: string; summary: string }
+export type TimelineItem = Item | ToolGroup | WrapUp | Chapter;
 
 /** A tool call that draws a "visualize" widget rather than doing work: `show_widget` or `…__show_widget`. */
 export const isWidgetTool = (name: string): boolean => name === "show_widget" || name.endsWith("__show_widget");
+
+// The Claude app's Code-tab tools, which draw something of their own there (only its sessions call them).
+const PLAN_TOOL = "mcp__ccd_turn__update_plan";
+const CHAPTER_TOOL = "mcp__ccd_session__mark_chapter";
+
+function inputOf(tool: ToolView): Record<string, unknown> | null {
+  if (typeof tool.input !== "string") return null;
+  try {
+    const value: unknown = JSON.parse(tool.input);
+    return value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null;
+  } catch { return null; } // Untrusted model input.
+}
+const words = (value: unknown, max: number): string => typeof value === "string" ? value.replace(/\s+/g, " ").trim().slice(0, max) : "";
+
+/** The closing box a wrap_up call draws, with the Claude app's limits (wrap-up.ts, which the host
+ * reads its pushes and status line from too); null when it has no question (the app draws no box
+ * then), undefined when its input cannot be read (it stays a tool row). */
+function wrapUpOf(tool: ToolView, ver: string): WrapUp | null | undefined {
+  const input = inputOf(tool);
+  if (!input) return undefined;
+  const { recap, ask, replies, blocked } = wrapUpFields(input);
+  if (!ask && !replies.length) return null;
+  return { type: "wrapUp", key: `w${tool.id}`, ver, recap, ask, replies, blocked, answered: false };
+}
 
 /** Presentation only: text, permissions and turn boundaries separate consecutive activity. */
 export function timelineItems(view: Pick<SessionView, "items" | "state">): TimelineItem[] {
@@ -168,6 +199,10 @@ export function timelineItems(view: Pick<SessionView, "items" | "state">): Timel
     }
     else { group.workers++; group.latest = row.description; }
   };
+  // The closing box sits under whatever the turn says after it, as in the Claude app: it is held until
+  // the turn ends (its result, or the person's next message).
+  let wrap: WrapUp | null = null;
+  const flushWrap = (): void => { if (wrap) { group = null; result.push(wrap); wrap = null; } };
   for (const item of view.items) {
     if (item.type === "subagent") {
       if (!owned.has(item.toolUseId)) add(item, item.key, item.ver);
@@ -179,6 +214,18 @@ export function timelineItems(view: Pick<SessionView, "items" | "state">): Timel
         result.push({ ...item, tools: [] });
       }
       for (const tool of item.tools) {
+        // The dock shows the task list; the closing box and chapters draw themselves.
+        if (tool.name === PLAN_TOOL) continue;
+        if (tool.name === WRAP_TOOL) {
+          const box = wrapUpOf(tool, item.ver);
+          if (box !== undefined) { if (box) wrap = box; continue; }
+        }
+        const chapter = tool.name === CHAPTER_TOOL ? inputOf(tool) : null;
+        if (chapter && words(chapter.title, 80)) {
+          group = null;
+          result.push({ type: "chapter", key: `c${tool.id}`, ver: item.ver, title: words(chapter.title, 80), summary: words(chapter.summary, 300) });
+          continue;
+        }
         // A widget is something to look at, not activity: it stands on its own instead of folding away.
         if (isWidgetTool(tool.name)) {
           group = null;
@@ -194,8 +241,17 @@ export function timelineItems(view: Pick<SessionView, "items" | "state">): Timel
     // As in the Claude app's default view, thinking is not drawn and does not split a run (most of it
     // has its text withheld anyway). Only thinking still streaming at the very end shows, as a live line.
     if (item.type === "thinking") continue;
+    if (item.type === "user" || item.type === "result") flushWrap();
     group = null;
     result.push(item);
+  }
+  flushWrap();
+  // A box the person has answered (a message of theirs follows it) keeps its words but not its buttons.
+  let answered = false;
+  for (let i = result.length - 1; i >= 0; i--) {
+    const it = result[i]!;
+    if (it.type === "user") answered = true;
+    else if (it.type === "wrapUp" && answered) result[i] = { ...it, answered: true, ver: `${it.ver}a` };
   }
   const tail = view.items.at(-1);
   if (tail?.type === "thinking" && tail.streaming) result.push(tail);
