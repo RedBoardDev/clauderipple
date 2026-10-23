@@ -401,7 +401,7 @@ export class GoogleAdapter {
   }
 
   /** Handle a fully-read Messages request. Model/effort have already been resolved by routing. */
-  async handle(req: http.IncomingMessage, res: http.ServerResponse, path: string, json: AnthropicRequest, model: string, effort: string | undefined): Promise<GoogleOutcome> {
+  async handle(req: http.IncomingMessage, res: http.ServerResponse, path: string, json: AnthropicRequest, model: string, effort: string | undefined, authentication?: Pick<GoogleProvider, "apiKey" | "headers">): Promise<GoogleOutcome> {
     if (path.startsWith("/v1/messages/count_tokens")) {
       const body = JSON.stringify({ input_tokens: estimateTokens(json) });
       res.writeHead(200, { "content-type": "application/json", "content-length": String(Buffer.byteLength(body)) }).end(body);
@@ -444,18 +444,20 @@ export class GoogleAdapter {
     const key = conversationKey(json);
     const startInput = Math.max(estimateTokens(json), this.lastInputByKey.get(key) ?? 0);
 
+    // A selected credential replaces the whole auth set; the adapter's configuration stays stable.
+    const requestAuth = this.cfg.auth === "api-key" ? authentication ?? this.cfg : this.cfg;
     const transport = createTransport(this.cfg.auth, {
-      ...(this.cfg.apiKey ? { apiKey: this.cfg.apiKey } : {}),
+      ...(requestAuth.apiKey ? { apiKey: requestAuth.apiKey } : {}),
       ...(this.cfg.url ? { url: this.cfg.url } : {}),
       ...(this.cfg.sessionHeader ? { sessionHeader: this.cfg.sessionHeader } : {}),
-      ...(this.cfg.headers ? { headers: this.cfg.headers } : {}),
+      ...(requestAuth.headers ? { headers: requestAuth.headers } : {}),
     });
 
     if (this.cfg.auth === "antigravity") {
       return this.handleAntigravity(res, json, upstreamRequest, transport, model, useEffort, wantStream, key, startInput, host!, signatures);
     }
 
-    const apiKey = resolveApiKey(this.cfg.apiKey);
+    const apiKey = resolveApiKey(requestAuth.apiKey);
     if (!apiKey) {
       const out = anthropicError(401, "authentication_error", "Google provider: no API key; set apiKey or GEMINI_API_KEY");
       res.writeHead(out.status, { "content-type": "application/json", "content-length": String(Buffer.byteLength(out.body)) }).end(out.body);

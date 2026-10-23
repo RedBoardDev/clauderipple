@@ -55,7 +55,7 @@ import { chatgptModelWindow } from "./providers/chatgpt/windows.ts";
 import { measureModel, refusedByPlan, type Measured, type WireCandidate } from "./capabilities.ts";
 import { catalogEntry } from "./catalog.ts";
 import { ModelScoreCatalog, buildModelScores } from "./model-scores.ts";
-import { ClaudeCodeAuthStore, nativeAnthropicHeaders, type ClaudeCodeCredentialReaders } from "./providers/anthropic.ts";
+import { ClaudeCodeAuthStore, claudeCodeAuthToken, nativeAnthropicHeaders, type ClaudeCodeCredentialReaders } from "./providers/anthropic.ts";
 import type { ObservedClaudeCodeAuth } from "./providers/anthropic-observed.ts";
 import { fetchClaudeModels, newClaudeReleases, type ClaudeModel } from "./providers/anthropic-models.ts";
 import { codexEnabled, codexHome } from "../../cli/src/codex.ts";
@@ -66,7 +66,7 @@ import { desktopClaudeCodeDirs } from "../../cli/src/claude-auth.ts";
 import { statusModEnabled, syncModelSlots } from "../../cli/src/settings.ts";
 import { ClaudeOAuthSession, type ClaudeOAuthState } from "./providers/claude-oauth.ts";
 import { readClaudeAuthFile } from "./providers/anthropic-token-file.ts";
-import { listClaudeAccounts, listClaudeAccountsWithSubject, removeClaudeAccount, updateClaudeAccount, setPreferredClaudeAccount } from "./providers/anthropic-accounts.ts";
+import { listClaudeAccounts, listClaudeAccountsWithSubject, removeClaudeAccount, updateClaudeAccount, setPreferredClaudeAccount, setCurrentClaudeAccountPaused } from "./providers/anthropic-accounts.ts";
 import { readChatGptAccounts, removeChatGptAccount, summarize as summarizeChatGptAccount, updateChatGptAccount } from "./providers/chatgpt/accounts.ts";
 import { exhaustedForMs, IMAGE_ASPECTS, IMAGE_BACKGROUNDS, IMAGE_FORMATS, type ChatGptAccountStatus, type ImageRequest, type ImageResult } from "./providers/chatgpt/index.ts";
 import type { GoogleAccountStatus } from "./providers/google/index.ts";
@@ -2321,7 +2321,9 @@ export function startAdmin(deps: AdminDeps): Promise<{ port: number; close(): vo
         const wanted = new URL(url, "http://127.0.0.1").searchParams.get("provider");
         const providers = Object.entries(deps.config().providers).filter(([, provider]) => provider.type === "anthropic" && provider.auth === "claude-code");
         const name = providers.find(([key]) => key === wanted)?.[0] ?? providers[0]?.[0];
-        const projection = new ClaudeAccountAuthPool({ home: homeDir(), current: claudeAuthStore(deps), log: deps.log }).peekCredentials();
+        const accountsPool = new ClaudeAccountAuthPool({ home: homeDir(), current: claudeAuthStore(deps), log: deps.log });
+        const currentPaused = accountsPool.isCurrentPaused();
+        const projection = accountsPool.peekCredentials(true);
         const reports = (name ? deps.credentials?.()[name] : undefined)
           ?? new CredentialPool().report(name ?? "claude", projection).map((row) => ({ ...row, id: projection.find((credential) => credential.id === row.id)!.ownerId! }));
         const accounts = listClaudeAccountsWithSubject(homeDir()).map(({ subjectHash: hash, ...account }) => {
@@ -2340,15 +2342,15 @@ export function startAdmin(deps: AdminDeps): Promise<{ port: number; close(): vo
         });
         const currentReport = reports.find((row) => row.id === "current");
         sendJson(res, 200, {
-          current: source ? {
+          current: source || currentPaused ? {
             id: "current",
             label: "Current Claude login",
             source,
             external: true,
-            paused: false,
+            paused: currentPaused,
             preferred: false,
-            state: currentReport?.state ?? "needs-login",
-            inUse: currentReport?.inUse === true,
+            state: currentPaused ? "paused" : currentReport?.state ?? "needs-login",
+            inUse: !currentPaused && currentReport?.inUse === true,
             ...(currentReport?.cooldownSeconds !== undefined ? { cooldownSeconds: currentReport.cooldownSeconds } : {}),
             ...(identity ? { email: identity.email } : {}),
             ...(usage.current ? { quota: usage.current } : {}),
@@ -2387,9 +2389,42 @@ export function startAdmin(deps: AdminDeps): Promise<{ port: number; close(): vo
           sendJson(res, 400, { error: "invalid account id" });
           return;
         }
+        if (id === "current") {
+          if (method === "DELETE") {
+            sendJson(res, 409, { error: "the current Claude login is managed by Claude Code or Claude Desktop" });
+            return;
+          }
+          let value: unknown;
+          try {
+            value = JSON.parse((await readBody(req)).toString("utf8"));
+          } catch {
+            sendJson(res, 400, { error: "invalid JSON" });
+            return;
+          }
+          if (!value || typeof value !== "object" || Array.isArray(value)) {
+            sendJson(res, 400, { error: "expected {paused?: boolean, clearCooldown?: true}" });
+            return;
+          }
+          const change = value as Record<string, unknown>;
+          if ("label" in change || "preferred" in change) {
+            sendJson(res, 409, { error: "the current Claude login is managed by Claude Code or Claude Desktop; only its local pause and cooldown can be changed here" });
+            return;
+          }
+          if (Object.keys(change).length === 0 || Object.keys(change).some((key) => key !== "paused" && key !== "clearCooldown") || (change.paused !== undefined && typeof change.paused !== "boolean") || (change.clearCooldown !== undefined && change.clearCooldown !== true)) {
+            sendJson(res, 400, { error: "expected {paused?: boolean, clearCooldown?: true}" });
+            return;
+          }
+          if (typeof change.paused === "boolean") {
+            setCurrentClaudeAccountPaused(homeDir(), change.paused, claudeCodeAuthToken(claudeAuthStore(deps).get()));
+          }
+          if (change.clearCooldown === true) deps.claudeClearCooldown?.("current");
+          deps.log.info("admin: updated local controls for the current Claude login");
+          sendJson(res, 200, { ok: true });
+          return;
+        }
         const validId = id === "legacy" || /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(id);
-        if (!validId || id === "current") {
-          sendJson(res, id === "current" ? 409 : 400, { error: id === "current" ? "the current Claude login is managed by Claude Code or Claude Desktop" : "invalid account id" });
+        if (!validId) {
+          sendJson(res, 400, { error: "invalid account id" });
           return;
         }
         if (method === "DELETE") {
@@ -2416,7 +2451,7 @@ export function startAdmin(deps: AdminDeps): Promise<{ port: number; close(): vo
           ...(typeof change.label === "string" ? { label: change.label } : {}),
           ...(typeof change.paused === "boolean" ? { paused: change.paused } : {}),
           ...(typeof change.preferred === "boolean" ? { preferred: change.preferred } : {}),
-        })) {
+        }, typeof change.paused === "boolean" ? claudeCodeAuthToken(claudeAuthStore(deps).get()) : undefined)) {
           sendJson(res, 404, { error: "Claude account not found" });
           return;
         }

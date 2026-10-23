@@ -8,12 +8,13 @@ import type { Credential } from "../pool.ts";
 import { redactErrorText } from "../redact.ts";
 import {
   markClaudeAccountNeedsReauth,
-  readClaudeOAuthAccounts,
+  readClaudeAccountPoolState,
   replaceClaudeOAuthAccount,
   type ClaudeOAuthAccount,
 } from "./anthropic-accounts.ts";
 import {
   ClaudeCodeAuthStore,
+  claudeCodeAuthToken,
   nativeAnthropicHeaders,
   observedAnthropicHeaders,
   type ClaudeCodeAuthOptions,
@@ -70,12 +71,27 @@ export class ClaudeAccountAuthPool {
     });
   }
 
-  /** Refresh all due stored accounts, with one network request per account in this process. */
+  /** Router-local inference eligibility; raw auth reads remain available to other consumers. */
+  isCurrentPaused(requestToken?: string): boolean {
+    const { accounts, currentPaused } = readClaudeAccountPoolState(this.home);
+    if (currentPaused) return true;
+    const paused = accounts.filter((account) => account.paused);
+    if (paused.length === 0) return false;
+    const currentToken = requestToken ?? claudeCodeAuthToken(this.current.get());
+    return paused.some((account) => account.token === currentToken);
+  }
+
+  /** Refresh all due usable stored accounts, with one network request per account in this process. */
   async refreshIfNeeded(): Promise<void> {
-    const due = readClaudeOAuthAccounts(this.home).filter((account) =>
-      !account.needsReauth && this.now() >= account.expiresAt - CLAUDE_OAUTH.refreshLeadMs,
+    const { accounts, currentPaused } = readClaudeAccountPoolState(this.home);
+    const due = accounts.filter((account) =>
+      !account.paused && !account.needsReauth && this.now() >= account.expiresAt - CLAUDE_OAUTH.refreshLeadMs,
     );
-    await Promise.all(due.map((account) => this.refresh(account)));
+    if (due.length === 0) return;
+    const pausedAliases = accounts.filter((account) => account.paused && due.some((candidate) => candidate.token === account.token));
+    const currentToken = currentPaused || pausedAliases.length > 0 ? claudeCodeAuthToken(this.current.get()) : undefined;
+    const nativePaused = currentPaused || pausedAliases.some((account) => account.token === currentToken);
+    await Promise.all(due.filter((account) => !(nativePaused && account.token === currentToken)).map((account) => this.refresh(account)));
   }
 
   private refresh(account: ClaudeOAuthAccount): Promise<void> {
@@ -121,44 +137,47 @@ export class ClaudeAccountAuthPool {
     return this.peekCredentials();
   }
 
-  /** Current projection without network I/O, used by status and pre-routing health checks. */
-  peekCredentials(): Credential[] {
+  /** Current projection without network I/O; metadata callers can retain paused credentials. */
+  peekCredentials(includePaused = false): Credential[] {
     const out: Credential[] = [];
-    const accounts = readClaudeOAuthAccounts(this.home);
+    const { accounts, currentPaused } = readClaudeAccountPoolState(this.home);
+    if (!includePaused && currentPaused && !accounts.some((account) => !account.paused && !account.needsReauth && this.now() < account.expiresAt)) return [];
     const current = this.current.get();
-    let currentToken: string | undefined;
-    if (!(current instanceof Error)) {
+    const currentToken = claudeCodeAuthToken(current);
+    const nativePaused = currentPaused || accounts.some((account) => account.paused && account.token === currentToken);
+    if (!(current instanceof Error) && currentToken && (includePaused || !nativePaused)) {
       if (current.source === "observed") {
-        currentToken = current.observed.authorization.replace(/^Bearer\s+/i, "");
         out.push({
           id: credentialId("current", currentToken),
           ownerId: "current",
           label: "Current Claude session",
+          paused: nativePaused,
           headers: observedAnthropicHeaders(current.observed),
         });
       } else {
-        currentToken = current.credentials.accessToken;
         out.push({
           id: credentialId("current", currentToken),
           ownerId: "current",
           label: "Current Claude login",
+          paused: nativePaused,
           headers: nativeAnthropicHeaders({ type: "anthropic", auth: "claude-code" }, current.credentials),
         });
       }
     }
     const currentAccount = accounts.find((account) => account.token === currentToken);
-    if (currentAccount?.paused) out.length = 0;
-    else if (currentAccount && out[0]) out[0].preferred = currentAccount.preferred === true;
+    if (currentAccount && out[0]) out[0].preferred = currentAccount.preferred === true;
     for (const account of accounts) {
-      if (account.paused || account.needsReauth || this.now() >= account.expiresAt) continue;
-      // The legacy single-account file is also what ClaudeCodeAuthStore read as current. Until the
-      // first migration write, omit that duplicate instead of trying the same token twice.
-      if (currentToken && account.token === currentToken) continue;
+      if ((!includePaused && account.paused) || account.needsReauth || this.now() >= account.expiresAt) continue;
+      const sameAsCurrent = account.token === currentToken;
+      // The legacy file may also be current. Deduplicate inference tokens, but keep paused aliases
+      // in metadata so each owner's controls and runtime health remain visible.
+      if (sameAsCurrent && !(includePaused && nativePaused)) continue;
       const credential: Credential = {
         id: credentialId(account.id, account.token, account.refreshToken),
         ownerId: account.id,
         label: account.label,
         preferred: account.preferred === true,
+        paused: account.paused === true || (sameAsCurrent && nativePaused),
         headers: nativeAnthropicHeaders(
           { type: "anthropic", auth: "claude-code" },
           { accessToken: account.token, expiresAt: account.expiresAt },
@@ -174,10 +193,9 @@ export class ClaudeAccountAuthPool {
 
   /** Runtime owner aliases for cooldown clearing; a legacy/current duplicate shares one token. */
   cooldownOwners(ownerId: string): string[] {
-    const account = readClaudeOAuthAccounts(this.home).find((account) => account.id === ownerId);
-    const current = this.current.get();
-    if (!account || current instanceof Error) return [ownerId];
-    const token = current.source === "observed" ? current.observed.authorization.replace(/^Bearer\s+/i, "") : current.credentials.accessToken;
+    const account = readClaudeAccountPoolState(this.home).accounts.find((account) => account.id === ownerId);
+    if (!account) return [ownerId];
+    const token = claudeCodeAuthToken(this.current.get());
     return account.token === token ? [ownerId, "current"] : [ownerId];
   }
 
@@ -185,7 +203,7 @@ export class ClaudeAccountAuthPool {
   reject(id: string): void {
     const ownerId = id.split(":", 1)[0]!;
     if (ownerId === "current") return;
-    const account = readClaudeOAuthAccounts(this.home).find((candidate) => candidate.id === ownerId);
+    const account = readClaudeAccountPoolState(this.home).accounts.find((candidate) => candidate.id === ownerId);
     // The 401 belongs to the token generation that made the request. A refresh or re-login may have
     // replaced it while the request was in flight; never quarantine that newer grant for an old 401.
     if (!account || credentialId(ownerId, account.token, account.refreshToken) !== id) return;

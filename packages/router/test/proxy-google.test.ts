@@ -30,9 +30,9 @@ function freePort(): Promise<number> {
   });
 }
 
-type Rig = { home: string; send: (body: unknown, path?: string) => Promise<{ status: number; body: string }>; records: () => RequestRecord[]; stop: () => Promise<void>; seen: { path: string; headers: http.IncomingHttpHeaders; body: Record<string, unknown> }[] };
+type Rig = { home: string; config: Config; send: (body: unknown, path?: string) => Promise<{ status: number; body: string }>; records: () => RequestRecord[]; stop: () => Promise<void>; seen: { path: string; headers: http.IncomingHttpHeaders; body: Record<string, unknown> }[] };
 
-async function rig(promptRefusal = false, argon?: "google" | "opencode"): Promise<Rig> {
+async function rig(promptRefusal = false, argon?: "google" | "opencode", replyParts?: (attempt: number) => Record<string, unknown>[]): Promise<Rig> {
   const seen: Rig["seen"] = [];
   const upstream = http.createServer((req, res) => {
     const chunks: Buffer[] = [];
@@ -48,7 +48,7 @@ async function rig(promptRefusal = false, argon?: "google" | "opencode"): Promis
       res.writeHead(200, { "content-type": "text/event-stream" });
       res.end(
         [
-          { candidates: [{ content: { parts: [{ text: "Hi" }] } }] },
+          { candidates: [{ content: { parts: replyParts?.(seen.length) ?? [{ text: "Hi" }] } }] },
           { candidates: [{ finishReason: "STOP" }], usageMetadata: { promptTokenCount: 4, candidatesTokenCount: 1 } },
         ]
           .map((record) => `data: ${JSON.stringify(record)}\n\n`)
@@ -90,6 +90,7 @@ async function rig(promptRefusal = false, argon?: "google" | "opencode"): Promis
     home,
     requests,
     agentDir: path.join(home, "agents"),
+    claudeCodeCredentialReaders: { keychain: () => null, credentialsFile: () => null },
   });
   await proxy.listen();
   if (promptRefusal) {
@@ -153,6 +154,7 @@ async function rig(promptRefusal = false, argon?: "google" | "opencode"): Promis
 
   return {
     home,
+    config: cfg,
     send,
     records: () => requests.list(20),
     seen,
@@ -227,6 +229,49 @@ for (const provider of ["google", "opencode"] as const) {
     } finally { await r.stop(); }
   });
 }
+
+test("interleaved compatible Google keys retain the first conversation's real tool signature", async () => {
+  const signature = Buffer.from("signed first conversation tool call".repeat(4)).toString("base64");
+  const r = await rig(false, "opencode", (attempt) => attempt === 1
+    ? [{ functionCall: { name: "lookup", args: {} }, thoughtSignature: signature }]
+    : [{ text: "Hi" }]);
+  try {
+    const provider = r.config.providers["opencode-go"]!;
+    if (provider.type !== "openai-compatible") assert.fail("expected compatible Google owner");
+    const baseModel = provider.models?.[0];
+    assert.ok(baseModel);
+    const model = "gemini-3-pro-preview";
+    provider.models = [{ ...baseModel, id: model }];
+    const credentials = [
+      { id: "key-a", headers: { authorization: "Bearer interleaved-key-A" }, preferred: false },
+      { id: "key-b", headers: { authorization: "Bearer interleaved-key-B" }, preferred: false },
+    ];
+    provider.headers = credentials[0]!.headers;
+    provider.credentials = credentials;
+    const firstUser = { role: "user", content: "conversation-a" };
+    const base = { model, max_tokens: 32, stream: true, metadata: { user_id: "interleaved-A" }, tools: [{ name: "lookup", description: "Look up a value", input_schema: { type: "object", properties: {} } }] };
+    const first = await r.send({ ...base, messages: [firstUser] });
+    assert.equal(first.status, 200);
+    let toolId = "";
+    for (const line of first.body.split("\n")) {
+      if (!line.startsWith("data:")) continue;
+      const event: unknown = JSON.parse(line.slice(5));
+      if (!event || typeof event !== "object" || !("content_block" in event)) continue;
+      const block = event.content_block;
+      if (block && typeof block === "object" && "type" in block && block.type === "tool_use" && "id" in block && typeof block.id === "string") toolId = block.id;
+    }
+    assert.ok(toolId, "the first upstream tool call must produce a client tool id");
+    credentials[1]!.preferred = true;
+    assert.equal((await r.send({ ...base, metadata: { user_id: "interleaved-B" }, messages: [{ role: "user", content: "conversation-b" }] })).status, 200);
+    assert.equal((await r.send({ ...base, messages: [
+      firstUser,
+      { role: "assistant", content: [{ type: "tool_use", id: toolId, name: "lookup", input: {} }] },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: toolId, content: "ok" }] },
+    ] })).status, 200);
+    assert.deepEqual(r.seen.map((request) => request.headers["x-goog-api-key"]), ["interleaved-key-A", "interleaved-key-B", "interleaved-key-A"], "preference does not move the first conversation off its healthy key");
+    assert.ok(JSON.stringify(r.seen[2]!.body).includes('"thoughtSignature":' + JSON.stringify(signature)), "the unchanged first conversation must replay its real signature after key B was used");
+  } finally { await r.stop(); }
+});
 
 test("a google model is refused a web_search side request, not sent upstream", async () => {
   const r = await rig();

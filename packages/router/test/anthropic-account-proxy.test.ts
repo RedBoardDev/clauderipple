@@ -4,6 +4,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import crypto from "node:crypto";
 import fs from "node:fs";
+import http from "node:http";
 import https from "node:https";
 import net from "node:net";
 import os from "node:os";
@@ -15,7 +16,7 @@ import { DEFAULTS, type Config } from "../src/config.ts";
 import { UpstreamHealth } from "../src/health.ts";
 import { Logger } from "../src/log.ts";
 import { ObservedClaudeCodeAuth } from "../src/providers/anthropic-observed.ts";
-import { readClaudeAccountsFile, saveClaudeOAuthAccount } from "../src/providers/anthropic-accounts.ts";
+import { readClaudeAccountsFile, saveClaudeOAuthAccount, setCurrentClaudeAccountPaused, updateClaudeAccount } from "../src/providers/anthropic-accounts.ts";
 import { Proxy } from "../src/proxy.ts";
 import { RequestLog } from "../src/requestlog.ts";
 import { createCa, createLeaf } from "../src/x509.ts";
@@ -30,7 +31,7 @@ function freePort(): Promise<number> {
   });
 }
 
-type Seen = { authorization?: string; currentOnly?: string; beta?: string; body: Record<string, unknown> };
+type Seen = { authorization?: string; apiKey?: string; currentOnly?: string; beta?: string; body: Record<string, unknown> };
 type Reply = { status: number; headers?: Record<string, string>; body?: string };
 
 async function nativeRig(reply: (seen: Seen, attempt: number) => Reply) {
@@ -48,6 +49,7 @@ async function nativeRig(reply: (seen: Seen, attempt: number) => Reply) {
       const body = JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string, unknown>;
       const item = {
         ...(typeof req.headers.authorization === "string" ? { authorization: req.headers.authorization } : {}),
+        ...(typeof req.headers["x-api-key"] === "string" ? { apiKey: req.headers["x-api-key"] } : {}),
         ...(typeof req.headers["anthropic-client-current-only"] === "string" ? { currentOnly: req.headers["anthropic-client-current-only"] } : {}),
         ...(typeof req.headers["anthropic-beta"] === "string" ? { beta: req.headers["anthropic-beta"] } : {}),
         body,
@@ -106,13 +108,15 @@ async function nativeRig(reply: (seen: Seen, attempt: number) => Reply) {
     health: new UpstreamHealth(() => 100, () => {}),
     home,
     requests,
+    agentDir: path.join(home, "agents"),
     observedClaudeCodeAuth: observed,
+    claudeCodeCredentialReaders: { keychain: () => null, credentialsFile: () => null },
     upstreamPort,
     upstreamAgent: new https.Agent({ ca: ca.certPem }),
   });
   await proxy.listen();
 
-  const send = async (conversation = "conversation-1"): Promise<number> => {
+  const sendRequest = async (conversation = "conversation-1", options: { path?: string; model?: string; authorization?: string | null; apiKey?: string } = {}): Promise<{ status: number; text: string }> => {
     const socket = net.connect(proxyPort, "127.0.0.1");
     await new Promise<void>((resolve) => socket.once("connect", resolve));
     socket.write("CONNECT localhost:443 HTTP/1.1\r\nHost: localhost:443\r\n\r\n");
@@ -120,7 +124,7 @@ async function nativeRig(reply: (seen: Seen, attempt: number) => Reply) {
     const secure = tls.connect({ socket, servername: "localhost", ca: ca.certPem });
     await new Promise<void>((resolve) => secure.once("secureConnect", resolve));
     const body = JSON.stringify({
-      model: "claude-opus-4-8",
+      model: options.model ?? "claude-opus-4-8",
       max_tokens: 32,
       metadata: { user_id: conversation },
       tools: [{ type: "web_search_20250305", name: "web_search", max_uses: 2 }],
@@ -128,25 +132,29 @@ async function nativeRig(reply: (seen: Seen, attempt: number) => Reply) {
       messages: [{ role: "user", content: "find this" }],
     });
     secure.write(
-      "POST /v1/messages HTTP/1.1\r\n" +
+      `POST ${options.path ?? "/v1/messages"} HTTP/1.1\r\n` +
       "Host: localhost\r\n" +
       "content-type: application/json\r\n" +
-      "authorization: Bearer caller-token\r\n" +
+      (options.authorization === null ? "" : `authorization: ${options.authorization ?? "Bearer caller-token"}\r\n`) +
+      (options.apiKey ? `x-api-key: ${options.apiKey}\r\n` : "") +
       "anthropic-client-current-only: caller-fingerprint\r\n" +
       "anthropic-beta: claude-code-20250219,prompt-caching-scope-2026-01-05\r\n" +
       `content-length: ${Buffer.byteLength(body)}\r\n\r\n${body}`,
     );
     const first = await new Promise<Buffer>((resolve) => secure.once("data", (chunk: Buffer) => setTimeout(() => resolve(chunk), 30)));
     secure.destroy();
-    return Number(/^HTTP\/1\.1 (\d{3})/.exec(first.toString("latin1"))?.[1] ?? 0);
+    const response = first.toString("utf8");
+    return { status: Number(/^HTTP\/1\.1 (\d{3})/.exec(response)?.[1] ?? 0), text: response.slice(response.indexOf("\r\n\r\n") + 4) };
   };
 
   return {
     home,
+    cfg,
     stored,
     seen,
     requests,
-    send,
+    sendRequest,
+    send: async (conversation = "conversation-1") => (await sendRequest(conversation)).status,
     stop: async () => {
       proxy.close();
       await new Promise<void>((resolve) => upstream.close(() => resolve()));
@@ -154,6 +162,139 @@ async function nativeRig(reply: (seen: Seen, attempt: number) => Reply) {
     },
   };
 }
+
+test("pausing native and stored accounts removes sticky choices until explicitly resumed", async () => {
+  const rig = await nativeRig(() => ({ status: 200 }));
+  try {
+    assert.equal(await rig.send("pause-conversation"), 200);
+    setCurrentClaudeAccountPaused(rig.home, true, "current-token");
+    assert.equal(await rig.send("pause-conversation"), 200);
+    assert.deepEqual(rig.seen.map((item) => item.authorization), ["Bearer current-token", "Bearer stored-token"]);
+    updateClaudeAccount(rig.home, rig.stored.id, { paused: true });
+    assert.equal(await rig.send("pause-conversation"), 200);
+    assert.equal(rig.seen.at(-1)?.authorization, "Bearer third-token");
+    for (const account of readClaudeAccountsFile(rig.home)) updateClaudeAccount(rig.home, account.id, { paused: true });
+    const unavailable = await rig.sendRequest("pause-conversation");
+    assert.equal(unavailable.status, 401);
+    assert.match(unavailable.text, /no usable Claude account/i);
+    assert.equal(rig.seen.length, 3, "all-paused must not fall back to the caller's headers");
+    assert.equal(rig.requests.list(1)[0]?.refusal, "no-account");
+    assert.equal(rig.requests.list(1)[0]?.upstreamCalled, false);
+    setCurrentClaudeAccountPaused(rig.home, false, "current-token");
+    assert.equal(await rig.send("pause-conversation"), 200);
+    assert.equal(rig.seen.at(-1)?.authorization, "Bearer current-token");
+  } finally {
+    await rig.stop();
+  }
+});
+
+for (const mode of ["rotation-off", "unconfigured"] as const) {
+  test(`native pause blocks Messages and count_tokens passthrough (${mode}), not Remote Control`, async () => {
+    const rig = await nativeRig(() => ({ status: 200 }));
+    try {
+      if (mode === "unconfigured") {
+        rig.cfg.providers = {};
+        rig.cfg.routes = {};
+      } else {
+        const provider = rig.cfg.providers.claude!;
+        assert.equal(provider.type, "anthropic");
+        if (provider.type === "anthropic") provider.accountPool = false;
+      }
+      setCurrentClaudeAccountPaused(rig.home, true, "current-token");
+      for (const requestPath of ["/v1/messages", "/v1/messages/count_tokens"]) {
+        const refused = await rig.sendRequest("paused-passthrough", { path: requestPath });
+        assert.equal(refused.status, 401);
+        assert.match(refused.text, /paused.*resume/i);
+        assert.equal(rig.requests.list(1)[0]?.upstreamCalled, false);
+        assert.equal(rig.requests.list(1)[0]?.refusal, "no-account");
+      }
+      assert.equal(rig.seen.length, 0);
+      assert.equal((await rig.sendRequest("bridge", { path: "/v1/environments/bridge" })).status, 200);
+      assert.equal(rig.seen.length, 1, "non-inference traffic retains its external authentication");
+      setCurrentClaudeAccountPaused(rig.home, false, "current-token");
+      assert.equal(await rig.send("paused-passthrough"), 200);
+      assert.equal(rig.seen.at(-1)?.authorization, "Bearer caller-token");
+    } finally {
+      await rig.stop();
+    }
+  });
+}
+
+test("native count_tokens checks the caller's paused grant instead of another current login", async () => {
+  const rig = await nativeRig(() => ({ status: 200 }));
+  try {
+    rig.cfg.providers = {};
+    rig.cfg.routes = {};
+    updateClaudeAccount(rig.home, rig.stored.id, { paused: true }, "current-token");
+    const refused = await rig.sendRequest("paused-count-token", { path: "/v1/messages/count_tokens", authorization: "Bearer stored-token" });
+    assert.equal(refused.status, 401);
+    assert.match(refused.text, /paused.*resume/i);
+    assert.equal(rig.seen.length, 0, "a different observed login cannot authorize the caller's paused token");
+    assert.equal(rig.requests.list(1)[0]?.upstreamCalled, false);
+  } finally {
+    await rig.stop();
+  }
+});
+
+test("native OAuth pause leaves an independent API-key passthrough untouched", async () => {
+  const rig = await nativeRig(() => ({ status: 200 }));
+  try {
+    rig.cfg.providers = {};
+    rig.cfg.routes = {};
+    setCurrentClaudeAccountPaused(rig.home, true, "current-token");
+    for (const requestPath of ["/v1/messages", "/v1/messages/count_tokens"]) {
+      assert.equal((await rig.sendRequest("independent-api-key", { path: requestPath, authorization: null, apiKey: "independent-test-key" })).status, 200);
+    }
+    assert.deepEqual(rig.seen.map((item) => [item.authorization, item.apiKey]), [
+      [undefined, "independent-test-key"], [undefined, "independent-test-key"],
+    ]);
+  } finally {
+    await rig.stop();
+  }
+});
+
+test("native retries skip an account paused while the first response is pending", async () => {
+  let home = "";
+  let nextId = "";
+  const rig = await nativeRig((_seen, attempt) => {
+    if (attempt !== 1) return { status: 200 };
+    updateClaudeAccount(home, nextId, { paused: true });
+    return { status: 429, headers: { "retry-after": "300" }, body: "{}" };
+  });
+  home = rig.home;
+  nextId = rig.stored.id;
+  try {
+    assert.equal(await rig.send("pause-before-retry"), 200);
+    assert.deepEqual(rig.seen.map((item) => item.authorization), ["Bearer current-token", "Bearer third-token"]);
+  } finally {
+    await rig.stop();
+  }
+});
+
+test("pausing the native login does not block an explicitly routed compatible provider", async () => {
+  let compatibleCalls = 0;
+  const compatible = http.createServer((req, res) => {
+    req.resume();
+    req.on("end", () => {
+      compatibleCalls++;
+      res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ id: "msg_routed", type: "message", role: "assistant", content: [], usage: {} }));
+    });
+  });
+  await new Promise<void>((resolve) => compatible.listen(0, "127.0.0.1", resolve));
+  const port = (compatible.address() as net.AddressInfo).port;
+  const rig = await nativeRig(() => ({ status: 200 }));
+  try {
+    rig.cfg.providers.other = { type: "anthropic-compatible", url: `http://127.0.0.1:${port}`, headers: { "x-api-key": "compatible-test-key" } };
+    rig.cfg.routes["claude-routed"] = { provider: "other", model: "other-model" };
+    setCurrentClaudeAccountPaused(rig.home, true, "current-token");
+    assert.equal((await rig.sendRequest("routed", { model: "claude-routed" })).status, 200);
+    assert.equal(compatibleCalls, 1);
+    assert.equal(rig.seen.length, 0);
+  } finally {
+    await rig.stop();
+    await new Promise<void>((resolve) => compatible.close(() => resolve()));
+  }
+});
 
 test("a native Claude turn survives 429, keeps the replacement account, and preserves server tools", async () => {
   const rig = await nativeRig((_seen, attempt) => attempt === 1

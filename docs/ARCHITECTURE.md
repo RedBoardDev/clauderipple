@@ -954,12 +954,53 @@ from, to}` at hour granularity — buckets whose hour start is in `[from, to)`. 
     first-key fallback; all paused means no upstream request. `inUse` identifies the next usable
     account for a new conversation (one or none), not `active`, which remains the last responder.
     Login account PATCH bodies accept boolean `preferred`/`paused` and `clearCooldown: true`;
-    Claude's existing PUT preference API remains supported. External Codex/current-Claude logins
-    retain their existing ownership restrictions. Compatible credentials persist boolean flags on
-    their `config.json` entries via PUT `/api/config` (validated, at most one preferred per provider);
+    Claude's existing PUT preference API remains supported. The external Codex login keeps its
+    ownership restrictions. Compatible credentials persist boolean flags on their `config.json`
+    entries via PUT `/api/config` (validated, at most one preferred per provider);
     `/api/status.credentials[name]` reports each entry's flags and selection, including a declared
     single key. POST `/api/credentials/clear-cooldown` with `{provider, id}` clears one key's runtime
     health. Cooldown clearing also works while an entry is paused, without resuming it.
+    - **Current Claude login pause.** PATCH `/api/claude-accounts/current` accepts only `paused`
+      and `clearCooldown`; renaming/deleting the external login remains forbidden, and preference
+      still uses the existing PUT. The existing v1 `claude-accounts.json` envelope holds optional
+      `current: {paused: boolean, aliases?: string[]}` metadata under the same lock/atomic 0600
+      write. Aliases are opaque local grant IDs linked by an exact token at an operator action,
+      never copied external credentials, tokens, emails or upstream identity. Every grant mutation preserves it; removing all stored grants preserves
+      a true native pause. Unreadable storage fails closed, and is never overwritten by a control
+      change. A paused current row remains visible even if the external sign-in is temporarily absent.
+      This controls the **current credential source**, across token changes and router restarts,
+      until explicitly resumed; it does not sign out or alter Claude Code/Desktop. Exact-token
+      stored aliases are paused/resumed in the same write from either account row. Their recorded
+      local IDs let Resume restore the linked grants after token rotation or legacy-file migration,
+      without resuming unrelated paused grants. Provenance is cleared on resume. Independently added
+      grants with different tokens retain their own controls, not an inferred human-identity policy; the dashboard shows
+      stored copies separately whenever either source is paused so their controls stay accessible.
+    - The native Messages/count-tokens OAuth passthrough checks this exclusion against the forwarded
+      Bearer in both CONNECT and absolute-form proxy requests, even with rotation off or no native
+      provider configured. Independent API-key requests,
+      routed providers and non-inference Remote Control traffic are unaffected. The native account
+      pool and both OpenAI-ingress endpoints use the same persisted selection. Compatible ingress
+      targets also choose an unpaused preferred key, or the first unpaused key, without retrying;
+      all paused means a local 503, never the mirrored first key. Paused native credentials retain
+      their runtime cooldown in status so it can be cleared without resuming the login. Inference
+      selection from an entirely paused native pool needs no OS credential lookup. Paused stored
+      grants start no OAuth refresh;
+      an already-running refresh retains a concurrent pause when its compare-and-swap completes.
+      Pausing does not cancel an in-flight turn.
+    - Compatible hosted searches and per-model Google wire overrides select from the original
+      credential pool **before** converting the selected headers. With all entries paused they
+      answer locally with 503, `refusal: no-account` and no upstream call, rather than using the
+      mirrored first key or falling through to native search. Selections after a failed hosted
+      search or an unwritten model fallback also use fresh controls. In-turn credential rotation
+      rereads operator controls even when only one key was initially available, but refuses an
+      endpoint or wire-family change instead of sending new credentials to the turn's old destination.
+      Search capability is checked on the effective provider of each attempt, not an earlier snapshot.
+      Converted Google requests inject selected authentication into a stable adapter per request, so
+      interleaved keys do not discard a healthy conversation's thought signatures or input estimates.
+      Tests: `shared-account-controls.test.ts`, `anthropic-accounts.test.ts`,
+      `anthropic-account-pool.test.ts`, `anthropic-account-proxy.test.ts`, `ingress-server.test.ts`,
+      `proxy-failover.test.ts`, `proxy-websearch.test.ts`, `admin.test.ts`, `ui-account-controls.test.ts`,
+      `absolute-proxy.test.ts`, `google-adapter.test.ts`, `proxy-google.test.ts`.
   - Four things an independent review found, each of which had made it past the unit tests because
     each lived in the wiring rather than the state machine: the pool never heard about the ChatGPT
     or openai-compatible adapters, so those providers looked healthy forever and a slot pointing at
