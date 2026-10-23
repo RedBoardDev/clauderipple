@@ -1,10 +1,11 @@
 // Integration through the actual mods engine. Only external host boundaries are stubbed.
 import { expect, mock, test } from 'claude-code/testing'
 import type { Engine } from 'claude-code/testing'
-import type { AgentSpawnInput, ModelCompleteRequest, ModelUsage, On, SessionMessage, ToolCallInput, TurnStepInput } from 'claude-code'
+import type { AgentSpawnInput, ModelApiError, ModelCompleteRequest, ModelUsage, On, SessionMessage, ToolCallInput, TurnStepInput } from 'claude-code'
 import { MOD_SETTINGS_SCHEMA_VERSION, DEFAULTS, normalizeModes, normalizeSettings } from '../hooks/settings'
 import type { Lang } from '../hooks/i18n'
-import type { AgentRec, ModSettingsSnapshot, Settings } from '../types'
+import type { AgentRec, JudgeRun, ModSettingsSnapshot, Settings } from '../types'
+import type { JevState } from '../hooks/ui/view'
 
 const NOW = 1000000
 const USAGE: ModelUsage = { input_tokens: 100, output_tokens: 10, cache_read_input_tokens: 40000, cache_creation_input_tokens: 0 }
@@ -93,7 +94,7 @@ function boundaries(on: On, patch: Partial<Settings> = {}, options: { config?: u
   })
   const files = new Map<string, string>()
   let logFailure: 'read' | 'write' | null = null
-  on('fs.exists', ($, e) => ({ value: files.has(e.path) }))
+  on('fs.exists', ($, e) => ({ value: files.has(e.path) || e.path.endsWith('config.json') || e.path.endsWith('/.config/jev/.env') && options.envFile !== undefined }))
   on('fs.write', ($, e) => {
     if (e.path.endsWith('/worker-picks.jsonl') && logFailure === 'write') return { deny: 'worker log write denied' }
     files.set(e.path, e.text)
@@ -589,13 +590,13 @@ for (const failure of ['read', 'write'] as const) test(`worker log ${failure} fa
   expect(b.files.get(path)!.trim().split('\n').length).toBe(2)
 })
 
-for (const error of ['api-error: overloaded (503)', 'aborted'] as const) test(`failed worker judge persists defaults with ${error}`, async ($, on) => {
+for (const error of ['api-error (503)', 'api-error (no response)', 'aborted'] as const) test(`failed worker judge persists defaults with ${error}`, async ($, on) => {
   const b = boundaries(on)
   http(on)
   on('model.complete', async ($, e) => {
     expect(e.timeoutMs).toBe(6000)
     if (error === 'aborted') await b.clock.advance(6000)
-    return { value: error === 'aborted' ? { isAnswered: false, reason: 'aborted', usage: USAGE } : { isAnswered: false, reason: 'api-error', status: 503, error: 'overloaded', usage: USAGE } }
+    return { value: error === 'aborted' ? { isAnswered: false, reason: 'aborted', usage: USAGE } : { isAnswered: false, reason: 'api-error', status: error === 'api-error (no response)' ? null : 503, error: 'overloaded', usage: USAGE } }
   })
   const sent = spawnStub(on)
   await start($)
@@ -1689,6 +1690,189 @@ function modelStub(on: On, answers: Record<string, string | undefined>) {
   })
   return models
 }
+function judgeDiagnostics(on: On) {
+  let runs: JudgeRun[] = []
+  let tested: JevState['test'] = { state: 'idle' }
+  on('state.set', { plugin: 'ripple', key: 'judgeRuns' }, async ($, e, next) => {
+    const result = await next(e)
+    runs = e.value as JudgeRun[]
+    return result
+  })
+  on('state.set', { plugin: 'ripple', key: 'jev' }, async ($, e, next) => {
+    const result = await next(e)
+    tested = (e.value as JevState).test
+    return result
+  })
+  return { runs: () => runs, test: () => tested }
+}
+const SYNTHETIC_DIAGNOSTIC = 'SYNTHETIC'
+for (const position of ['primary', 'secondary'] as const) for (const kind of ['model', 'haiku'] as const) test(`judge privacy: ${position} ${kind} api-error keeps only safe diagnostics`, async ($, on) => {
+  const target: Settings['judges'][number] = kind === 'model' ? { kind, model: 'router-b' } : { kind }
+  const preceding: Settings['judges'] = position === 'secondary' ? [{ kind: 'model', model: 'router-a' }] : []
+  // The unreachable Jev entry keeps the existing missing-key Test control available.
+  const b = boundaries(on, { judges: [...preceding, target, { kind: 'model', model: 'router-c' }, { kind: 'jev' }] })
+  const diagnostics = judgeDiagnostics(on)
+  http(on)
+  const models: string[] = []
+  on('model.complete', ($, e) => {
+    models.push(e.model)
+    if (e.model === 'router-a') return { value: { isAnswered: false, reason: 'empty-reply', usage: USAGE } }
+    if (e.model === 'router-c') return { value: { isAnswered: true, text: '{"domain":"general","level":"light","effort":"low","why":"safe verdict"}', usage: USAGE } }
+    // CLI 2.1.293 can return raw error text; 2.1.299 types promise categories instead.
+    return { value: { isAnswered: false, reason: 'api-error', status: e.model === 'haiku' ? 429 : 503, error: SYNTHETIC_DIAGNOSTIC.repeat(1000) as ModelApiError, usage: USAGE } }
+  })
+  const steps = stepStub(on)
+  const spawns = spawnStub(on)
+  await start($)
+  await submit($)
+  await step($)
+  await $.agent.spawn(SPAWN)
+  expect(steps[0]?.effort).toBe('low')
+  expect(spawns[0]).toMatchObject({ subagentType: 'deepseek-v4-1-flash', model: 'deepseek-v4.1-flash@max' })
+  const safe = 'api-error (503)'
+  const first = position === 'secondary' ? 'empty-reply' : safe
+  const attempts = [...preceding.map(target => ({ target, ms: 0, error: 'empty-reply' })), { target, ms: 0, error: safe }, { target: { kind: 'model', model: 'router-c' }, ms: 0 }]
+  const runs = diagnostics.runs()
+  expect(runs.map(run => run.for)).toEqual(['prompt', 'worker'])
+  expect(JSON.stringify(runs)).not.toContain(SYNTHETIC_DIAGNOSTIC)
+  for (const run of runs) expect(run).toMatchObject({ by: 'model', error: first, attempts })
+  const persisted = b.files.get('/home/test/.clauderipple/logs/worker-picks.jsonl')!
+  expect(persisted).not.toContain(SYNTHETIC_DIAGNOSTIC)
+  expect(JSON.parse(persisted)).toMatchObject({ by: 'judge', judge: 'model', error: first, attempts, verdict: { level: 'light' } })
+  await command($, 'settings')
+  const ui = await band($)
+  await ui.press({ key: 'jev-test' })
+  const tested = diagnostics.test()
+  expect(tested).toMatchObject({ state: 'fail' })
+  expect(tested?.message).toContain(first)
+  expect(JSON.stringify(tested)).not.toContain(SYNTHETIC_DIAGNOSTIC)
+  expect(JSON.stringify(await ui.findAll({ type: 'Text' }))).not.toContain(SYNTHETIC_DIAGNOSTIC)
+  expect(b.toasts.join('\n')).toContain(first)
+  expect(b.toasts.join('\n')).not.toContain(SYNTHETIC_DIAGNOSTIC)
+  expect(b.logs.join('\n')).not.toContain(SYNTHETIC_DIAGNOSTIC)
+  const oneRun = [...preceding.map(target => target.kind === 'model' ? target.model : target.kind), ...(kind === 'model' ? ['router-b'] : ['claude-haiku-5-5', 'haiku']), 'router-c']
+  expect(models).toEqual([...oneRun, ...oneRun, ...oneRun])
+  await ui.unmount()
+})
+
+for (const position of ['primary', 'secondary'] as const) test(`judge privacy: ${position} Jev HTTP 200 non-JSON never exposes the response body`, async ($, on) => {
+  const preceding: Settings['judges'] = position === 'secondary' ? [{ kind: 'model', model: 'router-a' }] : []
+  let keyAvailable = true
+  const b = boundaries(on, { judges: [...preceding, { kind: 'jev' }, { kind: 'model', model: 'router-c' }] }, { envFile: () => keyAvailable ? 'TYPESAFE_API_KEY=test-secret' : '' })
+  const diagnostics = judgeDiagnostics(on)
+  on('http.fetch', { url: 'https://api.typesafe.ai/v1/systemone' }, () => ({ value: { ok: true, status: 200, headers: {}, text: SYNTHETIC_DIAGNOSTIC } }))
+  http(on)
+  const models = modelStub(on, { 'router-c': '{"domain":"general","level":"light","effort":"low","why":"safe verdict"}' })
+  const steps = stepStub(on)
+  const spawns = spawnStub(on)
+  await start($)
+  await submit($)
+  await step($)
+  await $.agent.spawn(SPAWN)
+  expect(steps[0]?.effort).toBe('low')
+  expect(spawns[0]?.subagentType).toBe('deepseek-v4-1-flash')
+  const first = position === 'secondary' ? 'empty-reply' : 'invalid-response'
+  const attempts = [...preceding.map(target => ({ target, ms: 0, error: 'empty-reply' })), { target: { kind: 'jev' }, ms: 0, error: 'invalid-response' }, { target: { kind: 'model', model: 'router-c' }, ms: 0 }]
+  const runs = diagnostics.runs()
+  expect(runs.map(run => run.for)).toEqual(['prompt', 'worker'])
+  expect(JSON.stringify(runs)).not.toContain(SYNTHETIC_DIAGNOSTIC)
+  for (const run of runs) expect(run).toMatchObject({ by: 'model', error: first, attempts })
+  const persisted = b.files.get('/home/test/.clauderipple/logs/worker-picks.jsonl')!
+  expect(persisted).not.toContain(SYNTHETIC_DIAGNOSTIC)
+  expect(JSON.parse(persisted)).toMatchObject({ by: 'judge', judge: 'model', error: first, attempts })
+  // Open Test while the key is missing, then supply the fixture key for that call.
+  keyAvailable = false
+  await command($, 'settings')
+  const ui = await band($)
+  keyAvailable = true
+  await ui.press({ key: 'jev-test' })
+  const tested = diagnostics.test()
+  expect(tested).toMatchObject({ state: 'fail' })
+  expect(tested?.message).toContain(first)
+  expect(JSON.stringify(tested)).not.toContain(SYNTHETIC_DIAGNOSTIC)
+  expect(JSON.stringify(await ui.findAll({ type: 'Text' }))).not.toContain(SYNTHETIC_DIAGNOSTIC)
+  expect(b.toasts.join('\n')).toContain(first)
+  expect(b.toasts.join('\n')).not.toContain(SYNTHETIC_DIAGNOSTIC)
+  expect(b.logs.join('\n')).not.toContain(SYNTHETIC_DIAGNOSTIC)
+  const oneRun = [...preceding.map(target => target.kind === 'model' ? target.model : target.kind), 'router-c']
+  expect(models).toEqual([...oneRun, ...oneRun, ...oneRun])
+  await ui.unmount()
+})
+
+test('judge privacy: an unreadable TypeSafe key still falls back to configured Zen without exposing the failure', async ($, on) => {
+  const path = '/home/test/.config/jev/.env'
+  let denied = false
+  on('fs.read', { path }, ($, e, next) => denied ? { deny: SYNTHETIC_DIAGNOSTIC } : next(e))
+  const config = { ...CONFIG, providers: { ...CONFIG.providers, 'opencode-zen': { headers: { authorization: 'Bearer zen-test' }, models: [{ id: 'jev-1.13' }] } } }
+  const b = boundaries(on, { judges: [{ kind: 'jev' }], jevSource: 'typesafe' }, { config })
+  b.files.set(path, 'TYPESAFE_API_KEY=test-secret')
+  const diagnostics = judgeDiagnostics(on)
+  const zen: { body?: string; headers?: Readonly<Record<string, string>> }[] = []
+  http(on, false, config, input => { zen.push(input.init ?? {}) })
+  const models = modelStub(on, {})
+  const steps = stepStub(on)
+  await start($)
+  denied = true
+  await submit($)
+  await step($)
+  expect(zen.length).toBe(1)
+  expect(zen[0]?.headers?.authorization).toBe('Bearer zen-test')
+  expect(JSON.parse(zen[0]?.body ?? '{}')).toMatchObject({ model: 'jev-1.13' })
+  expect(models).toEqual([])
+  expect(steps[0]?.effort).toBe('high')
+  expect(diagnostics.runs()).toMatchObject([{ by: 'jev', effort: 'high', attempts: [{ target: { kind: 'jev' } }] }])
+  expect(diagnostics.runs()[0]?.error).toBeUndefined()
+  expect(JSON.stringify(diagnostics.runs())).not.toContain(SYNTHETIC_DIAGNOSTIC)
+  expect(b.toasts.join('\n')).not.toContain(SYNTHETIC_DIAGNOSTIC)
+  expect(b.logs.join('\n')).not.toContain(SYNTHETIC_DIAGNOSTIC)
+})
+
+for (const failure of ['config', 'file'] as const) test(`judge privacy: Jev ${failure} failure uses a fixed diagnostic and still falls back`, async ($, on) => {
+  const path = '/home/test/.config/jev/.env'
+  let denied = false
+  on('fs.read', { path }, ($, e, next) => denied ? { deny: SYNTHETIC_DIAGNOSTIC } : next(e))
+  const b = boundaries(on, { judges: [{ kind: 'jev' }, { kind: 'model', model: 'router-c' }], jevSource: failure === 'config' ? 'zen' : 'typesafe' })
+  if (failure === 'file') b.files.set(path, 'TYPESAFE_API_KEY=test-secret')
+  const diagnostics = judgeDiagnostics(on)
+  http(on)
+  const models = modelStub(on, { 'router-c': GOOD })
+  const steps = stepStub(on)
+  await start($)
+  if (failure === 'config') b.files.set('/home/test/.clauderipple/config.json', SYNTHETIC_DIAGNOSTIC)
+  else denied = true
+  await submit($)
+  await step($)
+  expect(models).toEqual(['router-c'])
+  expect(steps[0]?.effort).toBe('low')
+  expect(diagnostics.runs()).toMatchObject([{ error: 'judge-failed', attempts: [{ target: { kind: 'jev' }, error: 'judge-failed' }, { target: { kind: 'model', model: 'router-c' } }] }])
+  expect(JSON.stringify(diagnostics.runs())).not.toContain(SYNTHETIC_DIAGNOSTIC)
+  expect(b.toasts.join('\n')).toContain('judge-failed')
+  expect(b.toasts.join('\n')).not.toContain(SYNTHETIC_DIAGNOSTIC)
+  expect(b.logs.join('\n')).not.toContain(SYNTHETIC_DIAGNOSTIC)
+})
+
+for (const [status, diagnostic] of [
+  [200, 'Jev returned no verdict'],
+  [401, 'Jev key rejected'],
+  [402, 'Jev out of credits'],
+  [403, 'Jev key rejected'],
+  [429, 'Jev rate limited'],
+  [503, 'Jev request failed (503)'],
+] as const) test(`judge privacy: Jev preserves fixed guidance for HTTP ${status}`, async ($, on) => {
+  const b = boundaries(on, { judges: [{ kind: 'jev' }, { kind: 'model', model: 'router-c' }] }, { key: 'test-secret' })
+  const diagnostics = judgeDiagnostics(on)
+  on('http.fetch', { url: 'https://api.typesafe.ai/v1/systemone' }, () => ({ value: { ok: status === 200, status, headers: {}, text: JSON.stringify({ echo: SYNTHETIC_DIAGNOSTIC }) } }))
+  http(on)
+  const models = modelStub(on, { 'router-c': GOOD })
+  await start($)
+  await submit($)
+  expect(models).toEqual(['router-c'])
+  expect(diagnostics.runs()).toMatchObject([{ error: diagnostic, attempts: [{ target: { kind: 'jev' }, error: diagnostic }, { target: { kind: 'model', model: 'router-c' } }] }])
+  expect(JSON.stringify(diagnostics.runs())).not.toContain(SYNTHETIC_DIAGNOSTIC)
+  expect(b.toasts.join('\n')).toContain(diagnostic)
+  expect(b.toasts.join('\n')).not.toContain(SYNTHETIC_DIAGNOSTIC)
+})
+
 test('chain: Haiku fails (exact id and alias), then Jev answers; the run keeps both attempts and the first error', async ($, on) => {
   const b = boundaries(on, { judges: [{ kind: 'haiku' }, { kind: 'jev' }] }, { key: 'test-secret' })
   http(on, false, CONFIG, undefined, 'ok')

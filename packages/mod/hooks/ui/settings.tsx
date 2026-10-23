@@ -12,6 +12,7 @@ import type { RenderNode } from 'claude-code'
 
 import type { JudgeTarget, Settings, Skin } from '../../types'
 import { DEFAULT_JUDGE_MODEL, SKINS, judgeTargetKey } from '../settings'
+import { isJudgeOnlyModel } from '../judge-model'
 import { CELL_PX, TILE_PX } from './art'
 import type { TileArt } from './art'
 import { capsule, pill, pic, ripple, segmented, slider, toggle, well } from './kit'
@@ -109,7 +110,7 @@ export function judgeChain(lang: Frame['lang'], judges: readonly JudgeTarget[]):
 function modelChoices(view: SettingsView, lang: Frame['lang'], own?: string): { value: string; label: string }[] {
   const taken = new Set(view.settings.judges.flatMap(judge => (judge.kind === 'model' && judge.model !== own ? [judge.model] : [])))
   const out: { value: string; label: string }[] = []
-  for (const model of view.models ?? []) if (!taken.has(model.value) && !out.some(o => o.value === model.value)) out.push({ value: model.value, label: model.label })
+  for (const model of view.models ?? []) if (!isJudgeOnlyModel(model.value) && !taken.has(model.value) && !out.some(o => o.value === model.value)) out.push({ value: model.value, label: model.label })
   if (own && !out.some(o => o.value === own)) out.unshift({ value: own, label: own + ' · ' + t(lang, 'settings.judgeUnavailable') })
   return out
 }
@@ -117,7 +118,7 @@ function modelChoices(view: SettingsView, lang: Frame['lang'], own?: string): { 
 /** The model a new router entry starts on: the first router model not yet used, else the default. */
 function nextModel(view: SettingsView): string | undefined {
   const used = new Set(view.settings.judges.flatMap(judge => (judge.kind === 'model' ? [judge.model] : [])))
-  return [...(view.models ?? []).map(model => model.value), DEFAULT_JUDGE_MODEL].find(model => !used.has(model))
+  return [...(view.models ?? []).map(model => model.value), DEFAULT_JUDGE_MODEL].find(model => !isJudgeOnlyModel(model) && !used.has(model))
 }
 
 /** One entry of the chain: its place, its name (a router entry's model is pickable), then order controls. */

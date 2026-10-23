@@ -200,6 +200,118 @@ test("domain editors copy, edit and remove only the selected set's rule; new mod
   assert.ok(ui.state.settings.modes[0]!.domainRules!.ui);
 });
 
+test("ordered judge card edits one canonical judges list and saves schema 2 without scalar judge fields", async () => {
+  const source = fs.readFileSync(new URL('../../ui/app.js', import.meta.url), 'utf8');
+  const block = (from: string, to: string) => source.slice(source.indexOf(from), source.indexOf(to));
+  type Node = { attrs: Record<string, unknown>; children: Node[]; value: string; events: Record<string, () => void>; addEventListener: (name: string, fn: () => void) => void; appendChild: (node: Node) => void };
+  const el = (_tag: string, attrs: Record<string, unknown> = {}, children: Node[] = []): Node => {
+    const node: Node = { attrs, children: children.filter(Boolean), value: String(attrs.value ?? ''), events: {}, addEventListener(name, fn) { this.events[name] = fn; }, appendChild(child) { this.children.push(child); } };
+    for (const [key, value] of Object.entries(attrs)) if (key.startsWith('on') && typeof value === 'function') node.events[key.slice(2)] = value as () => void;
+    return node;
+  };
+  const cell = (_label: unknown, controls: Node | Node[], help: unknown) => el('cell', { help }, Array.isArray(controls) ? controls : [controls]);
+  const sent: { schemaVersion: number; settings: Record<string, unknown> }[] = [];
+  const build = new Function('el', 'cell', 'sent', `
+    const t = key => key, clone = value => JSON.parse(JSON.stringify(value));
+    const MOD_EFFORTS = ['low','medium','high','xhigh','max'];
+    ${block('const MOD_CLAUDE_MODELS', '// `base` is the router')}
+    const modState = { settings: clone(MOD_DEFAULTS), base: null, revision: 3, options: null, retiredNote: false };
+    let modSaveTimer = null, modSaving = false, modSaveAgain = false, modWrites = 0;
+    const modRefresh = () => {}, modStatus = () => {}, setTimeout = () => 1, clearTimeout = () => {}, toast = () => {}, showView = () => {};
+    const api = async (_url, init) => { sent.push(JSON.parse(init.body)); return { revision: 4, settings: JSON.parse(init.body).settings }; };
+    ${block('function modNormalize(', 'function modCap(')}
+    ${block('function modCap(', '/** Rebuild a region')}
+    ${block('function modSwitch(', 'function modCard(')}
+    function modCard(id, title, blurb, sections) { return el('card', {}, sections); }
+    ${block('function modPatch(', 'async function loadMod(')}
+    ${block('const modJudgeKey', 'function modCacheCard(')}
+    return { state: modState, card: modJudgeCard, normalize: modNormalize, save: saveMod };
+  `) as (el: unknown, cell: unknown, sent: unknown) => { state: { settings: { judges: { kind: string; model?: string }[]; jevSource: string }; options: unknown }; card: () => Node; normalize: (raw: unknown) => Record<string, unknown> & { judges: unknown[] }; save: () => Promise<void> };
+  const ui = build(el, cell, sent);
+  const walk = (node: Node): Node[] => [node, ...node.children.flatMap(walk)];
+  const find = (key: string) => walk(ui.card()).find(node => node.attrs['data-key'] === key);
+  const click = (key: string) => find(key)!.events.click!();
+  const judges = () => ui.state.settings.judges;
+  const labels = () => judges().map(j => j.kind === 'model' ? `model:${j.model}` : j.kind);
+  const disabled = (key: string) => Object.hasOwn(find(key)!.attrs, 'disabled');
+  ui.state.options = { models: [{ model: 'jev-1.13', provider: 'zen', name: 'Jev', judgeOnly: true }, { model: 'a', provider: 'p', name: 'A', judgeOnly: false }, { model: 'b', provider: 'p', name: 'B', judgeOnly: false }, { model: 'a', provider: 'q', name: 'Duplicate A', judgeOnly: false }], zen: { configured: false } };
+
+  // Legacy scalars never come back from the page; the canonical list or the Haiku default does.
+  assert.deepEqual(ui.normalize({ judge: 'jev', judgeModel: 'z' }).judges, [{ kind: 'haiku' }]);
+  assert.equal(Object.hasOwn(ui.normalize({ judge: 'jev', judgeModel: 'z' }), 'judge'), false);
+  assert.deepEqual(ui.normalize({ judges: [{ kind: 'jev' }, { kind: 'haiku' }] }).judges, [{ kind: 'jev' }, { kind: 'haiku' }]);
+
+  // A singleton is easy: nothing to move, nothing to remove, no source controls without Jev.
+  assert.deepEqual(labels(), ['haiku']);
+  assert.ok(disabled('judge:0:up') && disabled('judge:0:down') && disabled('judge:0:remove'));
+  assert.equal(find('jev-source:typesafe'), undefined);
+  assert.equal(find('judge:0')!.children.some(o => o.attrs.value === 'model:a' && o.attrs.text === 'A · p'), true, 'ordinary router models are offered');
+  assert.equal(find('judge:0')!.children.some(o => o.attrs.value === 'model:jev-1.13'), false, 'Jev requires its dedicated transport, not model.complete');
+
+  // Add walks Haiku, Jev, then each distinct router model; each target appears once.
+  click('judge-add'); click('judge-add');
+  assert.deepEqual(labels(), ['haiku', 'jev', 'model:a']);
+  assert.ok(find('jev-source:typesafe') && find('jev-source:zen'));
+  assert.ok(walk(ui.card()).some(node => node.attrs.text === 'mod.jevKeyNote'));
+  click('jev-source:zen');
+  assert.equal(ui.state.settings.jevSource, 'zen');
+  assert.ok(walk(ui.card()).some(node => node.attrs.help === 'mod.zenAdd'));
+  click('jev-source:typesafe');
+  assert.equal(ui.state.settings.jevSource, 'typesafe');
+  click('judge-add');
+  assert.deepEqual(labels(), ['haiku', 'jev', 'model:a', 'model:b']);
+  assert.equal(disabled('judge-add'), true);
+  // Every control has its own focus key.
+  const keys = walk(ui.card()).map(node => node.attrs['data-key']).filter(Boolean) as string[];
+  assert.equal(new Set(keys).size, keys.length);
+  for (const index of [0, 1, 2, 3]) for (const part of ['', ':up', ':down', ':remove']) assert.ok(keys.includes(`judge:${index}${part}`));
+  assert.ok(disabled('judge:0:up') && disabled('judge:3:down') && !disabled('judge:2:remove'));
+  // Another entry's target is not offered; the entry's own value and the free ones are.
+  assert.deepEqual(find('judge:2')!.children.map(o => o.attrs.value), ['model:a']);
+
+  // Picking model B for the slot that held A keeps one B: the slot's own change wins, the later duplicate drops.
+  const slot = find('judge:2')!;
+  slot.value = 'model:b'; slot.events.change!();
+  assert.deepEqual(labels(), ['haiku', 'jev', 'model:b']);
+  click('judge:1:up');
+  assert.deepEqual(labels(), ['jev', 'haiku', 'model:b']);
+  click('judge:1:down');
+  assert.deepEqual(labels(), ['jev', 'model:b', 'haiku']);
+  click('judge:1:remove');
+  assert.deepEqual(labels(), ['jev', 'haiku']);
+  click('judge:0:remove');
+  assert.deepEqual(labels(), ['haiku']);
+  assert.equal(find('jev-source:zen'), undefined);
+  assert.equal(disabled('judge:0:remove'), true);
+
+  // A previously configured specialized model stays as unavailable, not rewritten to dedicated Jev.
+  ui.state.settings.judges = [{ kind: 'model', model: 'jev-1.13' }, { kind: 'haiku' }];
+  const specialized = find('judge:0')!;
+  assert.equal(specialized.value, 'model:jev-1.13');
+  assert.equal(specialized.children.some(o => o.attrs.value === 'model:jev-1.13' && o.attrs.text === 'jev-1.13mod.unavailable'), true);
+  assert.equal(find('judge:1')!.children.some(o => o.attrs.value === 'model:jev-1.13'), false);
+  assert.deepEqual(labels(), ['model:jev-1.13', 'haiku']);
+  assert.equal(find('jev-source:zen'), undefined);
+
+  // A configured model discovery no longer lists stays selected and visible.
+  ui.state.settings.judges = [{ kind: 'model', model: 'gone' }, { kind: 'haiku' }];
+  const unknown = find('judge:0')!;
+  assert.equal(unknown.value, 'model:gone');
+  assert.equal(unknown.children.some(o => o.attrs.value === 'model:gone' && o.attrs.text === 'gonemod.unavailable'), true);
+  assert.deepEqual(labels(), ['model:gone', 'haiku']);
+
+  // The exhaustion rule is stated, not promised away as a fixed fallback.
+  const help = walk(ui.card()).find(node => node.attrs.class === 'group-footer');
+  assert.equal(help?.attrs.text, 'mod.judgeOrderHelp');
+
+  // Saving sends schema 2 with the canonical list and no scalar judge field.
+  await ui.save();
+  assert.equal(sent[0]!.schemaVersion, 2);
+  assert.deepEqual(sent[0]!.settings.judges, [{ kind: 'model', model: 'gone' }, { kind: 'haiku' }]);
+  assert.equal(Object.hasOwn(sent[0]!.settings, 'judge'), false);
+  assert.equal(Object.hasOwn(sent[0]!.settings, 'judgeModel'), false);
+});
+
 const { applyPickerSelections: apply, pickerSelectionsExcept: except } = loadPickerBlock();
 const groups = loadGroupedModels();
 

@@ -11,7 +11,7 @@ import type { On, RenderElement, RenderPropsOf } from 'claude-code'
 
 import type { AgentRec, Settings, Skin, StatusRequest } from '../types'
 import { STRINGS } from '../hooks/i18n'
-import { normalizeSettings } from '../hooks/settings'
+import { DEFAULT_JUDGE_MODEL, normalizeSettings } from '../hooks/settings'
 import { cardRows, renderAgents, talkOf, timeCells } from '../hooks/ui/agents'
 import { chOf, displayWidth } from '../hooks/ui/theme'
 import { commandLine, runSummary, shortPath, toolDetail } from '../hooks/ui/tools'
@@ -613,6 +613,74 @@ test('the judge chain reorders, adds and removes on both surfaces without duplic
     [...chain, { kind: 'model', model: 'router-b' }],
   ]
   expect(patched(calls)).toEqual([...once, ...once])
+})
+
+test('settings and setup never offer or auto-add raw Jev catalog models as generic judges on either surface', async ($, on) => {
+  const { calls, fn } = recorder()
+  const actions = { ...QUICK_ACTIONS, patch: fn('patch'), back: () => undefined, next: () => undefined, finish: () => undefined, skip: () => undefined }
+  // /api/config's RouterModel registry has no judgeOnly metadata; both spellings need the shared policy.
+  const specialized = [{ value: 'jev-1.13', label: 'Jev · zen', provider: 'zen' }, { value: 'JeV-2', label: 'Mixed Jev · zen', provider: 'zen' }]
+  const judges: Settings['judges'] = [{ kind: 'haiku' }, { kind: 'model', model: 'router-a' }]
+  const cases = [
+    { name: 'ordinary', models: [...specialized, ...MODELS, MODELS[1]!], judges, next: 'router-b' },
+    { name: 'specialized-only', models: specialized, judges, next: DEFAULT_JUDGE_MODEL },
+    { name: 'default-used', models: specialized, judges: [{ kind: 'model', model: DEFAULT_JUDGE_MODEL }] as Settings['judges'], next: undefined },
+  ]
+  for (const mode of ['settings', 'setup'] as const) for (const entry of cases) {
+    const settings = { ...SETTINGS, judges: entry.judges }
+    const jev: JevState = { source: null, test: { state: 'idle' } }
+    drawPane(on, mode + '-' + entry.name, (el, surface) => mode === 'settings'
+      ? renderSettings(el, frameOf(surface), { settings, models: entry.models, jev }, actions)
+      : renderSetup(el, frameOf(surface), { step: 1, draft: settings, models: entry.models, jev }, actions))
+  }
+  const expected: Settings['judges'][] = []
+  for (const surface of SURFACES) for (const mode of ['settings', 'setup'] as const) for (const entry of cases) {
+    const ui = await mount($, mode + '-' + entry.name, surface)
+    if (entry.name === 'ordinary') {
+      const select = await ui.find({ type: 'Select', key: 'judge-model-1' })
+      expect(select?.props.options, surface + ' ' + mode).toEqual(MODELS.map(({ value, label }) => ({ value, label })))
+      await ui.select({ key: 'judge-model-1', value: 'router-c' })
+      expected.push([{ kind: 'haiku' }, { kind: 'model', model: 'router-c' }])
+    }
+    expect(!!await ui.find({ key: 'judge-add-model' }), surface + ' ' + mode + ' ' + entry.name).toBe(entry.next !== undefined)
+    if (entry.next) {
+      await ui.press({ key: 'judge-add-model' })
+      expected.push([...entry.judges, { kind: 'model', model: entry.next }])
+    }
+    await ui.press({ key: 'judge-add-jev' })
+    expected.push([...entry.judges, { kind: 'jev' }])
+    await ui.unmount()
+  }
+  expect(patched(calls)).toEqual(expected)
+})
+
+test('settings and setup retain configured specialized and unknown generic judges as unavailable on either surface', async ($, on) => {
+  const { calls, fn } = recorder()
+  const actions = { ...QUICK_ACTIONS, patch: fn('patch'), back: () => undefined, next: () => undefined, finish: () => undefined, skip: () => undefined }
+  const judges: Settings['judges'] = [{ kind: 'model', model: 'JeV-2' }, { kind: 'model', model: 'gone-model' }, { kind: 'model', model: 'router-a' }]
+  const settings = { ...SETTINGS, judges }
+  const models = [{ value: 'JeV-2', label: 'Mixed Jev · zen', provider: 'zen' }, ...MODELS]
+  const jev: JevState = { source: null, test: { state: 'idle' } }
+  for (const mode of ['settings', 'setup'] as const) drawPane(on, 'unavailable-' + mode, (el, surface) => mode === 'settings'
+    ? renderSettings(el, frameOf(surface), { settings, models, jev }, actions)
+    : renderSetup(el, frameOf(surface), { step: 1, draft: settings, models, jev }, actions))
+  for (const surface of SURFACES) for (const mode of ['settings', 'setup'] as const) {
+    const ui = await mount($, 'unavailable-' + mode, surface)
+    for (const [index, value] of ['JeV-2', 'gone-model'].entries()) {
+      const select = await ui.find({ type: 'Select', key: 'judge-model-' + index })
+      expect(select?.props.value, surface + ' ' + mode).toBe(value)
+      expect(select?.props.options).toEqual([
+        { value, label: value + ' · not in the router’s list' },
+        ...MODELS.slice(1).map(({ value, label }) => ({ value, label })),
+      ])
+    }
+    const ordinary = await ui.find({ type: 'Select', key: 'judge-model-2' })
+    expect(ordinary?.props.options).toEqual(MODELS.map(({ value, label }) => ({ value, label })))
+    expect(await ui.find({ key: 'jev-source-zen' })).toBeUndefined()
+    await ui.press({ key: 'judge-add-model' })
+    await ui.unmount()
+  }
+  expect(patched(calls)).toEqual(Array(4).fill([...judges, { kind: 'model', model: 'router-b' }]))
 })
 
 test('one global Jev source selector shows when Jev is anywhere in the chain and patches only jevSource', async ($, on) => {

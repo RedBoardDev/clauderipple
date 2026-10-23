@@ -603,11 +603,18 @@ async function endModeIfOver($: EngineInterface): Promise<void> {
   } catch (error) { await report($, 'mode end', error) }
   finally { endingMode = false }
 }
+// Judge configuration can contain credentials; neither parser nor filesystem errors may quote it.
+async function jevConfig($: EngineInterface): Promise<unknown> {
+  try {
+    const path = `${await rippleHome($)}/config.json`
+    const file = await $.fs.exists(path) ? await $.fs.read(path) : undefined
+    return file ? JSON.parse(file) : undefined
+  } catch { throw new Error('judge-failed') }
+}
 async function jevKey($: EngineInterface, jevSource?: Settings['jevSource']): Promise<string | undefined> {
   const selected = jevSource ?? normalizeSettings(await read($, settingsDraft) ?? await read($, settings)).jevSource
   if (selected === 'zen') {
-    const file = await optionalFile($, `${await rippleHome($)}/config.json`)
-    const key = file ? zenJev(JSON.parse(file)).authorization : undefined
+    const key = zenJev(await jevConfig($)).authorization
     await update($, jev, value => ({ ...value, source: key ? 'zen' as const : null }))
     return key
   }
@@ -616,7 +623,11 @@ async function jevKey($: EngineInterface, jevSource?: Settings['jevSource']): Pr
     if ((await read($, jev)).source !== 'env') await update($, jev, value => ({ ...value, source: 'env' as const }))
     return env
   }
-  const file = await optionalFile($, `${await userHome($)}/.config/jev/.env`)
+  let file: string | undefined
+  try {
+    const path = `${await userHome($)}/.config/jev/.env`
+    file = await $.fs.exists(path) ? await $.fs.read(path) : undefined
+  } catch { throw new Error('judge-failed') }
   const key = file ? parseJevKey(file) : undefined
   const source: 'pasted' | 'file' | null = key ? ((await read($, jev)).source === 'pasted' ? 'pasted' : 'file') : null
   if ((await read($, jev)).source !== source) await update($, jev, value => ({ ...value, source }))
@@ -624,9 +635,7 @@ async function jevKey($: EngineInterface, jevSource?: Settings['jevSource']): Pr
 }
 /** OpenCode Zen's key from the router's config, when Zen lists a Jev model there; else none. */
 async function zenJevKey($: EngineInterface): Promise<string | undefined> {
-  const file = await optionalFile($, `${await rippleHome($)}/config.json`)
-  if (!file) return undefined
-  const config: unknown = JSON.parse(file)
+  const config = await jevConfig($)
   const models = object(object(object(config).providers)['opencode-zen']).models
   const listed = Array.isArray(models) && models.some(m => { const id = object(m).id; return typeof id === 'string' && id.toLowerCase().includes('jev') })
   return listed ? zenJev(config).authorization : undefined
@@ -665,28 +674,27 @@ type Judged = { verdict: Verdict | WorkerVerdict | undefined; by: JudgeKind; tar
 type Tried = { verdict?: Verdict | WorkerVerdict; error?: string; blip?: boolean }
 function judgeFailure(answer: ModelCompleteResult): string | undefined {
   if (answer.isAnswered) return undefined
-  return answer.reason === 'api-error' ? `${answer.reason}: ${answer.error} (${answer.status ?? 'no response'})` : answer.reason
+  // Older engines can put response text in error; only the closed reason and status are diagnostic.
+  return answer.reason === 'api-error' ? `${answer.reason} (${answer.status ?? 'no response'})` : answer.reason
 }
 async function completeJudge($: EngineInterface, model: string, system: string, prompt: string): Promise<ModelCompleteResult> {
   return $.model.complete({ model, system, prompt, maxTokens: 160, timeoutMs: 6000, effort: 'low' })
 }
 async function tryJev($: EngineInterface, s: Settings, input: JudgeInput | { description: string; prompt: string }, worker: boolean, language: Lang): Promise<Tried> {
-  let blip = false
   try {
     let source = s.jevSource
-    let key = await jevKey($, source)
-    // No TypeSafe key, but the router's OpenCode Zen offers Jev: ask Jev there.
+    let key: string | undefined
+    let keyFailed = false
+    try { key = await jevKey($, source) }
+    catch { keyFailed = true }
+    // An unreadable TypeSafe file must not block the existing Zen rescue; its failure stays private.
     if (!key && source === 'typesafe') {
       key = await zenJevKey($)
       if (key) source = 'zen'
     }
-    if (!key) throw new Error(t(language, source === 'zen' ? 'jev.zenMissing' : 'toasts.keyMissing'))
+    if (!key) return { error: keyFailed ? 'judge-failed' : t(language, source === 'zen' ? 'jev.zenMissing' : 'toasts.keyMissing') }
     const body = 'description' in input ? jevWorkerRequest(input) : jevEffortRequest(input)
-    let model = 'jev-latest'
-    if (source === 'zen') {
-      const file = await optionalFile($, `${await rippleHome($)}/config.json`)
-      model = file ? zenJev(JSON.parse(file)).model : model
-    }
+    const model = source === 'zen' ? zenJev(await jevConfig($)).model : 'jev-latest'
     const response = await Promise.race([
       $.http.fetch(source === 'zen' ? 'https://opencode.ai/zen/v1/systemone' : 'https://api.typesafe.ai/v1/systemone', { method: 'POST', headers: { 'content-type': 'application/json', authorization: source === 'zen' ? key : `Bearer ${key}` }, body: JSON.stringify({ ...body, model }) })
         .catch(() => 'network' as const),
@@ -695,18 +703,16 @@ async function tryJev($: EngineInterface, s: Settings, input: JudgeInput | { des
       $.clock.sleep(5000).then(() => null),
     ])
     // A dropped connection or a slow answer is often one bad moment, not a broken judge.
-    if (!response || response === 'network') {
-      blip = true
-      throw new Error(jevFailure(response ? 'network' : 'timeout', language))
-    }
-    if (!response.ok) throw new Error(jevFailure(response.status, language))
-    const json: unknown = JSON.parse(response.text)
+    if (!response || response === 'network') return { error: jevFailure(response ? 'network' : 'timeout', language), blip: true }
+    if (!response.ok) return { error: jevFailure(response.status, language) }
+    let json: unknown
+    try { json = JSON.parse(response.text) }
+    catch { return { error: 'invalid-response' } }
     // An unsure Jev still answered: its odds settle it here and the bias setting tips it later. The next judge is only for a Jev that failed.
     const verdict = worker ? parseJevWorker(json) : parseJevEffort(json, 'current' in input ? input.current : null, language)
     await update($, stats, value => addJudge(value, 'jev', 0, jevUsage(json)))
-    if (!verdict) throw new Error(t(language, 'toasts.jevNoVerdict'))
-    return { verdict }
-  } catch (error) { return { error: reason(error), blip } }
+    return verdict ? { verdict } : { error: t(language, 'toasts.jevNoVerdict') }
+  } catch { return { error: 'judge-failed' } }
 }
 async function tryModel($: EngineInterface, model: string, system: string, prompt: string, worker: boolean, language: Lang): Promise<Tried> {
   try {
@@ -714,7 +720,7 @@ async function tryModel($: EngineInterface, model: string, system: string, promp
     await update($, stats, value => addJudge(value, 'model', 0, answer.usage.input_tokens + answer.usage.output_tokens))
     const verdict = answer.isAnswered ? (worker ? parseWorkerVerdict(answer.text) : parseEffortVerdict(answer.text)) : undefined
     return verdict ? { verdict } : { error: judgeFailure(answer) ?? t(language, 'toasts.routerNoVerdict') }
-  } catch (error) { return { error: reason(error) } }
+  } catch { return { error: 'judge-failed' } }
 }
 /** Haiku on the person's login: the exact id first, its alias once when that went unanswered. */
 async function tryHaiku($: EngineInterface, system: string, prompt: string, worker: boolean, language: Lang): Promise<Tried> {
@@ -730,7 +736,7 @@ async function tryHaiku($: EngineInterface, system: string, prompt: string, work
     const verdict = answer.isAnswered ? (worker ? parseWorkerVerdict(answer.text) : parseEffortVerdict(answer.text)) : undefined
     if (verdict) return { verdict, ...(failure ? { error: failure } : {}) }
     return { error: failure ?? t(language, 'toasts.haikuNoVerdict') }
-  } catch (error) { return { error: failure ?? reason(error) } }
+  } catch { return { error: failure ?? 'judge-failed' } }
 }
 /** A router target is named by its model; Haiku and Jev by their kind. */
 function judgeLabel(target: JudgeTarget): string {
@@ -789,8 +795,8 @@ async function testJudge($: EngineInterface): Promise<void> {
     const failed = judged.attempts.find(attempt => attempt.error)
     const detail = failed ? (failed.target.kind === 'model' ? `${failed.target.model}: ${failed.error}` : failed.error) : judgeLabel(judged.target)
     await update($, jev, value => ({ ...value, test: { state: ok ? 'ok' as const : 'fail' as const, message: `${judged.ms} ms · ${judged.verdict?.effort ? t(language, 'band.' + judged.verdict.effort).toLowerCase() : t(language, 'toasts.noVerdict')} · ${detail}` } }))
-  } catch (error) {
-    await update($, jev, value => ({ ...value, test: { state: 'fail' as const, message: reason(error) } }))
+  } catch {
+    await update($, jev, value => ({ ...value, test: { state: 'fail' as const, message: 'judge-failed' } }))
   }
 }
 

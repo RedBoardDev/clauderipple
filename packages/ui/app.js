@@ -3793,7 +3793,7 @@ const MOD_DOMAIN_LEVELS = [
 const modClaude = (model, effort) => ({ target: { agent: "general-purpose", model }, effort });
 /** The mod's defaults (packages/mod/hooks/settings.ts), for a router that has stored nothing yet. */
 const MOD_DEFAULTS = {
-  effortAuto: true, judge: "haiku", judgeModel: "deepseek-v4.1-flash", jevSource: "typesafe",
+  effortAuto: true, judges: [{ kind: "haiku" }], jevSource: "typesafe",
   bias: 0, floor: "low", ceiling: "max", agentAuto: "auto",
   rules: {
     general: { mode: "ladder", rungs: {
@@ -3823,9 +3823,14 @@ let modWrites = 0;
  */
 function modNormalize(raw) {
   const value = raw && typeof raw === "object" && !Array.isArray(raw) ? clone(raw) : {};
+  // The retired scalar judge fields never travel back: `judges` is the one selection.
+  delete value.judge;
+  delete value.judgeModel;
+  const judges = Array.isArray(value.judges) && value.judges.length ? value.judges : clone(MOD_DEFAULTS.judges);
   return {
     ...clone(MOD_DEFAULTS),
     ...value,
+    judges,
     rules: { ...clone(MOD_DEFAULTS.rules), ...(value.rules || {}) },
     allow: Array.isArray(value.allow) ? value.allow : [],
     allowKnown: Array.isArray(value.allowKnown) ? value.allowKnown : [],
@@ -3989,7 +3994,7 @@ async function saveMod() {
       const sent = clone(modState.settings);
       let out;
       try {
-        out = await api("/api/mod-settings", { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ schemaVersion: 1, settings: sent, revision: modState.revision }) });
+        out = await api("/api/mod-settings", { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ schemaVersion: 2, settings: sent, revision: modState.revision }) });
       } catch (error) {
         if (error.status !== 409 || !error.body || !("settings" in error.body)) throw error;
         modWrites++;
@@ -4476,13 +4481,47 @@ function modWorkersCard() {
   ]);
 }
 
+const modJudgeKey = (target) => target.kind === "model" ? `model:${target.model}` : target.kind;
+const modJudgeTarget = (value) => value.startsWith("model:") ? { kind: "model", model: value.slice(6) } : { kind: value };
+/** Judges tried in order; the first valid verdict wins. Each target appears once: distinct router models stay separate. */
 function modJudgeCard() {
   const s = modState.settings;
   const zen = modState.options && modState.options.zen;
-  const rows = [cell(t("mod.judge"), modSegmented("judge", [{ value: "haiku", label: t("mod.haiku") }, { value: "jev", label: t("mod.jev") }, { value: "model", label: t("mod.routerModel") }], s.judge, t("mod.judge"), (judge) => modPatch({ judge })), null, "wide")];
-  const footers = [];
-  if (s.judge === "haiku") rows.push(el("div", { class: "cell-note", text: t("mod.haikuHint") }));
-  if (s.judge === "jev") {
+  const judges = s.judges;
+  const models = modModels();
+  const save = (next) => {
+    const seen = new Set();
+    const unique = next.filter((target) => { const key = modJudgeKey(target); return !seen.has(key) && seen.add(key); });
+    if (unique.length) modPatch({ judges: unique });
+  };
+  const used = (except) => new Set(judges.filter((_, at) => at !== except).map(modJudgeKey));
+  const free = (taken) => [
+    ...["haiku", "jev"].filter((kind) => !taken.has(kind)).map((kind) => ({ value: kind, label: t(`mod.${kind}`) })),
+    ...models.filter((model) => !taken.has(`model:${model.model}`)).map((model) => ({ value: `model:${model.model}`, label: `${model.name || model.model} · ${model.provider}` })),
+  ];
+  const entries = judges.map((target, index) => {
+    const key = `judge:${index}`;
+    const items = free(used(index));
+    // The configured value stays even when discovery no longer lists it.
+    const current = modJudgeKey(target);
+    if (target.kind === "model" && !items.some((item) => item.value === current)) items.push({ value: current, label: `${target.model}${modState.options ? t("mod.unavailable") : ""}` });
+    const select = modSelect(key, items, current, `${t("mod.judge")} ${index + 1}`, (value) => save(judges.map((item, at) => at === index ? modJudgeTarget(value) : item)));
+    const move = (delta) => { const next = [...judges]; [next[index], next[index + delta]] = [next[index + delta], next[index]]; save(next); };
+    const button = (suffix, text, label, disabled, onclick) => el("button", { type: "button", class: "btn secondary compact", "data-key": `${key}:${suffix}`, text, "aria-label": label, ...(disabled ? { disabled: "" } : {}), onclick });
+    return el("li", { class: "rung-item" }, [
+      select,
+      el("div", { class: "rung-actions" }, [
+        button("up", "↑", t("mod.modeMoveUp"), index === 0, () => move(-1)),
+        button("down", "↓", t("mod.modeMoveDown"), index === judges.length - 1, () => move(1)),
+        button("remove", "✕", t("common.remove"), judges.length <= 1, () => save(judges.filter((_, at) => at !== index))),
+      ]),
+    ]);
+  });
+  const next = free(used(-1))[0];
+  const add = el("button", { type: "button", class: "btn secondary compact", "data-key": "judge-add", text: t("mod.judgeAdd"), ...(next ? {} : { disabled: "" }), onclick: () => { if (next) save([...judges, modJudgeTarget(next.value)]); } });
+  const rows = [cell(el("span", { class: "cell-label strong", text: t("mod.judge") }), el("div", { class: "rung-list" }, [el("ol", {}, entries), add]), null, "wide rung-row")];
+  if (judges.some((target) => target.kind === "haiku")) rows.push(el("div", { class: "cell-note", text: t("mod.haikuHint") }));
+  if (judges.some((target) => target.kind === "jev")) {
     rows.push(cell(t("mod.jevSource"), modSegmented("jev-source", [{ value: "typesafe", label: t("mod.typesafe") }, { value: "zen", label: t("mod.zen") }], s.jevSource, t("mod.jevSource"), (jevSource) => modPatch({ jevSource })), null, "wide"));
     if (s.jevSource === "zen") {
       rows.push(zen && zen.configured
@@ -4492,13 +4531,7 @@ function modJudgeCard() {
       rows.push(el("div", { class: "cell-note", text: t("mod.jevKeyNote") }));
     }
   }
-  if (s.judge === "model") {
-    const models = modModels().map((model) => ({ value: model.model, label: `${model.name || model.model} · ${model.provider}` }));
-    rows.push(cell(t("mod.model"), models.length || s.judgeModel
-      ? modSelect("judge-model", models, s.judgeModel, t("mod.model"), (judgeModel) => modPatch({ judgeModel }))
-      : el("span", { text: modCap(t("mod.noModels")) }), modCap(t("mod.haikuFallback"))));
-  }
-  return modCard("judge", t("mod.judge"), t("mod.judgeBlurb"), [modSection(null, rows, footers)]);
+  return modCard("judge", t("mod.judge"), t("mod.judgeBlurb"), [modSection(null, rows, [t("mod.judgeOrderHelp")])]);
 }
 
 function modCacheCard() {

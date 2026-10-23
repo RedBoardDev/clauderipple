@@ -100,7 +100,7 @@ function judges(value: Record<string, unknown>): JudgeTarget[] {
     return [{ kind: 'haiku' }]
   }
   const parsed = normalizeJudgeTargets(value.judges)
-  // Invalid stored data still has a usable read view; the admin API rejects such explicit writes.
+  // In-memory callers retain defaults; the router rejects invalid explicit chains on reads and writes.
   return parsed.length ? parsed : [{ kind: 'haiku' }]
 }
 
