@@ -1,10 +1,11 @@
 // Integration through the actual mods engine. Only external host boundaries are stubbed.
 import { expect, mock, test } from 'claude-code/testing'
 import type { Engine } from 'claude-code/testing'
-import type { AgentSpawnInput, ModelCompleteRequest, ModelUsage, On, SessionMessage, ToolCallInput, TurnStepInput } from 'claude-code'
+import type { AgentSpawnInput, ModelApiError, ModelCompleteRequest, ModelUsage, On, SessionMessage, ToolCallInput, TurnStepInput } from 'claude-code'
 import { MOD_SETTINGS_SCHEMA_VERSION, DEFAULTS, normalizeModes, normalizeSettings } from '../hooks/settings'
 import type { Lang } from '../hooks/i18n'
-import type { AgentRec, ModSettingsSnapshot, Settings } from '../types'
+import type { AgentRec, JudgeRun, ModSettingsSnapshot, Settings } from '../types'
+import type { JevState } from '../hooks/ui/view'
 
 const NOW = 1000000
 const USAGE: ModelUsage = { input_tokens: 100, output_tokens: 10, cache_read_input_tokens: 40000, cache_creation_input_tokens: 0 }
@@ -93,7 +94,7 @@ function boundaries(on: On, patch: Partial<Settings> = {}, options: { config?: u
   })
   const files = new Map<string, string>()
   let logFailure: 'read' | 'write' | null = null
-  on('fs.exists', ($, e) => ({ value: files.has(e.path) }))
+  on('fs.exists', ($, e) => ({ value: files.has(e.path) || e.path.endsWith('config.json') || e.path.endsWith('/.config/jev/.env') && options.envFile !== undefined }))
   on('fs.write', ($, e) => {
     if (e.path.endsWith('/worker-picks.jsonl') && logFailure === 'write') return { deny: 'worker log write denied' }
     files.set(e.path, e.text)
@@ -135,11 +136,17 @@ function boundaries(on: On, patch: Partial<Settings> = {}, options: { config?: u
   on('prompt.fill', ($, e) => { filled.push(e.text); return { isFilled: true } })
   return { files, failWorkerLog: (value: 'read' | 'write' | null) => { logFailure = value }, registered, clock, saved, storeWrites, storeReads, settingsRequests, router: () => router, remote: (value: ModSettingsSnapshot) => { router = value }, offline: (value: boolean) => { offline = value }, conflict: (value: Settings) => { conflict = value }, alwaysConflict: (value: boolean) => { alwaysConflict = value }, toasts, logs, panes, submitted, contexts, filled, processes, language: () => resolvedLanguage, setLanguage: (value: unknown) => { hostLanguage = value }, setModel: (id: string) => { model = id }, setPercent: (value: number) => { percent = value } }
 }
-function http(on: On, exhausted = false, config: unknown = CONFIG, zen?: (input: { url: string; init?: { body?: string; headers?: Readonly<Record<string, string>> } }) => void) {
+function http(on: On, exhausted = false, config: unknown = CONFIG, zen?: (input: { url: string; init?: { body?: string; headers?: Readonly<Record<string, string>> } }) => void, jev?: 'ok' | 'http500' | 'badjson' | 'network') {
   const urls: string[] = []
   on('http.fetch', ($, e, next) => {
     if (e.url.endsWith('/api/mod-settings')) return next(e)
     urls.push(e.url)
+    if (e.url === 'https://api.typesafe.ai/v1/systemone' && jev) {
+      if (jev === 'network') throw new Error('ECONNRESET')
+      if (jev === 'http500') return { value: { ok: false, status: 500, headers: {}, text: '' } }
+      if (jev === 'badjson') return { value: { ok: true, status: 200, headers: {}, text: 'not json' } }
+      return { value: { ok: true, status: 200, headers: {}, text: JSON.stringify({ answers: { effort: { choice: 'high', confidence: 0.95 } } }) } }
+    }
     if (e.url === 'https://opencode.ai/zen/v1/systemone' && zen) {
       zen(e)
       return { value: { ok: true, status: 200, headers: {}, text: JSON.stringify({ model: 'jev-1.13', answers: { effort: { choice: 'high', confidence: 0.95 } }, usage: { input_tokens: 50, output_tokens: 10 } }) } }
@@ -537,7 +544,7 @@ test('ripple:auto is judged and rewritten to the light rung\'s agent at the rung
   expect(typeof row.id).toBe('string')
   expect(row).toEqual({
     ...JSON.parse(b.logs[0]!.slice('ClaudeRipple worker pick: '.length)),
-    type: 'pick', id: row.id, at: new Date(NOW).toISOString(), by: 'judge', judge: 'haiku', ms: 0, promptChars: SPAWN.prompt.length,
+    type: 'pick', id: row.id, at: new Date(NOW).toISOString(), by: 'judge', judge: 'haiku', ms: 0, promptChars: SPAWN.prompt.length, attempts: [{ target: { kind: 'haiku' }, ms: 0 }],
     verdict: { domain: 'general', level: 'light', kind: 'do', effort: 'low', sure: 0.9, why: 'small rename' },
   })
   const stats = await $.command.run({ command: 'ripple', origin: { kind: 'composer' }, presentation: { isFullscreen: true, columns: 140 }, args: 'stats' })
@@ -583,13 +590,13 @@ for (const failure of ['read', 'write'] as const) test(`worker log ${failure} fa
   expect(b.files.get(path)!.trim().split('\n').length).toBe(2)
 })
 
-for (const error of ['api-error: overloaded (503)', 'aborted'] as const) test(`failed worker judge persists defaults with ${error}`, async ($, on) => {
+for (const error of ['api-error (503)', 'api-error (no response)', 'aborted'] as const) test(`failed worker judge persists defaults with ${error}`, async ($, on) => {
   const b = boundaries(on)
   http(on)
   on('model.complete', async ($, e) => {
     expect(e.timeoutMs).toBe(6000)
     if (error === 'aborted') await b.clock.advance(6000)
-    return { value: error === 'aborted' ? { isAnswered: false, reason: 'aborted', usage: USAGE } : { isAnswered: false, reason: 'api-error', status: 503, error: 'overloaded', usage: USAGE } }
+    return { value: error === 'aborted' ? { isAnswered: false, reason: 'aborted', usage: USAGE } : { isAnswered: false, reason: 'api-error', status: error === 'api-error (no response)' ? null : 503, error: 'overloaded', usage: USAGE } }
   })
   const sent = spawnStub(on)
   await start($)
@@ -1001,7 +1008,7 @@ test('failed worker judge uses the standard rung; a missing worker moves up to t
 test('Zen Jev uses the exact config authorization and first Jev model with CLAUDERIPPLE_HOME', async ($, on) => {
   const paths: string[] = []
   const config = { ...CONFIG, providers: { ...CONFIG.providers, 'opencode-zen': { headers: { authorization: 'Bearer zen-config-key' }, models: [{ id: 'other' }, { id: 'jev-1.13' }, { id: 'jev-latest' }] } } }
-  boundaries(on, { judge: 'jev', jevSource: 'zen' }, { env: { CLAUDERIPPLE_HOME: '/custom/ripple' }, config, paths })
+  boundaries(on, { judges: [{ kind: 'jev' }, { kind: 'haiku' }], jevSource: 'zen' }, { env: { CLAUDERIPPLE_HOME: '/custom/ripple' }, config, paths })
   const sent: { url: string; body?: string; headers?: Readonly<Record<string, string>> }[] = []
   http(on, false, config, e => sent.push({ url: e.url, body: e.init?.body, headers: e.init?.headers }))
   const haiku = judgeStub(on)
@@ -1016,12 +1023,13 @@ test('Zen Jev uses the exact config authorization and first Jev model with CLAUD
   const ui = await band($)
   expect(await ui.find({ key: 'jev-key' })).toBeUndefined()
   expect(await ui.find({ key: 'jev-test' })).toBeUndefined()
-  expect(await ui.find({ key: 'jev-source-zen' })).toBeUndefined()
+  // The source choice is drawn whenever Jev is in the chain; with Zen's key found there is no key field or Test.
+  expect(await ui.find({ key: 'jev-source-zen' })).toBeDefined()
   await ui.unmount()
 })
 
 test('Zen without a key explains the missing key and falls back to Haiku', async ($, on) => {
-  const b = boundaries(on, { judge: 'jev', jevSource: 'zen' })
+  const b = boundaries(on, { judges: [{ kind: 'jev' }, { kind: 'haiku' }], jevSource: 'zen' })
   const urls = http(on)
   const haiku = judgeStub(on, '{"effort":"medium","why":"fallback"}')
   await start($)
@@ -1431,17 +1439,18 @@ for (const surface of ['terminal', 'desktop'] as const) test('quick controls sav
   await ui.press({ key: 'set-auto' })
   expect(b.router().settings.effortAuto).toBe(true)
   expect(puts()).toBe(++count)
-  for (const judge of ['jev', 'model', 'haiku'] as const) {
-    await ui.press({ key: 'judge-' + judge })
-    expect(b.router().settings.judge).toBe(judge)
-    expect(puts()).toBe(++count)
-  }
+  await ui.press({ key: 'judge-add-jev' })
+  expect(b.router().settings.judges).toEqual([{ kind: 'haiku' }, { kind: 'jev' }])
+  expect(puts()).toBe(++count)
+  await ui.press({ key: 'judge-remove-haiku' })
+  expect(b.router().settings.judges).toEqual([{ kind: 'jev' }])
+  expect(puts()).toBe(++count)
   await ui.press({ key: 'set-warm' })
   expect(b.router().settings.keepWarm).toBe(true)
   expect(puts()).toBe(++count)
   await ui.press({ key: 'close' })
   expect(puts()).toBe(count)
-  expect(b.router().settings).toMatchObject({ bias: 2, effortAuto: true, judge: 'haiku', keepWarm: true })
+  expect(b.router().settings).toMatchObject({ bias: 2, effortAuto: true, judges: [{ kind: 'jev' }], keepWarm: true })
   // Opening the panel reads the rung choices once, so a model ticked on the dashboard is offered.
   expect(urls.filter(url => url.endsWith('/api/mod-options')).length).toBe(1)
   await ui.press({ key: 'hide' })
@@ -1581,7 +1590,7 @@ test('Save caps a high judge pick until the reported limit resets', async ($, on
 })
 
 test('an unsure Jev still decides: no Haiku call, no alert, key only to TypeSafe', async ($, on) => {
-  const b = boundaries(on, { judge: 'jev' }, { key: 'test-secret' })
+  const b = boundaries(on, { judges: [{ kind: 'jev' }, { kind: 'haiku' }] }, { key: 'test-secret' })
   const judges = judgeStub(on, '{"effort":"high","why":"fallback"}')
   const sent = stepStub(on)
   const destinations: string[] = []
@@ -1608,8 +1617,8 @@ test('an unsure Jev still decides: no Haiku call, no alert, key only to TypeSafe
   expect(await (await band($)).find({ type: 'Text', text: /not answering/ })).toBeUndefined()
 })
 
-test('Jev times out at three seconds without blocking the person prompt, and says so only the second time running', async ($, on) => {
-  const b = boundaries(on, { judge: 'jev' }, { key: 'test-secret' })
+test('Jev times out at five seconds without blocking the person prompt, and says so only the second time running', async ($, on) => {
+  const b = boundaries(on, { judges: [{ kind: 'jev' }, { kind: 'haiku' }] }, { key: 'test-secret' })
   const judges = judgeStub(on, '{"effort":"medium","why":"fallback"}')
   on('http.fetch', async ($, e, next) => {
     if (e.url.endsWith('/api/mod-settings')) return next(e)
@@ -1619,7 +1628,7 @@ test('Jev times out at three seconds without blocking the person prompt, and say
   await start($)
   const pending = submit($)
   await b.clock.settle()
-  await b.clock.advance(3000)
+  await b.clock.advance(5000)
   const out = await pending
   expect(out.text).toContain('Implement')
   expect(judges.length).toBe(1)
@@ -1627,13 +1636,13 @@ test('Jev times out at three seconds without blocking the person prompt, and say
   expect(b.toasts.some(t => t.includes('timed out'))).toBe(false)
   const again = submit($, 'Refactor the parser across three files and verify.')
   await b.clock.settle()
-  await b.clock.advance(3000)
+  await b.clock.advance(5000)
   await again
   expect(b.toasts.some(t => t.includes('timed out'))).toBe(true)
 })
 
 test('a dropped Jev connection says it in plain words, and only the second time running', async ($, on) => {
-  const b = boundaries(on, { judge: 'jev' }, { key: 'test-secret' })
+  const b = boundaries(on, { judges: [{ kind: 'jev' }, { kind: 'haiku' }] }, { key: 'test-secret' })
   const judges = judgeStub(on, '{"effort":"medium","why":"fallback"}')
   on('http.fetch', ($, e, next) => {
     if (e.url.endsWith('/api/mod-settings')) return next(e)
@@ -1654,7 +1663,7 @@ test('a dropped Jev connection says it in plain words, and only the second time 
 })
 
 test('router judge falls back and Haiku retries its alias when unanswered', async ($, on) => {
-  boundaries(on, { judge: 'model', judgeModel: 'test-router-model' })
+  boundaries(on, { judges: [{ kind: 'model', model: 'test-router-model' }, { kind: 'haiku' }] })
   http(on)
   const models: string[] = []
   on('model.complete', ($, e) => {
@@ -1669,9 +1678,347 @@ test('router judge falls back and Haiku retries its alias when unanswered', asyn
   expect(sent[0]?.effort).toBe('low')
 })
 
+// ---- Ordered judge chains: only the configured targets run, in order, until one answers ------------
+
+const GOOD = '{"effort":"low","why":"simple"}'
+function modelStub(on: On, answers: Record<string, string | undefined>) {
+  const models: string[] = []
+  on('model.complete', ($, e) => {
+    models.push(e.model)
+    const text = answers[e.model]
+    return { value: text === undefined ? { isAnswered: false, reason: 'empty-reply', usage: USAGE } : { isAnswered: true, text, usage: USAGE } }
+  })
+  return models
+}
+function judgeDiagnostics(on: On) {
+  let runs: JudgeRun[] = []
+  let tested: JevState['test'] = { state: 'idle' }
+  on('state.set', { plugin: 'ripple', key: 'judgeRuns' }, async ($, e, next) => {
+    const result = await next(e)
+    runs = e.value as JudgeRun[]
+    return result
+  })
+  on('state.set', { plugin: 'ripple', key: 'jev' }, async ($, e, next) => {
+    const result = await next(e)
+    tested = (e.value as JevState).test
+    return result
+  })
+  return { runs: () => runs, test: () => tested }
+}
+const SYNTHETIC_DIAGNOSTIC = 'SYNTHETIC'
+for (const position of ['primary', 'secondary'] as const) for (const kind of ['model', 'haiku'] as const) test(`judge privacy: ${position} ${kind} api-error keeps only safe diagnostics`, async ($, on) => {
+  const target: Settings['judges'][number] = kind === 'model' ? { kind, model: 'router-b' } : { kind }
+  const preceding: Settings['judges'] = position === 'secondary' ? [{ kind: 'model', model: 'router-a' }] : []
+  // The unreachable Jev entry keeps the existing missing-key Test control available.
+  const b = boundaries(on, { judges: [...preceding, target, { kind: 'model', model: 'router-c' }, { kind: 'jev' }] })
+  const diagnostics = judgeDiagnostics(on)
+  http(on)
+  const models: string[] = []
+  on('model.complete', ($, e) => {
+    models.push(e.model)
+    if (e.model === 'router-a') return { value: { isAnswered: false, reason: 'empty-reply', usage: USAGE } }
+    if (e.model === 'router-c') return { value: { isAnswered: true, text: '{"domain":"general","level":"light","effort":"low","why":"safe verdict"}', usage: USAGE } }
+    // CLI 2.1.293 can return raw error text; 2.1.299 types promise categories instead.
+    return { value: { isAnswered: false, reason: 'api-error', status: e.model === 'haiku' ? 429 : 503, error: SYNTHETIC_DIAGNOSTIC.repeat(1000) as ModelApiError, usage: USAGE } }
+  })
+  const steps = stepStub(on)
+  const spawns = spawnStub(on)
+  await start($)
+  await submit($)
+  await step($)
+  await $.agent.spawn(SPAWN)
+  expect(steps[0]?.effort).toBe('low')
+  expect(spawns[0]).toMatchObject({ subagentType: 'deepseek-v4-1-flash', model: 'deepseek-v4.1-flash@max' })
+  const safe = 'api-error (503)'
+  const first = position === 'secondary' ? 'empty-reply' : safe
+  const attempts = [...preceding.map(target => ({ target, ms: 0, error: 'empty-reply' })), { target, ms: 0, error: safe }, { target: { kind: 'model', model: 'router-c' }, ms: 0 }]
+  const runs = diagnostics.runs()
+  expect(runs.map(run => run.for)).toEqual(['prompt', 'worker'])
+  expect(JSON.stringify(runs)).not.toContain(SYNTHETIC_DIAGNOSTIC)
+  for (const run of runs) expect(run).toMatchObject({ by: 'model', error: first, attempts })
+  const persisted = b.files.get('/home/test/.clauderipple/logs/worker-picks.jsonl')!
+  expect(persisted).not.toContain(SYNTHETIC_DIAGNOSTIC)
+  expect(JSON.parse(persisted)).toMatchObject({ by: 'judge', judge: 'model', error: first, attempts, verdict: { level: 'light' } })
+  await command($, 'settings')
+  const ui = await band($)
+  await ui.press({ key: 'jev-test' })
+  const tested = diagnostics.test()
+  expect(tested).toMatchObject({ state: 'fail' })
+  expect(tested?.message).toContain(first)
+  expect(JSON.stringify(tested)).not.toContain(SYNTHETIC_DIAGNOSTIC)
+  expect(JSON.stringify(await ui.findAll({ type: 'Text' }))).not.toContain(SYNTHETIC_DIAGNOSTIC)
+  expect(b.toasts.join('\n')).toContain(first)
+  expect(b.toasts.join('\n')).not.toContain(SYNTHETIC_DIAGNOSTIC)
+  expect(b.logs.join('\n')).not.toContain(SYNTHETIC_DIAGNOSTIC)
+  const oneRun = [...preceding.map(target => target.kind === 'model' ? target.model : target.kind), ...(kind === 'model' ? ['router-b'] : ['claude-haiku-5-5', 'haiku']), 'router-c']
+  expect(models).toEqual([...oneRun, ...oneRun, ...oneRun])
+  await ui.unmount()
+})
+
+for (const position of ['primary', 'secondary'] as const) test(`judge privacy: ${position} Jev HTTP 200 non-JSON never exposes the response body`, async ($, on) => {
+  const preceding: Settings['judges'] = position === 'secondary' ? [{ kind: 'model', model: 'router-a' }] : []
+  let keyAvailable = true
+  const b = boundaries(on, { judges: [...preceding, { kind: 'jev' }, { kind: 'model', model: 'router-c' }] }, { envFile: () => keyAvailable ? 'TYPESAFE_API_KEY=test-secret' : '' })
+  const diagnostics = judgeDiagnostics(on)
+  on('http.fetch', { url: 'https://api.typesafe.ai/v1/systemone' }, () => ({ value: { ok: true, status: 200, headers: {}, text: SYNTHETIC_DIAGNOSTIC } }))
+  http(on)
+  const models = modelStub(on, { 'router-c': '{"domain":"general","level":"light","effort":"low","why":"safe verdict"}' })
+  const steps = stepStub(on)
+  const spawns = spawnStub(on)
+  await start($)
+  await submit($)
+  await step($)
+  await $.agent.spawn(SPAWN)
+  expect(steps[0]?.effort).toBe('low')
+  expect(spawns[0]?.subagentType).toBe('deepseek-v4-1-flash')
+  const first = position === 'secondary' ? 'empty-reply' : 'invalid-response'
+  const attempts = [...preceding.map(target => ({ target, ms: 0, error: 'empty-reply' })), { target: { kind: 'jev' }, ms: 0, error: 'invalid-response' }, { target: { kind: 'model', model: 'router-c' }, ms: 0 }]
+  const runs = diagnostics.runs()
+  expect(runs.map(run => run.for)).toEqual(['prompt', 'worker'])
+  expect(JSON.stringify(runs)).not.toContain(SYNTHETIC_DIAGNOSTIC)
+  for (const run of runs) expect(run).toMatchObject({ by: 'model', error: first, attempts })
+  const persisted = b.files.get('/home/test/.clauderipple/logs/worker-picks.jsonl')!
+  expect(persisted).not.toContain(SYNTHETIC_DIAGNOSTIC)
+  expect(JSON.parse(persisted)).toMatchObject({ by: 'judge', judge: 'model', error: first, attempts })
+  // Open Test while the key is missing, then supply the fixture key for that call.
+  keyAvailable = false
+  await command($, 'settings')
+  const ui = await band($)
+  keyAvailable = true
+  await ui.press({ key: 'jev-test' })
+  const tested = diagnostics.test()
+  expect(tested).toMatchObject({ state: 'fail' })
+  expect(tested?.message).toContain(first)
+  expect(JSON.stringify(tested)).not.toContain(SYNTHETIC_DIAGNOSTIC)
+  expect(JSON.stringify(await ui.findAll({ type: 'Text' }))).not.toContain(SYNTHETIC_DIAGNOSTIC)
+  expect(b.toasts.join('\n')).toContain(first)
+  expect(b.toasts.join('\n')).not.toContain(SYNTHETIC_DIAGNOSTIC)
+  expect(b.logs.join('\n')).not.toContain(SYNTHETIC_DIAGNOSTIC)
+  const oneRun = [...preceding.map(target => target.kind === 'model' ? target.model : target.kind), 'router-c']
+  expect(models).toEqual([...oneRun, ...oneRun, ...oneRun])
+  await ui.unmount()
+})
+
+test('judge privacy: an unreadable TypeSafe key still falls back to configured Zen without exposing the failure', async ($, on) => {
+  const path = '/home/test/.config/jev/.env'
+  let denied = false
+  on('fs.read', { path }, ($, e, next) => denied ? { deny: SYNTHETIC_DIAGNOSTIC } : next(e))
+  const config = { ...CONFIG, providers: { ...CONFIG.providers, 'opencode-zen': { headers: { authorization: 'Bearer zen-test' }, models: [{ id: 'jev-1.13' }] } } }
+  const b = boundaries(on, { judges: [{ kind: 'jev' }], jevSource: 'typesafe' }, { config })
+  b.files.set(path, 'TYPESAFE_API_KEY=test-secret')
+  const diagnostics = judgeDiagnostics(on)
+  const zen: { body?: string; headers?: Readonly<Record<string, string>> }[] = []
+  http(on, false, config, input => { zen.push(input.init ?? {}) })
+  const models = modelStub(on, {})
+  const steps = stepStub(on)
+  await start($)
+  denied = true
+  await submit($)
+  await step($)
+  expect(zen.length).toBe(1)
+  expect(zen[0]?.headers?.authorization).toBe('Bearer zen-test')
+  expect(JSON.parse(zen[0]?.body ?? '{}')).toMatchObject({ model: 'jev-1.13' })
+  expect(models).toEqual([])
+  expect(steps[0]?.effort).toBe('high')
+  expect(diagnostics.runs()).toMatchObject([{ by: 'jev', effort: 'high', attempts: [{ target: { kind: 'jev' } }] }])
+  expect(diagnostics.runs()[0]?.error).toBeUndefined()
+  expect(JSON.stringify(diagnostics.runs())).not.toContain(SYNTHETIC_DIAGNOSTIC)
+  expect(b.toasts.join('\n')).not.toContain(SYNTHETIC_DIAGNOSTIC)
+  expect(b.logs.join('\n')).not.toContain(SYNTHETIC_DIAGNOSTIC)
+})
+
+for (const failure of ['config', 'file'] as const) test(`judge privacy: Jev ${failure} failure uses a fixed diagnostic and still falls back`, async ($, on) => {
+  const path = '/home/test/.config/jev/.env'
+  let denied = false
+  on('fs.read', { path }, ($, e, next) => denied ? { deny: SYNTHETIC_DIAGNOSTIC } : next(e))
+  const b = boundaries(on, { judges: [{ kind: 'jev' }, { kind: 'model', model: 'router-c' }], jevSource: failure === 'config' ? 'zen' : 'typesafe' })
+  if (failure === 'file') b.files.set(path, 'TYPESAFE_API_KEY=test-secret')
+  const diagnostics = judgeDiagnostics(on)
+  http(on)
+  const models = modelStub(on, { 'router-c': GOOD })
+  const steps = stepStub(on)
+  await start($)
+  if (failure === 'config') b.files.set('/home/test/.clauderipple/config.json', SYNTHETIC_DIAGNOSTIC)
+  else denied = true
+  await submit($)
+  await step($)
+  expect(models).toEqual(['router-c'])
+  expect(steps[0]?.effort).toBe('low')
+  expect(diagnostics.runs()).toMatchObject([{ error: 'judge-failed', attempts: [{ target: { kind: 'jev' }, error: 'judge-failed' }, { target: { kind: 'model', model: 'router-c' } }] }])
+  expect(JSON.stringify(diagnostics.runs())).not.toContain(SYNTHETIC_DIAGNOSTIC)
+  expect(b.toasts.join('\n')).toContain('judge-failed')
+  expect(b.toasts.join('\n')).not.toContain(SYNTHETIC_DIAGNOSTIC)
+  expect(b.logs.join('\n')).not.toContain(SYNTHETIC_DIAGNOSTIC)
+})
+
+for (const [status, diagnostic] of [
+  [200, 'Jev returned no verdict'],
+  [401, 'Jev key rejected'],
+  [402, 'Jev out of credits'],
+  [403, 'Jev key rejected'],
+  [429, 'Jev rate limited'],
+  [503, 'Jev request failed (503)'],
+] as const) test(`judge privacy: Jev preserves fixed guidance for HTTP ${status}`, async ($, on) => {
+  const b = boundaries(on, { judges: [{ kind: 'jev' }, { kind: 'model', model: 'router-c' }] }, { key: 'test-secret' })
+  const diagnostics = judgeDiagnostics(on)
+  on('http.fetch', { url: 'https://api.typesafe.ai/v1/systemone' }, () => ({ value: { ok: status === 200, status, headers: {}, text: JSON.stringify({ echo: SYNTHETIC_DIAGNOSTIC }) } }))
+  http(on)
+  const models = modelStub(on, { 'router-c': GOOD })
+  await start($)
+  await submit($)
+  expect(models).toEqual(['router-c'])
+  expect(diagnostics.runs()).toMatchObject([{ error: diagnostic, attempts: [{ target: { kind: 'jev' }, error: diagnostic }, { target: { kind: 'model', model: 'router-c' } }] }])
+  expect(JSON.stringify(diagnostics.runs())).not.toContain(SYNTHETIC_DIAGNOSTIC)
+  expect(b.toasts.join('\n')).toContain(diagnostic)
+  expect(b.toasts.join('\n')).not.toContain(SYNTHETIC_DIAGNOSTIC)
+})
+
+test('chain: Haiku fails (exact id and alias), then Jev answers; the run keeps both attempts and the first error', async ($, on) => {
+  const b = boundaries(on, { judges: [{ kind: 'haiku' }, { kind: 'jev' }] }, { key: 'test-secret' })
+  http(on, false, CONFIG, undefined, 'ok')
+  const models = modelStub(on, {})
+  const sent = stepStub(on)
+  await start($)
+  await submit($)
+  await step($)
+  expect(models).toEqual(['claude-haiku-5-5', 'haiku'])
+  expect(sent[0]?.effort).toBe('high')
+  const debug = await command($, 'stats')
+  expect(debug.text).toContain('haiku 2, jev 1')
+  expect(b.toasts.length).toBe(1)
+})
+
+test('chain: Jev fails on HTTP 500, then a router model answers; Haiku is never asked', async ($, on) => {
+  boundaries(on, { judges: [{ kind: 'jev' }, { kind: 'model', model: 'router-a' }] }, { key: 'test-secret' })
+  http(on, false, CONFIG, undefined, 'http500')
+  const models = modelStub(on, { 'router-a': GOOD })
+  const sent = stepStub(on)
+  await start($)
+  await submit($)
+  await step($)
+  expect(models).toEqual(['router-a'])
+  expect(sent[0]?.effort).toBe('low')
+})
+
+test('chain: two different router models take turns; the first valid verdict stops the chain', async ($, on) => {
+  boundaries(on, { judges: [{ kind: 'model', model: 'router-a' }, { kind: 'model', model: 'router-b' }, { kind: 'model', model: 'router-c' }] })
+  http(on)
+  const models = modelStub(on, { 'router-a': 'no json at all', 'router-b': GOOD, 'router-c': GOOD })
+  const sent = stepStub(on)
+  await start($)
+  await submit($)
+  await step($)
+  expect(models).toEqual(['router-a', 'router-b'])
+  expect(sent[0]?.effort).toBe('low')
+  const stats = await command($, 'stats')
+  expect(stats.text).toContain('model 2')
+})
+
+test('chain: a valid first verdict makes no further call', async ($, on) => {
+  boundaries(on, { judges: [{ kind: 'model', model: 'router-a' }, { kind: 'haiku' }, { kind: 'jev' }] }, { key: 'test-secret' })
+  const urls = http(on)
+  const models = modelStub(on, { 'router-a': GOOD })
+  stepStub(on)
+  await start($)
+  await submit($)
+  expect(models).toEqual(['router-a'])
+  expect(urls.some(url => url.includes('typesafe'))).toBe(false)
+})
+
+test('chain: an explicit list without Haiku never gets one; exhausted keeps the effort, and the toast does not promise Haiku', async ($, on) => {
+  const b = boundaries(on, { judges: [{ kind: 'model', model: 'router-a' }, { kind: 'model', model: 'router-b' }] })
+  http(on)
+  const models = modelStub(on, {})
+  const sent = stepStub(on)
+  await start($)
+  await submit($)
+  await step($)
+  expect(models).toEqual(['router-a', 'router-b'])
+  expect(sent[0]?.effort).toBe('medium')
+  expect(b.toasts.some(text => text.includes('Haiku'))).toBe(false)
+})
+
+test('chain: exhausted worker judge uses the default standard rung and logs every attempt without prompts', async ($, on) => {
+  const b = boundaries(on, { judges: [{ kind: 'model', model: 'router-a' }, { kind: 'jev' }] })
+  http(on, false, CONFIG, undefined, 'badjson')
+  const models = modelStub(on, { 'router-a': undefined })
+  const sent = spawnStub(on)
+  await start($)
+  await $.agent.spawn(SPAWN)
+  expect(models).toEqual(['router-a'])
+  expect(sent.length).toBe(1)
+  const row = JSON.parse(b.files.get('/home/test/.clauderipple/logs/worker-picks.jsonl')!.trim())
+  expect(row).toMatchObject({ by: 'default', judge: null, verdict: null })
+  expect(row.attempts.map((a: { target: unknown }) => a.target)).toEqual([{ kind: 'model', model: 'router-a' }, { kind: 'jev' }])
+  expect(row.attempts.every((a: { error?: string }) => typeof a.error === 'string')).toBe(true)
+  expect(row.error).toBe(row.attempts[0].error)
+  expect(JSON.stringify(row.attempts)).not.toContain('Rename')
+})
+
+test('chain: a missing Jev key, a dropped connection and malformed output each continue to the next target', async ($, on) => {
+  boundaries(on, { judges: [{ kind: 'jev' }, { kind: 'model', model: 'router-a' }] })
+  http(on)
+  const models = modelStub(on, { 'router-a': GOOD })
+  stepStub(on)
+  await start($)
+  await submit($)
+  expect(models).toEqual(['router-a'])
+})
+
+test('chain: only a run that asked Jev moves its blip count', async ($, on) => {
+  const b = boundaries(on, { judges: [{ kind: 'jev' }, { kind: 'model', model: 'router-a' }] }, { key: 'test-secret' })
+  http(on, false, CONFIG, undefined, 'network')
+  modelStub(on, { 'router-a': GOOD })
+  stepStub(on)
+  await start($)
+  await submit($)
+  expect(b.toasts).toEqual([])
+  await submit($, 'Refactor the parser across three files and verify.')
+  expect(b.toasts.some(text => text.includes('network unavailable'))).toBe(true)
+})
+
+test('chain: a different failing model is said again even when the reason text matches', async ($, on) => {
+  const b = boundaries(on, { judges: [{ kind: 'model', model: 'router-a' }, { kind: 'haiku' }] })
+  http(on)
+  modelStub(on, { 'claude-haiku-5-5': GOOD })
+  stepStub(on)
+  await start($)
+  await submit($)
+  expect(b.toasts.length).toBe(1)
+  expect(b.toasts[0]).toContain('router-a')
+})
+
+test('chain: Test stays strict when the primary failed though a later model answered', async ($, on) => {
+  boundaries(on, { judges: [{ kind: 'jev' }, { kind: 'model', model: 'router-a' }] })
+  http(on)
+  const models = modelStub(on, { 'router-a': GOOD })
+  await start($)
+  await command($, 'settings')
+  const ui = await band($)
+  await ui.press({ key: 'jev-test' })
+  expect(models).toEqual(['router-a'])
+  expect(await ui.find({ type: 'Text', text: /· low · Jev key missing/ })).toBeDefined()
+  await ui.unmount()
+})
+
+test('chain: the log pane names the model that failed and the one that answered', async ($, on) => {
+  boundaries(on, { judges: [{ kind: 'model', model: 'router-a' }, { kind: 'model', model: 'router-b' }] })
+  http(on)
+  modelStub(on, { 'router-b': GOOD })
+  stepStub(on)
+  await start($)
+  await submit($)
+  await $.command.run({ command: 'ripple-log', origin: { kind: 'composer' }, presentation: { isFullscreen: true, columns: 140 }, args: '' })
+  const ui = await $.ui.mount({ plugin: 'ripple', component: 'Pane', requestId: 'ripple-log', surface: 'terminal', props: { title: 'Log', isFocused: true, bodyColumns: 120, placement: 'inline', scroll: { offset: 0, bodyRows: 30 }, view: {} } })
+  await ui.press({ key: 'scope' })
+  expect(await ui.find({ type: 'Text', text: /router-a failed → router-b/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /router-a · .* · empty-reply/ })).toBeDefined()
+  await ui.unmount()
+})
+
 test('Jev key input preserves other env lines and chmods the file 600', async ($, on) => {
   let readingForSave = false
-  const b = boundaries(on, { judge: 'jev' }, { envFile: () => readingForSave ? 'OTHER=keep\nTYPESAFE_API_KEY=old\nTAIL=yes\n' : '' })
+  const b = boundaries(on, { judges: [{ kind: 'jev' }, { kind: 'haiku' }] }, { envFile: () => readingForSave ? 'OTHER=keep\nTYPESAFE_API_KEY=old\nTAIL=yes\n' : '' })
   http(on)
   const path = '/home/test/.config/jev/.env'
   await start($)
@@ -1686,7 +2033,7 @@ test('Jev key input preserves other env lines and chmods the file 600', async ($
 })
 
 test('Jev Test displays latency and a missing-key result', async ($, on) => {
-  boundaries(on, { judge: 'jev' })
+  boundaries(on, { judges: [{ kind: 'jev' }, { kind: 'haiku' }] })
   http(on)
   judgeStub(on, '{"effort":"low","why":"fallback"}')
   await start($)
@@ -1992,7 +2339,7 @@ test('setup step 2 opens the dashboard; its draft preserves edits and follows re
   http(on)
   await start($)
   const ui = await band($)
-  await ui.press({ key: 'judge-model' })
+  await ui.press({ key: 'judge-add-jev' })
   expect(b.settingsRequests.filter(r => r.method === 'PUT').length).toBe(0)
   await ui.press({ key: 'next' })
   expect(await ui.find({ type: 'Text', text: 'Workers start on the ladder; set it up on the dashboard.' })).toBeDefined()
@@ -2008,7 +2355,7 @@ test('setup step 2 opens the dashboard; its draft preserves edits and follows re
   await ui.press({ key: 'next' })
   expect(await ui.find({ type: 'Text', text: 'Claude Haiku · gpt-6-1-sol · gpt-6-astra · Claude Opus' })).toBeDefined()
   await ui.press({ key: 'finish' })
-  expect(b.router().settings).toMatchObject({ judge: 'model', keepWarm: true, keepWarmHours: 8, setupDone: true })
+  expect(b.router().settings).toMatchObject({ judges: [{ kind: 'haiku' }, { kind: 'jev' }], keepWarm: true, keepWarmHours: 8, setupDone: true })
   const saved = b.router().settings.rules.general
   expect(saved.mode === 'ladder' && saved.rungs.light).toEqual([light])
   expect(b.settingsRequests.filter(r => r.method === 'PUT').map(r => r.revision)).toEqual([2])
@@ -2067,7 +2414,7 @@ test('an idle band is asked again only when the minute it shows changes', async 
 })
 
 test('the judge says a failure once per reason, and Jev without a TypeSafe key asks Zen', async ($, on) => {
-  const b = boundaries(on, { judge: 'jev' }, { config: { ...CONFIG, providers: { ...CONFIG.providers, 'opencode-zen': { headers: { authorization: 'zen-key' }, models: [{ id: 'jev-1.13' }] } } } })
+  const b = boundaries(on, { judges: [{ kind: 'jev' }, { kind: 'haiku' }] }, { config: { ...CONFIG, providers: { ...CONFIG.providers, 'opencode-zen': { headers: { authorization: 'zen-key' }, models: [{ id: 'jev-1.13' }] } } } })
   const sent: string[] = []
   http(on, false, { ...CONFIG, providers: { ...CONFIG.providers, 'opencode-zen': { headers: { authorization: 'zen-key' }, models: [{ id: 'jev-1.13' }] } } }, e => { sent.push(e.init?.headers?.authorization ?? '') })
   judgeStub(on)
@@ -2079,7 +2426,7 @@ test('the judge says a failure once per reason, and Jev without a TypeSafe key a
 })
 
 test('a judge failing for the same reason is said once in a session', async ($, on) => {
-  const b = boundaries(on, { judge: 'jev' })
+  const b = boundaries(on, { judges: [{ kind: 'jev' }, { kind: 'haiku' }] })
   http(on)
   judgeStub(on)
   stepStub(on)
@@ -2087,7 +2434,7 @@ test('a judge failing for the same reason is said once in a session', async ($, 
   await submit($)
   await complete($)
   await submit($, 'Implement the next bounded change and verify the tests again.')
-  expect(b.toasts.filter(text => text.includes('keeping the current effort or asking Haiku')).length, JSON.stringify(b.toasts)).toBe(1)
+  expect(b.toasts.filter(text => text.includes('next configured judge')).length, JSON.stringify(b.toasts)).toBe(1)
 })
 
 // 2026-10-11: on the desktop a toggle was told only by dimness, which the host's hover undoes, so a

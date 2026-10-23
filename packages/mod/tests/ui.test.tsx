@@ -11,7 +11,7 @@ import type { On, RenderElement, RenderPropsOf } from 'claude-code'
 
 import type { AgentRec, Settings, Skin, StatusRequest } from '../types'
 import { STRINGS } from '../hooks/i18n'
-import { normalizeSettings } from '../hooks/settings'
+import { DEFAULT_JUDGE_MODEL, normalizeSettings } from '../hooks/settings'
 import { cardRows, renderAgents, talkOf, timeCells } from '../hooks/ui/agents'
 import { chOf, displayWidth } from '../hooks/ui/theme'
 import { commandLine, runSummary, shortPath, toolDetail } from '../hooks/ui/tools'
@@ -70,6 +70,7 @@ const DASH: DashboardView = {
   isWorking: false,
 }
 
+// The old scalar judge fields on purpose: normalization must turn them into the chain [Jev, Haiku].
 const SETTINGS: Settings = normalizeSettings({
   effortAuto: true,
   judge: 'jev',
@@ -416,7 +417,7 @@ test('리플이 greets in setup and quick settings and waits in empty panes, nev
 // ---- Settings and setup ------------------------------------------------------------------------
 
 /** Every quick control, on one screen on both surfaces (the desktop's tiles, the terminal's rows). */
-const QUICK_KEYS = ['set-auto', 'bias-2', 'judge-haiku', 'judge-jev', 'judge-model', 'set-warm']
+const QUICK_KEYS = ['set-auto', 'bias-2', 'judge-down-jev', 'judge-remove-haiku', 'judge-add-model', 'set-warm']
 
 test('quick settings draw on both surfaces with only session controls', async ($, on) => {
   drawPane(on, 'quick', (el, surface) => renderSettings(el, frameOf(surface), { settings: SETTINGS, jev: { source: null, test: { state: 'idle' } } }, QUICK_ACTIONS))
@@ -455,7 +456,7 @@ test('quick settings controls reach their callbacks on both surfaces', async ($,
     const ui = await mount($, 'quick', surface)
     await ui.press({ key: 'set-auto' })
     await ui.press({ key: 'bias-2' })
-    await ui.press({ key: 'judge-model' })
+    await ui.press({ key: 'judge-add-model' })
     await ui.input({ key: 'jev-key', text: 'ts-key' })
     await ui.press({ key: 'jev-test' })
     await ui.press({ key: 'set-warm' })
@@ -463,7 +464,7 @@ test('quick settings controls reach their callbacks on both surfaces', async ($,
     await ui.press({ key: 'close' })
     await ui.unmount()
   }
-  const once = ['patch:[{"effortAuto":false}]', 'patch:[{"bias":2}]', 'patch:[{"judge":"model"}]', 'key:["ts-key"]', 'test', 'patch:[{"keepWarm":true}]', 'all', 'close']
+  const once = ['patch:[{"effortAuto":false}]', 'patch:[{"bias":2}]', 'patch:[{"judges":[{"kind":"jev"},{"kind":"haiku"},{"kind":"model","model":"deepseek-v4.1-flash"}]}]', 'key:["ts-key"]', 'test', 'patch:[{"keepWarm":true}]', 'all', 'close']
   expect(calls).toEqual([...once, ...once])
 })
 
@@ -549,26 +550,197 @@ test('band, settings and log pictures stay within the SVG limit on every surface
   }
 })
 
-test('Jev key and Test row appear only for TypeSafe Jev with no known key', async ($, on) => {
+test('Jev key and Test row appear when Jev is anywhere in the chain, for TypeSafe with no known key', async ($, on) => {
   const sources: JevState['source'][] = [null, 'zen', 'env', 'file', 'pasted']
-  for (const judge of ['haiku', 'jev', 'model'] as const) {
+  const chains: Record<string, Settings['judges']> = {
+    haiku: [{ kind: 'haiku' }],
+    model: [{ kind: 'model', model: 'test-router-model' }, { kind: 'haiku' }],
+    jev: [{ kind: 'jev' }],
+    'haiku-jev': [{ kind: 'haiku' }, { kind: 'jev' }],
+    'model-jev': [{ kind: 'model', model: 'test-router-model' }, { kind: 'jev' }, { kind: 'haiku' }],
+  }
+  for (const [name, judges] of Object.entries(chains)) {
     for (const jevSource of ['typesafe', 'zen'] as const) {
-      for (const source of sources) drawPane(on, [judge, jevSource, source].join('-'), (el, surface) => renderSettings(el, frameOf(surface), { settings: { ...SETTINGS, judge, jevSource }, jev: { source, test: { state: 'idle' } } }, QUICK_ACTIONS))
+      for (const source of sources) drawPane(on, [name, jevSource, source].join('-'), (el, surface) => renderSettings(el, frameOf(surface), { settings: { ...SETTINGS, judges, jevSource }, jev: { source, test: { state: 'idle' } } }, QUICK_ACTIONS))
     }
   }
   for (const surface of SURFACES) {
-    for (const judge of ['haiku', 'jev', 'model'] as const) {
+    for (const name of Object.keys(chains)) {
       for (const jevSource of ['typesafe', 'zen'] as const) {
         for (const source of sources) {
-          const ui = await mount($, [judge, jevSource, source].join('-'), surface)
-          const shown = judge === 'jev' && jevSource === 'typesafe' && (source === null || source === 'zen')
-          expect(!!await ui.find({ type: 'Input', key: 'jev-key' }), surface + ' ' + [judge, jevSource, source]).toBe(shown)
+          const ui = await mount($, [name, jevSource, source].join('-'), surface)
+          const shown = name.includes('jev') && jevSource === 'typesafe' && (source === null || source === 'zen')
+          expect(!!await ui.find({ type: 'Input', key: 'jev-key' }), surface + ' ' + [name, jevSource, source]).toBe(shown)
           expect(!!await ui.find({ key: 'jev-test' })).toBe(shown)
           await ui.unmount()
         }
       }
     }
   }
+})
+
+const MODELS = [
+  { value: 'router-a', label: 'router-a · p1', provider: 'p1' },
+  { value: 'router-b', label: 'router-b · p2', provider: 'p2' },
+  { value: 'router-c', label: 'router-c · p2', provider: 'p2' },
+]
+
+const patched = (calls: string[]) => calls.map(call => JSON.parse(call.slice('patch:'.length))[0].judges as Settings['judges'])
+
+test('the judge chain reorders, adds and removes on both surfaces without duplicates', async ($, on) => {
+  const { calls, fn } = recorder()
+  const actions = { ...QUICK_ACTIONS, patch: fn('patch') }
+  const chain: Settings['judges'] = [{ kind: 'haiku' }, { kind: 'jev' }, { kind: 'model', model: 'router-a' }]
+  drawPane(on, 'chain', (el, surface) => renderSettings(el, frameOf(surface), { settings: { ...SETTINGS, judges: chain }, models: MODELS, jev: { source: 'env', test: { state: 'idle' } } }, actions))
+  for (const surface of SURFACES) {
+    const ui = await mount($, 'chain', surface)
+    // The ends have no way out of the list: the first cannot move earlier, the last later.
+    expect(await ui.find({ key: 'judge-up-haiku' }), surface).toBeUndefined()
+    expect(await ui.find({ key: 'judge-down-model:router-a' }), surface).toBeUndefined()
+    // Haiku and Jev are in already; only a router model is left to add, one not used yet.
+    expect(await ui.find({ key: 'judge-add-haiku' }), surface).toBeUndefined()
+    expect(await ui.find({ key: 'judge-add-jev' }), surface).toBeUndefined()
+    await ui.press({ key: 'judge-down-haiku' })
+    await ui.press({ key: 'judge-up-model:router-a' })
+    await ui.press({ key: 'judge-remove-jev' })
+    await ui.press({ key: 'judge-add-model' })
+    await ui.unmount()
+  }
+  const once: Settings['judges'][] = [
+    [{ kind: 'jev' }, { kind: 'haiku' }, { kind: 'model', model: 'router-a' }],
+    [{ kind: 'haiku' }, { kind: 'model', model: 'router-a' }, { kind: 'jev' }],
+    [{ kind: 'haiku' }, { kind: 'model', model: 'router-a' }],
+    [...chain, { kind: 'model', model: 'router-b' }],
+  ]
+  expect(patched(calls)).toEqual([...once, ...once])
+})
+
+test('settings and setup never offer or auto-add raw Jev catalog models as generic judges on either surface', async ($, on) => {
+  const { calls, fn } = recorder()
+  const actions = { ...QUICK_ACTIONS, patch: fn('patch'), back: () => undefined, next: () => undefined, finish: () => undefined, skip: () => undefined }
+  // /api/config's RouterModel registry has no judgeOnly metadata; both spellings need the shared policy.
+  const specialized = [{ value: 'jev-1.13', label: 'Jev · zen', provider: 'zen' }, { value: 'JeV-2', label: 'Mixed Jev · zen', provider: 'zen' }]
+  const judges: Settings['judges'] = [{ kind: 'haiku' }, { kind: 'model', model: 'router-a' }]
+  const cases = [
+    { name: 'ordinary', models: [...specialized, ...MODELS, MODELS[1]!], judges, next: 'router-b' },
+    { name: 'specialized-only', models: specialized, judges, next: DEFAULT_JUDGE_MODEL },
+    { name: 'default-used', models: specialized, judges: [{ kind: 'model', model: DEFAULT_JUDGE_MODEL }] as Settings['judges'], next: undefined },
+  ]
+  for (const mode of ['settings', 'setup'] as const) for (const entry of cases) {
+    const settings = { ...SETTINGS, judges: entry.judges }
+    const jev: JevState = { source: null, test: { state: 'idle' } }
+    drawPane(on, mode + '-' + entry.name, (el, surface) => mode === 'settings'
+      ? renderSettings(el, frameOf(surface), { settings, models: entry.models, jev }, actions)
+      : renderSetup(el, frameOf(surface), { step: 1, draft: settings, models: entry.models, jev }, actions))
+  }
+  const expected: Settings['judges'][] = []
+  for (const surface of SURFACES) for (const mode of ['settings', 'setup'] as const) for (const entry of cases) {
+    const ui = await mount($, mode + '-' + entry.name, surface)
+    if (entry.name === 'ordinary') {
+      const select = await ui.find({ type: 'Select', key: 'judge-model-1' })
+      expect(select?.props.options, surface + ' ' + mode).toEqual(MODELS.map(({ value, label }) => ({ value, label })))
+      await ui.select({ key: 'judge-model-1', value: 'router-c' })
+      expected.push([{ kind: 'haiku' }, { kind: 'model', model: 'router-c' }])
+    }
+    expect(!!await ui.find({ key: 'judge-add-model' }), surface + ' ' + mode + ' ' + entry.name).toBe(entry.next !== undefined)
+    if (entry.next) {
+      await ui.press({ key: 'judge-add-model' })
+      expected.push([...entry.judges, { kind: 'model', model: entry.next }])
+    }
+    await ui.press({ key: 'judge-add-jev' })
+    expected.push([...entry.judges, { kind: 'jev' }])
+    await ui.unmount()
+  }
+  expect(patched(calls)).toEqual(expected)
+})
+
+test('settings and setup retain configured specialized and unknown generic judges as unavailable on either surface', async ($, on) => {
+  const { calls, fn } = recorder()
+  const actions = { ...QUICK_ACTIONS, patch: fn('patch'), back: () => undefined, next: () => undefined, finish: () => undefined, skip: () => undefined }
+  const judges: Settings['judges'] = [{ kind: 'model', model: 'JeV-2' }, { kind: 'model', model: 'gone-model' }, { kind: 'model', model: 'router-a' }]
+  const settings = { ...SETTINGS, judges }
+  const models = [{ value: 'JeV-2', label: 'Mixed Jev · zen', provider: 'zen' }, ...MODELS]
+  const jev: JevState = { source: null, test: { state: 'idle' } }
+  for (const mode of ['settings', 'setup'] as const) drawPane(on, 'unavailable-' + mode, (el, surface) => mode === 'settings'
+    ? renderSettings(el, frameOf(surface), { settings, models, jev }, actions)
+    : renderSetup(el, frameOf(surface), { step: 1, draft: settings, models, jev }, actions))
+  for (const surface of SURFACES) for (const mode of ['settings', 'setup'] as const) {
+    const ui = await mount($, 'unavailable-' + mode, surface)
+    for (const [index, value] of ['JeV-2', 'gone-model'].entries()) {
+      const select = await ui.find({ type: 'Select', key: 'judge-model-' + index })
+      expect(select?.props.value, surface + ' ' + mode).toBe(value)
+      expect(select?.props.options).toEqual([
+        { value, label: value + ' · not in the router’s list' },
+        ...MODELS.slice(1).map(({ value, label }) => ({ value, label })),
+      ])
+    }
+    const ordinary = await ui.find({ type: 'Select', key: 'judge-model-2' })
+    expect(ordinary?.props.options).toEqual(MODELS.map(({ value, label }) => ({ value, label })))
+    expect(await ui.find({ key: 'jev-source-zen' })).toBeUndefined()
+    await ui.press({ key: 'judge-add-model' })
+    await ui.unmount()
+  }
+  expect(patched(calls)).toEqual(Array(4).fill([...judges, { kind: 'model', model: 'router-b' }]))
+})
+
+test('one global Jev source selector shows when Jev is anywhere in the chain and patches only jevSource', async ($, on) => {
+  const { calls, fn } = recorder()
+  const actions = { ...QUICK_ACTIONS, patch: fn('patch') }
+  const view = (judges: Settings['judges'], jevSource: Settings['jevSource'], source: JevState['source'] = null) => ({ settings: { ...SETTINGS, judges, jevSource }, jev: { source, test: { state: 'idle' as const } } })
+  drawPane(on, 'src-none', (el, surface) => renderSettings(el, frameOf(surface), view([{ kind: 'haiku' }], 'typesafe'), actions))
+  drawPane(on, 'src-backup', (el, surface) => renderSettings(el, frameOf(surface), view([{ kind: 'haiku' }, { kind: 'jev' }], 'typesafe', 'env'), actions))
+  drawPane(on, 'src-zen', (el, surface) => renderSettings(el, frameOf(surface), view([{ kind: 'model', model: 'router-a' }, { kind: 'jev' }], 'zen'), actions))
+  drawPane(on, 'src-setup', (el, surface) => renderSetup(el, frameOf(surface), { step: 1, draft: view([{ kind: 'haiku' }, { kind: 'jev' }], 'typesafe', 'env').settings, jev: { source: 'env', test: { state: 'idle' } } }, { patch: fn('patch'), jevKey: fn('key'), testJev: fn('test'), openAllSettings: fn('all'), back: fn('back'), next: fn('next'), finish: fn('finish'), skip: fn('skip') }))
+  for (const surface of SURFACES) {
+    const none = await mount($, 'src-none', surface)
+    expect(await none.find({ key: 'jev-source-zen' }), surface).toBeUndefined()
+    await none.unmount()
+    const backup = await mount($, 'src-backup', surface)
+    expect(await backup.find({ key: 'jev-source-typesafe' }), surface).toBeDefined()
+    expect(await backup.find({ type: 'Input', key: 'jev-key' }), surface).toBeUndefined()
+    await backup.press({ key: 'jev-source-zen' })
+    await backup.unmount()
+    const zen = await mount($, 'src-zen', surface)
+    expect(await zen.find({ type: 'Text', text: 'No OpenCode Zen authorization key in ClaudeRipple config' }), surface).toBeDefined()
+    expect(await zen.find({ type: 'Input', key: 'jev-key' }), surface).toBeUndefined()
+    await zen.unmount()
+    const setup = await mount($, 'src-setup', surface)
+    await setup.press({ key: 'jev-source-zen' })
+    await setup.unmount()
+  }
+  expect(calls).toEqual(Array(4).fill('patch:[{"jevSource":"zen"}]'))
+})
+
+test('a lone judge cannot be removed or moved, and a missing Haiku or Jev can be added back', async ($, on) => {
+  const { calls, fn } = recorder()
+  const actions = { ...QUICK_ACTIONS, patch: fn('patch') }
+  drawPane(on, 'lone', (el, surface) => renderSettings(el, frameOf(surface), { settings: { ...SETTINGS, judges: [{ kind: 'haiku' }] }, models: MODELS, jev: { source: 'env', test: { state: 'idle' } } }, actions))
+  for (const surface of SURFACES) {
+    const ui = await mount($, 'lone', surface)
+    for (const key of ['judge-up-haiku', 'judge-down-haiku', 'judge-remove-haiku', 'judge-add-haiku']) expect(await ui.find({ key }), surface + ' ' + key).toBeUndefined()
+    await ui.press({ key: 'judge-add-jev' })
+    await ui.unmount()
+  }
+  expect(patched(calls)).toEqual([[{ kind: 'haiku' }, { kind: 'jev' }], [{ kind: 'haiku' }, { kind: 'jev' }]])
+})
+
+test('several router models take turns, each one pickable, and an unknown configured model is kept', async ($, on) => {
+  const { calls, fn } = recorder()
+  const actions = { ...QUICK_ACTIONS, patch: fn('patch') }
+  const judges: Settings['judges'] = [{ kind: 'model', model: 'gone-model' }, { kind: 'model', model: 'router-b' }]
+  drawPane(on, 'models', (el, surface) => renderSettings(el, frameOf(surface), { settings: { ...SETTINGS, judges }, models: MODELS, jev: { source: 'env', test: { state: 'idle' } } }, actions))
+  for (const surface of SURFACES) {
+    const ui = await mount($, 'models', surface)
+    // The configured model that the router no longer lists stays, named as unavailable.
+    const unknown = await ui.find({ type: 'Select', key: 'judge-model-0' })
+    expect(unknown?.props.value, surface).toBe('gone-model')
+    expect(JSON.stringify(unknown?.props.options), surface).toContain('gone-model · not in the router’s list')
+    // Another entry's model is not offered again.
+    expect(JSON.stringify(unknown?.props.options), surface).not.toContain('"router-b"')
+    await ui.select({ key: 'judge-model-0', value: 'router-a' })
+    await ui.unmount()
+  }
+  expect(patched(calls)).toEqual([[{ kind: 'model', model: 'router-a' }, { kind: 'model', model: 'router-b' }], [{ kind: 'model', model: 'router-a' }, { kind: 'model', model: 'router-b' }]])
 })
 
 test('setup steps draw on both surfaces and move on', async ($, on) => {
@@ -595,6 +767,24 @@ test('setup steps draw on both surfaces and move on', async ($, on) => {
   }
   const once = ['next', 'all', 'back', 'patch:[{"keepWarm":true}]', 'finish']
   expect(calls).toEqual([...once, ...once])
+})
+
+test('setup edits the same judge chain as the quick settings', async ($, on) => {
+  const { calls, fn } = recorder()
+  const actions = { patch: fn('patch'), jevKey: fn('key'), testJev: fn('test'), openAllSettings: fn('all'), back: fn('back'), next: fn('next'), finish: fn('finish'), skip: fn('skip') }
+  drawPane(on, 'setup-chain', (el, surface) => renderSetup(el, frameOf(surface), { step: 1, draft: { ...SETTINGS, judges: [{ kind: 'haiku' }, { kind: 'jev' }] }, models: MODELS, jev: { source: null, test: { state: 'idle' } } }, actions))
+  drawPane(on, 'setup-done', (el, surface) => renderSetup(el, frameOf(surface), { step: 4, draft: { ...SETTINGS, judges: [{ kind: 'haiku' }, { kind: 'model', model: 'router-a' }] }, jev: { source: 'env', test: { state: 'idle' } } }, actions))
+  for (const surface of SURFACES) {
+    const ui = await mount($, 'setup-chain', surface)
+    // Jev in second place still asks for its key.
+    expect(await ui.find({ type: 'Input', key: 'jev-key' }), surface).toBeDefined()
+    await ui.press({ key: 'judge-up-jev' })
+    await ui.unmount()
+    const done = await mount($, 'setup-done', surface)
+    expect(await done.find({ type: 'Text', text: 'Auto on, judged by Haiku → router-a' }), surface).toBeDefined()
+    await done.unmount()
+  }
+  expect(patched(calls)).toEqual([[{ kind: 'jev' }, { kind: 'haiku' }], [{ kind: 'jev' }, { kind: 'haiku' }]])
 })
 
 // ---- Panes -------------------------------------------------------------------------------------

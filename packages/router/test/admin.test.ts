@@ -225,20 +225,37 @@ const putModSettings = (port: number, body: unknown) => fetch(`${base()}:${port}
   method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ schemaVersion: MOD_SETTINGS_SCHEMA_VERSION, ...(body as Record<string, unknown>) }),
 });
 
-test("admin mod-settings rejects an old session's full empty/default overwrite even at the current revision", async () => {
+test("admin mod-settings rejects old writers at a fresh revision without changing settings or backups", async () => {
   await withAdmin(makeCfg(), async ({ port, home }) => {
+    assert.equal(MOD_SETTINGS_SCHEMA_VERSION, 2);
     const steps = [{ target: { agent: "first" }, effort: "high" }, { target: { agent: "second" }, effort: "medium" }];
-    const settings = normalizeSettings({ rules: { general: { mode: "ladder", rungs: { light: steps, standard: steps, hard: steps, plan: steps } } }, modes: [{ id: "saved", name: "Saved mode", rungs: { hard: steps }, delegation: "eager", until: "none" }], activeMode: "saved" });
+    const settings = normalizeSettings({ judges: [{ kind: "haiku" }, { kind: "jev" }, { kind: "model", model: "custom-judge" }], rules: { general: { mode: "ladder", rungs: { light: steps, standard: steps, hard: steps, plan: steps } } }, modes: [{ id: "saved", name: "Saved mode", rungs: { hard: steps }, delegation: "eager", until: "none" }], activeMode: "saved" });
     const file = path.join(home, "mod-settings.json");
     const original = JSON.stringify({ settings, revision: 9, stored: true });
+    const backup = `${file}.bak-8`;
+    const previous = '{"revision":8,"settings":{"judge":"jev"}}\n';
     fs.writeFileSync(file, original);
-    // Pre-a931858 reads Step[] as no Step. An unrelated toggle PUTs empty rungs,
-    // and the admin fill used to turn that into a complete default overwrite.
-    for (const lost of [{ ...settings, rules: { general: { mode: "ladder", rungs: {} } }, modes: [] }, normalizeSettings(null)]) {
-      const response = await putModSettings(port, { settings: lost, revision: 9, schemaVersion: undefined });
-      assert.equal(response.status, 426);
-      assert.equal(fs.readFileSync(file, "utf8"), original);
+    fs.writeFileSync(backup, previous);
+    const names = fs.readdirSync(home).sort();
+    // Older clients lose Step[] or the judge chain when they normalize a full snapshot.
+    // Neither a missing version nor v1 may overwrite v2, even with the current revision.
+    for (const schemaVersion of [undefined, 1]) {
+      for (const lost of [{ ...settings, rules: { general: { mode: "ladder", rungs: {} } }, modes: [] }, { judge: "haiku", judgeModel: "old-default", language: "ko" }]) {
+        const response = await putModSettings(port, { settings: lost, revision: 9, schemaVersion });
+        assert.equal(response.status, 426);
+        assert.match(await response.text(), /reload ClaudeRipple/);
+        assert.equal(fs.readFileSync(file, "utf8"), original);
+        assert.equal(fs.readFileSync(backup, "utf8"), previous);
+        assert.deepEqual(fs.readdirSync(home).sort(), names);
+      }
     }
+    const response = await putModSettings(port, { settings, revision: 9, schemaVersion: 2 });
+    assert.equal(response.status, 200);
+    const saved = await response.json() as ModSettingsSnapshot;
+    assert.equal(saved.revision, 10);
+    assert.deepEqual(saved.settings.judges, settings.judges);
+    assert.equal(fs.readFileSync(`${file}.bak-9`, "utf8"), original);
+    assert.equal(fs.readFileSync(backup, "utf8"), previous);
   });
 });
 
@@ -261,7 +278,7 @@ test("admin mod-settings keeps ten exact previous files and refuses unsupported 
       if (process.platform !== "win32") assert.equal(fs.statSync(backup).mode & 0o777, 0o600);
     }
     const final = fs.readFileSync(file, "utf8");
-    for (const schemaVersion of [undefined, 0, 2, "1", null]) {
+    for (const schemaVersion of [undefined, 0, 1, MOD_SETTINGS_SCHEMA_VERSION + 1, String(MOD_SETTINGS_SCHEMA_VERSION), null]) {
       assert.equal((await putModSettings(port, { schemaVersion, settings: {}, revision: 13 })).status, 426);
     }
     assert.equal((await putModSettings(port, { settings: {}, revision: 0 })).status, 409);
@@ -285,7 +302,7 @@ test("admin mod-settings returns full defaults before storage, normalizes writes
     const snapshot = { settings, revision: 1, stored: true };
     assert.deepEqual(await saved.json(), snapshot);
     assert.deepEqual(await (await fetch(`${base()}:${port}/api/mod-settings`)).json(), snapshot);
-    assert.equal(settings.judge, defaults.settings.judge);
+    assert.deepEqual(settings.judges, defaults.settings.judges);
     assert.equal(settings.layout, defaults.settings.layout);
     assert.equal(settings.language, defaults.settings.language);
     assert.equal(settings.keepWarmMinTokens, 1234);
@@ -306,13 +323,85 @@ test("admin mod-settings empty-store conflicts include normalized defaults and s
   });
 });
 
-test("admin mod-settings normalizes legacy stored settings on GET without rewriting their revision", async () => {
+test("admin mod-settings migrates legacy judge singletons on GET without rewriting settings or revision", async () => {
   await withAdmin(makeCfg(), async ({ port, home }) => {
-    const old = { settings: { layout: "invalid", language: "pt", tiers: { light: { agent: "legacy" } } }, revision: 7 };
     const file = path.join(home, "mod-settings.json");
-    fs.writeFileSync(file, JSON.stringify(old));
-    assert.deepEqual(await (await fetch(`${base()}:${port}/api/mod-settings`)).json(), { settings: normalizeSettings(old.settings), revision: 7, stored: true });
-    assert.deepEqual(JSON.parse(fs.readFileSync(file, "utf8")), old);
+    const cases = [
+      { legacy: {}, judges: [{ kind: "haiku" }] },
+      { legacy: { judge: "haiku" }, judges: [{ kind: "haiku" }] },
+      { legacy: { judge: "jev", jevSource: "zen" }, judges: [{ kind: "jev" }, { kind: "haiku" }] },
+      { legacy: { judge: "model", judgeModel: " old-judge " }, judges: [{ kind: "model", model: "old-judge" }, { kind: "haiku" }] },
+      { legacy: { judge: "model" }, judges: [{ kind: "model", model: "deepseek-v4.1-flash" }, { kind: "haiku" }] },
+    ];
+    for (const { legacy, judges } of cases) {
+      const old = { settings: { layout: "invalid", language: "pt", tiers: { light: { agent: "legacy" } }, ...legacy }, revision: 7 };
+      const original = JSON.stringify(old, null, 2) + "\n";
+      fs.writeFileSync(file, original);
+      const response = await fetch(`${base()}:${port}/api/mod-settings`);
+      assert.equal(response.status, 200);
+      const snapshot = await response.json() as ModSettingsSnapshot;
+      assert.deepEqual(snapshot, { settings: normalizeSettings(old.settings), revision: 7, stored: true });
+      assert.deepEqual(snapshot.settings.judges, judges);
+      assert.equal(snapshot.settings.jevSource, legacy.jevSource ?? "typesafe");
+      assert.equal(Object.hasOwn(snapshot.settings, "judge"), false);
+      assert.equal(Object.hasOwn(snapshot.settings, "judgeModel"), false);
+      assert.equal(fs.readFileSync(file, "utf8"), original);
+      assert.deepEqual(fs.readdirSync(home).filter(name => name.startsWith("mod-settings.json.bak-")), []);
+    }
+  });
+});
+
+test("admin mod-settings round-trips explicit ordered judge chains without hidden fallbacks", async () => {
+  await withAdmin(makeCfg(), async ({ port, home }) => {
+    const cases = [
+      { judges: [{ kind: "haiku" }, { kind: "jev" }, { kind: "model", model: "unlisted/first-judge" }, { kind: "model", model: "unlisted/second-judge" }], jevSource: "zen" },
+      { judges: [{ kind: "jev" }], jevSource: "typesafe" },
+      { judges: [{ kind: "model", model: "unlisted/only-judge" }], jevSource: "zen" },
+      { judges: [{ kind: "haiku" }], jevSource: "typesafe" },
+    ];
+    for (const [index, input] of cases.entries()) {
+      const response = await putModSettings(port, { settings: { ...input, judge: "model", judgeModel: "ignored-legacy-model" }, revision: index });
+      assert.equal(response.status, 200);
+      const saved = await response.json() as ModSettingsSnapshot;
+      assert.equal(saved.revision, index + 1);
+      assert.deepEqual(saved.settings.judges, input.judges);
+      assert.equal(saved.settings.jevSource, input.jevSource);
+      assert.equal(Object.hasOwn(saved.settings, "judge"), false);
+      assert.equal(Object.hasOwn(saved.settings, "judgeModel"), false);
+      assert.deepEqual(await (await fetch(`${base()}:${port}/api/mod-settings`)).json(), saved);
+      assert.deepEqual(JSON.parse(fs.readFileSync(path.join(home, "mod-settings.json"), "utf8")), saved);
+    }
+    // Like worker lists, malformed entries drop in place; only exact targets de-duplicate.
+    const response = await putModSettings(port, { settings: { judges: [
+      { kind: "model", model: " first " }, null, { kind: "unknown" },
+      { kind: "model", model: " " }, { kind: "jev", model: "inapplicable" },
+      { kind: "model", model: "first" }, { kind: "model", model: "second" },
+    ] }, revision: cases.length });
+    assert.equal(response.status, 200);
+    const saved = await response.json() as ModSettingsSnapshot;
+    assert.deepEqual(saved.settings.judges, [{ kind: "model", model: "first" }, { kind: "jev" }, { kind: "model", model: "second" }]);
+    assert.deepEqual(await (await fetch(`${base()}:${port}/api/mod-settings`)).json(), saved);
+  });
+});
+
+test("admin mod-settings rejects explicit judge chains with no valid target before normalization", async () => {
+  await withAdmin(makeCfg(), async ({ port, home }) => {
+    const settings = normalizeSettings({ judges: [{ kind: "jev" }, { kind: "model", model: "keep-judge" }], jevSource: "zen" });
+    assert.equal((await putModSettings(port, { settings, revision: 0 })).status, 200);
+    assert.equal((await putModSettings(port, { settings, revision: 1 })).status, 200);
+    const file = path.join(home, "mod-settings.json");
+    const original = fs.readFileSync(file, "utf8");
+    const backup = fs.readFileSync(`${file}.bak-1`, "utf8");
+    const names = fs.readdirSync(home).sort();
+    for (const judges of [[], null, {}, "haiku", 1, false, [null, {}, { kind: "unknown" }, { kind: "model", model: " " }, { kind: "model", model: 1 }]]) {
+      const response = await putModSettings(port, { settings: { judges, judge: "haiku" }, revision: 2 });
+      assert.equal(response.status, 400, JSON.stringify(judges));
+      assert.match(await response.text(), /judges must contain at least one valid target/);
+      assert.equal(fs.readFileSync(file, "utf8"), original);
+      assert.equal(fs.readFileSync(`${file}.bak-1`, "utf8"), backup);
+      assert.deepEqual(fs.readdirSync(home).sort(), names);
+      assert.deepEqual(await (await fetch(`${base()}:${port}/api/mod-settings`)).json(), JSON.parse(original));
+    }
   });
 });
 
@@ -413,13 +502,20 @@ test("admin mod-settings round-trips allowKnown, the keys the allow-list was las
 
 test("admin mod-settings stale revisions return current settings; concurrent CAS has one winner", async () => {
   await withAdmin(makeCfg(), async ({ port }) => {
-    const responses = await Promise.all([putModSettings(port, { settings: { language: "ko" }, revision: 0 }), putModSettings(port, { settings: { language: "ja" }, revision: 0 })]);
+    const candidates = [
+      { language: "ko", judges: [{ kind: "haiku" }, { kind: "model", model: "first-judge" }] },
+      { language: "ja", judges: [{ kind: "jev" }, { kind: "model", model: "second-judge" }, { kind: "model", model: "third-judge" }] },
+    ];
+    const responses = await Promise.all(candidates.map(settings => putModSettings(port, { settings, revision: 0 })));
     assert.deepEqual(responses.map(r => r.status).sort(), [200, 409]);
     const current = await (await fetch(`${base()}:${port}/api/mod-settings`)).json() as ModSettingsSnapshot;
     assert.equal(current.stored, true);
     assert.equal(current.revision, 1);
     assert.deepEqual(current.settings, normalizeSettings(current.settings));
-    for (const response of responses) assert.deepEqual(await response.json(), current);
+    for (const [index, response] of responses.entries()) {
+      if (response.status === 200) assert.deepEqual(current.settings.judges, candidates[index]!.judges);
+      assert.deepEqual(await response.json(), current, "both the winner and CAS conflict return the entire chain");
+    }
     const stale = await putModSettings(port, { settings: {}, revision: 0 });
     assert.equal(stale.status, 409);
     assert.deepEqual(await stale.json(), current);
@@ -432,6 +528,17 @@ test("admin mod-settings refuses nonobjects, invalid revisions and secrets at an
       const response = await putModSettings(port, { settings });
       assert.equal(response.status, 400, JSON.stringify(settings));
       assert.doesNotMatch(await response.text(), /hidden/);
+    }
+    for (const judges of [
+      [{ kind: "haiku", apiKey: "hidden" }],
+      [{ kind: "haiku" }, { kind: "unknown", nested: [{ accessToken: "hidden" }] }],
+      [{ kind: "model", model: " ", password: "hidden" }],
+    ]) {
+      const response = await putModSettings(port, { settings: { judges } });
+      assert.equal(response.status, 400);
+      const text = await response.text();
+      assert.match(text, /credential fields/, "credentials are checked before target filtering or empty-chain validation");
+      assert.doesNotMatch(text, /hidden/);
     }
     for (const revision of [-1, 0.5, null, "0"]) assert.equal((await putModSettings(port, { settings: {}, revision })).status, 400);
     const malformed = await fetch(`${base()}:${port}/api/mod-settings`, { method: "PUT", body: "{" });
@@ -455,12 +562,20 @@ test("admin mod-settings enforces the UTF-8 64 KiB object limit at the exact bou
   });
 });
 
-test("admin mod-settings refuses to overwrite corrupt persistence", async () => {
+test("admin mod-settings treats invalid stored judge chains as corruption rather than defaulting or overwriting", async () => {
   await withAdmin(makeCfg(), async ({ port, home }) => {
     const file = path.join(home, "mod-settings.json");
-    fs.writeFileSync(file, "{");
-    assert.equal((await putModSettings(port, { settings: {} })).status, 500);
-    assert.equal(fs.readFileSync(file, "utf8"), "{");
+    const cases = [
+      { text: "{", status: 500 },
+      ...[[], null, [{ kind: "model", model: " " }]].map(judges => ({ text: JSON.stringify({ settings: { judges, judge: "haiku" }, revision: 7 }), status: 400 })),
+    ];
+    for (const { text, status } of cases) {
+      fs.writeFileSync(file, text);
+      assert.equal((await fetch(`${base()}:${port}/api/mod-settings`)).status, status);
+      assert.equal((await putModSettings(port, { settings: {}, revision: 7 })).status, status);
+      assert.equal(fs.readFileSync(file, "utf8"), text);
+      assert.deepEqual(fs.readdirSync(home).filter(name => name.startsWith("mod-settings.json.bak-")), []);
+    }
   });
 });
 

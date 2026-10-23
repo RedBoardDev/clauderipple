@@ -28,7 +28,7 @@ test('modes load validated: no mode is built in, bad entries are dropped, the ac
   assert.equal(normalizeSettings({}).activeMode, undefined)
   // Settings from before modes load as they did, with no modes.
   const old = normalizeSettings({ allow: ['gpt-6-1-sol'], judge: 'jev' })
-  assert.deepEqual([old.modes, old.allow, old.judge, Object.hasOwn(old, 'activeMode')], [[], ['gpt-6-1-sol'], 'jev', false])
+  assert.deepEqual([old.modes, old.allow, old.judges, Object.hasOwn(old, 'activeMode')], [[], ['gpt-6-1-sol'], [{ kind: 'jev' }, { kind: 'haiku' }], false])
   const modes = normalizeModes([
     { id: 'burn', name: '  Burn GPT  ', targets: ['chatgpt', 'chatgpt', ' ', 3], action: 'prefer', delegation: 'eager', until: 'reset' },
     { id: 'keep', name: 'Keep Claude', targets: ['anthropic'], action: 'avoid', delegation: 'loud', until: 1_800_000_000_000 },

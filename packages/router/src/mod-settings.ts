@@ -4,7 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { homeDir } from "./config.ts";
 import { withFileLock, writeJsonAtomic } from "./locked-file.ts";
-import { MOD_SETTINGS_SCHEMA_VERSION, hadRetiredRouting, normalizeSettings } from "../../mod/hooks/settings.ts";
+import { MOD_SETTINGS_SCHEMA_VERSION, hadRetiredRouting, normalizeJudgeTargets, normalizeSettings } from "../../mod/hooks/settings.ts";
 import type { ModSettingsSnapshot } from "../../mod/types/index.d.ts";
 
 export const MAX_MOD_SETTINGS_BYTES = 64 * 1024;
@@ -53,6 +53,8 @@ export function validateSettings(settings: unknown): asserts settings is Record<
   if (!object(settings)) throw new ModSettingsInputError("settings must be a JSON object");
   if (Buffer.byteLength(JSON.stringify(settings), "utf8") > MAX_MOD_SETTINGS_BYTES) throw new ModSettingsInputError("settings exceeds 64 KiB", 413);
   if (hasSecretKey(settings)) throw new ModSettingsInputError("settings must not contain credential fields (key, token, secret, password)");
+  // An explicit chain cannot silently become Haiku; malformed persisted chains are corruption too.
+  if (Object.hasOwn(settings, "judges") && !normalizeJudgeTargets(settings.judges).length) throw new ModSettingsInputError("judges must contain at least one valid target");
 }
 
 export function readModSettings(home = homeDir()): ModSettingsSnapshot {

@@ -46,7 +46,7 @@ const DASH: DashboardView = {
   isWorking: false,
 }
 
-const SETTINGS: Settings = normalizeSettings({ judge: 'jev', judgeModel: 'deepseek-v4.1-flash', modes: [{ id: 'm1', name: 'GPT 우선' }, { id: 'm2', name: '절약' }], activeMode: 'm1' } as never)
+const SETTINGS: Settings = normalizeSettings({ judges: [{ kind: 'jev' }, { kind: 'model', model: 'deepseek-v4.1-flash' }, { kind: 'haiku' }], modes: [{ id: 'm1', name: 'GPT 우선' }, { id: 'm2', name: '절약' }], activeMode: 'm1' } as never)
 
 /** Every plan window the limits row gauges: Claude's 5-hour, weekly and Fable, then two GPT accounts. */
 const LIMITS: LimitItem[] = [
@@ -72,7 +72,7 @@ const LIMITS_ALL: LimitItem[] = [
   { provider: 'opencode-go', type: 'opencode-go', title: 'Go', account: 0, kind: 'seven_day', label: '', windowMinutes: 10080, percent: 52, resetsAt: '2026-10-19T00:00:00Z' },
   { provider: 'opencode-go', type: 'opencode-go', title: 'Go', account: 0, kind: 'window', label: '', windowMinutes: 43200, percent: 92, resetsAt: '2026-10-18T05:43:30Z' },
 ]
-const SETTINGS_VIEW: SettingsView = { settings: SETTINGS, jev: { source: 'env', test: { state: 'idle' } } }
+const SETTINGS_VIEW: SettingsView = { settings: SETTINGS, models: [{ value: 'deepseek-v4.1-flash', label: 'deepseek-v4.1-flash · opencode', provider: 'opencode' }, { value: 'gpt-6.1-sol', label: 'gpt-6.1-sol · chatgpt', provider: 'chatgpt' }], jev: { source: 'env', test: { state: 'idle' } } }
 
 /** The Agents pane's width in a wide window, ~560 px, in cells; and a narrow one, ~360 px. */
 const PANE = 68
@@ -223,9 +223,9 @@ const SCENES: Scene[] = [
   { name: 'band-limits-all-140', columns: 140, draw: (el, f) => site(el, f, { ...DASH, limit: { kind: 'seven_day', percent: 88, resetsAt: '2026-10-12T18:20:00', save: false }, handoff: 'advised', extras: ['context', 'limits'], limits: LIMITS_ALL }) },
   { name: 'band-limits-all-94', columns: 94, draw: (el, f) => site(el, f, { ...DASH, limit: { kind: 'seven_day', percent: 88, resetsAt: '2026-10-12T18:20:00', save: false }, handoff: 'advised', extras: ['context', 'limits'], limits: LIMITS_ALL }) },
   { name: 'settings', draw: (el, f) => renderSettings(el, f, SETTINGS_VIEW, noop) },
-  { name: 'settings-off', draw: (el, f) => renderSettings(el, f, { ...SETTINGS_VIEW, settings: { ...SETTINGS, effortAuto: false, judge: 'haiku', keepWarm: true, activeMode: undefined } }, noop) },
-  { name: 'settings-key', draw: (el, f) => renderSettings(el, f, { settings: { ...SETTINGS, jevSource: 'typesafe', judge: 'jev' }, jev: { source: null, test: { state: 'fail', message: 'key rejected (401)' } } }, noop) },
-  { name: 'settings-router', columns: 70, draw: (el, f) => renderSettings(el, f, { ...SETTINGS_VIEW, settings: { ...SETTINGS, judge: 'model', bias: 1 } }, noop) },
+  { name: 'settings-off', draw: (el, f) => renderSettings(el, f, { ...SETTINGS_VIEW, settings: { ...SETTINGS, effortAuto: false, judges: [{ kind: 'haiku' }], keepWarm: true, activeMode: undefined } }, noop) },
+  { name: 'settings-key', draw: (el, f) => renderSettings(el, f, { settings: { ...SETTINGS, jevSource: 'typesafe', judges: [{ kind: 'jev' }] }, jev: { source: null, test: { state: 'fail', message: 'key rejected (401)' } } }, noop) },
+  { name: 'settings-router', columns: 70, draw: (el, f) => renderSettings(el, f, { ...SETTINGS_VIEW, settings: { ...SETTINGS, judges: [{ kind: 'model', model: 'deepseek-v4.1-flash' }, { kind: 'haiku' }], bias: 1 } }, noop) },
   { name: 'alert-cold', draw: alert({ kind: 'cold', tokens: 182_000, idleMinutes: 74 }) },
   { name: 'alert-kept', draw: alert({ kind: 'kept', pings: 2, tokens: 312_000, minutesLeft: 47 }) },
   { name: 'alert-swamp', draw: alert({ kind: 'swamp', percent: 63, tokens: 126_000 }) },
@@ -244,7 +244,7 @@ const SCENES: Scene[] = [
   { name: 'flat-band', skin: 'flat', draw: (el, f) => site(el, f, { ...DASH, warm: { on: true, pings: 2, cost: 9000 }, agents: { live: 2, total: 3 }, extras: ['context', 'limits'], limit: { kind: 'five_hour', percent: 42, resetsAt: '2026-10-12T15:40:00', save: false } }) },
   { name: 'flat-band-menu', skin: 'flat', draw: (el, f) => site(el, f, { ...DASH, effortMenu: true, effort: { level: 'xhigh', mode: 'manual' } }) },
   { name: 'flat-settings', skin: 'flat', draw: (el, f) => renderSettings(el, f, SETTINGS_VIEW, noop) },
-  { name: 'flat-settings-key', skin: 'flat', draw: (el, f) => renderSettings(el, f, { settings: { ...SETTINGS, jevSource: 'typesafe', judge: 'jev', effortAuto: false, keepWarm: true }, jev: { source: null, test: { state: 'fail', message: 'key rejected (401)' } } }, noop) },
+  { name: 'flat-settings-key', skin: 'flat', draw: (el, f) => renderSettings(el, f, { settings: { ...SETTINGS, jevSource: 'typesafe', judges: [{ kind: 'jev' }], effortAuto: false, keepWarm: true }, jev: { source: null, test: { state: 'fail', message: 'key rejected (401)' } } }, noop) },
   { name: 'flat-alert-swamp', skin: 'flat', draw: (el, f) => renderAlert(el, f, { kind: 'swamp', percent: 63, tokens: 126_000 }, noop) },
   { name: 'flat-alert-handoff', skin: 'flat', draw: (el, f) => renderAlert(el, f, { kind: 'handoffChoice', handoffKind: 'quick', after: 'continue' }, noop) },
   { name: 'flat-setup', skin: 'flat', draw: (el, f) => renderSetup(el, f, { step: 1, draft: SETTINGS, jev: { source: null, test: { state: 'idle' } } }, noop) },

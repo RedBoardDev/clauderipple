@@ -100,7 +100,7 @@ export function cardOf(frame: Frame, alert: AlertView, a: AlertActions): Card {
         key: 'judge',
         face: 'dazed',
         title: t(L, alert.network ? 'alerts.judgeNetworkTitle' : 'alerts.judgeTitle'),
-        body: t(L, 'alerts.judgeBody', { judge: t(L, JUDGE_NAME[alert.judge]), reason: alert.reason, fallback: t(L, alert.judge === 'haiku' ? 'alerts.keepEffort' : 'alerts.askHaiku') }),
+        body: t(L, 'alerts.judgeBody', { judge: t(L, JUDGE_NAME[alert.judge]), reason: alert.reason, fallback: t(L, 'alerts.askNextJudge') }),
         main: { key: 'settings', label: t(L, 'alerts.openSettings'), hotkey: 'o', onPress: a.openSettings },
         close: notNow,
       }

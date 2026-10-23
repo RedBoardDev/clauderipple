@@ -1,4 +1,4 @@
-import type { AgentRec, Effort, JudgeKind, Stats, Tier, Usage } from '../types'
+import type { AgentRec, Effort, JudgeAttempt, JudgeKind, JudgeTarget, Stats, Tier, Usage } from '../types'
 import { t } from './i18n.ts'
 import type { Lang } from './i18n.ts'
 
@@ -54,6 +54,15 @@ export function addPrompt(stats: Stats, effort: Effort): Stats {
 export function addJudge(stats: Stats, judge: JudgeKind, ms: number, tokens: number): Stats {
   return { ...stats, judge: { ...stats.judge, [judge]: stats.judge[judge] + 1,
     ms: stats.judge.ms + ms, tokens: stats.judge.tokens + tokens } }
+}
+
+/**
+ * What a chain of judge attempts amounts to: the first configured kind, the kind that answered (the
+ * last one tried when none did) and the first failure, which stays even when a later judge rescued.
+ */
+export function judgeOutcome(configured: readonly JudgeTarget[], attempts: readonly JudgeAttempt[]): { asked: JudgeKind; by: JudgeKind; error?: string } {
+  const error = attempts.find(attempt => attempt.error)?.error
+  return { asked: configured[0]?.kind ?? 'haiku', by: attempts.at(-1)?.target.kind ?? configured[0]?.kind ?? 'haiku', ...(error ? { error } : {}) }
 }
 
 export function addWorker(stats: Stats, tier: Tier): Stats {

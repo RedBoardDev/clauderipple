@@ -319,8 +319,50 @@ was; Plan is Hard's model one effort up); Auto stays Auto, shown as experimental
 `preference` are kept; only Auto still reads `preference`. Every pick writes one
 `ClaudeRipple worker pick:` debug line. Tests: `test/mod/ladder.test.ts`, `test/admin.test.ts`.
 
-`model-policy.ts:isJudgeOnlyModel` is the single judge-only rule: ids beginning with
-`jev` are not chat models (the OpenCode Zen note in `presets.ts`: `/systemone` only).
+**Ordered effort/worker judges (2026-10-23).** `Settings.judges` is the single active
+selection: a nonempty ordered list of `{kind:"haiku"}`, `{kind:"jev"}` and
+`{kind:"model", model:"<router model id>"}`. Each router entry owns its model, so different
+models of that kind remain distinct. `jevSource` keeps its existing shared transport/key
+resolution. The dashboard, quick settings and setup edit the same list; backups are optional,
+entries can move or be removed, and the last entry is protected. Unknown configured model ids
+remain visible rather than being removed by model discovery. Jev's `/systemone`-only models are
+not offered as generic completion targets: the dedicated Jev entry owns that transport. Sources:
+`hooks/settings.ts`, `hooks/ui/settings.tsx`, `ui/app.js`.
+
+The shared normalizer reads old `judge`/`judgeModel` scalars only when `judges` is absent.
+Legacy Jev/model settings become `[primary, Haiku]`, exposing their previous implicit rescue;
+Haiku/default becomes `[Haiku]`. A valid explicit list is authoritative, gains no hidden Haiku,
+and drops only malformed entries or exact duplicates, preserving order. The router refuses an
+explicit empty/all-invalid chain before normalization (also on disk reads), after the existing
+size/credential checks. Settings schema **2** rejects v1 writers with 426 before mutation; no
+client downgrades its write after that refusal. Lists rebase atomically, like worker rungs,
+while unrelated remote settings survive. Older running binaries cannot execute the new format:
+the router and mod need a coordinated update; the version guard prevents destructive writes,
+not old-reader misinterpretation. No live update is implied by these source changes.
+
+`register.tsx:judge` tries only configured targets, sequentially, for prompt effort, ordinary
+judge-based worker selection and the Test control. Tier markers keep upstream's judge-free
+selection; the retired shadow judge is not brought back. The first valid verdict stops the
+chain, including an uncertain but valid verdict. Existing per-target deadlines remain: Jev 5 seconds, model completion
+6 seconds, and Haiku's unanswered exact-id call may retry its alias once. Timeouts, missing keys,
+HTTP failures and malformed/no verdicts advance to the next target. There is no global budget
+that skips later targets, so longer chains can hold a prompt/spawn longer. When none answers,
+the prompt effort stays unchanged; a worker uses its existing general/standard/high default
+verdict and normal ladder, not a new fixed-model fallback. Runs and judge-based worker-pick records
+include ordered `{target, ms, error?}` attempts without prompts, response text or credentials.
+Diagnostics retain only fixed failure categories, HTTP status and known local guidance, never
+provider/engine exception text or JSON parser excerpts. Wall time is counted once and a rescued
+run retains the first failure for diagnosis. The log
+names concrete models and distinguishes recovery from exhaustion; the Test control still fails
+when a failed primary was rescued. Sources/tests: `hooks/register.tsx`, `hooks/stats.ts`,
+`hooks/ui/log.tsx`, `test/mod/judge-settings.test.ts`, `test/mod/judge-chain.test.ts`,
+`packages/mod/tests/register.test.tsx`, `packages/mod/tests/ui.test.tsx`,
+`packages/router/test/admin.test.ts` and `packages/router/test/ui-picker-selection.test.ts`.
+These are mocked/local contract checks, not a live-provider failover measurement.
+
+`hooks/judge-model.ts:isJudgeOnlyModel`, re-exported by the router's `model-policy.ts`,
+is the single judge-only rule: ids beginning with `jev` are not chat models (the OpenCode Zen
+note in `presets.ts`: `/systemone` only).
 Desktop/CLI picker injection (including aliases/routes targeting Jev), derived worker
 aliases, generated agents, AA auto-worker score candidates, OpenAI model lists and
 Codex catalogs exclude them; the next enabled agent sync removes previously

@@ -306,9 +306,12 @@ you map go to your provider, everything else goes to Anthropic byte for byte.
   instead of a generic "Agent".
 - **The ripple mod, above the prompt.** A band shows the reasoning effort, context, cache
   timer, and which model answered your last request with its cache hit. A small judge
-  model (Haiku 5.5 or Jev) reads each prompt with the recent turns and sets the effort,
-  low through max. Delegated work goes to `ripple:auto`, and the judge sends each task to
-  a worker by difficulty: light work to DeepSeek or GLM, hard work to GPT or Opus. Cards
+  model (Haiku 5.5, Jev, or a model through the router) reads each prompt with the recent
+  turns and sets the effort, low through max. Keep one judge or add backups in order:
+  Haiku → Jev → a router model, for example. The first valid verdict wins; only if every
+  configured judge fails does the current effort stay or the normal default worker choice
+  apply. Delegated work goes to `ripple:auto`, and the judge sends each task to a worker
+  by difficulty: light work to DeepSeek or GLM, hard work to GPT or Opus. Cards
   warn when the cache has gone cold, the context gets heavy or a plan window passes 80%,
   and offer compact or a handoff to a fresh session in the same folder. `Log` (or
   `/ripple-log`) opens the request log in a side pane. One switch on the Clients screen,
