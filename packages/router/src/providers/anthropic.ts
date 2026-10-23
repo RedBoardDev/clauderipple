@@ -28,6 +28,11 @@ export type ClaudeCodeAuthSource = "observed" | "env" | "keychain" | "credential
 export type ClaudeCodeAuth =
   | { source: "observed"; observed: ObservedClaudeCodeAuthSnapshot }
   | { source: "env" | "token-file" | "stored"; credentials: ClaudeCodeCredentials };
+export function claudeCodeAuthToken(auth: ClaudeCodeAuth | Error): string | undefined {
+  if (auth instanceof Error) return undefined;
+  return auth.source === "observed" ? auth.observed.authorization.replace(/^Bearer\s+/i, "") : auth.credentials.accessToken;
+}
+
 export type ClaudeCodeAuthOptions = {
   observed?: ObservedClaudeCodeAuth;
   home?: string;

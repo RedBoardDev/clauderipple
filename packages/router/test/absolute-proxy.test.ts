@@ -12,6 +12,7 @@ import { UpstreamHealth } from "../src/health.ts";
 import { Logger } from "../src/log.ts";
 import { absoluteProxyRequest, Proxy } from "../src/proxy.ts";
 import { RequestLog } from "../src/requestlog.ts";
+import { saveClaudeOAuthAccount, setCurrentClaudeAccountPaused, updateClaudeAccount } from "../src/providers/anthropic-accounts.ts";
 import { createCa, createLeaf } from "../src/x509.ts";
 
 test("rewrites Remote Control HTTPS absolute-form registration", () => {
@@ -61,7 +62,7 @@ function freePort(): Promise<number> {
   });
 }
 
-test("a live absolute-form request reaches the TLS origin with its body and closes", async () => {
+test("an absolute-form request preserves Remote Control and honors native inference pauses", async () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "cr-absolute-"));
   const ca = createCa({ cn: "clauderipple absolute proxy test" });
   const leaf = createLeaf({ host: "api.anthropic.com", caCertPem: ca.certPem, caKeyPem: ca.keyPem });
@@ -82,6 +83,7 @@ test("a live absolute-form request reaches the TLS origin with its body and clos
   const upstreamPort = (upstream.address() as net.AddressInfo).port;
   const proxyPort = await freePort();
   const cfg: Config = { ...DEFAULTS, listen: { host: "127.0.0.1", port: proxyPort } };
+  let dials = 0;
   const proxy = new Proxy({
     config: () => cfg,
     log: new Logger(path.join(home, "router.log"), 1e6, 1, false),
@@ -89,28 +91,50 @@ test("a live absolute-form request reaches the TLS origin with its body and clos
     health: new UpstreamHealth(() => 100, () => {}),
     home,
     requests: new RequestLog(path.join(home, "requests.jsonl")),
-    tlsConnect: (options) => tls.connect({ ...options, host: "127.0.0.1", port: upstreamPort, ca: ca.certPem }),
+    claudeCodeCredentialReaders: { keychain: () => null, credentialsFile: () => null },
+    tlsConnect: (options) => { dials++; return tls.connect({ ...options, host: "127.0.0.1", port: upstreamPort, ca: ca.certPem }); },
   });
   await proxy.listen();
+  const send = (pathname = "/v1/environments/bridge?source=cli", authentication = "Authorization: Bearer retained\r\n") => new Promise<string>((resolve, reject) => {
+    const socket = net.connect(proxyPort, "127.0.0.1");
+    let received = "";
+    socket.on("connect", () => socket.write(
+      `POST https://api.anthropic.com${pathname} HTTP/1.1\r\n` +
+      `Host: wrong.example\r\nProxy-Authorization: secret\r\n${authentication}` +
+      "Content-Length: 2\r\n\r\n{}",
+    ));
+    socket.on("data", (chunk) => { received += chunk.toString("latin1"); });
+    socket.on("end", () => resolve(received));
+    socket.on("error", reject);
+  });
   try {
-    const response = await new Promise<string>((resolve, reject) => {
-      const socket = net.connect(proxyPort, "127.0.0.1");
-      let received = "";
-      socket.on("connect", () => socket.write(
-        "POST https://api.anthropic.com/v1/environments/bridge?source=cli HTTP/1.1\r\n" +
-        "Host: wrong.example\r\nProxy-Authorization: secret\r\nAuthorization: Bearer retained\r\n" +
-        "Content-Length: 2\r\n\r\n{}",
-      ));
-      socket.on("data", (chunk) => { received += chunk.toString("latin1"); });
-      socket.on("end", () => resolve(received));
-      socket.on("error", reject);
-    });
+    const response = await send();
     assert.match(response, /^HTTP\/1\.1 200 OK/);
     assert.match(seen, /^POST \/v1\/environments\/bridge\?source=cli HTTP\/1\.1\r\n/);
     assert.match(seen, /\r\nHost: api\.anthropic\.com\r\n/);
     assert.match(seen, /\r\nAuthorization: Bearer retained\r\n/);
     assert.doesNotMatch(seen, /Proxy-Authorization/i);
     assert.equal(seen.slice(seen.indexOf("\r\n\r\n") + 4), "{}");
+    setCurrentClaudeAccountPaused(home, true, "retained");
+    for (const pathname of ["/v1/messages", "/v1/messages/count_tokens?beta=true"]) {
+      assert.match(await send(pathname), /^HTTP\/1\.1 401 /);
+    }
+    assert.equal(dials, 1, "paused native inference must be refused before opening an origin connection");
+    assert.match(await send(), /^HTTP\/1\.1 200 /, "Remote Control retains external authentication while inference is paused");
+    assert.match(await send("/v1/messages", "X-Api-Key: independent-absolute-key\r\n"), /^HTTP\/1\.1 200 /);
+    setCurrentClaudeAccountPaused(home, false, "retained");
+    assert.match(await send("/v1/messages"), /^HTTP\/1\.1 200 /);
+    const stored = saveClaudeOAuthAccount(home, { accessToken: "paused-owned", refreshToken: "absolute-owned-refresh", expiresAt: Date.now() + 3_600_000, accountId: "absolute-owned" });
+    updateClaudeAccount(home, stored.id, { paused: true });
+    const before = dials;
+    for (const pathname of ["/v1/messages", "/v1/messages/count_tokens"]) {
+      assert.match(await send(pathname, "Authorization: Bearer paused-owned\r\n"), /^HTTP\/1\.1 401 /);
+    }
+    assert.match(await send("/v1/messages", "Authorization: Bearer other-token\r\nAuthorization: Bearer paused-owned\r\n"), /^HTTP\/1\.1 401 /);
+    assert.match(await send("/v1/messages", "Authorization: Bearer\r\n paused-owned\r\n"), /^HTTP\/1\.1 401 /);
+    assert.equal(dials, before, "an observed login, duplicate header or folded header cannot authorize a paused token");
+    updateClaudeAccount(home, stored.id, { paused: false });
+    assert.match(await send("/v1/messages", "Authorization: Bearer paused-owned\r\n"), /^HTTP\/1\.1 200 /);
   } finally {
     proxy.close();
     await new Promise<void>((resolve) => upstream.close(() => resolve()));

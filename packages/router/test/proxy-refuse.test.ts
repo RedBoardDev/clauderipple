@@ -5,6 +5,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import https from "node:https";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
@@ -16,7 +17,7 @@ import { UpstreamHealth } from "../src/health.ts";
 import { Logger } from "../src/log.ts";
 import { Proxy } from "../src/proxy.ts";
 import { RequestLog, type RequestRecord } from "../src/requestlog.ts";
-import { createCa } from "../src/x509.ts";
+import { createCa, createLeaf } from "../src/x509.ts";
 
 function freePort(): Promise<number> {
   return new Promise((resolve) => {
@@ -35,15 +36,27 @@ const PROVIDERS: Config["providers"] = {
   anthropic: { type: "anthropic", auth: "claude-code", models: [{ id: "claude-opus-5" }] },
 };
 
-type Rig = { send: (model: string, path?: string) => Promise<{ status: number; body: string }>; records: () => RequestRecord[]; stop: () => void };
+type Rig = { send: (model: string, path?: string) => Promise<{ status: number; body: string }>; records: () => RequestRecord[]; upstreamRequests: () => number; stop: () => Promise<void> };
 
 async function rig(): Promise<Rig> {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "cr-refuse-"));
   const ca = createCa({ cn: "clauderipple test" });
   fs.writeFileSync(path.join(home, "ca.pem"), ca.certPem);
   fs.writeFileSync(path.join(home, "ca.key"), ca.keyPem);
+  const leaf = createLeaf({ host: "localhost", caCertPem: ca.certPem, caKeyPem: ca.keyPem });
+  let upstreamRequests = 0;
+  const upstream = https.createServer({ cert: leaf.certPem, key: leaf.keyPem }, (req, res) => {
+    req.resume();
+    req.on("end", () => {
+      upstreamRequests++;
+      res.writeHead(401, { "content-type": "application/json" }).end(JSON.stringify({ error: { type: "authentication_error", message: "local test origin" } }));
+    });
+  });
+  await new Promise<void>((resolve) => upstream.listen(0, "127.0.0.1", resolve));
+  const upstreamPort = (upstream.address() as net.AddressInfo).port;
+  const upstreamAgent = new https.Agent({ ca: ca.certPem });
   const proxyPort = await freePort();
-  const cfg: Config = { ...DEFAULTS, listen: { host: "127.0.0.1", port: proxyPort }, providers: PROVIDERS, routes: {}, direct: [], aliases: {} };
+  const cfg: Config = { ...DEFAULTS, upstream: "localhost", listen: { host: "127.0.0.1", port: proxyPort }, providers: PROVIDERS, routes: {}, direct: [], aliases: {} };
   const requests = new RequestLog(path.join(home, "requests.jsonl"));
   const proxy = new Proxy({
     config: () => cfg,
@@ -53,19 +66,22 @@ async function rig(): Promise<Rig> {
     home,
     requests,
     agentDir: path.join(home, "agents"), // empty: no derived aliases in play here
+    claudeCodeCredentialReaders: { keychain: () => null, credentialsFile: () => null },
+    upstreamPort,
+    upstreamAgent,
   });
   await proxy.listen();
 
   const send = async (model: string, pathName = "/v1/messages"): Promise<{ status: number; body: string }> => {
     const sock = net.connect(proxyPort, "127.0.0.1");
     await new Promise<void>((r) => sock.once("connect", () => r()));
-    sock.write("CONNECT api.anthropic.com:443 HTTP/1.1\r\nHost: api.anthropic.com:443\r\n\r\n");
+    sock.write("CONNECT localhost:443 HTTP/1.1\r\nHost: localhost:443\r\n\r\n");
     await new Promise<void>((r) => sock.once("data", () => r()));
-    const secure = tls.connect({ socket: sock, servername: "api.anthropic.com", ca: ca.certPem });
+    const secure = tls.connect({ socket: sock, servername: "localhost", ca: ca.certPem });
     await new Promise<void>((r) => secure.once("secureConnect", () => r()));
     const body = JSON.stringify({ model, max_tokens: 1, messages: [{ role: "user", content: "hi" }] });
     secure.write(
-      `POST ${pathName} HTTP/1.1\r\nHost: api.anthropic.com\r\ncontent-type: application/json\r\ncontent-length: ${Buffer.byteLength(body)}\r\n\r\n${body}`,
+      `POST ${pathName} HTTP/1.1\r\nHost: localhost\r\ncontent-type: application/json\r\ncontent-length: ${Buffer.byteLength(body)}\r\n\r\n${body}`,
     );
     const first = await new Promise<Buffer>((r) => secure.once("data", (d: Buffer) => setTimeout(() => r(d), 60)));
     secure.destroy();
@@ -78,7 +94,13 @@ async function rig(): Promise<Rig> {
   return {
     send,
     records: () => requests.list(20),
-    stop: () => { proxy.close(); fs.rmSync(home, { recursive: true, force: true }); },
+    upstreamRequests: () => upstreamRequests,
+    stop: async () => {
+      proxy.close();
+      upstreamAgent.destroy();
+      await new Promise<void>((resolve) => upstream.close(() => resolve()));
+      fs.rmSync(home, { recursive: true, force: true });
+    },
   };
 }
 
@@ -93,7 +115,7 @@ test("an unroutable non-claude model is refused 400 with the reason, not sent up
     assert.equal(rec.ok, false, "counted as a failure, not a success");
     assert.match(rec.note ?? "", /ClaudeRipple: no provider declares/);
   } finally {
-    r.stop();
+    await r.stop();
   }
 });
 
@@ -104,7 +126,7 @@ test("an ambiguous model is refused 400 and names both providers", async () => {
     assert.equal(status, 400);
     assert.match((JSON.parse(body) as { error: { message: string } }).error.message, /declared by two providers \(opencode-go, deepseek\)/);
   } finally {
-    r.stop();
+    await r.stop();
   }
 });
 
@@ -115,18 +137,20 @@ test("count_tokens on an unroutable non-claude model is refused the same way", a
     assert.equal(status, 400);
     assert.match((JSON.parse(body) as { error: { message: string } }).error.message, /ClaudeRipple: no provider declares/);
   } finally {
-    r.stop();
+    await r.stop();
   }
 });
 
 test("a native claude-* model is never refused: it passes through to Anthropic", async () => {
   const r = await rig();
   try {
-    // Routed to the real upstream. Whatever Anthropic answers, it must not be our refusal — that is
-    // what "passes through" means, and it holds whether the network is up (401/404) or not (502).
-    const { body } = await r.send("claude-opus-5");
+    // The local TLS origin's refusal must reach the client unchanged, not become a router refusal.
+    const { status, body } = await r.send("claude-opus-5");
+    assert.equal(status, 401);
+    assert.equal(r.upstreamRequests(), 1);
+    assert.match(body, /local test origin/);
     assert.doesNotMatch(body, /ClaudeRipple:/, "not refused by us");
   } finally {
-    r.stop();
+    await r.stop();
   }
 });

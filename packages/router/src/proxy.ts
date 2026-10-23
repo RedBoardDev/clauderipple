@@ -61,6 +61,7 @@ const HOP_BY_HOP = new Set(["connection", "keep-alive", "proxy-connection", "tra
 // are dropped rather than forwarded: the provider header replaces only the one it happens to share
 // a name with, and the other would otherwise travel to an endpoint that is not Anthropic.
 const CLIENT_AUTH = new Set(["authorization", "x-api-key"]);
+const CLAUDE_LOGIN_PAUSED = JSON.stringify({ type: "error", error: { type: "authentication_error", message: "ClaudeRipple: this Claude login is paused; resume it in Providers > Accounts" } });
 /** How much of an upstream error body is kept for the log. */
 const ERROR_HEAD_MAX = 4096;
 /** Methods safe to send twice (RFC 9110 §9.2.2), and so the only ones resent after a stale socket. */
@@ -625,6 +626,20 @@ export class Proxy {
 
   /** Forward an HTTPS absolute-form request without terminating it through the routing layer. */
   private forwardAbsolute(sock: net.Socket, request: AbsoluteProxyRequest, rest: Buffer): void {
+    if (request.host === this.deps.config().upstream && request.path.startsWith("/v1/messages")) {
+      const rawHeaders: string[] = [];
+      // Unfold only for eligibility checks; the original header bytes remain unchanged on forwarding.
+      for (const line of request.head.toString("latin1").replace(/\r?\n[ \t]+/g, " ").split(/\r?\n/).slice(1)) {
+        const colon = line.indexOf(":");
+        if (colon > 0) rawHeaders.push(line.slice(0, colon).trim(), line.slice(colon + 1).trim());
+      }
+      if (this.isClaudeInferencePaused(request.path, rawHeaders)) {
+        sock.end("HTTP/1.1 401 Unauthorized\r\ncontent-type: application/json\r\ncontent-length: " + Buffer.byteLength(CLAUDE_LOGIN_PAUSED) + "\r\nconnection: close\r\n\r\n" + CLAUDE_LOGIN_PAUSED);
+        sock.resume();
+        this.deps.log.info("absolute native inference refused: Claude login paused");
+        return;
+      }
+    }
     const servername = net.isIP(request.host) ? undefined : request.host;
     const up = request.tls
       ? (this.deps.tlsConnect ?? tls.connect)({ host: request.host, port: request.port, ...(servername ? { servername } : {}), ALPNProtocols: ["http/1.1"] })
@@ -724,6 +739,24 @@ export class Proxy {
   }
 
   // ---- per-request handling ----------------------------------------------------------
+
+  /** The same source exclusion for native CONNECT and absolute-form inference. */
+  private isClaudeInferencePaused(path: string, rawHeaders: readonly string[]): boolean {
+    if (!path.startsWith("/v1/messages")) return false;
+    const authorizations: string[] = [];
+    let apiKey = false;
+    for (let i = 0; i + 1 < rawHeaders.length; i += 2) {
+      const name = rawHeaders[i]!.toLowerCase();
+      const value = rawHeaders[i + 1]!.trim();
+      if (name === "authorization") authorizations.push(value);
+      else if (name === "x-api-key" && value) apiKey = true;
+    }
+    if (authorizations.length === 0 && apiKey) return false;
+    const tokens = new Set(authorizations.filter((value) => /^Bearer\s+\S+$/i.test(value)).map((value) => value.replace(/^Bearer\s+/i, "")));
+    return tokens.size > 0
+      ? [...tokens].some((token) => this.claudeAccounts.isCurrentPaused(token))
+      : this.claudeAccounts.isCurrentPaused();
+  }
 
   private async handle(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
     const log = this.deps.log;
@@ -881,7 +914,7 @@ export class Proxy {
     let searchAttempted = false;
     const markSearchAttempted = (): void => { searchAttempted = true; };
     if (search && cfg.webSearch) {
-      const served = await this.serveWebSearch(res, json!, search, cfg.webSearch, record, finish, markSearchAttempted);
+      const served = await this.serveWebSearch(res, json!, search, cfg.webSearch, record, finish, markSearchAttempted, searchAttempted);
       if (served) return;
       // Fall through on failure: the ordinary path still answers, and a search that quietly
       // returns nothing is worse than one that costs what it always cost.
@@ -892,7 +925,7 @@ export class Proxy {
     if (webFetch) record.purpose = "web-fetch";
     if (webFetch && cfg.webSearch) {
       const settings = cfg.webSearch;
-      if (this.targetUsable(settings, cfg)) {
+      if (this.targetUsable(settings, this.deps.config())) {
         const ladder = effortLevels(cfg).providers[settings.provider];
         const levels = ladder?.models?.[settings.model] ?? ladder?.default ?? [];
         fetchRoute = { ...settings, effort: levels.includes("low") ? "low" : undefined, tag: `${String(model)}->${settings.model} (web fetch)` };
@@ -968,7 +1001,7 @@ export class Proxy {
       // A slot with fallbacks picks its provider before anything is sent, so a primary that is rate
       // limited for the next hour is skipped rather than rediscovered once per request. A distinct
       // prompt refusal can also select one fallback below, but only before any response is written.
-      let route = resolved ? this.chooseTarget(resolved, cfg, log) : null;
+      let route = resolved ? this.chooseTarget(resolved, this.deps.config(), log) : null;
       /** The request before any target rewrote it, kept only when a Google target may hand the turn back. */
       let pristine: typeof json | undefined;
       const source = typeof model === "string" ? model : "-";
@@ -985,43 +1018,12 @@ export class Proxy {
       // Do not inspect it elsewhere: it must never enter logs, RequestLog, picker diagnostics, or admin data.
       if (isApiHost && pathname === "/v1/messages" && !route) this.deps.observedClaudeCodeAuth?.observe(req.rawHeaders);
 
-      // A `WebSearch` side request routed to a provider that cannot run the server tool must not be
-      // sent. The tool is dropped on every translated path, which leaves "you are an assistant for
-      // performing a web search tool use / perform a web search for the query: …" with no tool
-      // attached — and a model told to search with nothing to search with narrates a tool call
-      // instead. OpenCode Go's DeepSeek answered exactly that, in its own markup, as HTTP 200
-      // (measured 2026-09-18), and the session reported the search tool as unresponsive.
-      //
-      // Say so in the shape the CLI prints. A search that fails visibly can be retried by a human;
-      // one that returns prose shaped like an answer cannot.
-      if (search && route && json && !this.canRunServerTools(route.provider, cfg)) {
-        // A ChatGPT provider has a search of its own — the backend `webSearch` names — so a search
-        // routed there is served by it, not refused. Requiring `webSearch` as well refused every
-        // search of a `smallFast` slot pointed at Luna while the Clients screen called that provider
-        // searchable (2026-10-07: 41 searches failed with nothing on screen to say why). A configured
-        // backend on this same provider has already had its try above.
-        // The same holds for a plan that searches on another of its endpoints (`anthropicSearch`).
-        const own = (cfg.providers[route.provider]?.type === "chatgpt" || searchProviderFor(cfg.providers[route.provider], route.model) !== undefined) &&
-          cfg.webSearch?.provider !== route.provider;
-        if (own && (await this.serveWebSearch(res, json, search, { provider: route.provider, model: route.model }, record, finish, markSearchAttempted))) return;
-        const blocks = webSearchErrorBlocks(search, "unavailable");
-        const model = typeof json.model === "string" ? json.model : "unknown";
-        const wantStream = json.stream === true;
-        const payload = wantStream ? webSearchSse(model, blocks, 0) : JSON.stringify(webSearchMessage(model, blocks, 0));
-        res.writeHead(200, wantStream
-          ? { "content-type": "text/event-stream", "cache-control": "no-cache", connection: "keep-alive" }
-          : { "content-type": "application/json" }).end(payload);
-        log.warn(`web search: ${route.provider} cannot run server tools and no webSearch backend is configured; refused rather than answered with invented results`);
-        record = { ...record, target: route.model, provider: route.provider, purpose: "web-search" };
-        finish("200", Buffer.byteLength(payload), `web search refused: ${route.provider} runs no server tools`, false, { ...(!searchAttempted ? { upstreamCalled: false as const } : {}), refusal: "web-search-unsupported" });
-        return;
-      }
-
       let compatCaps: ReturnType<typeof resolveCompatibleCaps> | undefined;
       let compatChanges: string[] = [];
       /** The credential this attempt is using, and so the one a failure is charged to. */
       let chosen: Credential | null = null;
       let penalised: { provider: string; id: string } | null = null;
+      let nativeAccountTarget = false;
       let target: { protocol: "http:" | "https:"; host: string; port: number; agent: http.Agent | https.Agent; extraHeaders: Record<string, string>; basePath?: string; dropClientAuth?: boolean; dropHeaders?: Set<string>; dropHeaderPrefixes?: string[] };
       // Re-enter only for the one unwritten Google turn (prompt refusal or no model capacity). Each target sees the original
       // request, not the primary's rewritten effort, stripped thread, or translated body.
@@ -1030,7 +1032,7 @@ export class Proxy {
         if (route && json) {
           record = { ...record, target: route.model, provider: route.provider };
           delete record.effort;
-          const configured = cfg.providers[route.provider];
+          const configured = this.deps.config().providers[route.provider];
           if (!configured) {
             finish("500", 0, `unknown provider ${route.provider}`, true, { ...(!searchAttempted ? { upstreamCalled: false as const } : {}), refusal: "unknown-provider" });
             res.writeHead(500, { "content-type": "application/json" }).end(JSON.stringify({ error: { type: "clauderipple_config", message: `unknown provider ${route.provider}` } }));
@@ -1040,6 +1042,39 @@ export class Proxy {
           // several protocols is one provider, and this is where the model's own shape is folded in so
           // the branches below pick the adapter it actually needs.
           const provider = providerFor(configured, route.model);
+          nativeAccountTarget = provider.type === "anthropic";
+          // A `WebSearch` side request routed to a provider that cannot run the server tool must not be
+          // sent. The tool is dropped on every translated path, which leaves "you are an assistant for
+          // performing a web search tool use / perform a web search for the query: …" with no tool
+          // attached — and a model told to search with nothing to search with narrates a tool call
+          // instead. OpenCode Go's DeepSeek answered exactly that, in its own markup, as HTTP 200
+          // (measured 2026-09-18), and the session reported the search tool as unresponsive.
+          //
+          // Say so in the shape the CLI prints. A search that fails visibly can be retried by a human;
+          // one that returns prose shaped like an answer cannot.
+          if (search && !this.canRunServerTools(provider)) {
+            // A ChatGPT provider has a search of its own — the backend `webSearch` names — so a search
+            // routed there is served by it, not refused. Requiring `webSearch` as well refused every
+            // search of a `smallFast` slot pointed at Luna while the Clients screen called that provider
+            // searchable (2026-10-07: 41 searches failed with nothing on screen to say why). A configured
+            // backend on this same provider has already had its try above.
+            // The same holds for a plan that searches on another of its endpoints (`anthropicSearch`).
+            const own = (configured?.type === "chatgpt" || searchProviderFor(configured, route.model) !== undefined) &&
+              cfg.webSearch?.provider !== route.provider;
+            if (own && (await this.serveWebSearch(res, json, search, { provider: route.provider, model: route.model }, record, finish, markSearchAttempted, searchAttempted))) return;
+            const blocks = webSearchErrorBlocks(search, "unavailable");
+            const model = typeof json.model === "string" ? json.model : "unknown";
+            const wantStream = json.stream === true;
+            const payload = wantStream ? webSearchSse(model, blocks, 0) : JSON.stringify(webSearchMessage(model, blocks, 0));
+            res.writeHead(200, wantStream
+              ? { "content-type": "text/event-stream", "cache-control": "no-cache", connection: "keep-alive" }
+              : { "content-type": "application/json" }).end(payload);
+            log.warn(`web search: ${route.provider} cannot run server tools and no webSearch backend is configured; refused rather than answered with invented results`);
+            record = { ...record, target: route.model, provider: route.provider, purpose: "web-search" };
+            finish("200", Buffer.byteLength(payload), `web search refused: ${route.provider} runs no server tools`, false, { ...(!searchAttempted ? { upstreamCalled: false as const } : {}), refusal: "web-search-unsupported" });
+            return;
+          }
+
           // Only the Google adapter can return a turn unwritten, so only it pays for the copy.
           if (!pristine && provider.type === "google") pristine = structuredClone(json);
           rewriteBody(json, route, cfg.effortClamp);
@@ -1084,25 +1119,33 @@ export class Proxy {
             if (credentials.length === 0) {
               const out = JSON.stringify({ type: "error", error: { type: "overloaded_error", message: "모든 API 키가 일시 중지되어 있습니다." } });
               res.writeHead(503, { "content-type": "application/json" }).end(out);
-              finish("503", out.length, "all credentials paused", false, { upstreamCalled: false });
+              finish("503", out.length, "all credentials paused", false, { ...(!searchAttempted ? { upstreamCalled: false as const } : {}), refusal: "no-account" });
               return;
             }
             const key = conversationKey(json as unknown as AnthropicRequest);
             let using = this.pool.pick(route.provider, credentials, key) ?? credentials[0]!;
             const tried = new Set([using.id]);
             const poolName = route.provider;
-            const next = credentials.length > 1 ? (status: number, retryAfter: number | undefined, body: string): Record<string, string> | null => {
+            const poolModel = route.model;
+            const next = (status: number, retryAfter: number | undefined, body: string): Record<string, string> | null => {
               if (!classify(status, undefined, body).retryable) return null;
-              const candidate = this.pool.pick(poolName, credentials.filter((c) => !tried.has(c.id)), key);
+              // A pause or provider removal while the first attempt was pending must apply to the
+              // next selection too, even when saving replaced the whole configuration snapshot.
+              const configured = this.deps.config().providers[poolName];
+              if (!configured) return null;
+              const currentProvider = providerFor(configured, poolModel);
+              if (currentProvider.type !== "openai-compatible" || currentProvider.url !== provider.url || (currentProvider.wire ?? "chat") !== (provider.wire ?? "chat")) return null;
+              const available = this.credentialsOf(poolName, currentProvider).filter((c) => !tried.has(c.id));
+              const candidate = this.pool.pick(poolName, available, key);
               if (!candidate) return null;
               this.pool.penalise(poolName, using.id, status, retryAfter, body);
               log.info(`RETRY ${poolName}: ${using.label ?? using.id} answered ${status}, trying ${candidate.label ?? candidate.id}`);
               using = candidate;
               tried.add(using.id);
               return using.headers;
-            } : undefined;
+            };
             try {
-              const o = await this.openai(route.provider, provider).handle(req, res, path, json as unknown as AnthropicRequest, route.model, routeEffort, { headers: using.headers, ...(next ? { next } : {}) });
+              const o = await this.openai(route.provider, provider).handle(req, res, path, json as unknown as AnthropicRequest, route.model, routeEffort, { headers: using.headers, next });
               if (o.status >= 400) this.pool.penalise(poolName, using.id, o.upstreamStatus ?? o.status, o.retryAfterMs, o.errorBody);
               else if (o.status > 0) this.pool.succeed(poolName, using.id);
               if (!path.startsWith("/v1/messages/count_tokens")) this.providerHealth.observe(route.provider, o.status, o.exhaustion);
@@ -1129,8 +1172,25 @@ export class Proxy {
             const routeEffort = effortOf(json);
             if (routeEffort) record.effort = routeEffort;
             tag = `GOOGLE ${route.tag} effort=${routeEffort ?? "-"}`;
+            let googleProvider = provider;
+            let googleCredential: Credential | undefined;
+            if (configured.type === "anthropic-compatible" || configured.type === "openai-compatible") {
+              // A model's Google wire must select from its owner's pool before converting the
+              // selected headers into Google's API key. The mirrored first key is not a fallback.
+              const credentials = this.credentialsOf(route.provider, configured);
+              if (credentials.length === 0) {
+                const out = JSON.stringify({ type: "error", error: { type: "overloaded_error", message: "ClaudeRipple: all API keys are paused; resume an account in Providers > Accounts" } });
+                res.writeHead(503, { "content-type": "application/json" }).end(out);
+                finish("503", out.length, "all credentials paused", false, { ...(!searchAttempted ? { upstreamCalled: false as const } : {}), refusal: "no-account" });
+                return;
+              }
+              googleCredential = this.pool.pick(route.provider, credentials, conversationKey(json as unknown as AnthropicRequest)) ?? credentials[0]!;
+              const selected = providerFor({ ...configured, headers: googleCredential.headers }, route.model);
+              if (selected.type !== "google") throw new Error("Google model wire changed during credential selection");
+              googleProvider = selected;
+            }
             try {
-              const o = await this.google(route.provider, provider).handle(req, res, path, json as unknown as AnthropicRequest, route.model, routeEffort);
+              const o = await this.google(route.provider, provider).handle(req, res, path, json as unknown as AnthropicRequest, route.model, routeEffort, googleCredential ? googleProvider : undefined);
               if (o.kind === "prompt-incompatible" || o.kind === "model-capacity") {
                 const why = o.kind === "prompt-incompatible" ? "prompt" : "capacity";
                 const alreadyRetried = unwrittenSeen;
@@ -1141,7 +1201,7 @@ export class Proxy {
                   return;
                 }
                 const fallback = !alreadyRetried && resolved
-                  ? this.unwrittenFallback(resolved, route, cfg, why) : null;
+                  ? this.unwrittenFallback(resolved, route, this.deps.config(), why) : null;
                 if (fallback) {
                   unwrittenFallbackNote = `${o.note}; fallback ${route.provider}/${route.model} → ${fallback.provider}/${fallback.model}`;
                   log.info(`FAILOVER ${unwrittenFallbackNote}`);
@@ -1154,11 +1214,11 @@ export class Proxy {
                 finish(String(o.status), Buffer.byteLength(o.errorBody), o.note, true, o.kind === "prompt-incompatible" ? { refusal: "prompt-incompatible" } : undefined);
                 return;
               }
-              this.recordOutcome(route.provider, o.status);
+              this.recordOutcome(route.provider, o.status, googleCredential?.id);
               if (!path.startsWith("/v1/messages/count_tokens")) this.providerHealth.observe(route.provider, o.status, o.exhaustion);
               finish(String(o.status), o.bytes, o.note, o.status >= 400, { ...o, ...(searchAttempted ? { upstreamCalled: undefined } : {}) });
             } catch (e) {
-              this.recordOutcome(route.provider, 0);
+              this.recordOutcome(route.provider, 0, googleCredential?.id);
               finish("-", 0, `google error ${(e as NodeJS.ErrnoException).code ?? ""} ${(e as Error).message}`);
               if (!res.headersSent) res.writeHead(502, { "content-type": "application/json" }).end(JSON.stringify({ type: "error", error: { type: "api_error", message: (e as Error).message } }));
               else res.destroy();
@@ -1202,7 +1262,7 @@ export class Proxy {
             // prompt caching, beta features and the client's exact tool contract remain first-party.
             const credentials = await this.claudeAccounts.credentials();
             if (credentials.length === 0) {
-              const out = JSON.stringify({ type: "error", error: { type: "authentication_error", message: "ClaudeRipple: no usable Claude account; sign in or reauthenticate an account" } });
+              const out = JSON.stringify({ type: "error", error: { type: "authentication_error", message: "ClaudeRipple: no usable Claude account; resume a paused login, sign in or reauthenticate an account" } });
               res.writeHead(401, { "content-type": "application/json", "content-length": String(Buffer.byteLength(out)) }).end(out);
               finish("401", out.length, "no usable Claude account", true, { ...(!searchAttempted ? { upstreamCalled: false as const } : {}), refusal: "no-account" });
               return;
@@ -1267,7 +1327,7 @@ export class Proxy {
           if (credentials.length === 0) {
             const out = JSON.stringify({ type: "error", error: { type: "overloaded_error", message: "모든 API 키가 일시 중지되어 있습니다." } });
             res.writeHead(503, { "content-type": "application/json" }).end(out);
-            finish("503", out.length, "all credentials paused", false, { upstreamCalled: false });
+            finish("503", out.length, "all credentials paused", false, { ...(!searchAttempted ? { upstreamCalled: false as const } : {}), refusal: "no-account" });
             return;
           }
           // The same key the prompt cache is keyed on. `metadata.user_id` alone is one value for every
@@ -1301,6 +1361,15 @@ export class Proxy {
           tag = `${route.provider.toUpperCase()} ${route.tag} effort=${routeEffort ?? "-"}`;
           }
         } else if (isApiHost) {
+          // Disabling rotation does not opt the current login back in. Check the actual native
+          // destination, not the requested model: routed providers and Remote Control stay untouched.
+          if (this.isClaudeInferencePaused(path, req.rawHeaders)) {
+            const out = CLAUDE_LOGIN_PAUSED;
+            res.writeHead(401, { "content-type": "application/json", "content-length": String(Buffer.byteLength(out)) }).end(out);
+            tag = "REFUSE";
+            finish("401", out.length, "Claude login paused", true, { ...(!searchAttempted ? { upstreamCalled: false as const } : {}), refusal: "no-account" });
+            return;
+          }
           target = { protocol: "https:", host: cfg.upstream, port: this.deps.upstreamPort ?? 443, agent: this.deps.upstreamAgent ?? this.upstreamAgent, extraHeaders: {} };
           tag = `PASS ${typeof model === "string" ? model : "-"}`;
           // Passthrough stays byte-exact unless another model's thinking would get the turn refused.
@@ -1399,12 +1468,22 @@ export class Proxy {
       const nextCredential = (status: number, body = ""): Credential | null => {
         if (!route || !penalised || res.headersSent) return null;
         if (!classify(status, undefined, body).retryable) return null;
-        const owner = cfg.providers[route.provider];
+        const currentConfig = this.deps.config();
+        const owner = currentConfig.providers[route.provider];
         if (!owner) return null;
-        // The model's own shape again: its credential pool is the provider's, but an auth convention
-        // this model overrides has to be the one the retry actually sends.
+        // Re-read pauses before selecting a retry, but never send newly selected credentials to an
+        // old destination after a simultaneous endpoint or wire change.
         const provider = providerFor(owner, route.model);
-        const native = provider.type === "anthropic" && provider.accountPool;
+        const native = provider.type === "anthropic" && provider.accountPool && provider.auth === "claude-code";
+        if (native !== nativeAccountTarget) return null;
+        if (native) {
+          if (currentConfig.upstream !== target.host) return null;
+        } else {
+          if (provider.type !== "anthropic-compatible") return null;
+          const url = new URL(provider.url);
+          const port = Number(url.port) || (url.protocol === "https:" ? 443 : 80);
+          if (url.protocol !== target.protocol || url.hostname !== target.host || port !== target.port || url.pathname.replace(/\/+$/, "") !== (target.basePath ?? "")) return null;
+        }
         const available = native ? this.claudeAccounts.peekCredentials() : this.credentialsOf(route.provider, provider);
         const rest = available.filter((c) => !tried.has(c.id));
         if (rest.length === 0) return null;
@@ -1696,9 +1775,10 @@ export class Proxy {
     json: Record<string, unknown>,
     query: WebSearchQuery,
     settings: NonNullable<Config["webSearch"]>,
-    record: { source?: string; target?: string; provider?: string; purpose?: RequestRecord["purpose"] },
+    record: { source?: string; target?: string; provider?: string; purpose?: RequestRecord["purpose"]; upstreamCalled?: boolean; refusal?: RequestRecord["refusal"] },
     finish: (status: string, bytes: number, note?: string, failed?: boolean) => void,
     markAttempted: () => void,
+    upstreamAlreadyCalled = false,
   ): Promise<boolean> {
     const configured = this.deps.config().providers[settings.provider];
     if (!configured) {
@@ -1708,7 +1788,24 @@ export class Proxy {
     // Which backend is chosen below depends on the wire the search model speaks, which may not be
     // the provider's own — or on the endpoint its plan searches on, which may not be the model's.
     const searchVia = searchProviderFor(configured, settings.model);
-    const provider = searchVia ?? providerFor(configured, settings.model);
+    let provider = searchVia ?? providerFor(configured, settings.model);
+    if ((configured.type === "anthropic-compatible" || configured.type === "openai-compatible") && (provider.type === "anthropic-compatible" || provider.type === "openai-compatible")) {
+      const credentials = this.credentialsOf(settings.provider, configured);
+      if (credentials.length === 0) {
+        const out = JSON.stringify({ type: "error", error: { type: "overloaded_error", message: "ClaudeRipple: all API keys are paused; resume an account in Providers > Accounts to use web search" } });
+        res.writeHead(503, { "content-type": "application/json", "content-length": String(Buffer.byteLength(out)) }).end(out);
+        record.target = `${settings.provider}/${settings.model}`;
+        record.provider = settings.provider;
+        record.purpose = "web-search";
+        if (!upstreamAlreadyCalled) record.upstreamCalled = false;
+        record.refusal = "no-account";
+        finish("503", out.length, "web search refused: all credentials paused", false);
+        return true;
+      }
+      const using = this.pool.pick(settings.provider, credentials, conversationKey(json as unknown as AnthropicRequest)) ?? credentials[0]!;
+      const selected = { ...configured, headers: using.headers };
+      provider = searchProviderFor(selected, settings.model) ?? providerFor(selected, settings.model);
+    }
     const url = "url" in provider && typeof provider.url === "string" ? provider.url : undefined;
     if (!url && provider.type !== "chatgpt") {
       this.deps.log.warn(`web search: provider ${settings.provider} has no url; leaving the request alone`);
@@ -1731,7 +1828,7 @@ export class Proxy {
       // Refuse before sending rather than after. A provider that cannot run the server tool is sent
       // "perform a web search" with no tool attached, and a model told to search with nothing to
       // search with narrates a tool call instead — an answer shaped like success, holding nothing.
-      if (!searchVia && !this.canRunServerTools(settings.provider, this.deps.config())) {
+      if (!searchVia && !this.canRunServerTools(provider)) {
         this.deps.log.warn(`web search: provider ${settings.provider} does not run server tools; leaving the request alone`);
         return false;
       }
@@ -1775,12 +1872,11 @@ export class Proxy {
    * say so, measured per provider — `serverTools` in compat.ts. Two routes to the same vendor can
    * differ: DeepSeek's own endpoint runs it, the same model through OpenCode Go does not.
    */
-  private canRunServerTools(name: string, cfg: Config): boolean {
-    const provider = cfg.providers[name];
+  private canRunServerTools(provider: Config["providers"][string]): boolean {
     // A routed native account still calls Anthropic's Messages API unchanged, so Anthropic executes
     // its own server tools. Only translated/compatible providers need an explicit measured capability.
-    if (provider?.type === "anthropic") return provider.accountPool === true && provider.auth === "claude-code";
-    if (!provider || provider.type !== "anthropic-compatible") return false;
+    if (provider.type === "anthropic") return provider.accountPool === true && provider.auth === "claude-code";
+    if (provider.type !== "anthropic-compatible") return false;
     const preset = provider.preset ? PRESETS.find((entry) => entry.id === provider.preset) : undefined;
     return resolveCompatibleCaps(preset ? { ...(preset.serverTools ? { serverTools: true } : {}) } : undefined, provider.caps).serverTools;
   }
@@ -1836,18 +1932,18 @@ export class Proxy {
     }
     if (provider.type === "chatgpt") return this.chatgpt(target.provider, provider).hasUsable();
     if (provider.type === "google" && provider.auth === "antigravity") return this.google(target.provider, provider).hasUsable();
-    return this.pool.hasUsable(target.provider, this.credentialsOf(target.provider, provider));
+    const poolProvider = provider.type === "google" && (configured.type === "anthropic-compatible" || configured.type === "openai-compatible") ? configured : provider;
+    return this.pool.hasUsable(target.provider, this.credentialsOf(target.provider, poolProvider));
   }
 
   /**
-   * Tell the pool how a translated provider's turn went. These adapters hold their own credential —
-   * an OAuth grant, or configured headers — so there is one of it, but the pool still has to hear
-   * about the result or `hasUsable` says yes forever and a slot can never fail over away.
+   * Tell the pool how a translated provider's turn went. Most adapters own one default credential;
+   * a converted Google wire supplies its selected key's id. Without these outcomes `hasUsable`
+   * says yes forever and a slot can never fail over away.
    *
    * A status of 0 means the attempt threw before an answer, which is a connect failure.
    */
-  private recordOutcome(provider: string, status: number): void {
-    const id = "default";
+  private recordOutcome(provider: string, status: number, id = "default"): void {
     if (status >= 400 || status === 0) this.pool.penalise(provider, id, status);
     else if (status > 0) this.pool.succeed(provider, id);
   }
@@ -1889,7 +1985,7 @@ export class Proxy {
     const out: Record<string, ReturnType<CredentialPool["report"]>> = {};
     for (const [name, provider] of Object.entries(cfg.providers)) {
       const creds = provider.type === "anthropic" && provider.accountPool
-        ? this.claudeAccounts.peekCredentials()
+        ? this.claudeAccounts.peekCredentials(true)
         : this.credentialsOf(name, provider, true);
       if (!(provider.type === "anthropic" && provider.accountPool) && !("credentials" in provider && provider.credentials?.length)) continue;
       out[name] = this.pool.report(name, creds).map((report) => {

@@ -287,7 +287,11 @@ you map go to your provider, everything else goes to Anthropic byte for byte.
   conversation stays on the account that answered. Before the response starts, a
   quota or authentication refusal moves that turn to the next account. This native
   Claude Desktop/Code path is separate from the translated Codex ingress, which picks
-  one available login and does not rotate accounts.
+  one available login and does not rotate accounts. Pause or resume any listed sign-in
+  under **Providers → Accounts** without deleting its login data. Pausing the current
+  OAuth login also blocks OAuth passthrough with rotation off; independent API-key requests
+  remain usable. It does not sign out Claude Code/Desktop. Separately added OAuth grants
+  keep their own pause controls.
 - **Several ChatGPT accounts.** Each `clauderipple login` (or **+ Add ChatGPT account**
   in the dashboard) adds one. When an account hits its limit, the next one takes over
   the same request and the spent one rests until its window resets; a conversation

@@ -2186,11 +2186,12 @@ function claudePreferButton(name, id, disabled) {
 }
 
 /**
- * The same pool controls for stored logins and API keys; borrowed logins omit these.
+ * The same pool controls for logins and API keys; native Claude keeps its own preference action.
  * @param {{preferred?: boolean, paused?: boolean, state?: string, cooldownSeconds?: number}} account
  * @param {(change: {preferred?: boolean, paused?: boolean, clearCooldown?: true}) => Promise<unknown>} patch
+ * @param {boolean} [includePreference=true]
  */
-function accountPoolActions(account, patch) {
+function accountPoolActions(account, patch, includePreference = true) {
   const actions = [];
   const add = (text, change) => {
     const button = el("button", { class: "btn secondary compact", type: "button", text });
@@ -2202,7 +2203,7 @@ function accountPoolActions(account, patch) {
     });
     actions.push(button);
   };
-  add(t(account.preferred ? "providers.preferClear" : "providers.preferAction"), { preferred: !account.preferred });
+  if (includePreference) add(t(account.preferred ? "providers.preferClear" : "providers.preferAction"), { preferred: !account.preferred });
   add(t(account.paused ? "providers.chatgptResume" : "providers.chatgptPause"), { paused: !account.paused });
   if (account.state === "cooling" || account.cooldownSeconds > 0) add(t("providers.chatgptClearCooldown"), { clearCooldown: true });
   return actions;
@@ -2219,10 +2220,14 @@ function accountPoolBadges(account) {
 
 function renderClaudeAccountRows(target, data, name, generation) {
   if (generation !== providerDetailGeneration) return;
-  // A stored account the router recognises as the current login (left over from an earlier setup)
-  // is the same person's one account: it gets no row of its own and is not counted.
+  const patchAccount = async (id, change) => {
+    await api(`/api/claude-accounts/${encodeURIComponent(id)}`, { method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify(change) });
+    await refreshClaudeAccountPanel(name);
+  };
+  // Merge unpaused copies of the current login, but keep either copy's pause state and resume
+  // action visible when one is paused.
   const all = Array.isArray(data.accounts) ? data.accounts : [];
-  const duplicates = data.current ? all.filter((account) => account.sameAsCurrent) : [];
+  const duplicates = data.current && !data.current.paused ? all.filter((account) => account.sameAsCurrent && !account.paused) : [];
   // Rows follow the order the router tries them in: the preferred account, else the current login, first.
   const stored = all.filter((account) => !duplicates.includes(account));
   const preferredIndex = stored.findIndex((account) => account.preferred);
@@ -2242,7 +2247,11 @@ function renderClaudeAccountRows(target, data, name, generation) {
       } catch (error) { removeOld.disabled = false; toast(t("common.actionFailed"), true, error.message); }
     });
   }
-  const currentActions = [choosable && leader !== "current" ? claudePreferButton(name, null, false) : null, removeOld].filter(Boolean);
+  const currentActions = [
+    choosable && leader !== "current" ? claudePreferButton(name, null, false) : null,
+    ...(data.current ? accountPoolActions(data.current, (change) => patchAccount("current", change), false) : []),
+    removeOld,
+  ].filter(Boolean);
   const currentRow = data.current ? el("article", { class: "cell account-card current" }, [
     el("div", { class: "cell-text account-card-copy" }, [
       el("strong", { text: t("providers.anthropicCurrentLogin") }), data.current.email ? el("span", { class: "small", text: data.current.email }) : null,
@@ -2268,10 +2277,7 @@ function renderClaudeAccountRows(target, data, name, generation) {
       try { await api(`/api/claude-accounts/${encodeURIComponent(account.id)}`, { method: "DELETE" }); await refreshClaudeAccountPanel(name); }
       catch (error) { toast(t("common.actionFailed"), true, error.message); }
     });
-    const actions = [...accountPoolActions(account, async (change) => {
-      await api(`/api/claude-accounts/${encodeURIComponent(account.id)}`, { method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify(change) });
-      await refreshClaudeAccountPanel(name);
-    }), rename, remove];
+    const actions = [...accountPoolActions(account, (change) => patchAccount(account.id, change)), rename, remove];
     if (unavailable) {
       const reauth = el("button", { class: "btn secondary compact", type: "button", text: t("providers.reauthAction") });
       reauth.addEventListener("click", () => openClaudeAccountConsent(name));

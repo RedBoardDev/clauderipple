@@ -11,7 +11,7 @@ import path from "node:path";
 import tls from "node:tls";
 
 import { CertStore } from "../src/certs.ts";
-import { DEFAULTS, type Config } from "../src/config.ts";
+import { DEFAULTS, type Config, type Provider } from "../src/config.ts";
 import { UpstreamHealth } from "../src/health.ts";
 import { Logger } from "../src/log.ts";
 import { Proxy } from "../src/proxy.ts";
@@ -53,14 +53,23 @@ function decodeHttpResponse(raw: Buffer): { status: number; body: string } {
 }
 
 type SearchReply = {
-  message: { content: { type?: string; content?: unknown }[]; usage: { server_tool_use: { web_search_requests: number } } };
+  status: number;
+  message: { content: { type?: string; content?: unknown }[]; usage: { server_tool_use: { web_search_requests: number } }; error?: { type?: string; message?: string } };
   seenTool: unknown;
   target: string | undefined;
   record: RequestRecord | undefined;
 };
 
-/** One `WebSearch` side request for `model`, through a real proxy whose ChatGPT backend is local. */
-async function searchThrough(model: string, cfgFor: (backendUrl: string) => Partial<Config>): Promise<SearchReply> {
+type SearchRig = {
+  seen: http.IncomingHttpHeaders[];
+  search: (model: string) => Promise<SearchReply>;
+  replaceProviders: (providers: Config["providers"]) => void;
+  stop: () => Promise<void>;
+};
+type BackendReply = (res: http.ServerResponse) => void;
+
+/** A local hosted-search backend, reached through the real CONNECT/TLS proxy. */
+async function searchRig(cfgFor: (backendUrl: string) => Partial<Config>, reply?: BackendReply): Promise<SearchRig> {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "cr-proxy-websearch-"));
   const ca = createCa({ cn: "clauderipple web-search test" });
   fs.writeFileSync(path.join(home, "ca.pem"), ca.certPem);
@@ -73,12 +82,15 @@ async function searchThrough(model: string, cfgFor: (backendUrl: string) => Part
   }));
 
   let seenTool: unknown;
+  const seen: http.IncomingHttpHeaders[] = [];
   const backend = http.createServer((req, res) => {
     const chunks: Buffer[] = [];
     req.on("data", (chunk: Buffer) => chunks.push(chunk));
     req.on("end", () => {
       const body = JSON.parse(Buffer.concat(chunks).toString("utf8")) as { tools?: unknown[] };
       seenTool = body.tools?.[0];
+      seen.push(req.headers);
+      if (reply) { reply(res); return; }
       const events = [
         { type: "response.output_text.delta", delta: "Node.js 24 is current." },
         { type: "response.output_text.annotation.added", annotation: { type: "url_citation", title: "Node.js", url: "https://nodejs.org/en/download" } },
@@ -91,7 +103,7 @@ async function searchThrough(model: string, cfgFor: (backendUrl: string) => Part
   await new Promise<void>((resolve) => backend.listen(0, "127.0.0.1", resolve));
   const backendPort = (backend.address() as net.AddressInfo).port;
   const proxyPort = await freePort();
-  const cfg: Config = {
+  let cfg: Config = {
     ...DEFAULTS,
     listen: { host: "127.0.0.1", port: proxyPort },
     ...cfgFor(`http://127.0.0.1:${backendPort}`),
@@ -105,10 +117,11 @@ async function searchThrough(model: string, cfgFor: (backendUrl: string) => Part
     home,
     requests,
     agentDir: path.join(home, "agents"),
+    claudeCodeCredentialReaders: { keychain: () => null, credentialsFile: () => null },
   });
   await proxy.listen();
 
-  try {
+  const search: SearchRig["search"] = async (model) => {
     const socket = net.connect(proxyPort, "127.0.0.1");
     await new Promise<void>((resolve, reject) => {
       socket.once("connect", resolve);
@@ -150,18 +163,34 @@ async function searchThrough(model: string, cfgFor: (backendUrl: string) => Part
     });
     secure.destroy();
     const decoded = decodeHttpResponse(response);
-    assert.equal(decoded.status, 200);
     return {
+      status: decoded.status,
       message: JSON.parse(decoded.body) as SearchReply["message"],
       seenTool,
       target: requests.list(10).find((entry) => entry.kind === "messages")?.target,
       record: requests.list(10).find((entry) => entry.kind === "messages"),
     };
-  } finally {
-    proxy.close();
-    await new Promise<void>((resolve) => backend.close(() => resolve()));
-    fs.rmSync(home, { recursive: true, force: true });
-  }
+  };
+  return {
+    seen, search,
+    replaceProviders: (providers) => { cfg = { ...cfg, providers }; },
+    stop: async () => {
+      proxy.close();
+      backend.closeAllConnections();
+      await new Promise<void>((resolve) => backend.close(() => resolve()));
+      fs.rmSync(home, { recursive: true, force: true });
+    },
+  };
+}
+
+/** One `WebSearch` side request for `model`, through a real proxy whose ChatGPT backend is local. */
+async function searchThrough(model: string, cfgFor: (backendUrl: string) => Partial<Config>): Promise<SearchReply> {
+  const rig = await searchRig(cfgFor);
+  try {
+    const reply = await rig.search(model);
+    assert.equal(reply.status, 200);
+    return reply;
+  } finally { await rig.stop(); }
 }
 
 function assertSearched(reply: SearchReply, target: string): void {
@@ -229,3 +258,122 @@ test("a search routed to OpenCode Go's DeepSeek is refused, since the plan does 
   assert.equal(contacted, false, "nothing was sent to the relay");
   assert.equal(reply.record?.refusal, "web-search-unsupported");
 });
+
+test("operator pause: failed hosted search re-reads credentials before ordinary fallback", async () => {
+  let providers: Config["providers"] = {};
+  const rig = await searchRig((url) => {
+    providers = {
+      search: { type: "openai-compatible", url, headers: { authorization: "Bearer hosted-search-test-key" } },
+      answer: {
+        type: "anthropic-compatible", url, caps: { serverTools: true },
+        headers: { "x-api-key": "fallback-test-key" },
+        credentials: [{ id: "default", headers: { "x-api-key": "fallback-test-key" } }],
+      },
+    };
+    return { providers, routes: { "claude-haiku-4-5": { provider: "answer", model: "search-model" } }, webSearch: { provider: "search", model: "search-model" } };
+  }, (res) => {
+    if (res.req.headers.authorization === "Bearer hosted-search-test-key") {
+      const answer = providers.answer!;
+      assert.equal(answer.type, "anthropic-compatible");
+      if (answer.type === "anthropic-compatible") {
+        rig.replaceProviders({ ...providers, answer: { ...answer, credentials: answer.credentials!.map((credential) => ({ ...credential, paused: true })) } });
+      }
+      res.writeHead(429, { "content-type": "application/json" }).end(JSON.stringify({ error: { message: "local hosted search unavailable" } }));
+      return;
+    }
+    res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ id: "msg_unexpected", type: "message", role: "assistant", content: [], usage: {} }));
+  });
+  try {
+    const reply = await rig.search("claude-haiku-4-5");
+    assert.equal(reply.status, 503);
+    assert.equal(rig.seen.length, 1, "the newly paused fallback key must not reach an origin");
+    assert.equal(reply.record?.refusal, "no-account");
+    assert.notEqual(reply.record?.upstreamCalled, false, "the failed hosted search already contacted an origin");
+  } finally { await rig.stop(); }
+});
+
+test("failed hosted search checks the replacement provider's actual server-tool capability", async () => {
+  let providers: Config["providers"] = {};
+  let destination = "";
+  const rig = await searchRig((url) => {
+    destination = url;
+    providers = {
+      search: { type: "openai-compatible", url, headers: { authorization: "Bearer capability-search-key" } },
+      answer: { type: "anthropic-compatible", url, headers: { "x-api-key": "old-capability-key" }, caps: { serverTools: true } },
+    };
+    return { providers, routes: { "claude-haiku-4-5": { provider: "answer", model: "search-model" } }, webSearch: { provider: "search", model: "search-model" } };
+  }, (res) => {
+    if (res.req.headers.authorization === "Bearer capability-search-key") {
+      rig.replaceProviders({ ...providers, answer: { type: "openai-compatible", url: destination, headers: { authorization: "Bearer replacement-key" } } });
+      res.writeHead(429, { "content-type": "application/json" }).end(JSON.stringify({ error: { message: "hosted search unavailable" } }));
+      return;
+    }
+    res.writeHead(200, { "content-type": "text/event-stream" }).end('data: {"choices":[{"delta":{"content":"INVENTED_SEARCH"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n');
+  });
+  try {
+    const reply = await rig.search("claude-haiku-4-5");
+    assert.equal(reply.status, 200);
+    assert.equal(rig.seen.length, 1, "the replacement that cannot search must not receive an ordinary inference");
+    assert.equal(reply.record?.refusal, "web-search-unsupported");
+    assert.equal(reply.record?.purpose, "web-search");
+    assert.doesNotMatch(JSON.stringify(reply.message), /INVENTED_SEARCH/);
+    assert.ok(reply.message.content.some((block) => block.type === "web_search_tool_result"));
+    assert.notEqual(reply.record?.upstreamCalled, false, "the failed hosted search did contact its origin");
+  } finally { await rig.stop(); }
+});
+
+for (const type of ["openai-compatible", "anthropic-compatible"] as const) {
+  test(`operator pause: configured ${type} WebSearch uses only eligible credentials`, async (t) => {
+    const header = type === "openai-compatible" ? "authorization" : "x-api-key";
+    const key = (name: string): string => type === "openai-compatible" ? `Bearer search-${name}` : `search-${name}`;
+    const credentials = [
+      { id: "default", headers: { [header]: key("a") }, paused: true, preferred: false },
+      { id: "second", headers: { [header]: key("b") }, paused: false, preferred: true },
+    ];
+    const hit = { type: "web_search_result", title: "Node.js", url: "https://nodejs.org/en/download" };
+    const r = await searchRig((url) => {
+      const common = { url, headers: credentials[0]!.headers, credentials, models: [{ id: "search-model" }] };
+      const provider: Provider = type === "anthropic-compatible"
+        ? { type, ...common, caps: { serverTools: true } }
+        : { type, ...common };
+      return {
+        providers: { p: provider },
+        routes: { "claude-haiku-4-5": { provider: "p", model: "search-model" } },
+        webSearch: { provider: "p", model: "search-model" },
+      };
+    }, (res) => {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify(type === "openai-compatible"
+        ? { choices: [{ message: { content: "Found Node.js.", annotations: [{ type: "url_citation", url_citation: { title: hit.title, url: hit.url } }] } }] }
+        : { content: [{ type: "web_search_tool_result", content: [hit] }] }));
+    });
+    try {
+      await t.test("a paused mirror key cannot displace the available preferred key", async () => {
+        const reply = await r.search("claude-haiku-4-5");
+        assert.equal(reply.status, 200);
+        assert.deepEqual(reply.message.content.find((block) => block.type === "web_search_tool_result")?.content, [hit]);
+        assert.deepEqual(r.seen.map((headers) => headers[header]), [key("b")]);
+      });
+      await t.test("all paused returns explicit unavailability without an origin request", async () => {
+        credentials[1]!.paused = true;
+        const before = r.seen.length;
+        const reply = await r.search("claude-haiku-4-5");
+        assert.equal(r.seen.length, before, "no paused key may reach the search backend");
+        assert.equal(reply.status, 503);
+        assert.equal(reply.message.error?.type, "overloaded_error");
+        assert.match(reply.message.error?.message ?? "", /paused|일시 중지/iu);
+        assert.equal(reply.record?.refusal, "no-account");
+        assert.equal(reply.record?.upstreamCalled, false);
+      });
+      await t.test("resuming the first key restores its eligibility without restarting", async () => {
+        credentials[0]!.paused = false;
+        credentials[0]!.preferred = true;
+        credentials[1]!.preferred = false;
+        const before = r.seen.length;
+        const reply = await r.search("claude-haiku-4-5");
+        assert.equal(reply.status, 200);
+        assert.deepEqual(r.seen.slice(before).map((headers) => headers[header]), [key("a")]);
+      });
+    } finally { await r.stop(); }
+  });
+}

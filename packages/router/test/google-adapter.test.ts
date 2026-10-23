@@ -6,10 +6,11 @@ import os from "node:os";
 import path from "node:path";
 import { GoogleAdapter, googleLooksLikeAuth, googleRetryDelayMs } from "../src/providers/google/index.ts";
 import { Logger } from "../src/log.ts";
+import type { GoogleProvider } from "../src/config.ts";
 import type { AnthropicRequest } from "../src/providers/chatgpt/translate.ts";
 
 const seen: { path: string; headers: http.IncomingHttpHeaders; body: Record<string, unknown> }[] = [];
-let mode: "text" | "tool" | "cut" | "badkey" = "text";
+let mode: "text" | "tool" | "cut" | "badkey" | "reflect" = "text";
 const sse = (records: Record<string, unknown>[]) => records.map((record) => `data: ${JSON.stringify(record)}\n\n`).join("");
 
 const upstream = http.createServer((req, res) => {
@@ -17,8 +18,11 @@ const upstream = http.createServer((req, res) => {
   req.on("data", (chunk: Buffer) => chunks.push(chunk));
   req.on("end", () => {
     seen.push({ path: req.url ?? "", headers: req.headers, body: JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string, unknown> });
-    if (mode === "badkey") {
-      res.writeHead(400, { "content-type": "application/json" }).end(JSON.stringify({ error: { code: 400, message: "API key not valid. Please pass a valid API key.", status: "API_KEY_INVALID" } }));
+    if (mode === "badkey" || mode === "reflect") {
+      const message = mode === "reflect"
+        ? `Rejected ${req.headers["x-goog-api-key"]} and ${req.headers["x-api-key"]}`
+        : "API key not valid. Please pass a valid API key.";
+      res.writeHead(400, { "content-type": "application/json" }).end(JSON.stringify({ error: { code: 400, message, status: "API_KEY_INVALID" } }));
       return;
     }
     res.writeHead(200, { "content-type": "text/event-stream" });
@@ -55,12 +59,13 @@ const upstreamPort = await listen(upstream);
 const log = new Logger(null, 1_000_000, 1, false);
 const home = fs.mkdtempSync(path.join(os.tmpdir(), "cr-google-adapter-"));
 let adapter = new GoogleAdapter("fake", { type: "google", auth: "api-key", apiKey: "test-key", url: `http://127.0.0.1:${upstreamPort}` }, home, log);
+let authentication: Pick<GoogleProvider, "apiKey" | "headers"> | undefined;
 const front = http.createServer((req, res) => {
   const chunks: Buffer[] = [];
   req.on("data", (chunk: Buffer) => chunks.push(chunk));
   req.on("end", () => {
     const json = JSON.parse(Buffer.concat(chunks).toString("utf8")) as AnthropicRequest;
-    void adapter.handle(req, res, req.url ?? "/v1/messages", json, "gemini-3-pro-preview", "high");
+    void adapter.handle(req, res, req.url ?? "/v1/messages", json, "gemini-3-pro-preview", "high", authentication);
   });
 });
 const frontPort = await listen(front);
@@ -127,6 +132,109 @@ test("a session header, the provider's own headers and a client user-agent ride 
 
   // Leave the following tests on the plain AI Studio adapter.
   adapter = new GoogleAdapter("fake", { type: "google", auth: "api-key", apiKey: "test-key", url: `http://127.0.0.1:${upstreamPort}` }, home, log);
+});
+
+test("per-call authentication replaces the key and headers without changing the configured authentication", async () => {
+  mode = "text";
+  adapter = new GoogleAdapter("opencode", {
+    type: "google", auth: "api-key", apiKey: "configured-key-a", url: `http://127.0.0.1:${upstreamPort}`,
+    sessionHeader: "x-opencode-session",
+    headers: { "x-account-id": "account-a", "x-extra": "configured", "x-config-only": "configured-only", authorization: "Bearer configured-token" },
+  }, home, log);
+  authentication = {
+    apiKey: "selected-key-b",
+    headers: { "x-account-id": "account-b", "x-extra": "selected", "x-selected-only": "kept", "x-goog-api-key": "shadowed-key" },
+  };
+  try {
+    const selected = await call(request);
+    assert.equal(selected.status, 200);
+    const first = seen.at(-1)!;
+    assert.equal(first.headers["x-goog-api-key"], "selected-key-b");
+    assert.equal(first.headers["x-account-id"], "account-b");
+    assert.equal(first.headers["x-extra"], "selected");
+    assert.equal(first.headers["x-selected-only"], "kept");
+    assert.equal(first.headers["x-config-only"], undefined);
+    assert.equal(first.headers.authorization, undefined);
+    assert.equal(first.path, "/v1beta/models/gemini-3-pro-preview:streamGenerateContent?alt=sse");
+    assert.match(String(first.headers["user-agent"]), /^clauderipple\/\d+\.\d+\.\d+$/);
+    const session = String(first.headers["x-opencode-session"]);
+    assert.match(session, /^[0-9a-f]{32}$/);
+
+    authentication = undefined;
+    const configured = await call(request);
+    assert.equal(configured.status, 200);
+    const next = seen.at(-1)!;
+    assert.equal(next.headers["x-goog-api-key"], "configured-key-a");
+    assert.equal(next.headers["x-account-id"], "account-a");
+    assert.equal(next.headers["x-extra"], "configured");
+    assert.equal(next.headers["x-config-only"], "configured-only");
+    assert.equal(next.headers.authorization, "Bearer configured-token");
+    assert.equal(next.headers["x-selected-only"], undefined);
+    assert.equal(next.headers["x-opencode-session"], session);
+  } finally {
+    authentication = undefined;
+  }
+});
+
+test("per-call authentication without headers never reuses configured identity headers", async () => {
+  mode = "text";
+  adapter = new GoogleAdapter("fake", {
+    type: "google", auth: "api-key", apiKey: "configured-key-a", url: `http://127.0.0.1:${upstreamPort}`,
+    headers: { authorization: "Bearer configured-token", "x-account-id": "account-a", "x-config-only": "configured-only" },
+  }, home, log);
+  authentication = { apiKey: "selected-key-b" };
+  try {
+    const response = await call(request);
+    assert.equal(response.status, 200);
+    const sent = seen.at(-1)!;
+    assert.equal(sent.headers.authorization, undefined);
+    assert.equal(sent.headers["x-account-id"], undefined);
+    assert.equal(sent.headers["x-config-only"], undefined);
+    assert.equal(sent.headers["x-goog-api-key"], "selected-key-b");
+  } finally {
+    authentication = undefined;
+  }
+});
+
+test("per-call authentication without a key never reuses the configured key", async () => {
+  mode = "text";
+  adapter = new GoogleAdapter("fake", {
+    type: "google", auth: "api-key", apiKey: "configured-key-a", url: `http://127.0.0.1:${upstreamPort}`,
+  }, home, log);
+  authentication = { headers: { "x-account-id": "account-b" } };
+  const before = seen.length;
+  try {
+    const response = await call(request);
+    assert.equal(response.status, 401);
+    assert.match(response.text, /no API key/);
+    assert.equal(seen.length, before, "a missing selected key must not send the configured one");
+  } finally {
+    authentication = undefined;
+  }
+});
+
+test("reflected errors redact the selected key and selected credential headers", async (t) => {
+  mode = "reflect";
+  const warnings: string[] = [];
+  t.mock.method(log, "warn", (message: string) => { warnings.push(message); });
+  adapter = new GoogleAdapter("fake", {
+    type: "google", auth: "api-key", apiKey: "configured-key-a", url: `http://127.0.0.1:${upstreamPort}`,
+  }, home, log);
+  authentication = { apiKey: "selected-opaque-value-b", headers: { "x-api-key": "selected-header-value" } };
+  try {
+    const response = await call(request);
+    assert.equal(response.status, 401);
+    assert.equal(seen.at(-1)!.headers["x-goog-api-key"], "selected-opaque-value-b");
+    assert.equal(seen.at(-1)!.headers["x-api-key"], "selected-header-value");
+    assert.equal(warnings.length, 1);
+    for (const text of [response.text, ...warnings]) {
+      assert.match(text, /\[REDACTED\]/);
+      assert.ok(!text.includes("selected-opaque-value-b"));
+      assert.ok(!text.includes("selected-header-value"));
+    }
+  } finally {
+    authentication = undefined;
+  }
 });
 
 test("a function call carries its signature into the store and it is replayed on the next turn", async () => {

@@ -448,7 +448,7 @@ export class OpenAiIngress {
       // projection preserves source precedence and keeps ClaudeRipple's added accounts as the fallback
       // that the old single OAuth file provided before multi-account storage.
       const credential = (await this.claudeAccounts.credentials())[0];
-      if (!credential) return { status: 401, bytes: sendJson(res, 401, openAiError("Claude login unavailable — connect a Claude subscription", "authentication_error")), note: "Claude OAuth unavailable" };
+      if (!credential) return { status: 401, bytes: sendJson(res, 401, openAiError("Claude login unavailable — resume a paused login or connect a Claude subscription", "authentication_error")), note: "Claude OAuth unavailable" };
       authentication = credential.headers;
     } else if (native) {
       try {
@@ -456,6 +456,13 @@ export class OpenAiIngress {
       } catch (error) {
         return { status: 401, bytes: sendJson(res, 401, openAiError((error as Error).message, "authentication_error")), note: "Anthropic API key unavailable" };
       }
+    } else if (provider.credentials?.length) {
+      // Like native ingress, select once without retries. A declared pool is authoritative: its
+      // mirrored first key in `headers` must never bypass a pause, including after model auth conversion.
+      const credential = provider.credentials.find((entry) => entry.paused !== true && entry.preferred === true)
+        ?? provider.credentials.find((entry) => entry.paused !== true);
+      if (!credential) return { status: 503, bytes: sendJson(res, 503, openAiError("All provider credentials are paused — resume a paused credential in ClaudeRipple", "server_error")), note: "compatible credentials paused" };
+      authentication = credential.headers;
     } else authentication = provider.headers ?? {};
     const headers: Record<string, string> = { "content-type": "application/json", accept: stream ? "text/event-stream" : "application/json", "content-length": String(body.length), ...authentication };
     const lib = protocol === "https:" ? https : http;

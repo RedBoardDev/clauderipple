@@ -7,7 +7,7 @@ import path from "node:path";
 import { OpenAiIngress } from "../src/ingress/server.ts";
 import { Logger } from "../src/log.ts";
 import { ClaudeAccountAuthPool } from "../src/providers/anthropic-account-pool.ts";
-import { saveClaudeOAuthAccount } from "../src/providers/anthropic-accounts.ts";
+import { saveClaudeOAuthAccount, setCurrentClaudeAccountPaused, updateClaudeAccount } from "../src/providers/anthropic-accounts.ts";
 import { ClaudeCodeAuthStore, ClaudeCodeCredentialStore } from "../src/providers/anthropic.ts";
 import { RequestLog } from "../src/requestlog.ts";
 import type { Config } from "../src/config.ts";
@@ -101,6 +101,75 @@ test("Chat Completions non-stream and stream traverse same provider", async () =
   assert.equal(requests.list(10)[0]?.note, "openai-ingress chat");
 });
 
+for (const converted of [false, true]) {
+  for (const endpoint of ["responses", "chat/completions"]) {
+    test(`${endpoint} respects compatible credential controls${converted ? " after per-model wire/auth conversion" : ""}`, async () => {
+      const compatibleSeen: { headers: http.IncomingHttpHeaders; pathname: string | undefined }[] = [];
+      let originStatus = 200;
+      const origin = http.createServer((req, res) => {
+        req.resume();
+        req.on("end", () => {
+          compatibleSeen.push({ headers: req.headers, pathname: req.url });
+          res.writeHead(originStatus, { "content-type": "application/json" }).end(JSON.stringify(originStatus === 200
+            ? { id: "msg_compatible_controls", type: "message", role: "assistant", content: [{ type: "text", text: "ok" }], stop_reason: "end_turn", usage: { input_tokens: 1, output_tokens: 1 } }
+            : { error: { message: "test origin rate limit" } }));
+        });
+      });
+      const originPort = await listen(origin);
+      const url = `http://127.0.0.1:${originPort}`;
+      const keyHeaders = (key: string): Record<string, string> => converted
+        ? { authorization: `Bearer ${key}`, "x-credential": key }
+        : { "x-api-key": key, "x-credential": key };
+      const first = { id: "a", headers: keyHeaders("ingress-key-A"), paused: true };
+      const available = { id: "c", headers: keyHeaders("ingress-key-C"), paused: false };
+      const preferred = { id: "b", headers: keyHeaders("ingress-key-B"), preferred: true, paused: false };
+      const credentials = [first, available, preferred];
+      const compatibleConfig: Config = {
+        ...config,
+        providers: { local: converted
+          ? { type: "openai-compatible", url: `${url}/openai-wire`, headers: first.headers, credentials, models: [{ id: input.model, wire: "anthropic", url: `${url}/anthropic-wire`, authHeader: "x-api-key" }] }
+          : { type: "anthropic-compatible", url: `${url}/anthropic-wire`, headers: first.headers, credentials } },
+      };
+      const compatibleIngress = new OpenAiIngress({ config: () => compatibleConfig, log, requests, claudeCodeCredentialReaders: noClaudeCodeCredentialReaders });
+      const port = await compatibleIngress.listen();
+      const body = endpoint === "responses" ? input : { model: input.model, messages: [{ role: "user", content: "say ok" }] };
+      const invoke = () => call(`/v1/${endpoint}`, body, port);
+      const assertKeys = (expected: string[]): void => {
+        assert.deepEqual(compatibleSeen.map(({ headers }) => headers["x-api-key"]), expected);
+        assert.deepEqual(compatibleSeen.map(({ headers }) => headers["x-credential"]), expected, "the complete selected header set is used");
+        assert.ok(compatibleSeen.every(({ headers, pathname }) => headers.authorization === undefined && pathname === "/anthropic-wire/v1/messages"), "only transformed provider auth reaches the model's Anthropic endpoint");
+      };
+      try {
+        assert.equal((await invoke()).status, 200);
+        assertKeys(["ingress-key-B"]);
+        preferred.paused = true;
+        assert.equal((await invoke()).status, 200);
+        assertKeys(["ingress-key-B", "ingress-key-C"]);
+        available.paused = true;
+        const refused = await invoke();
+        assert.equal(refused.status, 503);
+        const error = JSON.parse(refused.text).error;
+        assert.equal(error.type, "server_error");
+        assert.equal(error.param, null);
+        assert.equal(error.code, null);
+        assert.match(error.message, /resume.*paused/i);
+        assert.equal(compatibleSeen.length, 2, "all paused means no origin call, not the mirrored first key");
+        first.paused = false;
+        assert.equal((await invoke()).status, 200);
+        assertKeys(["ingress-key-B", "ingress-key-C", "ingress-key-A"]);
+        available.paused = false;
+        originStatus = 429;
+        assert.equal((await invoke()).status, 429);
+        assertKeys(["ingress-key-B", "ingress-key-C", "ingress-key-A", "ingress-key-A"]);
+        assert.equal(compatibleSeen.length, 4, "a turn never retries on another available credential");
+      } finally {
+        await compatibleIngress.drain(1);
+        await new Promise<void>((resolve) => origin.close(() => resolve()));
+      }
+    });
+  }
+}
+
 test("Responses reject previous_response_id to remain stateless", async () => {
   const response = await call("/v1/responses", { ...input, previous_response_id: "resp_old" });
   assert.equal(response.status, 400);
@@ -134,6 +203,54 @@ test("native ingress uses one added Claude account without enabling failover", a
     assert.equal(response.status, 200);
     assert.equal(nativeSeen.length, 1);
     assert.equal(nativeSeen[0]!.authorization, "Bearer added-access");
+  } finally {
+    await nativeIngress.drain(1);
+    await new Promise<void>((resolve) => native.close(() => resolve()));
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("native ingress respects persistent pauses in both Responses and Chat Completions", async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "cr-ingress-native-pause-"));
+  const nativeSeen: http.IncomingHttpHeaders[] = [];
+  const native = http.createServer((req, res) => {
+    req.resume();
+    req.on("end", () => {
+      nativeSeen.push(req.headers);
+      res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ id: "msg_native_pause", type: "message", role: "assistant", content: [{ type: "text", text: "ok" }], stop_reason: "end_turn", usage: { input_tokens: 1, output_tokens: 1 } }));
+    });
+  });
+  const nativePort = await listen(native);
+  const added = saveClaudeOAuthAccount(home, { accessToken: "added-pause-test", refreshToken: "added-pause-refresh", expiresAt: Date.now() + 3_600_000, accountId: "added-pause-account" });
+  const current = new ClaudeCodeAuthStore(new ClaudeCodeCredentialStore(() => JSON.stringify({ claudeAiOauth: { accessToken: "current-pause-test", expiresAt: Date.now() + 3_600_000 } })), { home, env: {}, credentialReaders: noClaudeCodeCredentialReaders });
+  const claudeAccounts = new ClaudeAccountAuthPool({ home, current, log });
+  const nativeConfig: Config = {
+    ...config,
+    providers: { claude: { type: "anthropic", auth: "claude-code", accountPool: false } },
+    routes: { "claude-sonnet-5": { provider: "claude", model: "claude-sonnet-5" } },
+  };
+  const nativeIngress = new OpenAiIngress({ config: () => nativeConfig, log, requests, home, claudeAccounts, nativeUpstream: `http://127.0.0.1:${nativePort}`, claudeCodeCredentialReaders: noClaudeCodeCredentialReaders });
+  const port = await nativeIngress.listen();
+  const calls = [
+    { pathname: "/v1/responses", body: input },
+    { pathname: "/v1/chat/completions", body: { model: input.model, messages: [{ role: "user", content: "say ok" }] } },
+  ];
+  try {
+    for (const request of calls) assert.equal((await call(request.pathname, request.body, port)).status, 200);
+    assert.deepEqual(nativeSeen.map((headers) => headers.authorization), ["Bearer current-pause-test", "Bearer current-pause-test"]);
+    setCurrentClaudeAccountPaused(home, true, "current-pause-test");
+    for (const request of calls) assert.equal((await call(request.pathname, request.body, port)).status, 200);
+    assert.deepEqual(nativeSeen.slice(2).map((headers) => headers.authorization), ["Bearer added-pause-test", "Bearer added-pause-test"]);
+    updateClaudeAccount(home, added.id, { paused: true });
+    for (const request of calls) {
+      const refused = await call(request.pathname, request.body, port);
+      assert.equal(refused.status, 401);
+      assert.match(refused.text, /resume a paused/i);
+    }
+    assert.equal(nativeSeen.length, 4, "neither endpoint falls back to the ingress bearer token");
+    setCurrentClaudeAccountPaused(home, false, "current-pause-test");
+    for (const request of calls) assert.equal((await call(request.pathname, request.body, port)).status, 200);
+    assert.deepEqual(nativeSeen.slice(4).map((headers) => headers.authorization), ["Bearer current-pause-test", "Bearer current-pause-test"]);
   } finally {
     await nativeIngress.drain(1);
     await new Promise<void>((resolve) => native.close(() => resolve()));

@@ -96,6 +96,7 @@ async function rig(providers: Config["providers"], routes: Config["routes"]): Pr
     home,
     requests: new RequestLog(path.join(home, "requests.jsonl")),
     claudeCodeCredentialReaders: noClaudeCodeCredentialReaders,
+    agentDir: path.join(home, "agents"),
   });
   await proxy.listen();
 
@@ -230,6 +231,69 @@ test("OpenAI pool: a 429 hops inside the turn, cools only that key and stays sti
     assert.ok(health[0]!.cooldownSeconds! > 290);
     assert.deepEqual(r.proxy.providerHealth.snapshot(), {}, "only the successful final outcome reaches provider health");
     assert.match(r.logs(), /첫 번째 answered 429, trying 두 번째/);
+  } finally { await r.stop(); await up.close(); }
+});
+
+for (const wire of ["chat", "anthropic"] as const) {
+  test(`operator pause: ${wire} retry re-reads the pool after the first refusal`, async () => {
+    const up = await upstream((n) => {
+      if (n !== 1) return wire === "chat" ? chatAnswer : { status: 200 };
+      const provider = r.config.providers.p!;
+      assert.equal(provider.type, "openai-compatible");
+      if (provider.type === "openai-compatible") {
+        // ConfigStore replaces the snapshot on reload; mutating an old row would hide a stale closure.
+        r.config.providers.p = {
+          ...provider,
+          credentials: provider.credentials!.map((credential) => credential.id === "second"
+            ? { ...credential, paused: true }
+            : { ...credential }),
+        };
+      }
+      return { status: 429, headers: { "retry-after": "300" }, body: JSON.stringify({ type: "error", error: { type: "rate_limit_error", message: "limited" } }) };
+    });
+    const provider = openaiPooled(up.port);
+    if (wire === "anthropic") provider.models = [{ id: "m", wire, url: `http://127.0.0.1:${up.port}` }];
+    const r: Rig = await rig({ p: provider }, { "claude-opus-4-8": { provider: "p", model: "m" } });
+    try {
+      const response = await r.sendDetailed();
+      assert.deepEqual(up.seen.map((row) => row.auth), ["Bearer opaque-first-key"], "the newly paused second key must never be selected by the retry");
+      assert.equal(response.status, 429, "the first refusal is preserved when no retry credential remains");
+      assert.match(response.body, /rate_limit_error/);
+    } finally { await r.stop(); await up.close(); }
+  });
+}
+
+test("operator resume: OpenAI retry sees a credential resumed during the first attempt", async () => {
+  const up = await upstream((attempt) => {
+    if (attempt !== 1) return chatAnswer;
+    const configured = r.config.providers.p!;
+    assert.equal(configured.type, "openai-compatible");
+    if (configured.type === "openai-compatible") {
+      r.config.providers.p = { ...configured, credentials: configured.credentials!.map((credential) => ({ ...credential, paused: false })) };
+    }
+    return { status: 429, headers: { "retry-after": "300" }, body: "{}" };
+  });
+  const provider = openaiPooled(up.port);
+  provider.credentials![1]!.paused = true;
+  const r = await rig({ p: provider }, { "claude-opus-4-8": { provider: "p", model: "m" } });
+  try {
+    assert.equal((await r.sendDetailed()).status, 200);
+    assert.deepEqual(up.seen.map((row) => row.auth), ["Bearer opaque-first-key", "Bearer opaque-second-key"]);
+  } finally { await r.stop(); await up.close(); }
+});
+
+test("credential retry refuses a compatible-to-native change even when host names match", async () => {
+  const up = await upstream((attempt) => {
+    if (attempt !== 1) return { status: 200 };
+    r.config.providers.p = { type: "anthropic", auth: "claude-code", accountPool: true };
+    r.config.upstream = "127.0.0.1";
+    return { status: 429, headers: { "retry-after": "300" }, body: "{}" };
+  });
+  const r = await rig({ p: { type: "anthropic-compatible", url: `http://127.0.0.1:${up.port}/old-endpoint`, headers: { "x-api-key": "old-compatible-test-key" } } }, { "claude-opus-4-8": { provider: "p", model: "m" } });
+  saveClaudeOAuthAccount(r.home, { accessToken: "native-switch-test-token", refreshToken: "native-switch-test-refresh", expiresAt: Date.now() + 3_600_000, accountId: "native-switch-test-owner" });
+  try {
+    assert.equal((await r.sendDetailed()).status, 429);
+    assert.deepEqual(up.seen, [{ key: "old-compatible-test-key", auth: undefined }], "the old HTTP endpoint must never receive the newly configured native OAuth credential");
   } finally { await r.stop(); await up.close(); }
 });
 
@@ -370,6 +434,48 @@ for (const type of ["anthropic-compatible", "openai-compatible"] as const) {
     } finally { await r.stop(); await up.close(); }
   });
 }
+
+test("operator pause: a compatible provider's Google wire keeps credential controls", async (t) => {
+  const up = await recorder(() => ({
+    status: 200,
+    body: JSON.stringify({
+      candidates: [{ content: { role: "model", parts: [{ text: "google key answer" }] }, finishReason: "STOP" }],
+      usageMetadata: { promptTokenCount: 4, candidatesTokenCount: 2 },
+    }),
+  }));
+  const provider = openaiPooled(up.port);
+  provider.models = [{ id: "gemini-3.8-flash", wire: "google", url: `http://127.0.0.1:${up.port}/google`, authHeader: "x-api-key" }];
+  provider.credentials![0]!.paused = true;
+  provider.credentials![1]!.preferred = true;
+  const r = await rig({ p: provider }, { "claude-opus-4-8": { provider: "p", model: "gemini-3.8-flash" } });
+  try {
+    assert.deepEqual(validate(r.config), [], "the fixture uses a supported per-model Google override");
+    await t.test("a paused mirror key cannot displace the available preferred key", async () => {
+      const response = await r.sendDetailed();
+      assert.equal(response.status, 200);
+      assert.match(response.body, /google key answer/);
+      assert.deepEqual(up.hits.map((hit) => hit.headers["x-goog-api-key"]), ["opaque-second-key"]);
+      assert.equal(up.hits[0]!.path, "/google/v1beta/models/gemini-3.8-flash:generateContent");
+    });
+    await t.test("all paused returns unavailability without contacting the Google origin", async () => {
+      provider.credentials![1]!.paused = true;
+      const before = up.hits.length;
+      const response = await r.sendDetailed();
+      assert.equal(up.hits.length, before, "the Google wire cannot fall back to the paused mirrored key");
+      assert.equal(response.status, 503);
+      assert.match(response.body, /"type":"overloaded_error"/);
+      assert.match(response.body, /paused|일시 중지/iu);
+    });
+    await t.test("resuming the first key restores eligibility without restarting", async () => {
+      provider.credentials![0]!.paused = false;
+      provider.credentials![0]!.preferred = true;
+      provider.credentials![1]!.preferred = false;
+      const before = up.hits.length;
+      assert.equal(await r.send(), 200);
+      assert.deepEqual(up.hits.slice(before).map((hit) => hit.headers["x-goog-api-key"]), ["opaque-first-key"]);
+    });
+  } finally { await r.stop(); await up.close(); }
+});
 
 test("a rate-limited credential hands the conversation to the next one, which then keeps it", async () => {
   // The first key is always out of quota; the second always answers.

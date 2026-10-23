@@ -42,7 +42,16 @@ export type ClaudeOAuthAccount = {
   paused?: boolean;
 };
 
-type ClaudeAccountsFile = { version: 1; accounts: ClaudeOAuthAccount[] };
+type ClaudeAccountsFile = {
+  version: 1;
+  accounts: ClaudeOAuthAccount[];
+  /** Router-local opt-out for the external login source, independent of its token generation. */
+  current?: {
+    paused: boolean;
+    /** Local owners linked by an exact token at pause time, so rotation or migration cannot orphan resume. */
+    aliases?: string[];
+  };
+};
 
 function withAccountLock<T>(home: string, mutate: () => T): T {
   return withFileLock(claudeAccountsPath(home), mutate);
@@ -78,20 +87,64 @@ function validAccount(value: unknown): value is ClaudeOAuthAccount {
     && (a.paused === undefined || typeof a.paused === "boolean");
 }
 
-function parseClaudeAccountsFile(home: string): ClaudeOAuthAccount[] | null {
+function parseClaudeAccountsFile(home: string): ClaudeAccountsFile | null {
   try {
-    const parsed = JSON.parse(fs.readFileSync(claudeAccountsPath(home), "utf8")) as Partial<ClaudeAccountsFile>;
-    if (parsed.version !== 1 || !Array.isArray(parsed.accounts) || !parsed.accounts.every(validAccount)) return null;
+    const parsed: unknown = JSON.parse(fs.readFileSync(claudeAccountsPath(home), "utf8"));
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)
+      || !("version" in parsed) || parsed.version !== 1
+      || !("accounts" in parsed) || !Array.isArray(parsed.accounts) || !parsed.accounts.every(validAccount)) return null;
+    let current: ClaudeAccountsFile["current"];
+    if ("current" in parsed) {
+      if (!parsed.current || typeof parsed.current !== "object" || Array.isArray(parsed.current)
+        || !("paused" in parsed.current) || typeof parsed.current.paused !== "boolean") return null;
+      if ("aliases" in parsed.current) {
+        if (!Array.isArray(parsed.current.aliases)
+          || !parsed.current.aliases.every((id: unknown): id is string => typeof id === "string" && id.length > 0)) return null;
+        current = { paused: parsed.current.paused, aliases: [...parsed.current.aliases] };
+      } else {
+        current = { paused: parsed.current.paused };
+      }
+    }
     const seen = new Set<string>();
-    return parsed.accounts.filter((account) => !seen.has(account.id) && seen.add(account.id)).map((account) => ({ ...account }));
+    const accounts = parsed.accounts.filter((account) => !seen.has(account.id) && seen.add(account.id)).map((account) => ({ ...account }));
+    return { version: 1, accounts, ...(current ? { current } : {}) };
   } catch (error) {
-    return (error as NodeJS.ErrnoException).code === "ENOENT" ? [] : null;
+    return (error as NodeJS.ErrnoException).code === "ENOENT" ? { version: 1, accounts: [] } : null;
   }
 }
 
 /** Read only the multi-account file. Malformed secret storage fails closed as an empty pool. */
 export function readClaudeAccountsFile(home: string): ClaudeOAuthAccount[] {
-  return parseClaudeAccountsFile(home) ?? [];
+  return parseClaudeAccountsFile(home)?.accounts ?? [];
+}
+
+/** An unreadable store cannot silently resume an external login the operator may have paused. */
+export function isCurrentClaudeAccountPaused(home: string): boolean {
+  const file = parseClaudeAccountsFile(home);
+  return file === null || file.current?.paused === true;
+}
+
+function applyCurrentPause(file: ClaudeAccountsFile, paused: boolean, currentToken: string | undefined): void {
+  const aliases = new Set(file.current?.paused ? file.current.aliases : []);
+  for (const account of file.accounts) {
+    if (account.token === currentToken) aliases.add(account.id);
+  }
+  file.current = { paused, ...(paused && aliases.size > 0 ? { aliases: [...aliases] } : {}) };
+  const now = new Date().toISOString();
+  for (const account of file.accounts) {
+    if (!aliases.has(account.id)) continue;
+    // Set the alias before an in-flight refresh rotates it; its CAS keeps the latest pause.
+    account.paused = paused;
+    account.updatedAt = now;
+  }
+}
+
+export function setCurrentClaudeAccountPaused(home: string, paused: boolean, currentToken?: string): void {
+  withAccountLock(home, () => {
+    const file = readClaudeOAuthAccountsForMutation(home);
+    applyCurrentPause(file, paused, currentToken);
+    writeClaudeAccountsFile(home, file);
+  });
 }
 
 /**
@@ -118,18 +171,27 @@ function withLegacyOAuthAccount(home: string, accounts: ClaudeOAuthAccount[]): C
   ];
 }
 
-export function readClaudeOAuthAccounts(home: string): ClaudeOAuthAccount[] {
-  const accounts = parseClaudeAccountsFile(home);
-  if (accounts === null) return [];
+/** Fresh account and operator-control snapshot; unreadable storage excludes the native source too. */
+export function readClaudeAccountPoolState(home: string): { accounts: ClaudeOAuthAccount[]; currentPaused: boolean } {
+  const file = parseClaudeAccountsFile(home);
+  if (file === null) return { accounts: [], currentPaused: true };
   // Once a valid pool file exists it is the single source of truth. A retained legacy file (for
   // example where directory fsync is unavailable) must not resurrect an account removed from it.
-  return fs.existsSync(claudeAccountsPath(home)) ? accounts : withLegacyOAuthAccount(home, accounts);
+  return {
+    accounts: fs.existsSync(claudeAccountsPath(home)) ? file.accounts : withLegacyOAuthAccount(home, file.accounts),
+    currentPaused: file.current?.paused === true,
+  };
 }
 
-function readClaudeOAuthAccountsForMutation(home: string): ClaudeOAuthAccount[] {
-  const accounts = parseClaudeAccountsFile(home);
-  if (accounts === null) throw new Error("Claude account store is unreadable; refusing to overwrite it");
-  return fs.existsSync(claudeAccountsPath(home)) ? accounts : withLegacyOAuthAccount(home, accounts);
+export function readClaudeOAuthAccounts(home: string): ClaudeOAuthAccount[] {
+  return readClaudeAccountPoolState(home).accounts;
+}
+
+function readClaudeOAuthAccountsForMutation(home: string): ClaudeAccountsFile {
+  const file = parseClaudeAccountsFile(home);
+  if (file === null) throw new Error("Claude account store is unreadable; refusing to overwrite it");
+  if (!fs.existsSync(claudeAccountsPath(home))) file.accounts = withLegacyOAuthAccount(home, file.accounts);
+  return file;
 }
 
 /** Windows has no directory fsync, so a flushed file plus successful atomic rename completes migration there. */
@@ -137,8 +199,8 @@ export function legacyMigrationDurable(directoryDurable: boolean, platform = pro
   return directoryDurable || platform === "win32";
 }
 
-function writeClaudeAccountsFile(home: string, accounts: ClaudeOAuthAccount[]): void {
-  const { directoryDurable } = writeJsonAtomic(claudeAccountsPath(home), { version: 1, accounts } satisfies ClaudeAccountsFile);
+function writeClaudeAccountsFile(home: string, file: ClaudeAccountsFile): void {
+  const { directoryDurable } = writeJsonAtomic(claudeAccountsPath(home), file);
   // POSIX keeps the legacy refresh token unless the directory entry is durable; Windows has no
   // directory fsync, so the flushed file + rename is its durability boundary and must complete
   // migration rather than resurrect a removed legacy account.
@@ -163,7 +225,8 @@ function defaultLabel(accounts: readonly ClaudeOAuthAccount[], email?: string): 
 /** Add a distinct account, or atomically replace the same upstream account after re-login. */
 export function saveClaudeOAuthAccount(home: string, grant: ClaudeOAuthAccountGrant, now = new Date().toISOString()): ClaudeAccountSummary {
   return withAccountLock(home, () => {
-    const accounts = readClaudeOAuthAccountsForMutation(home);
+    const file = readClaudeOAuthAccountsForMutation(home);
+    const { accounts } = file;
     const hash = subjectHash(grant.accountId);
     const index = hash ? accounts.findIndex((account) => account.subjectHash === hash) : -1;
     const previous = index >= 0 ? accounts[index] : undefined;
@@ -182,7 +245,7 @@ export function saveClaudeOAuthAccount(home: string, grant: ClaudeOAuthAccountGr
     };
     if (index >= 0) accounts[index] = account;
     else accounts.push(account);
-    writeClaudeAccountsFile(home, accounts);
+    writeClaudeAccountsFile(home, file);
     return summarize(account);
   });
 }
@@ -196,7 +259,8 @@ export function replaceClaudeOAuthAccount(
   now = new Date().toISOString(),
 ): boolean {
   return withAccountLock(home, () => {
-    const accounts = readClaudeOAuthAccountsForMutation(home);
+    const file = readClaudeOAuthAccountsForMutation(home);
+    const { accounts } = file;
     const index = accounts.findIndex((account) => account.id === id && account.refreshToken === expectedRefreshToken);
     if (index < 0) return false;
     const previous = accounts[index]!;
@@ -209,7 +273,7 @@ export function replaceClaudeOAuthAccount(
       needsReauth: false,
       ...(grant.email ? { email: grant.email } : {}),
     };
-    writeClaudeAccountsFile(home, accounts);
+    writeClaudeAccountsFile(home, file);
     return true;
   });
 }
@@ -217,11 +281,12 @@ export function replaceClaudeOAuthAccount(
 /** Mark only the generation that actually failed; a simultaneous successful login wins. */
 export function markClaudeAccountNeedsReauth(home: string, id: string, expectedRefreshToken: string): boolean {
   return withAccountLock(home, () => {
-    const accounts = readClaudeOAuthAccountsForMutation(home);
+    const file = readClaudeOAuthAccountsForMutation(home);
+    const { accounts } = file;
     const index = accounts.findIndex((account) => account.id === id && account.refreshToken === expectedRefreshToken);
     if (index < 0) return false;
     accounts[index] = { ...accounts[index]!, needsReauth: true, updatedAt: new Date().toISOString() };
-    writeClaudeAccountsFile(home, accounts);
+    writeClaudeAccountsFile(home, file);
     return true;
   });
 }
@@ -230,11 +295,12 @@ export function renameClaudeAccount(home: string, id: string, label: string): bo
   return updateClaudeAccount(home, id, { label });
 }
 
-export function updateClaudeAccount(home: string, id: string, change: { label?: string; paused?: boolean; preferred?: boolean }): boolean {
+export function updateClaudeAccount(home: string, id: string, change: { label?: string; paused?: boolean; preferred?: boolean }, currentToken?: string): boolean {
   const clean = change.label?.replace(/[\x00-\x1f\x7f]/g, "").trim().slice(0, 80);
   if (change.label !== undefined && !clean) return false;
   return withAccountLock(home, () => {
-    const accounts = readClaudeOAuthAccountsForMutation(home);
+    const file = readClaudeOAuthAccountsForMutation(home);
+    const { accounts } = file;
     const index = accounts.findIndex((account) => account.id === id);
     if (index < 0) return false;
     if (change.preferred === true) for (const account of accounts) account.preferred = false;
@@ -245,7 +311,11 @@ export function updateClaudeAccount(home: string, id: string, change: { label?: 
       ...(change.preferred !== undefined ? { preferred: change.preferred } : {}),
       updatedAt: new Date().toISOString(),
     };
-    writeClaudeAccountsFile(home, accounts);
+    if (change.paused !== undefined && (accounts[index]!.token === currentToken
+      || (file.current?.paused && file.current.aliases?.includes(id)))) {
+      applyCurrentPause(file, change.paused, currentToken);
+    }
+    writeClaudeAccountsFile(home, file);
     return true;
   });
 }
@@ -256,7 +326,8 @@ export function updateClaudeAccount(home: string, id: string, change: { label?: 
  */
 export function setPreferredClaudeAccount(home: string, id: string | null): boolean {
   return withAccountLock(home, () => {
-    const accounts = readClaudeOAuthAccountsForMutation(home);
+    const file = readClaudeOAuthAccountsForMutation(home);
+    const { accounts } = file;
     if (id !== null && !accounts.some((account) => account.id === id)) return false;
     let changed = false;
     const next = accounts.map((account) => {
@@ -266,24 +337,33 @@ export function setPreferredClaudeAccount(home: string, id: string | null): bool
       const { preferred: _, ...rest } = account;
       return want ? { ...rest, preferred: true } : rest;
     });
-    if (changed) writeClaudeAccountsFile(home, next);
+    if (changed) writeClaudeAccountsFile(home, { ...file, accounts: next });
     return true;
   });
 }
 
 export function removeClaudeAccount(home: string, id: string): boolean {
   return withAccountLock(home, () => {
-    const accounts = readClaudeOAuthAccountsForMutation(home);
+    const file = readClaudeOAuthAccountsForMutation(home);
+    const { accounts } = file;
     const next = accounts.filter((account) => account.id !== id);
     if (next.length === accounts.length) return false;
-    writeClaudeAccountsFile(home, next);
+    writeClaudeAccountsFile(home, { ...file, accounts: next });
     return true;
   });
 }
 
 export function removeAllClaudeAccounts(home: string): boolean {
   return withAccountLock(home, () => {
+    const file = readClaudeOAuthAccountsForMutation(home);
     let removed = removeClaudeAuthFile(home);
+    if (file.current?.paused) {
+      if (file.accounts.length > 0) {
+        writeClaudeAccountsFile(home, { ...file, accounts: [] });
+        removed = true;
+      }
+      return removed;
+    }
     try {
       fs.unlinkSync(claudeAccountsPath(home));
       removed = true;

@@ -7,6 +7,8 @@ import os from "node:os";
 import path from "node:path";
 import { DEFAULTS, type Config, type ProviderModel } from "../src/config.ts";
 import { Logger } from "../src/log.ts";
+import { CredentialPool } from "../src/pool.ts";
+import { ClaudeAccountAuthPool } from "../src/providers/anthropic-account-pool.ts";
 import { backfillContextWindows, effortLevelsForModel, googleHealth, measureUnsettledModels, parseUpdateCheck, startAdmin, type AdminDeps } from "../src/admin.ts";
 import type { ImageRequest } from "../src/providers/chatgpt/index.ts";
 import type { GoogleAccountStatus } from "../src/providers/google/index.ts";
@@ -136,6 +138,118 @@ for (const kind of ["chatgpt", "claude", "google"]) {
     });
   });
 }
+
+test("the current Claude login can be paused locally without changing its external credentials", async () => {
+  const observed = new ObservedClaudeCodeAuth();
+  observed.observe(["authorization", "Bearer current-test-token", "anthropic-version", "2023-06-01"]);
+  const cleared: string[] = [];
+  await withAdmin(makeCfg({ providers: { claude: { type: "anthropic", auth: "claude-code", accountPool: true } } }), async ({ port, home }) => {
+    const alias = saveClaudeOAuthAccount(home, { accessToken: "current-test-token", refreshToken: "alias-refresh", expiresAt: Date.now() + 3_600_000, accountId: "current-alias" });
+    const other = saveClaudeOAuthAccount(home, { accessToken: "other-test-token", refreshToken: "other-refresh", expiresAt: Date.now() + 3_600_000, accountId: "other-account" });
+    const endpoint = `${base()}:${port}/api/claude-accounts`;
+    const patch = (body: unknown) => fetch(`${endpoint}/current`, { method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+    const snapshot = async () => await (await fetch(endpoint)).json() as {
+      current: { paused: boolean; state: string; inUse: boolean; external: boolean };
+      accounts: { id: string; paused: boolean; inUse: boolean }[];
+    };
+    assert.equal((await snapshot()).current.inUse, true);
+    assert.equal((await patch({ paused: true })).status, 200);
+    const paused = await snapshot();
+    assert.equal(paused.current.paused, true);
+    assert.equal(paused.current.state, "paused");
+    assert.equal(paused.current.inUse, false);
+    assert.equal(paused.current.external, true);
+    assert.equal(paused.accounts.find((account) => account.id === alias.id)?.paused, true, "the exact-token alias cannot bypass the pause");
+    assert.equal(paused.accounts.find((account) => account.id === other.id)?.inUse, true);
+    assert.equal((await patch({ clearCooldown: true })).status, 200);
+    assert.deepEqual(cleared, ["current"]);
+    assert.equal((await snapshot()).current.paused, true, "clearing health does not resume a login");
+    const aliasEndpoint = `${endpoint}/${alias.id}`;
+    const patchAlias = (paused: boolean) => fetch(aliasEndpoint, { method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify({ paused }) });
+    assert.equal((await patchAlias(false)).status, 200);
+    assert.equal((await snapshot()).current.paused, false, "resuming the exact-token alias must restore its native eligibility too");
+    assert.equal((await snapshot()).current.inUse, true);
+    assert.equal((await patchAlias(true)).status, 200);
+    assert.equal((await snapshot()).current.paused, true);
+    for (const invalid of [null, [], {}, { paused: 1 }, { clearCooldown: false }, { paused: true, extra: true }]) {
+      assert.equal((await patch(invalid)).status, 400);
+    }
+    assert.equal((await patch({ label: "renamed" })).status, 409);
+    assert.equal((await patch({ preferred: true })).status, 409);
+    assert.equal((await fetch(`${endpoint}/current`, { method: "DELETE" })).status, 409);
+    assert.equal((await patch({ paused: false })).status, 200);
+    assert.equal((await snapshot()).current.paused, false);
+    assert.equal((await snapshot()).current.inUse, true);
+    const grant = readClaudeAccountsFile(home).find((account) => account.id === alias.id)!;
+    assert.equal(grant.token, "current-test-token");
+    assert.equal(grant.refreshToken, "alias-refresh");
+    assert.equal(grant.paused, false);
+    assert.equal(observed.getFresh()?.authorization, "Bearer current-test-token", "external auth remains unchanged");
+  }, { observedClaudeCodeAuth: observed, claudeClearCooldown: (id) => { cleared.push(id); } });
+});
+
+test("a paused native Claude login keeps its real cooldown visible until health is cleared", async () => {
+  const time = Date.now();
+  const now = () => time;
+  const observed = new ObservedClaudeCodeAuth();
+  observed.observe(["authorization", "Bearer native-cooldown-access"], now());
+  const health = new CredentialPool({ now });
+  let accounts: ClaudeAccountAuthPool | undefined;
+  await withAdmin(makeCfg({ providers: { claude: { type: "anthropic", auth: "claude-code", accountPool: true } } }), async ({ port, home }) => {
+    accounts = new ClaudeAccountAuthPool({ home, now, env: {}, observed, credentialReaders: noClaudeCodeCredentialReaders, log: { info: () => {}, warn: () => {} } });
+    const current = accounts.peekCredentials()[0]!;
+    health.penalise("claude", current.id, 429, 60_000);
+    const endpoint = `${base()}:${port}/api/claude-accounts`;
+    const patch = (body: unknown) => fetch(`${endpoint}/current`, { method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+    const snapshot = async () => (await (await fetch(endpoint)).json() as {
+      current: { paused: boolean; state: string; inUse: boolean; cooldownSeconds?: number };
+    }).current;
+    const cooling = await snapshot();
+    assert.equal(cooling.state, "cooling");
+    assert.equal(cooling.cooldownSeconds, 60);
+    assert.equal(cooling.paused, false);
+    assert.equal(cooling.inUse, false);
+    assert.equal((await patch({ paused: true })).status, 200);
+    const paused = await snapshot();
+    assert.equal(paused.state, "paused");
+    assert.equal(paused.paused, true);
+    assert.equal(paused.inUse, false);
+    assert.equal(paused.cooldownSeconds, 60, "pausing must not hide an actual native cooldown");
+    assert.equal((await patch({ clearCooldown: true })).status, 200);
+    const cleared = await snapshot();
+    assert.equal(cleared.cooldownSeconds, undefined);
+    assert.equal(cleared.paused, true, "clearing runtime health must not resume the source");
+    assert.equal(cleared.state, "paused");
+    assert.equal(cleared.inUse, false);
+    assert.equal((await patch({ paused: false })).status, 200);
+    const resumed = await snapshot();
+    assert.equal(resumed.state, "ready");
+    assert.equal(resumed.inUse, true);
+  }, {
+    observedClaudeCodeAuth: observed,
+    credentials: () => {
+      const projection = accounts?.peekCredentials(true) ?? [];
+      return { claude: health.report("claude", projection).map((row) => ({ ...row, id: projection.find((credential) => credential.id === row.id)?.ownerId ?? row.id })) };
+    },
+    claudeClearCooldown: (id) => health.clearOwner("claude", id),
+  });
+});
+
+test("a paused current Claude source stays visible and can be resumed without a usable external login", async () => {
+  await withAdmin(makeCfg(), async ({ port }) => {
+    const endpoint = `${base()}:${port}/api/claude-accounts`;
+    const patch = (paused: boolean) => fetch(`${endpoint}/current`, { method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify({ paused }) });
+    assert.equal((await patch(true)).status, 200);
+    const paused = await (await fetch(endpoint)).json() as { current: { source: string | null; paused: boolean; state: string; inUse: boolean } };
+    assert.equal(paused.current.source, null);
+    assert.equal(paused.current.paused, true);
+    assert.equal(paused.current.state, "paused");
+    assert.equal(paused.current.inUse, false);
+    assert.equal((await patch(false)).status, 200);
+    const resumed = await (await fetch(endpoint)).json() as { current: unknown };
+    assert.equal(resumed.current, null);
+  });
+});
 
 test("PUT /api/config persists credential control flags and refuses invalid or duplicate preferences", async () => {
   const cfg = makeCfg({ providers: { p: { type: "anthropic-compatible", url: "http://127.0.0.1:1", credentials: [{ id: "a", headers: {}, preferred: true, paused: true }] } } });
