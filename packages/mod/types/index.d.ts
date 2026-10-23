@@ -52,6 +52,10 @@ export type JudgeInput = {
 
 /** Who judges: Haiku on the person's Claude login, TypeSafe's Jev, or a model through the router. */
 export type JudgeKind = 'haiku' | 'jev' | 'model'
+/** One configured judge. Router entries keep their own model, so several can take turns. */
+export type JudgeTarget = { kind: 'haiku' } | { kind: 'jev' } | { kind: 'model'; model: string }
+/** One attempted target, without prompts, responses or credentials. */
+export type JudgeAttempt = { target: JudgeTarget; ms: number; error?: string }
 /**
  * One verdict as the log pane lists it beside the router's requests: a Jev call never reaches the
  * router, so without this nothing showed who judged, how long it took or that it fell back.
@@ -60,14 +64,16 @@ export type JudgeRun = {
   at: number
   /** The effort of a prompt, or the worker for a spawn. */
   for: 'prompt' | 'worker'
-  /** The judge the settings ask for, and the one that answered (Haiku when it fell back). */
+  /** The first configured judge and the one that answered, or the last attempted on exhaustion. */
   asked: JudgeKind
   by: JudgeKind
   ms: number
   effort?: Effort
   sure?: number
-  /** Why the asked judge gave no verdict. */
+  /** Why the first failed attempt gave no verdict, even when a later judge answered. */
   error?: string
+  /** Absent on runs kept by an older mod across a module reload. */
+  attempts?: JudgeAttempt[]
 }
 
 /** Domain is the kind of work; level is its required capability, independently. */
@@ -138,9 +144,8 @@ export type Mode = {
 
 export type Settings = {
   effortAuto: boolean
-  judge: JudgeKind
-  /** The router model id the `model` judge asks. */
-  judgeModel: string
+  /** Nonempty after normalization; only these targets run, in this order, until one answers. */
+  judges: JudgeTarget[]
   bias: -2 | -1 | 0 | 1 | 2
   floor: Effort
   ceiling: Effort

@@ -1,7 +1,9 @@
-import type { Calibration, Domain, DomainRules, Effort, Level, Mode, Rule, Rung, Settings, SettingsChange, Skin, Step, TierTarget } from '../types/index.d.ts'
+import type { Calibration, Domain, DomainRules, Effort, JudgeTarget, Level, Mode, Rule, Rung, Settings, SettingsChange, Skin, Step, TierTarget } from '../types/index.d.ts'
 
 /** Bump whenever a writer's normalization can lose another format's fields. */
-export const MOD_SETTINGS_SCHEMA_VERSION = 1
+export const MOD_SETTINGS_SCHEMA_VERSION = 2
+/** The router judge used by older settings that did not name a model, and by the add control. */
+export const DEFAULT_JUDGE_MODEL = 'deepseek-v4.1-flash'
 
 export const DOMAINS: readonly Domain[] = ['general', 'design', 'frontend', 'backend', 'infra', 'data', 'test', 'docs', 'research']
 export const LEVELS: readonly Level[] = ['light', 'standard', 'deep']
@@ -16,7 +18,7 @@ export const RUNG_EFFORT: Readonly<Record<Rung, Effort>> = { light: 'low', stand
 const claude = (model: string, effort: Effort): Step => ({ target: { agent: 'general-purpose', model }, effort })
 
 export const DEFAULTS: Settings = {
-  effortAuto: true, judge: 'haiku', judgeModel: 'deepseek-v4.1-flash', jevSource: 'typesafe',
+  effortAuto: true, judges: [{ kind: 'haiku' }], jevSource: 'typesafe',
   bias: 0, floor: 'low', ceiling: 'max', agentAuto: 'auto',
   rules: {
     // The spec's "Claude + GPT" example; a rung whose worker is missing moves up and says so.
@@ -64,6 +66,44 @@ function object(raw: unknown): Record<string, unknown> {
 function names(raw: unknown): string[] {
   return Array.isArray(raw) ? [...new Set(raw.filter((v): v is string => typeof v === 'string' && !!v.trim()).map(v => v.trim()))] : []
 }
+
+/** Stable identity for duplicate prevention; different router models remain separate targets. */
+export function judgeTargetKey(target: JudgeTarget): string {
+  return target.kind === 'model' ? `model:${target.model}` : target.kind
+}
+
+function judgeTarget(raw: unknown): JudgeTarget | undefined {
+  const value = object(raw)
+  if (value.kind === 'haiku' || value.kind === 'jev') return { kind: value.kind }
+  if (value.kind === 'model' && typeof value.model === 'string' && value.model.trim()) return { kind: 'model', model: value.model.trim() }
+  return undefined
+}
+
+/** Validate and copy explicit targets, keeping their order and dropping only malformed or duplicate entries. */
+export function normalizeJudgeTargets(raw: unknown): JudgeTarget[] {
+  const parsed: JudgeTarget[] = []
+  const seen = new Set<string>()
+  for (const entry of Array.isArray(raw) ? raw : []) {
+    const target = judgeTarget(entry)
+    if (!target || seen.has(judgeTargetKey(target))) continue
+    seen.add(judgeTargetKey(target))
+    parsed.push(target)
+  }
+  return parsed
+}
+
+/** Legacy singletons expose their old Haiku rescue; a valid explicit list gains no hidden target. */
+function judges(value: Record<string, unknown>): JudgeTarget[] {
+  if (!Object.hasOwn(value, 'judges')) {
+    if (value.judge === 'jev') return [{ kind: 'jev' }, { kind: 'haiku' }]
+    if (value.judge === 'model') return [{ kind: 'model', model: typeof value.judgeModel === 'string' && value.judgeModel.trim() ? value.judgeModel.trim() : DEFAULT_JUDGE_MODEL }, { kind: 'haiku' }]
+    return [{ kind: 'haiku' }]
+  }
+  const parsed = normalizeJudgeTargets(value.judges)
+  // Invalid stored data still has a usable read view; the admin API rejects such explicit writes.
+  return parsed.length ? parsed : [{ kind: 'haiku' }]
+}
+
 function target(raw: unknown, fallback?: TierTarget): TierTarget | undefined {
   const value = object(raw)
   const agent = typeof value.agent === 'string' && value.agent.trim() ? value.agent.trim() : fallback?.agent
@@ -294,19 +334,18 @@ export function normalizeSettings(raw: unknown, workers?: readonly Worker[]): Se
   }
   const ticked = names(Array.isArray(value.allow) ? value.allow : object(stored.general).mode === 'auto' ? object(stored.general).allow : [])
   const savedKnown = names(value.allowKnown)
-  const result: Settings = { ...DEFAULTS, rules, allow: workers?.length ? migrateAllow(ticked, workers) : ticked, allowKnown: savedKnown, providers: {}, hide: [...DEFAULTS.hide], extras: [...DEFAULTS.extras], fallback: { ...DEFAULTS.fallback } }
+  const result: Settings = { ...DEFAULTS, judges: judges(value), rules, allow: workers?.length ? migrateAllow(ticked, workers) : ticked, allowKnown: savedKnown, providers: {}, hide: [...DEFAULTS.hide], extras: [...DEFAULTS.extras], fallback: { ...DEFAULTS.fallback } }
   for (const [name, enabled] of Object.entries(object(value.providers))) if (typeof enabled === 'boolean') result.providers[name] = enabled
   for (const key of ['effortAuto', 'keepWarm', 'setupDone', 'swampAlert'] as const) if (typeof value[key] === 'boolean') result[key] = value[key]
   if (Array.isArray(value.extras)) result.extras = [...new Set(value.extras.filter((part): part is string => typeof part === 'string' && EXTRAS.includes(part)))]
   const choices = {
-    judge: ['haiku', 'jev', 'model'], jevSource: ['typesafe', 'zen'], bias: [-2, -1, 0, 1, 2], floor: EFFORTS,
+    jevSource: ['typesafe', 'zen'], bias: [-2, -1, 0, 1, 2], floor: EFFORTS,
     delegation: ['normal', 'eager'],
     ceiling: EFFORTS, agentAuto: ['off', 'auto', 'all'], keepWarmHours: [1, 2, 4, 8], compactWith: ['haiku', 'session'],
     handoffAfter: ['continue', 'confirm', 'copy'], handoffButton: ['advised', 'always'], layout: ['dashboard', 'minimal'],
     appearance: ['auto', 'dark', 'light'], skin: SKINS, language: ['auto', 'ko', 'en', 'zh', 'ja', 'es', 'pt'],
   } as const
   for (const key of Object.keys(choices) as (keyof typeof choices)[]) if ((choices[key] as readonly unknown[]).includes(value[key])) Object.assign(result, { [key]: value[key] })
-  if (typeof value.judgeModel === 'string' && value.judgeModel.trim()) result.judgeModel = value.judgeModel.trim()
   if (typeof value.handoffSkill === 'string') result.handoffSkill = value.handoffSkill.trim().replace(/^\//, '')
   if (typeof value.keepWarmMinTokens === 'number' && Number.isFinite(value.keepWarmMinTokens) && value.keepWarmMinTokens >= 0) result.keepWarmMinTokens = value.keepWarmMinTokens
   if (typeof value.swampAt === 'number' && Number.isFinite(value.swampAt) && value.swampAt >= 0 && value.swampAt <= 100) result.swampAt = value.swampAt

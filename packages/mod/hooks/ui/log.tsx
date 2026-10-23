@@ -5,7 +5,7 @@
 import { t } from '../i18n'
 import type { RenderNode } from 'claude-code'
 
-import type { JudgeRun, StatusRequest } from '../../types'
+import type { JudgeRun, JudgeTarget, StatusRequest } from '../../types'
 import { GREET_SIZE, action, actions as actions_, speak } from './parts'
 import type { Els } from './parts'
 import { cacheTone, providerColor, textTone } from './theme'
@@ -55,12 +55,33 @@ function entry(el: Els, frame: Frame, record: StatusRequest, mineOnly: boolean):
 
 const JUDGE_NAME = { haiku: 'settings.haiku', jev: 'settings.jev', model: 'agents.routerModel' } as const
 
-/** A verdict of this session's judge: who answered, in how long, what it chose, or why it fell back. */
+/** A target by its model when it is a router model (two of them can take turns), else by its kind. */
+function targetName(frame: Frame, target: JudgeTarget): string {
+  return target.kind === 'model' ? target.model : t(frame.lang, JUDGE_NAME[target.kind])
+}
+
+/**
+ * A verdict of this session's judge: who answered, in how long, what it chose, or why it fell back.
+ * A run from an older mod has no attempts: it still shows its asked and answering kinds.
+ */
 function judgeEntry(el: Els, frame: Frame, run: JudgeRun): RenderNode {
   const { Box, Text } = el
   const tone = textTone(frame.appearance)
-  const fell = run.by !== run.asked
-  const who = fell ? t(frame.lang, 'log.judgeFell', { asked: t(frame.lang, JUDGE_NAME[run.asked]), by: t(frame.lang, JUDGE_NAME[run.by]) }) : t(frame.lang, JUDGE_NAME[run.by])
+  const attempts = run.attempts ?? []
+  const answered = run.effort !== undefined
+  const first = attempts[0]?.target
+  const failed = attempts.find(attempt => attempt.error)
+  const last = attempts.at(-1)?.target
+  // Exhausted: nothing answered after more than one try, or the only one failed.
+  const exhausted = attempts.length > 0 && !answered
+  const recovered = attempts.length > 1 && answered
+  const fell = attempts.length ? exhausted || recovered : run.by !== run.asked
+  const who = exhausted
+    ? t(frame.lang, 'log.judgeExhausted', { judges: attempts.map(a => targetName(frame, a.target)).join(' → ') })
+    : recovered && first && last
+      ? t(frame.lang, 'log.judgeFell', { asked: attempts.filter(a => a.error).map(a => targetName(frame, a.target)).join(' → ') || targetName(frame, first), by: targetName(frame, last) })
+      : attempts.length ? targetName(frame, last!)
+        : fell ? t(frame.lang, 'log.judgeFell', { asked: t(frame.lang, JUDGE_NAME[run.asked]), by: t(frame.lang, JUDGE_NAME[run.by]) }) : t(frame.lang, JUDGE_NAME[run.by])
   const verdict = run.effort ? effortLabel(run.effort, frame.lang) + (run.sure !== undefined ? ' · ' + t(frame.lang, 'log.sure', { percent: Math.round(run.sure * 100) }) : '') : t(frame.lang, 'toasts.noVerdict')
   return (
     <Box key={'judge-' + run.at} flexDirection="column">
@@ -71,9 +92,13 @@ function judgeEntry(el: Els, frame: Frame, run: JudgeRun): RenderNode {
         <Text dimColor>{'→ ' + verdict}</Text>
         <Text dimColor>{seconds(run.ms / 1000, frame.lang)}</Text>
       </Box>
-      {run.error ? (
+      {attempts.length > 1 ? attempts.filter(a => a.error).map((a, at) => (
+        <Text key={'attempt-' + at} color={tone.warn} wrap="wrap">
+          {targetName(frame, a.target) + ' · ' + seconds(a.ms / 1000, frame.lang) + ' · ' + a.error}
+        </Text>
+      )) : run.error ? (
         <Text color={tone.warn} wrap="wrap">
-          {run.error}
+          {failed?.target.kind === 'model' ? failed.target.model + ': ' + run.error : run.error}
         </Text>
       ) : null}
     </Box>

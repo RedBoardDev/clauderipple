@@ -2,7 +2,7 @@
 // Timers own background work; hooks only admit/rewrite a request and record its result.
 import { atom, read, update } from 'claude-code'
 import type { AgentSpawnInput, EngineInterface, ModelCompleteResult, ModelForkResult, Register, RenderElement, RenderInput, SessionCompactResult, SessionRateLimit, ToolCallInput, TurnStepInput, TurnUsage } from 'claude-code'
-import type { AgentRec, Effort, JudgeInput, JudgeKind, JudgeRun, LimitItem, ModSettingsSnapshot, Pick, Settings, StatusRequest, TierTarget, Verdict, WorkerCandidate, WorkerPick, WorkerVerdict } from '../types'
+import type { AgentRec, Effort, JudgeAttempt, JudgeInput, JudgeKind, JudgeRun, JudgeTarget, LimitItem, ModSettingsSnapshot, Pick, Settings, StatusRequest, TierTarget, Verdict, WorkerCandidate, WorkerPick, WorkerVerdict } from '../types'
 import { MOD_SETTINGS_SCHEMA_VERSION, RUNG_EFFORT, applySettingsChanges, normalizeSettings, settingsChanges } from './settings'
 import { rungOf } from './ladder'
 import { debugText, langFrom, t } from './i18n'
@@ -18,7 +18,7 @@ import { bandPriority, claudeLimitsFrom, claudeScopedFrom, coldAlert, hotAlert, 
 import type { ScopedLimit } from './session'
 import { COMPACT_SYSTEM, compactResult, serializeTranscript } from './compact'
 import { ADVICE_SYSTEM, FULL_PROMPT, QUICK_PROMPT, adviceDue, adviceInput, parseAdvice, wrapForNewChat } from './handoff'
-import { addAgentStep, addJudge, addPrompt, addRequest, addWarm, addWorker, emptyStats, formatStats, sentEffort } from './stats'
+import { addAgentStep, addJudge, addPrompt, addRequest, addWarm, addWorker, emptyStats, formatStats, judgeOutcome, sentEffort } from './stats'
 import { besideBand, renderBand, renderFooter } from './ui/band'
 import { renderAlert } from './ui/alerts'
 import { renderSettings } from './ui/settings'
@@ -262,7 +262,8 @@ async function installSettings($: EngineInterface, s: Settings): Promise<void> {
     await update($, settingsDraft, () => null)
     await update($, settingsBase, () => null)
   }
-  if (s.judge !== previous.judge || s.jevSource !== previous.jevSource || (s.judge === 'jev' && (await read($, jev)).source === null)) await jevKey($)
+  const usesJev = (value: Settings) => value.judges.some(target => target.kind === 'jev')
+  if (usesJev(s) !== usesJev(previous) || s.jevSource !== previous.jevSource || (usesJev(s) && (await read($, jev)).source === null)) await jevKey($)
 }
 function settingsSnapshot(text: string): ModSettingsSnapshot {
   const value = object(JSON.parse(text))
@@ -606,7 +607,9 @@ async function down($: EngineInterface, message: string, network = false): Promi
   await $.ui.toast(t(await read($, lang), 'toasts.judgeDown', { reason: message }))
 }
 
-type Judged = { verdict: Verdict | WorkerVerdict | undefined; by: JudgeKind; ms: number; error?: string }
+type Judged = { verdict: Verdict | WorkerVerdict | undefined; by: JudgeKind; target: JudgeTarget; ms: number; error?: string; attempts: JudgeAttempt[] }
+/** One target's try: a verdict, why it gave none (or what failed on the way to one), and whether Jev only blipped. */
+type Tried = { verdict?: Verdict | WorkerVerdict; error?: string; blip?: boolean }
 function judgeFailure(answer: ModelCompleteResult): string | undefined {
   if (answer.isAnswered) return undefined
   return answer.reason === 'api-error' ? `${answer.reason}: ${answer.error} (${answer.status ?? 'no response'})` : answer.reason
@@ -614,85 +617,112 @@ function judgeFailure(answer: ModelCompleteResult): string | undefined {
 async function completeJudge($: EngineInterface, model: string, system: string, prompt: string): Promise<ModelCompleteResult> {
   return $.model.complete({ model, system, prompt, maxTokens: 160, timeoutMs: 6000, effort: 'low' })
 }
+async function tryJev($: EngineInterface, s: Settings, input: JudgeInput | { description: string; prompt: string }, worker: boolean, language: Lang): Promise<Tried> {
+  let blip = false
+  try {
+    let source = s.jevSource
+    let key = await jevKey($, source)
+    // No TypeSafe key, but the router's OpenCode Zen offers Jev: ask Jev there.
+    if (!key && source === 'typesafe') {
+      key = await zenJevKey($)
+      if (key) source = 'zen'
+    }
+    if (!key) throw new Error(t(language, source === 'zen' ? 'jev.zenMissing' : 'toasts.keyMissing'))
+    const body = 'description' in input ? jevWorkerRequest(input) : jevEffortRequest(input)
+    let model = 'jev-latest'
+    if (source === 'zen') {
+      const file = await optionalFile($, `${await rippleHome($)}/config.json`)
+      model = file ? zenJev(JSON.parse(file)).model : model
+    }
+    const response = await Promise.race([
+      $.http.fetch(source === 'zen' ? 'https://opencode.ai/zen/v1/systemone' : 'https://api.typesafe.ai/v1/systemone', { method: 'POST', headers: { 'content-type': 'application/json', authorization: source === 'zen' ? key : `Bearer ${key}` }, body: JSON.stringify({ ...body, model }) })
+        .catch(() => 'network' as const),
+      // Jev answers in about 2.1–2.4 s even with a full context (measured 2026-10-22), so 3 s timed
+      // out whenever OpenCode slowed down — and the next judge then cost more than waiting.
+      $.clock.sleep(5000).then(() => null),
+    ])
+    // A dropped connection or a slow answer is often one bad moment, not a broken judge.
+    if (!response || response === 'network') {
+      blip = true
+      throw new Error(jevFailure(response ? 'network' : 'timeout', language))
+    }
+    if (!response.ok) throw new Error(jevFailure(response.status, language))
+    const json: unknown = JSON.parse(response.text)
+    // An unsure Jev still answered: its odds settle it here and the bias setting tips it later. The next judge is only for a Jev that failed.
+    const verdict = worker ? parseJevWorker(json) : parseJevEffort(json, 'current' in input ? input.current : null, language)
+    await update($, stats, value => addJudge(value, 'jev', 0, jevUsage(json)))
+    if (!verdict) throw new Error(t(language, 'toasts.jevNoVerdict'))
+    return { verdict }
+  } catch (error) { return { error: reason(error), blip } }
+}
+async function tryModel($: EngineInterface, model: string, system: string, prompt: string, worker: boolean, language: Lang): Promise<Tried> {
+  try {
+    const answer = await completeJudge($, model, system, prompt)
+    await update($, stats, value => addJudge(value, 'model', 0, answer.usage.input_tokens + answer.usage.output_tokens))
+    const verdict = answer.isAnswered ? (worker ? parseWorkerVerdict(answer.text) : parseEffortVerdict(answer.text)) : undefined
+    return verdict ? { verdict } : { error: judgeFailure(answer) ?? t(language, 'toasts.routerNoVerdict') }
+  } catch (error) { return { error: reason(error) } }
+}
+/** Haiku on the person's login: the exact id first, its alias once when that went unanswered. */
+async function tryHaiku($: EngineInterface, system: string, prompt: string, worker: boolean, language: Lang): Promise<Tried> {
+  let failure: string | undefined
+  try {
+    let answer = await completeJudge($, HAIKU, system, prompt)
+    await update($, stats, value => addJudge(value, 'haiku', 0, answer.usage.input_tokens + answer.usage.output_tokens))
+    if (!answer.isAnswered) {
+      failure = judgeFailure(answer)
+      answer = await completeJudge($, 'haiku', system, prompt)
+      await update($, stats, value => addJudge(value, 'haiku', 0, answer.usage.input_tokens + answer.usage.output_tokens))
+    }
+    const verdict = answer.isAnswered ? (worker ? parseWorkerVerdict(answer.text) : parseEffortVerdict(answer.text)) : undefined
+    if (verdict) return { verdict, ...(failure ? { error: failure } : {}) }
+    return { error: failure ?? t(language, 'toasts.haikuNoVerdict') }
+  } catch (error) { return { error: failure ?? reason(error) } }
+}
+/** A router target is named by its model; Haiku and Jev by their kind. */
+function judgeLabel(target: JudgeTarget): string {
+  return target.kind === 'model' ? target.model : target.kind
+}
+/**
+ * Asks the configured judges in order and stops at the first verdict. Nothing is appended to the
+ * list: an exhausted chain returns no verdict and the caller keeps the effort or the ladder it has.
+ * Wall time is counted once, over the whole chain.
+ */
 async function judge($: EngineInterface, s: Settings, input: JudgeInput | { description: string; prompt: string }, worker: boolean, testing = false): Promise<Judged> {
   const language = await read($, lang)
   const started = await $.clock.now()
   const system = worker ? WORKER_JUDGE_SYSTEM : EFFORT_JUDGE_SYSTEM
   const prompt = 'description' in input ? workerJudgeInput(input) : judgeContext(input)
-  let failure: string | undefined
-  let by: JudgeKind = s.judge
+  const targets = s.judges
+  const attempts: JudgeAttempt[] = []
   let verdict: Verdict | WorkerVerdict | undefined
-  let blip = false
-  if (s.judge === 'jev') {
-    try {
-      let source = s.jevSource
-      let key = await jevKey($, source)
-      // No TypeSafe key, but the router's OpenCode Zen offers Jev: ask Jev there.
-      if (!key && source === 'typesafe') {
-        key = await zenJevKey($)
-        if (key) source = 'zen'
-      }
-      if (!key) throw new Error(t(language, source === 'zen' ? 'jev.zenMissing' : 'toasts.keyMissing'))
-      const body = 'description' in input ? jevWorkerRequest(input) : jevEffortRequest(input)
-      let model = 'jev-latest'
-      if (source === 'zen') {
-        const file = await optionalFile($, `${await rippleHome($)}/config.json`)
-        model = file ? zenJev(JSON.parse(file)).model : model
-      }
-      const response = await Promise.race([
-        $.http.fetch(source === 'zen' ? 'https://opencode.ai/zen/v1/systemone' : 'https://api.typesafe.ai/v1/systemone', { method: 'POST', headers: { 'content-type': 'application/json', authorization: source === 'zen' ? key : `Bearer ${key}` }, body: JSON.stringify({ ...body, model }) })
-          .catch(() => 'network' as const),
-        // Jev answers in about 2.1–2.4 s even with a full context (measured 2026-10-22), so 3 s timed
-        // out whenever OpenCode slowed down — and the Haiku fallback then cost more than waiting.
-        $.clock.sleep(5000).then(() => null),
-      ])
-      // A dropped connection or a slow answer is often one bad moment, not a broken judge.
-      if (!response || response === 'network') {
-        blip = true
-        throw new Error(jevFailure(response ? 'network' : 'timeout', language))
-      }
-      if (!response.ok) throw new Error(jevFailure(response.status, language))
-      const json: unknown = JSON.parse(response.text)
-      // An unsure Jev still answered: its odds settle it here and the bias setting tips it later. Haiku is only for a Jev that failed.
-      verdict = worker ? parseJevWorker(json) : parseJevEffort(json, 'current' in input ? input.current : null, language)
-      await update($, stats, value => addJudge(value, 'jev', 0, jevUsage(json)))
-      if (!verdict) throw new Error(t(language, 'toasts.jevNoVerdict'))
-    } catch (error) { failure = reason(error); verdict = undefined }
-  }
-  if (s.judge === 'model') {
-    try {
-      const answer = await completeJudge($, s.judgeModel, system, prompt)
-      await update($, stats, value => addJudge(value, 'model', 0, answer.usage.input_tokens + answer.usage.output_tokens))
-      verdict = answer.isAnswered ? (worker ? parseWorkerVerdict(answer.text) : parseEffortVerdict(answer.text)) : undefined
-      if (!verdict) failure = judgeFailure(answer) ?? t(language, 'toasts.routerNoVerdict')
-    } catch (error) { failure = reason(error) }
-  }
-  if (!verdict) {
-    by = 'haiku'
-    try {
-      let answer = await completeJudge($, HAIKU, system, prompt)
-      await update($, stats, value => addJudge(value, 'haiku', 0, answer.usage.input_tokens + answer.usage.output_tokens))
-      if (!answer.isAnswered) {
-        failure ??= judgeFailure(answer)
-        answer = await completeJudge($, 'haiku', system, prompt)
-        await update($, stats, value => addJudge(value, 'haiku', 0, answer.usage.input_tokens + answer.usage.output_tokens))
-      }
-      verdict = answer.isAnswered ? (worker ? parseWorkerVerdict(answer.text) : parseEffortVerdict(answer.text)) : undefined
-      if (!verdict) failure ??= t(language, 'toasts.haikuNoVerdict')
-    } catch (error) { failure ??= reason(error) }
+  let jevTried = false
+  let jevBlip = false
+  for (const target of targets) {
+    const began = await $.clock.now()
+    const tried = target.kind === 'jev' ? await tryJev($, s, input, worker, language)
+      : target.kind === 'model' ? await tryModel($, target.model, system, prompt, worker, language)
+        : await tryHaiku($, system, prompt, worker, language)
+    attempts.push({ target, ms: Math.max(0, await $.clock.now() - began), ...(tried.error ? { error: tried.error } : {}) })
+    if (target.kind === 'jev') { jevTried = true; jevBlip = !!tried.blip }
+    if (tried.verdict) { verdict = tried.verdict; break }
   }
   const ms = Math.max(0, await $.clock.now() - started)
   await update($, stats, value => ({ ...value, judge: { ...value.judge, ms: value.judge.ms + ms } }))
+  const outcome = judgeOutcome(targets, attempts)
+  const last = attempts.at(-1)!.target
   if (!testing) {
     // The log pane lists it: a Jev call never reaches the router, so nothing else would show it.
-    const run: JudgeRun = { at: started, for: worker ? 'worker' : 'prompt', asked: s.judge, by, ms, ...(verdict?.effort ? { effort: verdict.effort } : {}), ...(verdict?.sure !== undefined ? { sure: verdict.sure } : {}), ...(failure ? { error: failure } : {}) }
+    const run: JudgeRun = { at: started, for: worker ? 'worker' : 'prompt', asked: outcome.asked, by: outcome.by, ms, attempts, ...(verdict?.effort ? { effort: verdict.effort } : {}), ...(verdict?.sure !== undefined ? { sure: verdict.sure } : {}), ...(outcome.error ? { error: outcome.error } : {}) }
     await update($, judgeRuns, value => [...value, run].slice(-40))
-    // A network blip or timeout is said only when it happens twice running; Haiku covers the one prompt.
-    jevBlips = blip ? jevBlips + 1 : 0
-    if (failure && !(blip && jevBlips < 2)) await down($, failure, blip)
+    // A network blip or timeout is said only when it happens twice running; the next judge covers the one prompt.
+    // Only a run that asked Jev moves the count: another judge's work says nothing of Jev's connection.
+    if (jevTried) jevBlips = jevBlip ? jevBlips + 1 : 0
+    const said = attempts.find(attempt => attempt.error && !(attempt.target.kind === 'jev' && jevBlip && jevBlips < 2))
+    if (said) await down($, said.target.kind === 'model' ? `${said.target.model}: ${said.error}` : said.error!, said.target.kind === 'jev' && jevBlip)
     else if (await read($, judgeDown)) await update($, judgeDown, () => null)
   }
-  return { verdict, by, ms, ...(failure ? { error: failure } : {}) }
+  return { verdict, by: outcome.by, target: last, ms, attempts, ...(outcome.error ? { error: outcome.error } : {}) }
 }
 async function testJudge($: EngineInterface): Promise<void> {
   const language = await read($, lang)
@@ -700,8 +730,12 @@ async function testJudge($: EngineInterface): Promise<void> {
   try {
     const s = normalizeSettings(await read($, settingsDraft) ?? await read($, settings))
     const judged = await judge($, s, { messages: [], next: 'Rename a local variable in one function and verify the result.' }, false, true)
+    // Honest: a primary that failed is a failed test even when a later judge answered, and the
+    // message names the model that failed or, with none failing, the target that answered.
     const ok = !!judged.verdict && !judged.error
-    await update($, jev, value => ({ ...value, test: { state: ok ? 'ok' as const : 'fail' as const, message: `${judged.ms} ms · ${judged.verdict?.effort ? t(language, 'band.' + judged.verdict.effort).toLowerCase() : t(language, 'toasts.noVerdict')} · ${judged.error ?? judged.by}` } }))
+    const failed = judged.attempts.find(attempt => attempt.error)
+    const detail = failed ? (failed.target.kind === 'model' ? `${failed.target.model}: ${failed.error}` : failed.error) : judgeLabel(judged.target)
+    await update($, jev, value => ({ ...value, test: { state: ok ? 'ok' as const : 'fail' as const, message: `${judged.ms} ms · ${judged.verdict?.effort ? t(language, 'band.' + judged.verdict.effort).toLowerCase() : t(language, 'toasts.noVerdict')} · ${detail}` } }))
   } catch (error) {
     await update($, jev, value => ({ ...value, test: { state: 'fail' as const, message: reason(error) } }))
   }
@@ -723,6 +757,7 @@ async function requestPick($: EngineInterface, e: AgentSpawnInput, s: Settings):
   let ms = 0
   let rawVerdict: WorkerVerdict | null = null
   let judgeError: string | undefined
+  let judgeAttempts: JudgeAttempt[] | undefined
   let target: TierTarget | undefined
   const mode = activeModeOf(s)
   const routing = routingSettings(s)
@@ -747,12 +782,14 @@ async function requestPick($: EngineInterface, e: AgentSpawnInput, s: Settings):
       }
       ms = judged?.ms ?? 0
       judgeError = judged?.error
+      judgeAttempts = judged?.attempts
     }
   } else {
     const judged = await judge($, s, { description: e.description, prompt: e.prompt }, true)
     if (judged.verdict && 'domain' in judged.verdict) { rawVerdict = judged.verdict; verdict = judged.verdict; by = judged.by }
     ms = judged.ms
     judgeError = judged.error
+    judgeAttempts = judged.attempts
   }
   // Availability is request-time state, not the ten-minute panel catalogue. Refresh after the
   // judge (which may itself take a while), before every pick, even when no mode is active.
@@ -786,7 +823,7 @@ async function requestPick($: EngineInterface, e: AgentSpawnInput, s: Settings):
   // The brief itself is never logged (it can hold anything); its length is. To re-judge a pick,
   // its brief is in the session's own transcript under the same description.
   const named = by === 'marker' || by === 'default' || by === 'session'
-  await persistWorkerPick($, { type: 'pick', id, ...entry, at: new Date(now).toISOString(), verdict: rawVerdict, by: named ? by : 'judge', judge: named ? null : by, ...(tier ? { tier } : {}), ms, ...(judgeError ? { error: judgeError } : {}), promptChars: e.prompt.length })
+  await persistWorkerPick($, { type: 'pick', id, ...entry, at: new Date(now).toISOString(), verdict: rawVerdict, by: named ? by : 'judge', judge: named ? null : by, ...(tier ? { tier } : {}), ms, ...(judgeError ? { error: judgeError } : {}), ...(judgeAttempts ? { attempts: judgeAttempts } : {}), promptChars: e.prompt.length })
   if (fallbackReason) await $.ui.toast(t(language, 'toasts.workerFallback', { reason: fallbackReason, name: targetLabel(selected, language) }))
   await update($, lastSpawn, () => value)
   await update($, stats, current => addWorker(current, verdict.level))
@@ -802,7 +839,7 @@ async function shadowJudge($: EngineInterface, s: Settings, id: string, input: {
   try {
     const judged = await judge($, s, input, true)
     const verdict = judged.verdict && 'domain' in judged.verdict ? judged.verdict : null
-    await persistWorkerPick($, { type: 'shadow', pick: id, at: new Date(await $.clock.now()).toISOString(), verdict, rung: verdict ? rungOf(verdict) : null, judge: judged.by, ms: judged.ms, ...(judged.error ? { error: judged.error } : {}) })
+    await persistWorkerPick($, { type: 'shadow', pick: id, at: new Date(await $.clock.now()).toISOString(), verdict, rung: verdict ? rungOf(verdict) : null, judge: judged.by, ms: judged.ms, attempts: judged.attempts, ...(judged.error ? { error: judged.error } : {}) })
     return judged
   } catch (error) { await report($, 'shadow judge', error); return undefined }
 }
@@ -847,6 +884,8 @@ async function startPanel($: EngineInterface, which: 'settings' | 'setup'): Prom
   if (which === 'setup') await update($, setupStep, () => 1)
   await update($, panel, () => which)
   await jevKey($)
+  // The judge chain's model list is the router's whole catalogue, not the ticked workers.
+  try { await refreshModels($) } catch (error) { await report($, 'judge model catalogue', error) }
   if (which === 'settings') await refreshLadder($)
 }
 /**
@@ -1265,7 +1304,7 @@ async function dashboard($: EngineInterface, working: boolean): Promise<Dashboar
   }
 }
 async function settingsView($: EngineInterface): Promise<SettingsView> {
-  return { settings: await currentSettings($), jev: await read($, jev), ladder: await read($, ladderOptions) }
+  return { settings: await currentSettings($), jev: await read($, jev), ladder: await read($, ladderOptions), models: await read($, routerModels) }
 }
 async function frameOf($: EngineInterface, e: RenderInput): Promise<Frame> {
   const s = await currentSettings($)
@@ -1292,7 +1331,7 @@ async function alertView($: EngineInterface, now: number): Promise<AlertView | n
   if (which === 'compact') return { kind: 'compactNote', draft: await read($, compactNote) }
   if (which === 'clear') return { kind: 'clear' }
   if (which === 'handoff') return { kind: 'handoffChoice', handoffKind: await read($, handoffChoiceKind), after: await read($, handoffChoiceAfter) }
-  if (which === 'judgeDown') return { kind: 'judgeDown', judge: s.judge, reason: d === 'down' ? t(language, 'alerts.demoDown') : downReason!, network: d !== 'down' && await read($, judgeDownNetwork) }
+  if (which === 'judgeDown') return { kind: 'judgeDown', judge: s.judges[0]?.kind ?? 'haiku', reason: d === 'down' ? t(language, 'alerts.demoDown') : downReason!, network: d !== 'down' && await read($, judgeDownNetwork) }
   if (which === 'hot') return { kind: 'hot', limitKind: h?.kind ?? 'five_hour', percent: d === 'hot' ? 86 : h!.percent, resetsAt: h?.resetsAt, save: (await read($, saveUntil) ?? 0) > now }
   if (which === 'result') {
     if (!writing) return { kind: 'result', ...result! }
@@ -1338,7 +1377,7 @@ function settingsActions($: EngineInterface): SettingsActions {
   return { patch: async change => {
       const s = await currentSettings($)
       const saved = await saveSettings($, { ...s, ...change }, s)
-      if (change.judge || change.jevSource) await jevKey($)
+      if (change.judges || change.jevSource) await jevKey($)
       if (!saved) await $.ui.toast(t(await read($, lang), 'band.routerDown'))
     },
     jevKey: async key => { try { await saveJevKey($, key) } catch (error) { await $.ui.toast(t(await read($, lang), 'toasts.error', { reason: reason(error) })) } }, testJev: () => testJudge($),
@@ -1453,7 +1492,7 @@ export const register: Register = on => {
         open = null
       }
       if (open === 'setup') await rebaseDraft($)
-      if ((await currentSettings($)).judge === 'jev' && (await read($, jev)).source === null) await jevKey($)
+      if ((await currentSettings($)).judges.some(target => target.kind === 'jev') && (await read($, jev)).source === null) await jevKey($)
       if (open === 'settings') { await update($, settingsDraft, () => null); await update($, settingsBase, () => null); await jevKey($) }
       if (!(await currentSettings($)).setupDone && !open) await startPanel($, 'setup')
     } catch (error) { await report($, 'session.start', error) }
@@ -1715,7 +1754,7 @@ export const register: Register = on => {
       const language = await read($, lang)
       const [sub = 'settings', arg] = e.args.trim().toLowerCase().split(/\s+/)
       if (sub === 'stats') return { text: formatStats(await read($, stats), language) }
-      if (sub === 'debug') return { text: debugText(language, { judge: (await currentSettings($)).judge, judgeModel: (await currentSettings($)).judgeModel, pick: await read($, pick), paused: await read($, paused), cache: await read($, cache), warm: await read($, warm), lastSpawn: await read($, lastSpawn), lastRequest: await read($, lastRequest), model: await $.session.model(), limit: await read($, limit), hostRateLimits: (await $.session.usage()).rateLimits }) }
+      if (sub === 'debug') return { text: debugText(language, { judges: (await currentSettings($)).judges, pick: await read($, pick), paused: await read($, paused), cache: await read($, cache), warm: await read($, warm), lastSpawn: await read($, lastSpawn), lastRequest: await read($, lastRequest), model: await $.session.model(), limit: await read($, limit), hostRateLimits: (await $.session.usage()).rateLimits }) }
       if (sub === 'settings' || sub === 'setup') await startPanel($, sub)
       else if (sub === 'auto') await toggleAuto($)
       else if (sub === 'warm') await toggleWarm($)
@@ -1769,7 +1808,7 @@ export const register: Register = on => {
         if (choice) return renderAlert(el, frame, choice, alertActions($, choice)) as RenderElement
       }
       if (which === 'setup') {
-        return renderSetup(el, frame, { draft: normalizeSettings(await read($, settingsDraft) ?? await read($, settings)), jev: await read($, jev), step: await read($, setupStep) }, setupActions($)) as RenderElement
+        return renderSetup(el, frame, { draft: normalizeSettings(await read($, settingsDraft) ?? await read($, settings)), jev: await read($, jev), step: await read($, setupStep), models: await read($, routerModels) }, setupActions($)) as RenderElement
       }
       if (await read($, bandHidden)) return next(e)
       const alert = await alertView($, frame.now)

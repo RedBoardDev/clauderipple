@@ -9,7 +9,7 @@ const ALLOW_WORKERS = [
 ]
 
 test('defaults hold one ladder', () => {
-  assert.equal(DEFAULTS.judge, 'haiku')
+  assert.deepEqual(DEFAULTS.judges, [{ kind: 'haiku' }])
   assert.equal(DEFAULTS.jevSource, 'typesafe')
   // The spec's "Claude + GPT" example ladder; the four workers replaced the field rules, so every field follows it.
   assert.deepEqual(DEFAULTS.rules, { general: { mode: 'ladder', rungs: {
@@ -90,8 +90,8 @@ test('only the general ladder survives loading: Auto is a ladder to fill, field 
   assert.deepEqual(normalizeSettings({ allow: ['gpt-6-1-sol', 'gpt-6-1-sol', 3], rules: { general: { mode: 'auto', allow: ['ignored'] } } }).allow, ['gpt-6-1-sol'])
 })
 test('unrelated valid settings survive and invalid values retain defaults', () => {
-  const s = normalizeSettings({ effortAuto: false, judge: 'jev', judgeModel: ' custom ', bias: 2, floor: 'max', ceiling: 'low', agentAuto: 'all', keepWarmHours: 8, handoffSkill: ' /handoff ', hide: ['route', 'bogus', 'timer', 'route', 4], fallback: { agent: 'custom', model: ' opus ' } })
-  assert.equal(s.effortAuto, false); assert.equal(s.judgeModel, 'custom'); assert.equal(s.handoffSkill, 'handoff')
+  const s = normalizeSettings({ effortAuto: false, judge: 'model', judgeModel: ' custom ', bias: 2, floor: 'max', ceiling: 'low', agentAuto: 'all', keepWarmHours: 8, handoffSkill: ' /handoff ', hide: ['route', 'bogus', 'timer', 'route', 4], fallback: { agent: 'custom', model: ' opus ' } })
+  assert.equal(s.effortAuto, false); assert.deepEqual(s.judges, [{ kind: 'model', model: 'custom' }, { kind: 'haiku' }]); assert.equal(s.handoffSkill, 'handoff')
   assert.deepEqual(s.hide, ['route', 'timer']); assert.deepEqual(s.fallback, { agent: 'custom', model: 'opus' })
   assert.deepEqual(normalizeSettings({ bias: '2', jevSource: 'bad', rules: [], providers: [], autoTieBand: -1 }), DEFAULTS)
   for (const n of [-1, 101, NaN, Infinity]) assert.equal(normalizeSettings({ swampAt: n }).swampAt, 50)

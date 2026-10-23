@@ -1,6 +1,18 @@
 # Changelog
 
-## 0.12.7 — 2026-10-22
+## Unreleased
+
+### Added
+
+- **Judges can take over in a chosen order.** Keep one judge or configure an ordered chain of
+  Haiku, Jev and router models in the dashboard, quick settings or setup. Each router entry owns
+  its model; the first valid verdict stops the chain. When every judge fails, the current effort
+  stays and worker selection uses its existing default. Logs show the attempted targets and
+  failures. Older Jev/model settings migrate with their previous Haiku rescue visible in the list;
+  explicit lists have no hidden judge. Shared settings use schema v2 so an older writer cannot
+  erase the chain; update the router and mod together before editing these settings.
+
+## 0.12.7 - 2026-10-22
 
 ### Fixed
 

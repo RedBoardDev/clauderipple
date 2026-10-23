@@ -2,7 +2,7 @@
 // callbacks it hands in. Every renderer in ./ is a pure function of (elements, view, actions);
 // none of them calls the engine, so they can be drawn and tested anywhere.
 
-import type { AgentRec, Effort, HandoffKind, JudgeKind, JudgeRun, LadderOptions, LimitItem, Pick, Settings, Skin, StatusRequest, TierTarget } from '../../types'
+import type { AgentRec, Effort, HandoffKind, JudgeKind, JudgeRun, LadderOptions, LimitItem, Pick as EffortPick, RouterModel, Settings, Skin, StatusRequest, TierTarget } from '../../types'
 import type { Appearance } from './theme'
 import { t } from '../i18n'
 import type { Lang } from '../i18n'
@@ -60,7 +60,7 @@ export type DashboardView = {
     /** The judge's reason, a few words. */
     why?: string
     /** Who gave it. */
-    by?: Pick['by']
+    by?: EffortPick['by']
     /** When the judge started (deciding): keeps the glow's phase across redraws. */
     since?: number
   }
@@ -172,6 +172,8 @@ export type SettingsView = {
   jev: JevState
   /** What each rung can run (the ticked models); null until the router has answered. */
   ladder?: LadderOptions | null
+  /** The router's models a judge entry can take; a configured model missing here is still shown. */
+  models?: readonly RouterModel[]
 }
 
 export type SettingsActions = {
@@ -192,6 +194,8 @@ export type SetupView = {
   step: SetupStep
   draft: Settings
   jev: JevState
+  /** The router's models a judge entry can take (as in SettingsView). */
+  models?: readonly RouterModel[]
 }
 
 export type SetupActions = {

@@ -10,8 +10,8 @@
 import { t } from '../i18n'
 import type { RenderNode } from 'claude-code'
 
-import type { Settings, Skin } from '../../types'
-import { SKINS } from '../settings'
+import type { JudgeTarget, Settings, Skin } from '../../types'
+import { DEFAULT_JUDGE_MODEL, SKINS, judgeTargetKey } from '../settings'
 import { CELL_PX, TILE_PX } from './art'
 import type { TileArt } from './art'
 import { capsule, pill, pic, ripple, segmented, slider, toggle, well } from './kit'
@@ -75,35 +75,123 @@ export function effortRows(el: Els, frame: Frame, d: Settings, a: SettingsAction
   return out
 }
 
-/** The Jev key field and its test, when TypeSafe's Jev judges and no key is known. */
+/** Jev anywhere in the chain: its key (TypeSafe) is needed whichever place it takes. */
+export function usesJev(d: Settings): boolean {
+  return d.judges.some(judge => judge.kind === 'jev')
+}
+
+/** The Jev key field and its test, when TypeSafe's Jev is anywhere in the chain and no key is known. */
 export function needsKey(view: SettingsView): boolean {
-  return view.settings.judge === 'jev' && view.settings.jevSource === 'typesafe' && !['env', 'file', 'pasted'].includes(view.jev.source ?? '')
+  return usesJev(view.settings) && view.settings.jevSource === 'typesafe' && !['env', 'file', 'pasted'].includes(view.jev.source ?? '')
+}
+
+/** The two places Jev can run from, one choice for the whole chain. */
+function sourceOptions(lang: Frame['lang']): { value: Settings['jevSource']; label: string }[] {
+  return [{ value: 'typesafe', label: t(lang, 'settings.sourceTypesafe') }, { value: 'zen', label: t(lang, 'settings.sourceZen') }]
+}
+
+/** Zen is picked but no Zen authorization is known. */
+export function zenMissing(view: SettingsView): boolean {
+  return usesJev(view.settings) && view.settings.jevSource === 'zen' && view.jev.source !== 'zen'
+}
+
+/** One judge by name: Haiku, Jev, or the router model's own id. */
+export function judgeLabel(lang: Frame['lang'], target: JudgeTarget): string {
+  return target.kind === 'model' ? target.model : t(lang, target.kind === 'haiku' ? 'settings.haiku' : 'settings.jev')
+}
+
+/** The chain in the order it is tried: `Jev → Haiku`. */
+export function judgeChain(lang: Frame['lang'], judges: readonly JudgeTarget[]): string {
+  return judges.map(target => judgeLabel(lang, target)).join(' → ')
+}
+
+/** Router models a router entry can take now: not another entry's, and its own kept even when unknown. */
+function modelChoices(view: SettingsView, lang: Frame['lang'], own?: string): { value: string; label: string }[] {
+  const taken = new Set(view.settings.judges.flatMap(judge => (judge.kind === 'model' && judge.model !== own ? [judge.model] : [])))
+  const out: { value: string; label: string }[] = []
+  for (const model of view.models ?? []) if (!taken.has(model.value) && !out.some(o => o.value === model.value)) out.push({ value: model.value, label: model.label })
+  if (own && !out.some(o => o.value === own)) out.unshift({ value: own, label: own + ' · ' + t(lang, 'settings.judgeUnavailable') })
+  return out
+}
+
+/** The model a new router entry starts on: the first router model not yet used, else the default. */
+function nextModel(view: SettingsView): string | undefined {
+  const used = new Set(view.settings.judges.flatMap(judge => (judge.kind === 'model' ? [judge.model] : [])))
+  return [...(view.models ?? []).map(model => model.value), DEFAULT_JUDGE_MODEL].find(model => !used.has(model))
+}
+
+/** One entry of the chain: its place, its name (a router entry's model is pickable), then order controls. */
+function judgeEntry(el: Els, frame: Frame, view: SettingsView, a: SettingsActions, target: JudgeTarget, at: number, desk: boolean): RenderNode {
+  const { Box, Text } = el
+  const L = frame.lang
+  const list = view.settings.judges
+  const k = lookOf(frame)
+  const key = judgeTargetKey(target)
+  const quiet = desk ? k.mute : { dimColor: true }
+  const put = (next: JudgeTarget[]) => a.patch({ judges: next })
+  const move = (by: -1 | 1) => {
+    const next = [...list]
+    ;[next[at], next[at + by]] = [next[at + by]!, next[at]!]
+    put(next)
+  }
+  const button = (id: string, glyph: string, word: string, enabled: boolean, press: () => void) =>
+    enabled
+      ? desk ? pill(el, frame, id + '-' + key, glyph, 'ghost', press, 'teal') : action(el, frame, id + '-' + key, glyph + ' ' + word, press)
+      : <Text key={id + '-off-' + key} {...quiet}>{glyph}</Text>
+  const choices = target.kind === 'model' ? modelChoices(view, L, target.model) : []
+  const name = target.kind !== 'model'
+    ? <Text key={'judge-name-' + key} {...(desk ? k.ink : {})}>{judgeLabel(L, target)}</Text>
+    : 'Select' in el && choices.length > 1
+      ? <el.Select key={'judge-model-' + at} options={choices} value={target.model} onSelect={(model: string) => put(list.map((judge, i) => (i === at ? { kind: 'model' as const, model } : judge)))} />
+      : <Text key={'judge-name-' + key} {...(desk ? k.ink : {})}>{target.model}</Text>
+  return (
+    <Box key={'judge-entry-' + key} flexDirection="row" alignItems="center" columnGap={1} flexWrap="wrap">
+      <Text {...quiet}>{String(at + 1) + '.'}</Text>
+      {name}
+      {list.length > 1 ? button('judge-up', '↑', t(L, 'settings.judgeMoveUp'), at > 0, () => move(-1)) : null}
+      {list.length > 1 ? button('judge-down', '↓', t(L, 'settings.judgeMoveDown'), at < list.length - 1, () => move(1)) : null}
+      {list.length > 1 ? button('judge-remove', '✕', t(L, 'settings.judgeRemove'), true, () => put(list.filter((_, i) => i !== at))) : null}
+    </Box>
+  )
+}
+
+/** The ordered chain as entries, the adds that are left, and what the order means. Both surfaces use it. */
+function judgeList(el: Els, frame: Frame, view: SettingsView, a: SettingsActions, desk: boolean): RenderNode[] {
+  const { Box, Text } = el
+  const L = frame.lang
+  const list = view.settings.judges
+  const k = lookOf(frame)
+  const quiet = desk ? k.mute : { dimColor: true }
+  const adds: { id: string; name: string; target: JudgeTarget }[] = []
+  for (const kind of ['haiku', 'jev'] as const) if (!list.some(judge => judge.kind === kind)) adds.push({ id: kind, name: judgeLabel(L, { kind }), target: { kind } })
+  const model = nextModel(view)
+  if (model) adds.push({ id: 'model', name: t(L, 'settings.routerModel'), target: { kind: 'model', model } })
+  const add = (x: (typeof adds)[number]) => {
+    const label = t(L, 'settings.judgeAdd', { name: x.name })
+    const press = () => a.patch({ judges: [...list, x.target] })
+    return desk ? pill(el, frame, 'judge-add-' + x.id, label, 'ghost', press, 'teal') : action(el, frame, 'judge-add-' + x.id, label, press)
+  }
+  const out: RenderNode[] = [
+    <Box key="judge-entries" flexDirection="column" rowGap={desk ? 1 : 0}>
+      {list.map((target, at) => judgeEntry(el, frame, view, a, target, at, desk))}
+    </Box>,
+  ]
+  if (adds.length) out.push(<Box key="judge-adds" flexDirection="row" flexWrap="wrap" columnGap={1} rowGap={desk ? 1 : 0}>{adds.map(add)}</Box>)
+  if (list.some(judge => judge.kind === 'model') && !(view.models ?? []).length) out.push(<Text key="judge-no-model" {...quiet} wrap="wrap">{t(L, 'settings.judgeNoModel')}</Text>)
+  out.push(<Text key="judge-order" {...quiet} wrap="wrap">{t(L, list.length > 1 ? 'settings.judgeOrder' : 'settings.judgeOnly')}</Text>)
+  return out
 }
 
 export function judgeRows(el: Els, frame: Frame, view: SettingsView, a: SettingsActions): RenderNode[] {
-  const d = view.settings
   const tone = textTone(frame.appearance)
   const { Box, Text } = el
   const out: RenderNode[] = [
-    row(
-      el,
-      frame,
-      'judge',
-      t(frame.lang, 'settings.judge'),
-      textSegmented(
-        el,
-        frame,
-        'judge',
-        [
-          { value: 'haiku', label: t(frame.lang, 'settings.haiku') },
-          { value: 'jev', label: t(frame.lang, 'settings.jev') },
-          { value: 'model', label: t(frame.lang, 'settings.routerModel') },
-        ] as const,
-        d.judge,
-        judge => a.patch({ judge }),
-      ),
-    ),
+    row(el, frame, 'judge', t(frame.lang, 'settings.judge'), <Box key="judge-list" flexDirection="column">{judgeList(el, frame, view, a, false)}</Box>),
   ]
+  if (usesJev(view.settings)) {
+    out.push(row(el, frame, 'jev-source', t(frame.lang, 'settings.jevSource'), textSegmented(el, frame, 'jev-source', sourceOptions(frame.lang), view.settings.jevSource, jevSource => a.patch({ jevSource }))))
+    if (zenMissing(view)) out.push(row(el, frame, 'jev-zen', t(frame.lang, 'settings.key'), <Text color={tone.bad} wrap="wrap">{t(frame.lang, 'jev.zenMissing')}</Text>))
+  }
   if (needsKey(view)) {
     const jev = view.jev
     const placeholder = t(frame.lang, 'settings.keyPaste')
@@ -158,8 +246,9 @@ export function modeItems(frame: Frame, d: Settings): { value: string; label: st
   return [{ value: '', label: t(frame.lang, 'settings.modeNone') }, ...d.modes.map(m => ({ value: m.id, label: m.name }))]
 }
 
-function judgeName(frame: Frame, judge: Settings['judge']): string {
-  return t(frame.lang, judge === 'haiku' ? 'settings.haiku' : judge === 'jev' ? 'settings.jev' : 'settings.routerModel')
+/** Who judges first, as the quick settings say it. */
+function judgeName(frame: Frame, judges: Settings['judges']): string {
+  return judgeLabel(frame.lang, judges[0]!)
 }
 
 // ---- Desktop: the deep's tiles -------------------------------------------------------------------
@@ -237,20 +326,17 @@ export function effortTile(el: Els, frame: Frame, view: SettingsView, a: Setting
   })
 }
 
-/** Who judges: Haiku, Jev or a router model; Jev's key field when it needs one. */
+/** Who judges, in order: Haiku, Jev and router models; Jev's key field when it needs one. */
 export function judgeTile(el: Els, frame: Frame, view: SettingsView, a: SettingsActions): RenderNode {
   const { Box, Text } = el
   const L = frame.lang
   const d = view.settings
   const k = lookOf(frame)
-  const body: RenderNode[] = [
-    segmented(el, frame, 'judge', [
-      { value: 'haiku', label: t(L, 'settings.haiku') },
-      { value: 'jev', label: t(L, 'settings.jev') },
-      { value: 'model', label: t(L, 'settings.routerModel') },
-    ] as const, d.judge, judge => a.patch({ judge }), 'teal'),
-  ]
-  if (d.judge === 'model' && d.judgeModel) body.push(note(el, frame, 'judge-model-name', t(L, 'settings.routerModel') + ' · ' + d.judgeModel))
+  const body: RenderNode[] = judgeList(el, frame, view, a, true)
+  if (usesJev(d)) {
+    body.push(segmented(el, frame, 'jev-source', sourceOptions(L), d.jevSource, jevSource => a.patch({ jevSource }), 'teal'))
+    if (zenMissing(view)) body.push(note(el, frame, 'jev-zen', t(L, 'jev.zenMissing'), { color: k.tone('red') }))
+  }
   if (needsKey(view)) {
     const jev = view.jev
     const placeholder = t(L, 'settings.keyPaste')
@@ -270,7 +356,7 @@ export function judgeTile(el: Els, frame: Frame, view: SettingsView, a: Settings
       </Box>,
     )
   }
-  return tile(el, frame, { id: 'judge', art: { kind: 'judge', judge: d.judge }, title: t(L, 'settings.judge'), line: t(L, 'settings.judgeLine'), body })
+  return tile(el, frame, { id: 'judge', art: { kind: 'judge', judge: d.judges[0]!.kind }, title: t(L, 'settings.judge'), line: t(L, 'settings.judgeLine'), body })
 }
 
 /** The worker set that is on: Base or a named mode. */
@@ -323,13 +409,13 @@ export function skinTile(el: Els, frame: Frame, view: SettingsView, a: SettingsA
 /** What 리플이 says the settings do right now, in a sentence or two. */
 export function settingsSay(frame: Frame, d: Settings): string {
   const L = frame.lang
-  const effort = d.effortAuto ? t(L, 'settings.sayAuto', { judge: judgeName(frame, d.judge) }) : t(L, 'settings.sayManual')
+  const effort = d.effortAuto ? t(L, 'settings.sayAuto', { judge: judgeName(frame, d.judges) }) : t(L, 'settings.sayManual')
   return d.keepWarm ? effort + ' ' + t(L, 'settings.sayWarm') : effort
 }
 
 /** Rows the quick settings take on the desktop, about: for the sea's height (five tiles, three rows of two or five of one). */
 function panelRows(frame: Frame, view: SettingsView): number {
-  return (tilesAcross(frame) === 2 ? 30 : 45) + (needsKey(view) ? 4 : 0)
+  return (tilesAcross(frame) === 2 ? 30 : 45) + (needsKey(view) ? 4 : 0) + (usesJev(view.settings) ? 3 : 0) + 2 * (view.settings.judges.length - 1) + 3
 }
 
 function settingsDrawn(el: Els, frame: Frame, view: SettingsView, a: SettingsActions): RenderNode {
