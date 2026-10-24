@@ -70,8 +70,9 @@
 ## Daily-driver safety
 
 - The live router is this repo's npm build installed in `~/.clauderipple/lib`,
-  run by launchd (`com.clauderipple.router`, proxy 8791, admin port configurable).
-  A restart alone does not pick up repository changes: `npm pack` →
+  run by launchd (`com.clauderipple.router`). Read the proxy and admin ports from
+  the active configuration; do not assume defaults. A restart alone does not pick
+  up repository changes: `npm pack` →
   `npm install --prefix ~/.clauderipple/lib <tgz>` → `clauderipple restart`.
 - Git maintenance authorization does not by itself authorize replacing or
   restarting the live installation. When deployment is requested, preserve the
