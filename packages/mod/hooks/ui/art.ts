@@ -321,7 +321,7 @@ export function extraHoverArt(widthPx: number): string {
 export type PillLook = 'primary' | 'ghost'
 
 /** Glyphs a button may lead with, drawn on a 12 px square. */
-export type Glyph = 'open' | 'close' | 'gear' | 'back' | 'next' | 'copy' | 'save' | 'compact' | 'handoff'
+export type Glyph = 'open' | 'close' | 'gear' | 'back' | 'next' | 'copy' | 'save' | 'compact'
 
 export const GLYPH: Record<Glyph, string> = {
   open: '<path d="M7 2.2h2.8V5M9.8 2.2L5.6 6.4M8.8 7.4v2.4H2.2V3.2h2.4"/>',
@@ -332,7 +332,6 @@ export const GLYPH: Record<Glyph, string> = {
   copy: '<rect x="4" y="4" width="6" height="6" rx="1.2"/><path d="M8 4V2.8A.8.8 0 0 0 7.2 2H2.8a.8.8 0 0 0-.8.8v4.4a.8.8 0 0 0 .8.8H4"/>',
   save: '<path d="M6 1.5v9M2.5 7l3.5 3.5L9.5 7"/>',
   compact: '<path d="M3.5 1.8L6 4.3l2.5-2.5M3.5 10.2L6 7.7l2.5 2.5M1.8 6h8.4"/>',
-  handoff: '<path d="M1.8 6h6.4M5.8 3.4L8.4 6 5.8 8.6M10.4 2.2v7.6"/>',
 }
 
 /**
@@ -577,7 +576,7 @@ export function barArt(percent: number, tone: Tone | 'ink'): string {
 export const ICON_PX = 16
 
 /** Line icons of the band's controls, 16 px. */
-export type Icon = 'flame' | 'gear' | 'agents' | 'log' | 'compact' | 'clear'
+export type Icon = 'flame' | 'gear' | 'agents' | 'log' | 'compact' | 'clear' | 'pin'
 
 export const FLAME = 'M8.1 14.3c2.8 0 4.5-1.9 4.5-4.4 0-2.8-2.4-4.2-2.8-7.2-1.7 1.1-2.6 2.8-2.5 4.3-1-.4-1.5-1.4-1.6-2.3-1.4 1.3-2 2.9-2 5.2 0 2.5 1.6 4.4 4.4 4.4z'
 
@@ -586,6 +585,8 @@ export const ICON: Record<Icon, string> = {
   gear: '<circle cx="8" cy="8" r="2.3"/><path d="M8 1.7v1.8M8 12.5v1.8M1.7 8h1.8M12.5 8h1.8M3.5 3.5l1.3 1.3M11.2 11.2l1.3 1.3M3.5 12.5l1.3-1.3M11.2 4.8l1.3-1.3"/><circle cx="8" cy="8" r="4.8"/>',
   agents: '<circle cx="4.8" cy="5" r="2.1"/><circle cx="11.4" cy="5" r="2.1"/><path d="M1.6 13.4c.4-2.4 1.7-3.6 3.2-3.6s2.8 1.2 3.2 3.6M8.2 13.4c.4-2.4 1.7-3.6 3.2-3.6s2.8 1.2 3.2 3.6"/>',
   log: '<path d="M2.4 3.8h11.2M2.4 8h11.2M2.4 12.2h6.8"/>',
+  // A pin: a round head and its needle.
+  pin: '<circle cx="9.8" cy="5.6" r="3.2"/><path d="M7.6 7.8L2.8 12.6"/>',
   // Two arrows coming in from the corners to the middle: the chat drawn down into itself.
   compact: '<path d="M3.2 3.2L7.1 7.1M7.1 7.1H4.9M7.1 7.1V4.9M12.8 12.8L8.9 8.9M8.9 8.9h2.2M8.9 8.9v2.2"/>',
   // An eraser laid on its edge, the sleeve band bold, a short line being swept away below.

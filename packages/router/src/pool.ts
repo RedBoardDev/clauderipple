@@ -157,17 +157,34 @@ export class CredentialPool {
     return h;
   }
 
-  private usable(provider: string, id: string): boolean {
+  /**
+   * A quota scope's health lives beside the credential's own, under `provider/credential#scope`. A
+   * scope is a part of one credential's quota that runs out on its own: Antigravity counts Gemini
+   * models and Claude/GPT models separately, and one group at 100% must not rest the other.
+   */
+  private scopedKey(provider: string, id: string, scope: string): string { return `${this.key(provider, id)}#${scope}`; }
+
+  private scopedHealthOf(provider: string, id: string, scope: string): Health {
+    const key = this.scopedKey(provider, id, scope);
+    let h = this.health.get(key);
+    if (!h) { h = { cooldownUntil: 0, quarantined: false, failures: 0 }; this.health.set(key, h); }
+    return h;
+  }
+
+  private usable(provider: string, id: string, scope?: string): boolean {
     const h = this.healthOf(provider, id);
-    return !h.quarantined && h.cooldownUntil <= this.now();
+    if (h.quarantined || h.cooldownUntil > this.now()) return false;
+    if (!scope) return true;
+    return (this.health.get(this.scopedKey(provider, id, scope))?.cooldownUntil ?? 0) <= this.now();
   }
 
   /**
    * The credential to use, or null when every one of them is cooling or quarantined. The
    * conversation's existing credential wins while it is healthy; otherwise the first usable one in
-   * configured order, which makes the order meaningful rather than incidental.
+   * configured order, which makes the order meaningful rather than incidental. With a `scope`, a
+   * credential whose quota for that scope is resting is skipped too.
    */
-  pick(provider: string, credentials: readonly Credential[], conversation?: string): Credential | null {
+  pick(provider: string, credentials: readonly Credential[], conversation?: string, scope?: string): Credential | null {
     if (credentials.length === 0) return null;
     this.expireSticky();
     const stickyKey = JSON.stringify([provider, conversation]);
@@ -175,13 +192,13 @@ export class CredentialPool {
       const held = this.sticky.get(stickyKey);
       if (held) {
         const current = credentials.find((c) => (c.ownerId ?? c.id) === held.ownerId);
-        if (current && !current.paused && this.usable(provider, current.id)) {
+        if (current && !current.paused && this.usable(provider, current.id, scope)) {
           held.at = this.now();
           return current;
         }
       }
     }
-    const usable = (c: Credential): boolean => !c.paused && this.usable(provider, c.id);
+    const usable = (c: Credential): boolean => !c.paused && this.usable(provider, c.id, scope);
     const next = credentials.find((c) => c.preferred && usable(c)) ?? credentials.find(usable);
     if (!next) return null;
     if (conversation) this.sticky.set(stickyKey, { ownerId: next.ownerId ?? next.id, at: this.now() });
@@ -193,15 +210,21 @@ export class CredentialPool {
    * committed to a provider, so a session whose primary is rate-limited for the next hour goes to
    * its fallback instead of failing once per request until the window resets.
    */
-  hasUsable(provider: string, credentials: readonly Credential[]): boolean {
-    return credentials.some((c) => !c.paused && this.usable(provider, c.id));
+  hasUsable(provider: string, credentials: readonly Credential[], scope?: string): boolean {
+    return credentials.some((c) => !c.paused && this.usable(provider, c.id, scope));
   }
 
-  /** Record a failure. Returns the verdict so the caller can decide whether to try the next one. */
-  penalise(provider: string, id: string, status: number, retryAfterMs?: number, body = ""): Verdict {
+  /**
+   * Record a failure. Returns the verdict so the caller can decide whether to try the next one.
+   *
+   * With a `scope`, a rate limit rests only that scope of the credential: the vendor said one quota
+   * group is spent, not that the credential is. Every other failure (a refused credential, a 402, a
+   * broken upstream) is still about the whole credential and rests all of it.
+   */
+  penalise(provider: string, id: string, status: number, retryAfterMs?: number, body = "", scope?: string): Verdict {
     const verdict = classify(status, retryAfterMs, body);
     if (!verdict.retryable) return verdict;
-    const h = this.healthOf(provider, id);
+    const h = scope && verdict.kind === "rate-limit" ? this.scopedHealthOf(provider, id, scope) : this.healthOf(provider, id);
     h.failures++;
     if (verdict.quarantine) h.quarantined = true;
     else h.cooldownUntil = Math.max(h.cooldownUntil, this.now() + verdict.cooldownMs);
@@ -213,25 +236,43 @@ export class CredentialPool {
    *
    * An unexpired cooldown is left alone. Requests overlap, and a 200 arriving after a concurrent
    * 429 does not mean the rate limit went away — clearing it here would send the next turn straight
-   * back into the limit. The cooldown expires on its own soon enough.
+   * back into the limit. The cooldown expires on its own soon enough. The same holds for the scope
+   * the answer was in.
    */
-  succeed(provider: string, id: string): void {
+  succeed(provider: string, id: string, scope?: string): void {
     const h = this.healthOf(provider, id);
     if (h.cooldownUntil <= this.now()) h.cooldownUntil = 0;
     h.quarantined = false;
     h.failures = 0;
+    const scoped = scope ? this.health.get(this.scopedKey(provider, id, scope)) : undefined;
+    if (scoped && scoped.cooldownUntil <= this.now()) this.health.delete(this.scopedKey(provider, id, scope!));
   }
 
-  /** Operator action from the dashboard: give a parked credential another chance now. */
+  /** Operator action from the dashboard: give a parked credential, and all its scopes, another chance now. */
   clear(provider: string, id?: string): void {
-    if (id) { this.health.delete(this.key(provider, id)); return; }
+    if (id) {
+      const key = this.key(provider, id);
+      for (const k of [...this.health.keys()]) if (k === key || k.startsWith(`${key}#`)) this.health.delete(k);
+      return;
+    }
     for (const key of [...this.health.keys()]) if (key.startsWith(`${provider}/`)) this.health.delete(key);
   }
 
-  /** Clear every token generation of one durable login, including a paused or expired one. */
+  /** Clear every token generation of one durable login, including a paused or expired one, and its scopes. */
   clearOwner(provider: string, ownerId: string): void {
     const prefix = `${this.key(provider, ownerId)}:`;
     for (const key of this.health.keys()) if (key.startsWith(prefix)) this.health.delete(key);
+  }
+
+  /** Seconds until each resting scope of one credential is usable again; empty when none rests. */
+  scopeCooldowns(provider: string, id: string): Record<string, number> {
+    const now = this.now();
+    const prefix = `${this.key(provider, id)}#`;
+    const out: Record<string, number> = {};
+    for (const [key, h] of this.health) {
+      if (key.startsWith(prefix) && h.cooldownUntil > now) out[key.slice(prefix.length)] = Math.ceil((h.cooldownUntil - now) / 1000);
+    }
+    return out;
   }
 
   /** For the Health screen: why a credential is not being used, and for how long. */

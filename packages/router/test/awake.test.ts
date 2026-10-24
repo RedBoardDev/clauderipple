@@ -13,8 +13,11 @@ import { AWAKE_DEFAULTS, type AwakeSettings } from "../src/config.ts";
 const BATT_AC = "Now drawing from 'AC Power'\n -InternalBattery-0 (id=7995491)\t55%; AC attached; not charging present: true\n";
 const BATT_LOW = "Now drawing from 'Battery Power'\n -InternalBattery-0 (id=7995491)\t15%; discharging; 1:02 remaining present: true\n";
 const THERM_NONE = "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded\n";
-const ioreg = (lid: boolean, causesSleep: boolean, disabled: boolean): string =>
-  `  |   "AppleClamshellCausesSleep" = ${causesSleep ? "Yes" : "No"}\n  |   "AppleClamshellState" = ${lid ? "Yes" : "No"}\n  |   "SleepDisabled" = ${disabled ? "Yes" : "No"}\n`;
+// `caps`: "System Capabilities" — 15 measured in a full wake (2026-10-24); a dark wake lacks Graphics (2).
+const FULL_WAKE = 15;
+const DARK_WAKE = 9;
+const ioreg = (lid: boolean, causesSleep: boolean, disabled: boolean, caps?: number): string =>
+  `${caps === undefined ? "" : `  |   "System Capabilities" = ${caps}\n`}  |   "AppleClamshellCausesSleep" = ${causesSleep ? "Yes" : "No"}\n  |   "AppleClamshellState" = ${lid ? "Yes" : "No"}\n  |   "SleepDisabled" = ${disabled ? "Yes" : "No"}\n`;
 
 test("battery: AC, battery, and a Mac without one", () => {
   assert.deepEqual(parseBattery(BATT_AC), { percent: 55, onBattery: false });
@@ -30,8 +33,10 @@ test("thermal: measured 'nothing recorded' is normal, a recorded level is a warn
 });
 
 test("clamshell flags from ioreg", () => {
-  assert.deepEqual(parseClamshell(ioreg(true, false, false)), { lidClosed: true, causesSleep: false, sleepDisabled: false });
-  assert.deepEqual(parseClamshell(""), { lidClosed: null, causesSleep: null, sleepDisabled: null });
+  assert.deepEqual(parseClamshell(ioreg(true, false, false)), { lidClosed: true, causesSleep: false, sleepDisabled: false, darkWake: null });
+  assert.deepEqual(parseClamshell(""), { lidClosed: null, causesSleep: null, sleepDisabled: null, darkWake: null });
+  assert.equal(parseClamshell(ioreg(false, true, true, FULL_WAKE)).darkWake, false);
+  assert.equal(parseClamshell(ioreg(true, true, false, DARK_WAKE)).darkWake, true);
 });
 
 const NOW = Date.parse("2026-10-20T12:00:00Z");
@@ -54,6 +59,9 @@ test("decision table: modes, the working window, until, and the guards", () => {
     ["working, last call 5 min ago", base({ lastActivityAt: NOW - 5 * 60_000 }), true, /last model call 300s ago/],
     ["working, last call just over 10 min ago", base({ lastActivityAt: NOW - WORKING_GRACE_MS - 1 }), false, /idle/],
     ["working, never active", base(), false, /idle/],
+    ["a call in a dark wake takes no hold", base({ inFlight: 1, darkWake: true }), false, /^asleep: /],
+    ["a hold already taken is kept in a dark wake", base({ inFlight: 1, darkWake: true, held: true }), true, /1 model call running/],
+    ["on is kept in a dark wake", base({ s: { mode: "on" }, darkWake: true }), true, /^on$/],
     ["battery under the floor on battery", base({ s: { mode: "on" }, battery: { percent: 15, onBattery: true } }), false, /battery 15% is below 20%/],
     ["battery under the floor on AC is fine", base({ s: { mode: "on" }, battery: { percent: 15, onBattery: false } }), true, /^on$/],
     ["floor is configurable", base({ s: { mode: "on", batteryFloorPercent: 10 }, battery: { percent: 15, onBattery: true } }), true, /^on$/],
@@ -79,10 +87,11 @@ type FakeMac = {
   battCode: number;
   sudo: "ok" | "refused";
   sleepnowUnprivileged: boolean;
+  caps: number;
 };
 
 function fakeMac(over: Partial<FakeMac> = {}): FakeMac & { run: (f: string, a: string[]) => Promise<RunResult> } {
-  const m: FakeMac = { calls: [], sleepDisabled: false, lid: false, causesSleepWhenReleased: true, batt: BATT_AC, battCode: 0, sudo: "ok", sleepnowUnprivileged: true, ...over };
+  const m: FakeMac = { calls: [], sleepDisabled: false, lid: false, causesSleepWhenReleased: true, batt: BATT_AC, battCode: 0, sudo: "ok", sleepnowUnprivileged: true, caps: FULL_WAKE, ...over };
   const ok = (stdout = ""): RunResult => ({ code: 0, stdout, stderr: "" });
   return Object.assign(m, {
     run: async (file: string, args: string[]): Promise<RunResult> => {
@@ -90,7 +99,7 @@ function fakeMac(over: Partial<FakeMac> = {}): FakeMac & { run: (f: string, a: s
       m.calls.push(line);
       if (line === "/usr/bin/pmset -g batt") return { code: m.battCode, stdout: m.battCode === 0 ? m.batt : "", stderr: "" };
       if (line === "/usr/bin/pmset -g therm") return ok(THERM_NONE);
-      if (line.startsWith("/usr/sbin/ioreg")) return ok(ioreg(m.lid, m.lid && !m.sleepDisabled && m.causesSleepWhenReleased, m.sleepDisabled));
+      if (line.startsWith("/usr/sbin/ioreg")) return ok(ioreg(m.lid, m.lid && !m.sleepDisabled && m.causesSleepWhenReleased, m.sleepDisabled, m.caps));
       if (line.startsWith("/usr/bin/sudo -n /usr/bin/pmset -a disablesleep ")) {
         if (m.sudo === "refused") return { code: 1, stdout: "", stderr: "sudo: a password is required\n" };
         m.sleepDisabled = line.endsWith(" 1");
@@ -176,6 +185,27 @@ test("releasing with the lid closed and nothing else holding it puts the Mac to 
   const i1 = mac.calls.indexOf("/usr/bin/pmset sleepnow");
   assert.ok(i0 >= 0 && i1 > i0, "clear first, then sleep");
   assert.equal(clock.t - before, SLEEPNOW_SETTLE_MS, "waits for the lid state to settle before reading it");
+});
+
+test("a call in a dark wake takes no hold; the lid opening takes it, and a dark-wake reading keeps it", async () => {
+  // 2026-10-24 01:09: keep-warm pings in a maintenance dark wake held a closed lid awake for 72 min.
+  const mac = fakeMac({ lid: true, caps: DARK_WAKE });
+  const { c, lines } = controller(mac, { settings: settings({ mode: "working" }), activity: () => ({ inFlight: 1 }) });
+  await c.tick();
+  assert.ok(!mac.calls.some((l) => l.includes("disablesleep")), "no hold in a dark wake");
+  assert.equal(c.status().applied, false);
+  assert.match(c.status().reason, /^asleep: /);
+  assert.ok(lines.includes(`awake: ${c.status().reason}`));
+  mac.lid = false;
+  mac.caps = FULL_WAKE;
+  await c.tick();
+  assert.equal(c.status().applied, true);
+  mac.lid = true;
+  mac.caps = DARK_WAKE;
+  mac.calls.length = 0;
+  await c.tick();
+  assert.equal(c.status().applied, true);
+  assert.ok(!mac.calls.some((l) => l.includes("disablesleep 0")));
 });
 
 test("closed lid on an external display (closed-display mode) is never put to sleep", async () => {

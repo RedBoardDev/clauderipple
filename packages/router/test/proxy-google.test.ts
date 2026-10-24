@@ -30,15 +30,20 @@ function freePort(): Promise<number> {
   });
 }
 
-type Rig = { home: string; send: (body: unknown, path?: string) => Promise<{ status: number; body: string }>; records: () => RequestRecord[]; stop: () => Promise<void>; seen: { path: string; headers: http.IncomingHttpHeaders; body: Record<string, unknown> }[] };
+type Rig = { home: string; send: (body: unknown, path?: string) => Promise<{ status: number; headers: string; body: string }>; records: () => RequestRecord[]; stop: () => Promise<void>; seen: { path: string; headers: http.IncomingHttpHeaders; body: Record<string, unknown> }[] };
 
-async function rig(promptRefusal = false, argon?: "google" | "opencode"): Promise<Rig> {
+async function rig(promptRefusal = false, argon?: "google" | "opencode", reply?: { status: number; body: string; headers?: Record<string, string> }): Promise<Rig> {
   const seen: Rig["seen"] = [];
   const upstream = http.createServer((req, res) => {
     const chunks: Buffer[] = [];
     req.on("data", (chunk: Buffer) => chunks.push(chunk));
     req.on("end", () => {
       seen.push({ path: req.url ?? "", headers: req.headers, body: JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string, unknown> });
+      if (reply) {
+        res.writeHead(reply.status, { "content-type": "application/json", ...reply.headers });
+        res.end(reply.body);
+        return;
+      }
       if (promptRefusal && JSON.stringify(seen.at(-1)!.body).includes("You are a Claude agent, built on Anthropic's Claude Agent SDK.")) {
         res.writeHead(429, { "content-type": "application/json" }).end(JSON.stringify({ error: {
           code: 429, status: "RESOURCE_EXHAUSTED", message: "Resource has been exhausted (e.g. check quota).",
@@ -105,7 +110,7 @@ async function rig(promptRefusal = false, argon?: "google" | "opencode"): Promis
     finally { globalThis.fetch = originalFetch; }
   }
 
-  const send = async (body: unknown, pathName = "/v1/messages"): Promise<{ status: number; body: string }> => {
+  const send = async (body: unknown, pathName = "/v1/messages"): Promise<{ status: number; headers: string; body: string }> => {
     const sock = net.connect(proxyPort, "127.0.0.1");
     await new Promise<void>((r) => sock.once("connect", () => r()));
     sock.write("CONNECT api.anthropic.com:443 HTTP/1.1\r\nHost: api.anthropic.com:443\r\n\r\n");
@@ -148,7 +153,7 @@ async function rig(promptRefusal = false, argon?: "google" | "opencode"): Promis
       }
       raw2 = out;
     }
-    return { status, body: raw2 };
+    return { status, headers: head, body: raw2 };
   };
 
   return {
@@ -186,6 +191,39 @@ test("an Antigravity SDK refusal is logged as an upstream request failure withou
     assert.equal(r.seen[1]!.headers.authorization, r.seen[0]!.headers.authorization);
   } finally {
     await r.stop();
+  }
+});
+
+// Claude Code retries a plain 429 ten times over ~2.5 minutes. Google's monthly spending cap is not
+// a rate limit — no retry inside that window can succeed — so the answer says not to (#89).
+test("a Google spending-cap 429 says not to retry; a bare 429 rate limit does not", async () => {
+  const request = { model: "gemini-3-pro-preview", max_tokens: 16, stream: true, messages: [{ role: "user", content: "hi" }] };
+  const capped = await rig(false, undefined, {
+    status: 429,
+    headers: { "retry-after": "120" },
+    body: JSON.stringify({ error: { code: 429, status: "RESOURCE_EXHAUSTED", message: "Your project has exceeded its monthly spending cap." } }),
+  });
+  try {
+    const res = await capped.send(request);
+    assert.equal(res.status, 429);
+    assert.match(res.headers, /x-should-retry: false/i);
+    assert.match(res.headers, /retry-after: 120/i);
+    assert.match(res.body, /monthly spending cap/, "the status and body are unchanged");
+  } finally {
+    await capped.stop();
+  }
+
+  const rate = await rig(false, undefined, {
+    status: 429,
+    headers: { "retry-after": "2" },
+    body: JSON.stringify({ error: { code: 429, status: "RESOURCE_EXHAUSTED", message: "Resource has been exhausted (e.g. check quota)." } }),
+  });
+  try {
+    const res = await rate.send(request);
+    assert.equal(res.status, 429);
+    assert.doesNotMatch(res.headers, /x-should-retry/i);
+  } finally {
+    await rate.stop();
   }
 });
 

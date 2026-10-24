@@ -4,8 +4,9 @@
 // Claude app turn that closed on a question the person must answer.
 // They arrive as an appended event, or as a Mac-session alert (Sessions.onAlert) for a session the
 // host is not tailing. Tapping the push opens exactly that session (its id is in the payload's
-// session field). The payload is metadata only — session title plus fixed state words, never
-// conversation text.
+// session field). The payload is the session title and what the turn did (its last reply, the
+// approval it waits for, or the question), as in the native push: RFC 8291 encrypts it end to end,
+// so the push service never reads it. Without that context it is the title plus fixed state words.
 //
 // The VAPID key pair is made once and kept under the host's config dir (0600); a new pair would
 // orphan every subscription. Subscriptions are per device (the phone's clientId) and a push
@@ -13,6 +14,7 @@
 import path from "node:path";
 import webpush from "web-push";
 import { readJson, writeFileAtomic } from "./fsutil.ts";
+import { pushContent, type PushContext } from "./push-content.ts";
 import type { PushEvent, PushSubscriptionJSON, SessionSummary } from "./protocol.ts";
 
 export const VISIBLE_MS = 30_000;
@@ -104,6 +106,8 @@ export interface NotifierOptions {
   /** true while a connected phone looked at this session in the last SEEN_MS */
   seenRecently: (session: string) => boolean;
   summary: (session: string) => SessionSummary | undefined;
+  /** The same private context the native push encrypts (push-content.ts); a web push is end-to-end encrypted too. */
+  context?: (session: string, event: PushEvent) => PushContext | Promise<PushContext>;
   log?: (line: string) => void;
 }
 
@@ -143,9 +147,22 @@ export class Notifier {
     if (!s) return;
     // A question is an ask like an approval: it waits for the person, so it is urgent and short-lived.
     const urgent = event.kind === "permission" || event.kind === "question";
+    // Resolve once per event, and only when there is a subscription to send it to.
+    let context: Promise<PushContext> | undefined;
     await Promise.all(Object.entries(this.subs).map(async ([clientId, stored]) => {
-      const p = pushFor(event, s, stored.lang);
+      let p = pushFor(event, s, stored.lang);
       if (!p) return;
+      // Say what the turn did, as the native push does; a phone that installed the web app keeps the
+      // fixed words only when the context cannot be read.
+      if (this.opts.context) {
+        try {
+          context ??= Promise.resolve(this.opts.context(session, event));
+          const content = pushContent(event, stored.lang, await context, p.body);
+          p = { ...p, title: content.title, body: content.body };
+        } catch {
+          this.opts.log?.(`push: content unavailable for device ${clientId.slice(0, 8)}; sending fixed words`);
+        }
+      }
       try {
         await this.opts.send(stored.sub, JSON.stringify(p), { urgency: urgent ? "high" : "normal", ttl: urgent ? 3600 : 86_400, topic: p.tag.replace(/[^\w-]/g, "").slice(0, 32) });
       } catch (e) {

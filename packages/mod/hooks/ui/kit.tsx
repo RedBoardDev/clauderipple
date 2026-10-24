@@ -82,10 +82,18 @@ export function lift(el: Els): RenderNode {
   return <Box position="absolute" top={0} left={0} />
 }
 
+/**
+ * What a picture says when its caller has nothing to say (a plate, a fade, a light): the desktop
+ * drops an Svg whose `alt` is empty once trimmed, so such a picture was never drawn (2026-10-24:
+ * the prompt's grey card and the floating head's plate, the words beneath showing through).
+ */
+const QUIET_ALT = 'ClaudeRipple'
+
 /** A picture, `width` × `height` px, in a Box of its own that never shrinks. */
 export function pic(el: Els, key: string, source: string, alt: string, width: number, height: number): RenderNode {
   if (!('Svg' in el)) return ''
   const { Box, Svg } = el
+  if (!alt.trim()) alt = QUIET_ALT
   if (width > SVG_MAX_PX || height > SVG_MAX_PX) {
     // Crop the same drawing, not separately generated seas: gradients, corners and motion retain
     // their original coordinates on either side of every join, in either skin and theme.
@@ -102,7 +110,7 @@ export function pic(el: Els, key: string, source: string, alt: string, width: nu
         const cropped = root.replace(/\bwidth="[^"]*"/, 'width="' + w + '"')
           .replace(/\bheight="[^"]*"/, 'height="' + tileHeight + '"')
           .replace(/viewBox="[^"]*"/, 'viewBox="' + [vx + x * vw / width, vy + y * vh / height, w * vw / width, tileHeight * vh / height].join(' ') + '"')
-        tiles.push(<Svg key={key + '-' + x + '-' + y} source={cropped + source.slice(root.length)} alt={x === 0 && y === 0 ? alt : ''} width={w} height={tileHeight} />)
+        tiles.push(<Svg key={key + '-' + x + '-' + y} source={cropped + source.slice(root.length)} alt={x === 0 && y === 0 ? alt : QUIET_ALT} width={w} height={tileHeight} />)
       }
       rows.push(<Box key={'row-' + y} flexDirection="row" flexShrink={0} columnGap={0} alignItems="flex-start">{tiles}</Box>)
     }

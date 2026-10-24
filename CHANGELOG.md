@@ -1,5 +1,140 @@
 # Changelog
 
+## 0.12.14 — 2026-10-24
+
+### Added
+
+- **The band's Handoff is back as one button.** The session's own model writes the resume note in a
+  fork, so nothing is sent to this chat and it is never cleared. A new Code session then opens in
+  the same folder with the note in its prompt box, waiting for Enter; a note past about 12,000
+  characters goes to `~/.clauderipple/handoffs` and the box says to read it. A fork that fails says
+  so, and the advice judge and settings removed earlier stay removed.
+- **Delegation no longer uses a second model to choose the worker** (#90). The session writes the
+  tier and domain on the first line and the owner's ladder names the model, while the effort judge
+  stays. A model is named only with a `Model reason: user "…"` or `Model reason: rule <file>` line,
+  which the mod checks and never reads as language: a missing reason, a quote the owner did not say
+  or an unknown name is refused and the session is told why, and the reason line never reaches the
+  worker. Nothing usable on the rung or the one above is refused with a toast instead of running on
+  the session's own model. With the takeover set to ripple:auto, a worker called by name, or
+  general-purpose on a model, runs as called; only All spawns checks those calls for a reason. The
+  dashboard's help for the setting now says so.
+- **A model pinned in the owner's own words stays for the session.** "앞으로 솔로" or "솔로 고정"
+  adds a top row to the band, "위임 고정: Sol", with the sentence that pinned it and 해제 at the
+  end; the hover card is gone since the reason is now in view. A sentence that only mentions a
+  model no longer pins or unpins, an exact id beats a family word, and a family alone takes the
+  generated worker, else the newest version. The owner's words for this task outrank a pin, and a
+  pin outranks a written rule.
+- **A ladder's rows mean difficulty again, and `ui` is asked for only where it is needed.** Light
+  and standard run on the light row, hard and plan on the heavy one, and rows stored under either
+  split read right. The `ui` domain word is for visual design, a new screen's layout or UX
+  decisions; restoring, porting, wiring or translating existing UI code takes no domain word. The
+  dashboard folds and edits the rows the same way, and its hints say so.
+- **The Agents pane lists background commands and watches beside the agents.** A command left
+  running, one that times out and a Monitor watch each get a tile in the same capsule, with what it
+  runs and how long, and end with their status and exit code; TaskStop ends one at once. An agent's
+  card asks for the Claude app's own agent view where the host draws one and, on the desktop, opens
+  the pane's conversation, now in the app's layout: the prompt in a grey card, words as paragraphs,
+  each run of tool calls one quiet line worded as the app words it. The tile list keeps the
+  capsule's totals and figures, and the phone words the same run the same way.
+- **Pressing the band's context chip opens a context breakdown pane.** The grid and legend are
+  measured against Claude Code's compaction window rather than the model's, then memory files, MCP
+  tools by server, skills and agents follow, each capped with a "more" toggle. It opens on the local
+  estimate, "다시 계산" recounts with the token-count API, and Escape or another press closes it.
+  The chip's tip now carries the same press, the chip lights under the pointer, and the band's
+  share is the pane's own figure.
+- **The dashboard chooses the compaction model and Claude Code's compaction point.** Any Claude or
+  router model, with its effort, can write the summary instead of only Haiku or the app's own
+  compactor, and `autoCompactWindow` takes 400k, 500k, 600k, the model default or a custom value.
+  `settings.json` stays that value's one home; a per-model value `/autocompact` saved is read, and
+  a dashboard save drops it, since it would outrank the top-level one. The band's heavy mark is a
+  fixed 80% of that window, so `swampAt` is gone.
+- **A phone session's settings are confirmed, and always-allow is scoped to the session.** An HTTP
+  success and the CLI's own application are told apart, a write that was never confirmed is not
+  replayed after a restart, and per-session writes are serialized. A partial model or effort change
+  keeps the part that landed, a restart keeps the writer's accepted input, and always-allow keeps
+  the condition the CLI offered, in that session only.
+- **A phone's files come through one bounded session boundary.** Desktop transcripts, SDK messages
+  and workers share it: traversal, symlinks, secret files, changed handles and oversized deliveries
+  are refused while the conversation around them stays, and a session's own Claude temp folder
+  stays readable. Blob ids are scoped to the log epoch, edited attachments get fresh ids, and
+  widget rows no longer draw the same file card twice.
+
+### Changed
+
+- **The eager-delegation note rides on every prompt.** It used to go once when eager delegation was
+  turned on and once after each compaction, so between compactions the main chat read one line far
+  back in a long context. A note on every prompt costs about twenty tokens and leaves nothing to
+  bury.
+
+### Fixed
+
+- **Windows: the tray's shortcuts work while the router runs** (#87). The launcher appended to a log
+  the router's scheduled task held open for as long as it ran, so PowerShell stopped before node
+  started and the desktop and Start-menu shortcuts did nothing. It now writes its own
+  `logs\tray-launcher.log`, and runs without a log if that cannot be opened either.
+- **A provider that has run out fails a worker at once** (#89). A spending cap or a used-up quota
+  now carries `x-should-retry: false` and a `retry-after` for when the provider is back, so Claude
+  Code no longer retries the same 429 ten times over about two and a half minutes. Status and body
+  are unchanged, and a bare rate limit is forwarded as before.
+- **A Claude pool with nothing usable sends the turn on the app's own sign-in** (#88). Once every
+  main-chat model routed to the Claude provider, the app's login was never refreshed and aged out
+  after 12 hours; with its stored account revoked, every turn got "no usable Claude account" until
+  the provider was deleted. A turn with the client's Bearer now goes out on it, and one without is
+  still refused. Closing the dashboard's sign-in dialog while the token exchange ran no longer
+  drops the sign-in.
+- **A spent Google quota group rests only that group, on that host** (#84 by @csa906). A 429
+  `QUOTA_EXHAUSTED` for the Claude (3P) group rested the whole account, so Gemini models on it went
+  out too, and a rest on one host blocked the other. The pool now rests the group per account and
+  host, the ladder skips only the models in it (an effort suffix included), the dashboard shows
+  which group rests where with one button to use the account now, and the group's return counts
+  accounts that are only cooling. A 402, a 429 without that evidence and a 503 behave as before.
+- **A stored Claude account keeps the mod's workers available** (#81 by @RedBoardDev). The mod's
+  ladder called a Claude provider unusable whenever Claude Code's own login was not seen, even with
+  ready stored accounts serving every turn, and skipped every worker on that provider.
+- **Injected CLI bootstrap models get their descriptions** (#86 by @csa906). A description left out
+  is filled at the bootstrap boundary, while explicit descriptions, empty strings and upstream
+  options stay as they are.
+- **Each routed worker compacts at its own window.** A 272000 written at install capped every
+  routed worker, so 6.1 Sol's 475000 and DeepSeek's and MiniMax's million all compacted there.
+  Install now writes Claude Code's 1,000,000 ceiling for a per-model window unless
+  `--max-context-tokens` names another, and the bootstrap sends every window inside the CLI's
+  100K–1M range, so Gemini's 1,048,576 applies at the ceiling instead of being dropped.
+- **A dark wake no longer keeps a sleeping Mac awake.** Cache keep-warm pings and scheduled tasks
+  during maintenance dark wakes were counted as work, turning ~45 s wakes into 72 and 35 minutes
+  awake on battery with the lid shut. A hold now starts only in a full wake, read from the same
+  ioreg call as the clamshell flags; a hold already taken is kept, and mode "on" is unchanged.
+- **Windows: the new Claude data folders are found, and `uninstall --purge` finishes its own
+  cleanup.** A pasted image or scratchpad file under `%TEMP%\claude\…` reaches the phone, the
+  bundled CLI under `%LOCALAPPDATA%\Claude-Data\…` is found, and the session folder is allowed only
+  with its owner and ACL checked. Purge run from the install's own node.exe could not delete its
+  folder yet exited 0: an outside step now finishes it, the command no longer reports success it
+  did not have, and it removes only what the ownership manifest names. A cleaned environment also
+  keeps its `PSModulePath`.
+- **Outside text is cleaned and bounded once, so no surface is refused or loses its controls.** A
+  blank press across each card, a long queued phone message, a judge failure or a pinned sentence
+  could push the band's buttons past the engine's text budget; one ESC from an error refused the
+  log, queue, alerts and settings whole, and a long model name broke the band's width limit. Each
+  surface now gets a bounded share through one boundary, cards open from their title or arrow, and
+  a failure page does not read the state again.
+- **The band and the panes draw again.** A picture with a blank alt no longer vanishes (it takes the
+  word ClaudeRipple), worker updates no longer redraw the band, so 리플이's eyes, waves and ripples
+  play out, an agent card's title stays light, and a run's line takes the page's ink under the
+  pointer as the app's does.
+- **The Agents pane stays within the engine's limits and its fallback cannot fail too.** Long
+  fallback reasons, titles and an unfolded conversation passed the engine's 20,000-node limit and
+  were refused whole, and the fallback re-read the state that had just failed. Reasons and titles
+  are now previews, a conversation shows at most its last 512 entries, and the fallback draws from
+  what the render had already read.
+- **A worker that ends before its spawn is recorded is listed as ended.** A workflow's verify
+  agents failed in 72 ms, and their end found no record to close, so 29 cards stayed live 12 hours
+  after the run; the end is now kept until the record lands, and the record is written as ended.
+- **A phone's notifications and updates say and do the right thing.** Question and plan
+  notifications name the question and its options instead of serialized tool input, a web push
+  carries the same private context as the native one, and an older phone app gets the earlier reply
+  shapes while a newer one names what it reads. A host update skipped because the host was busy is
+  retried each minute once nothing is running, queued or handing off, and a tray relaunch that
+  failed retries from one minute up to fifteen.
+
 ## 0.12.13 — 2026-10-23
 
 ### Added

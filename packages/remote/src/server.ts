@@ -7,6 +7,7 @@ import module from "node:module";
 import path from "node:path";
 import { WebSocketServer } from "ws";
 import { tokenMatches } from "./config.ts";
+import { clientEvent, clientFeatures, settingsResponse } from "./client-compat.ts";
 import type { Phone } from "./local-control.ts";
 import { browse, macConsent, makeFolder, recentFolders } from "./folders.ts";
 import type { RecentSource } from "./folders.ts";
@@ -90,6 +91,7 @@ interface Client {
   /** session → last seq sent to this client */
   attached: Map<string, number>;
   pumping: Set<string>;
+  features: ReturnType<typeof clientFeatures>;
 }
 
 export class HostServer {
@@ -98,6 +100,15 @@ export class HostServer {
   private wss: WebSocketServer;
   private clients = new Set<Client>();
   private localHttp: http.Server | null = null;
+  private refreshing = false;
+  private handling = 0;
+
+  /** Atomic on the host's event loop: no accepted command or queued turn can race this reservation. */
+  prepareRefresh(): boolean {
+    if (this.refreshing || this.handling || !this.opts.sessions.prepareRefresh()) return false;
+    this.refreshing = true;
+    return true;
+  }
   private lastSeen = new Map<string, number>();
 
   phones(): Phone[] {
@@ -142,7 +153,7 @@ export class HostServer {
   constructor(opts: ServerOptions) {
     this.opts = opts;
     const desktopProblem = opts.sessions.desktopProblem?.();
-    this.hostInfo = { name: opts.hostName, version: opts.version, routerOk: true, queue: true, ...(desktopProblem ? { desktopProblem } : {}) };
+    this.hostInfo = { name: opts.hostName, version: opts.version, routerOk: true, queue: true, capabilities: { sessionFiles: true }, ...(desktopProblem ? { desktopProblem } : {}) };
     this.http = http.createServer((req, res) => this.serve(req, res));
     this.wss = new WebSocketServer({ noServer: true, maxPayload: FRAME_CAP });
     this.http.on("upgrade", (req, socket, head) => {
@@ -210,7 +221,7 @@ export class HostServer {
         this.timers.push(setInterval(() => this.reapStale(), PING_MS));
         this.timers.push(setInterval(() => void this.checkRouter(), 15_000));
         this.timers.push(setInterval(() => this.pollDesktop(), 3000));
-        this.timers.push(setInterval(() => this.opts.sessions.pollQueued(), 1000));
+        this.timers.push(setInterval(() => { if (!this.refreshing) this.opts.sessions.pollQueued(); }, 1000));
         void this.checkRouter();
         resolve();
       });
@@ -329,14 +340,16 @@ export class HostServer {
 
   /** A phone connected, directly or through the relay; it must say hello with the token within 10 s. */
   connected(ws: Peer): void {
-    const c: Client = { ws, authed: false, clientId: "", visibleAt: 0, lastRx: Date.now(), attached: new Map(), pumping: new Set() };
+    const c: Client = { ws, authed: false, clientId: "", visibleAt: 0, lastRx: Date.now(), attached: new Map(), pumping: new Set(), features: new Set() };
     this.clients.add(c);
     const helloTimer = setTimeout(() => { if (!c.authed) ws.close(4001, "hello"); }, 10_000);
     ws.on("message", (data) => {
       c.lastRx = Date.now();
       let msg: ClientMsg;
       try { msg = JSON.parse(String(data)) as ClientMsg; } catch { return; }
-      void this.onClient(c, msg).catch((e: Error) => this.send(c, { t: "error", code: "internal", message: e.message }));
+      this.handling++;
+      void this.onClient(c, msg).catch((e: Error) => this.send(c, { t: "error", code: "internal", message: e.message }))
+        .finally(() => { this.handling--; });
     });
     ws.on("close", () => {
       clearTimeout(helloTimer);
@@ -354,6 +367,7 @@ export class HostServer {
 
   private send(c: Client, msg: HostMsg): void {
     if (c.ws.readyState !== c.ws.OPEN) return;
+    if (msg.t === "events" || msg.t === "history") msg = { ...msg, events: msg.events.map(event => clientEvent(event, c.features)) };
     const text = JSON.stringify(msg);
     if (Buffer.byteLength(text) > FRAME_CAP) {
       // The log caps events and pages, so this means a bug; say so rather than kill the socket (Paseo #2610).
@@ -376,11 +390,17 @@ export class HostServer {
         }
         c.authed = true;
         c.clientId = clientId;
+        c.features = clientFeatures(msg.features);
         this.send(c, { t: "ready", host: this.hostInfo, sessions: this.opts.sessions.list(), groups: this.opts.sessions.groups() });
       } else {
         this.send(c, { t: "denied", reason: "token" });
         c.ws.close(4003, "denied");
       }
+      return;
+    }
+    if (this.refreshing) {
+      if ("reqId" in msg && msg.reqId) this.send(c, { t: "res", reqId: msg.reqId, ok: false, error: "호스트 업데이트 중입니다. 잠시 후 다시 시도해 주세요." });
+      else this.send(c, { t: "error", code: "host_updating", message: "호스트 업데이트 중입니다. 잠시 후 다시 시도해 주세요.", ...("clientMsgId" in msg ? { clientMsgId: msg.clientMsgId } : {}) });
       return;
     }
     const s = this.opts.sessions;
@@ -434,7 +454,8 @@ export class HostServer {
       case "decide":
         try {
           if (msg.decision !== "allow" && msg.decision !== "allow_always" && msg.decision !== "deny") throw new Error("invalid decision");
-          if (!await s.decide(msg.session, msg.id, msg.decision, msg.message, msg.answers)) throw new Error("이미 처리됨");
+          if (msg.decision === "allow_always" && !c.features.has("scopedAlways")) throw new Error("허용 범위를 확인하려면 앱을 업데이트해 주세요. 이번 요청만 허용할 수 있습니다.");
+          if (!await s.decide(msg.session, msg.id, msg.decision, msg.message, msg.answers, msg.reqId)) throw new Error("이미 처리됨");
           if (msg.reqId) this.send(c, { t: "res", reqId: msg.reqId, ok: true, data: null });
         } catch (e) {
           if (msg.reqId) this.send(c, { t: "res", reqId: msg.reqId, ok: false, error: (e as Error).message });
@@ -443,8 +464,8 @@ export class HostServer {
         return;
       case "set_mode":
         try {
-          await s.setMode(msg.sessionId, msg.mode);
-          this.send(c, { t: "res", reqId: msg.reqId, ok: true, data: null });
+          const data = await s.setMode(msg.sessionId, msg.mode, msg.reqId);
+          this.send(c, settingsResponse(msg.reqId, data, c.features));
         } catch (e) {
           this.send(c, { t: "res", reqId: msg.reqId, ok: false, error: (e as Error).message });
         }
@@ -453,9 +474,14 @@ export class HostServer {
       case "set_model":
         try {
           // Stop from the phone also pauses what it queued: the person decides what goes next.
+          let data = null;
           if (msg.t === "interrupt") { s.holdQueue(msg.session); await s.interrupt(msg.session); }
-          else await s.setModel(msg.session, msg.model, msg.effort);
-          if (msg.reqId) this.send(c, { t: "res", reqId: msg.reqId, ok: true, data: null });
+          else data = await s.setModel(msg.session, msg.model, msg.effort, msg.reqId);
+          if (msg.reqId) this.send(c, data ? settingsResponse(msg.reqId, data, c.features) : { t: "res", reqId: msg.reqId, ok: true, data });
+          else if (data && data.status !== "applied" && !c.features.has("settingsResult")) {
+            const response = settingsResponse("", data, c.features);
+            if (response.t === "res" && !response.ok) this.send(c, { t: "error", code: msg.t, session: msg.session, message: response.error });
+          }
         } catch (e) {
           if (msg.reqId) this.send(c, { t: "res", reqId: msg.reqId, ok: false, error: (e as Error).message });
           else this.send(c, { t: "error", code: msg.t, session: msg.session, message: (e as Error).message });
@@ -509,7 +535,8 @@ export class HostServer {
         if (!s.has(op.session)) throw new Error("no such session");
         const text = s.blob(op.session, op.id);
         if (text === null) throw new Error("no such blob");
-        const offset = Math.max(0, op.offset ?? 0);
+        const offset = op.offset ?? 0;
+        if (!Number.isSafeInteger(offset) || offset < 0 || offset > text.length) throw new Error("Invalid blob offset.");
         const end = Math.min(text.length, offset + BLOB_CHUNK_CHARS);
         const chunk: BlobChunk = { text: text.slice(offset, end), offset, next: end < text.length ? end : null, bytes: Buffer.byteLength(text) };
         return chunk;
@@ -517,7 +544,8 @@ export class HostServer {
       case "sub": {
         const log = s.subLog(op.session, op.sub);
         if (!log) throw new Error("no such subagent");
-        return log.readAfter(op.afterSeq ?? 0);
+        const page = log.readAfter(op.afterSeq ?? 0);
+        return { ...page, events: page.events.map(event => clientEvent(event, c.features)) };
       }
       /** The folder comes from the session (its record's cwd; a Claude app session's summary),
        * never from the phone, so one connection can only ever read sessions it can already see. */

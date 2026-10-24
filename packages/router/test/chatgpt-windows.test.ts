@@ -8,7 +8,7 @@ import assert from "node:assert/strict";
 import { DEFAULTS, type Config } from "../src/config.ts";
 import { parseCodexCatalog } from "../src/providers/chatgpt/catalog.ts";
 import { chatgptModelWindow, noteChatgptModelWindows } from "../src/providers/chatgpt/windows.ts";
-import { injectBootstrap } from "../src/bootstrap.ts";
+import { CLI_WINDOW_MAX, injectBootstrap } from "../src/bootstrap.ts";
 import { chatPickerModels, injectPickerModels, providerModelWindow } from "../src/picker.ts";
 
 const cfg: Config = {
@@ -73,4 +73,17 @@ test("an explicit route window still wins over the catalogue", () => {
     routes: { ...cfg.routes, "claude-opus-4-7": { provider: "chatgpt", model: "gpt-6.1-sol", contextWindow: 1_000_000 } },
   };
   assert.equal(boot(explicit).auto_compact_windows["claude-opus-4-7"], 1_000_000);
+});
+
+// Claude Code drops a per-model window over its 1M ceiling whole, and the model then compacts at
+// the session's own setting: Gemini's 1,048,576 never applied (2026-10-24).
+test("a window over Claude Code's ceiling is sent at the ceiling, on the picker entry and on a route", () => {
+  const over: Config = {
+    ...cfg,
+    routes: { ...cfg.routes, "claude-sonnet-5": { provider: "deepseek", model: "deepseek-v4.1-flash", contextWindow: 2_000_000 } },
+    cli: { ...cfg.cli, extraModels: [...cfg.cli.extraModels, { model: "gemini-3.8-flash", name: "Gemini", contextWindow: 1_048_576 }] },
+  };
+  assert.equal(boot(over).auto_compact_windows["gemini-3.8-flash"], CLI_WINDOW_MAX);
+  assert.equal(boot(over).auto_compact_windows["claude-sonnet-5"], CLI_WINDOW_MAX);
+  assert.equal(CLI_WINDOW_MAX, 1_000_000);
 });

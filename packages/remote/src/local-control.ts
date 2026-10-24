@@ -17,6 +17,8 @@ export interface LocalControlOptions {
   shutdown?(): void;
   /** A turn is in progress: an update restarts the host only when this is false. */
   busy?(): boolean;
+  prepareRefresh?(): boolean;
+  refresh?(): void;
 }
 
 export function isLoopback(address: string | undefined): boolean {
@@ -82,6 +84,12 @@ export class LocalControl {
           restartRequired: saved.bind !== cfg.bind || saved.relay !== cfg.relay,
           busy: this.opts.busy?.() ?? false,
         });
+        return;
+      }
+      if (route === "/local/refresh" && req.method === "POST" && this.opts.prepareRefresh && this.opts.refresh) {
+        if (!this.opts.prepareRefresh()) { json(res, 409, { error: "host busy" }); return; }
+        res.once("finish", () => this.opts.refresh?.());
+        json(res, 200, { ok: true });
         return;
       }
       if (route === "/local/shutdown" && req.method === "POST" && this.opts.shutdown) {

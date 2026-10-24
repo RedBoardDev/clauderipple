@@ -7,6 +7,24 @@ Revised 2026-10-12: the main chat no longer names a tier. It only decides whethe
 always to `ripple:auto`; the judge picks among all four tiers, `max` included (deep + plan). The
 four tier agents (`ripple:low/medium/high/max`) are no longer registered.
 
+**Superseded 2026-10-24: there is no worker judge.** Who names a worker's model had changed three
+times in two days (4000c3f the owner's settings only, 28ae836 the session's marker, e9876fc the
+judge reading the owner's last few messages). Each fix closed the last incident and opened another:
+the session carried "솔 시켜" over to later tasks; the judge gave a render step's "딥시크" to the
+translation before it and could not see the written rule that translation runs on Opus. Now:
+
+- The session writes the tier and domain marker (`[[ripple: standard ui]]`); none is general
+  standard. The owner's ladder names the model. No model call is made to route a worker.
+- A model is named only with its source on the line after the marker: `Model reason: user "<the
+  owner's exact words>"` or `Model reason: rule <file> — <rule>`. The mod checks, never reads as
+  language: no reason, a quote the owner did not say, or an unknown name is refused.
+- Order: the owner's words for this task, then a standing pin, then a written rule, then the ladder.
+- Nothing usable on the rung or the one above is refused; the session's own model no longer runs it.
+- The effort judge for the main session stays.
+
+Principle (Astra's review, adopted by the owner): a wrong call is fixed in the criteria or the
+review; the decision does not move again. The sections below are history where they differ.
+
 ## Why
 
 The ladder was still too much to set: presets, four rungs × model × effort × backup, two field
@@ -142,7 +160,9 @@ its name; `기본` (Base) means the base worker set, not a saved mode.
 - **Delegation** — `normal` or `eager` (보통 / 적극 — 메인 대화는 지휘만). The main chat may run on
   any model, so no string names Claude as the one directing. Eager adds the existing
   hidden `prompt.submit` context note: "Delegate everything except judgment and final review to
-  ripple:auto." First prompt after activation and after main-chat compaction only.
+  ripple:auto." Sent with every prompt while eager, because a note sent only on activation and
+  after a main-chat compaction is buried in a long context, and main chats were seen doing the
+  work themselves (2026-10-24).
 - **End** — `until: 'none' | number | { reset: '<provider>' }`: until turned off, epoch-ms time,
   or the named provider's first known quota reset **after activation** (끄기 전까지 / 시각 지정 /
   한도 초기화 때). Only that provider's reset counts, whatever the rung lists use.
@@ -212,6 +232,12 @@ that set's current general rungs and opens the same ordered-list editor. Turning
 the override. The router fills empty rungs in existing Base and mode domain ladders using the
 same `fillLadder` as general, without creating absent overrides. All six UI languages cover the
 controls. The shared model checklist stays on Base.
+
+**The split moved back 2026-10-24: light work is `light` + `standard`, heavy work `hard` + `plan`.**
+The 10-22 move below answered a worker judge that read ordinary design as `standard`; with the
+judge gone the session names the tier, and design names Opus itself with a written rule, so the
+owner's two rows mean difficulty again ("표준까지는 소넷"). `twoLevelRungs` reads stored rows the
+same way (light, else standard; heavy from plan down), so either stored split reads right.
 
 **A domain ladder has two levels, not four (2026-10-21; the split moved 2026-10-22).** The stored
 shape keeps the four rungs, so `ladderPick` and `rungOf` are untouched. Light work is the `light`

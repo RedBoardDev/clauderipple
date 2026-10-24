@@ -53,6 +53,30 @@ test("a one-off script prefix is remembered without its original environment", {
   }
 });
 
+test("Windows script updates remove inherited PSModulePath after merging their environment", () => {
+  const saved = process.env.PSModulePath;
+  process.env.PSModulePath = "C:\\Program Files\\PowerShell\\Modules";
+  try {
+    let called = false;
+    const result = runUpdate({ kind: "script", prefix: "C:\\Ripple" }, { node: process.execPath, env: {}, cli: "unused.js" }, "clauderipple@test", {
+      platform: "win32",
+      run: (program, _args, options) => {
+        called = true;
+        assert.equal(program, "powershell.exe");
+        assert.equal(Object.keys(options.env).some(key => key.toLowerCase() === "psmodulepath"), false);
+        assert.equal(options.env.CLAUDERIPPLE_PREFIX, "C:\\Ripple");
+        assert.equal(options.env.CLAUDERIPPLE_PACKAGE, "clauderipple@test");
+        return { status: 0 };
+      },
+    });
+    assert.equal(called, true);
+    assert.equal(result.ok, true);
+  } finally {
+    if (saved === undefined) delete process.env.PSModulePath;
+    else process.env.PSModulePath = saved;
+  }
+});
+
 test("versions compare by number, not as text", () => {
   assert.equal(isNewer("0.6.0", "0.5.1"), true);
   assert.equal(isNewer("0.10.0", "0.9.9"), true);

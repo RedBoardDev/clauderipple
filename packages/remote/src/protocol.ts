@@ -39,7 +39,17 @@ export const HOST_SILENT_MS = STALE_MS + PING_MS;
 export const PERMISSION_MODES = ["plan", "default", "acceptEdits", "auto", "bypassPermissions"] as const;
 export type PermissionMode = typeof PERMISSION_MODES[number];
 export interface Question { question: string; header: string; options: { label: string; description: string }[]; multiSelect: boolean }
-export interface PermissionContent { requestKind?: "tool" | "plan" | "question"; questions?: Question[] }
+export interface PermissionContent { requestKind?: "tool" | "plan" | "question"; questions?: Question[]; alwaysAllow?: { scope: "session"; summary: string } }
+export type RuleStatus = "sent" | "confirmed" | "unknown";
+/** Only worker-confirmed values are included; a transport acknowledgement is not application. */
+export interface SettingsResult {
+  status: "applied" | "partial" | "unknown";
+  model?: string;
+  effort?: Effort | null;
+  permissionMode?: PermissionMode;
+  errors?: { model?: string; effort?: string; permissionMode?: string };
+}
+export interface SessionControls { model: boolean; effort: boolean; permissionModes: PermissionMode[] }
 
 export type Effort = "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra";
 
@@ -69,14 +79,17 @@ export type Text = string | BlobRef;
 
 /** Image bytes are base64 in the existing chunked blob transport, never in an event. */
 export interface ImagePart { type: "image"; blob?: string; mediaType: string; width?: number; height?: number }
-export interface MessageImages { images?: ImagePart[] }
+export interface SessionFile { id: string; name: string; mediaType: string; bytes: number; status: "ready" | "blocked" | "missing" | "too_large"; blob?: string }
+export interface MessageImages { images?: ImagePart[]; files?: SessionFile[] }
+export const SESSION_FILE_TOTAL = 32 * 1024 * 1024;
+export const SESSION_FILE_NAME = 160;
 export const ATTACHMENT_CAP = 8 * 1024 * 1024;
 export const ATTACHMENT_COUNT = 8;
 export interface Attachment { blob: string; name: string; mediaType: string }
 export type SendBehavior = "steer" | "interrupt";
 export function defaultEffort(efforts: Effort[]): Effort | null { return efforts.includes("high") ? "high" : efforts[0] ?? null; }
 
-export interface ToolCall { id: string; name: string; /** one line a person reads: a command, a path */ summary: string; input?: Text; /** Computed before a large input becomes a blob. Counts describe supplied edits, not unseen file context. */ changes?: { added: number; removed: number } }
+export interface ToolCall { id: string; name: string; files?: SessionFile[]; /** one line a person reads: a command, a path */ summary: string; input?: Text; /** Computed before a large input becomes a blob. Counts describe supplied edits, not unseen file context. */ changes?: { added: number; removed: number } }
 
 export type EventBody = MessageImages & (
   | { kind: "user"; text: string; clientMsgId: string }
@@ -91,7 +104,8 @@ export type EventBody = MessageImages & (
   | { kind: "subagent"; toolUseId: string; sub: string; description: string; model: string | null; status: "running" | "done" | "failed"; steps: number }
   | ({ kind: "permission"; id: string; tool: string; title: string; summary: string; input: Text; canAlways: boolean } & PermissionContent)
   | { kind: "mode"; mode: PermissionMode }
-  | { kind: "permission_decided"; id: string; decision: "allow" | "allow_always" | "deny" | "expired"; reason?: string }
+  | { kind: "permission_decided"; id: string; decision: "allow" | "allow_always" | "deny" | "expired"; reason?: string; ruleStatus?: RuleStatus }
+  | ({ kind: "settings"; reqId: string } & SettingsResult)
   | { kind: "result"; ok: boolean; error?: string; ms: number; turns: number }
   | { kind: "state"; state: SessionState; detail?: string }
   | { kind: "figures"; figures: Figures }
@@ -176,6 +190,8 @@ export interface SessionSummary {
   model: string;
   effort: Effort | null;
   permissionMode?: PermissionMode;
+  /** Absent on older hosts: controls must stay disabled. Values above describe the next turn. */
+  controls?: SessionControls;
   state: SessionState;
   /** Main-turn state is authoritative for desktop Remote Control sessions. */
   desktopBridge?: boolean;
@@ -232,13 +248,18 @@ export interface FolderEntry { path: string; name: string; lastUsed?: number; mo
 export interface HostInfo { name: string; version: string; routerOk: boolean; routerProblem?: string; desktopProblem?: string;
   /** The host keeps queued messages (ReqOp enqueue/queue_*); an older host leaves the queue to the phone. */
   queue?: boolean;
+  capabilities?: { sessionFiles: boolean };
   /** the mod's mode, effort range and provider limits; absent on older hosts or when the router is down */
   ripple?: RippleStatus }
 
 // ---- client → host --------------------------------------------------------------------
 
+/** Per-connection opt-in. Missing/non-array lists mean no features; unknown entries are ignored. */
+export const CLIENT_FEATURES = ["settingsResult", "scopedAlways", "sessionFiles"] as const;
+export type ClientFeature = typeof CLIENT_FEATURES[number];
+
 export type ClientMsg =
-  | { t: "hello"; token: string; clientId: string }
+  | { t: "hello"; token: string; clientId: string; features?: ClientFeature[] }
   | { t: "ping"; n: number }
   /** `afterSeq` 0 or absent with no epoch: send the tail page. */
   | { t: "attach"; session: string; epoch?: string; afterSeq?: number }

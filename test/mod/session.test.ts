@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { hottest, limitLabel, saveUntil, swamped, coldAlert, hotAlert, hotWindowMoved, swampAlert, keptAlert, bandPriority, claudeLimitsFrom, CLAUDE_USAGE_STALE_MS } from '../../packages/mod/hooks/session.ts'
+import { hottest, limitLabel, saveUntil, swamped, contextWindow, coldAlert, hotAlert, hotWindowMoved, swampAlert, keptAlert, bandPriority, claudeLimitsFrom, CLAUDE_USAGE_STALE_MS } from '../../packages/mod/hooks/session.ts'
 const now = Date.parse('2026-10-10T00:00:00Z')
 const hot = { kind: 'five_hour', percent: 80, resetsAt: '2026-10-10T05:00:00Z' }
 
@@ -75,8 +75,23 @@ test('kept is counted pings while the memo still holds; an expired cache is the 
   assert.equal(keptAlert({ pings: 2, tokens: 40000 }, { ...memo, expiresAt: now }, now), false)
 })
 
-test('dismissed hot returns at +10 points and swamp at +15 points of context, inclusively', () => {
-  assert.equal(hotAlert(hot, null), true)
+test('the context percent is measured against the compaction window when it is smaller than the model window', () => {
+  // A 1M model compacting at 400k: the band reads 40k as 10%, not 4%.
+  assert.equal(contextWindow(1_000_000, 400_000), 400_000)
+  // An override above the model window would compact after an overflow: the model window wins.
+  assert.equal(contextWindow(200_000, 400_000), 200_000)
+  assert.equal(contextWindow(1_000_000, 1_000_000), 1_000_000)
+  assert.equal(contextWindow(1_000_000, null), 1_000_000)
+  assert.equal(contextWindow(1_000_000, undefined), 1_000_000)
+  assert.equal(contextWindow(1_000_000, 0), 1_000_000)
+  // The share the band and the heavy alert read: 80% of the 400k window is 320k, not 800k.
+  const at400k = { tokens: 320_000, percent: 320_000 / 400_000 * 100, window: contextWindow(1_000_000, 400_000) }
+  assert.equal(swamped(at400k), 80)
+  assert.equal(swampAlert(swamped(at400k), null), true)
+  assert.equal(swamped({ ...at400k, tokens: 319_999, percent: 319_999 / 400_000 * 100 }), null)
+})
+
+test('dismissed hot returns at +10 points and swamp at +15 points of context, inclusively', () => {  assert.equal(hotAlert(hot, null), true)
   assert.equal(hotAlert(null, null), false)
   assert.equal(hotAlert({ ...hot, percent: 79.9 }, null), false)
   assert.equal(hotAlert({ ...hot, percent: 89.9 }, 80), false)
@@ -91,7 +106,7 @@ test('dismissed hot returns at +10 points and swamp at +15 points of context, in
 
 test('band priority is exactly panels, failure, hot, results, cold, swamp, kept, dashboard', () => {
   const all = { judgeDown: true, hot: true, result: true, cold: true, swamp: true, kept: true }
-  for (const panel of ['settings', 'compact', 'handoff', 'setup'] as const) assert.equal(bandPriority({ ...all, panel }), panel)
+  for (const panel of ['settings', 'compact', 'setup'] as const) assert.equal(bandPriority({ ...all, panel }), panel)
   assert.equal(bandPriority(all), 'judgeDown')
   assert.equal(bandPriority({ ...all, judgeDown: false }), 'hot')
   assert.equal(bandPriority({ ...all, judgeDown: false, hot: false }), 'result')

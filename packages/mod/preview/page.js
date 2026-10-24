@@ -184,6 +184,8 @@
       case 'Button':
         return button(node, t, scope, prefix)
       case 'Svg': {
+        // The app refuses an Svg whose alt is blank once trimmed and draws nothing in its place.
+        if (!String(p.alt ?? '').trim()) return document.createComment('Svg refused: blank alt')
         const img = document.createElement('img')
         img.src = 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(p.source)
         img.alt = p.alt

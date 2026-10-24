@@ -26,7 +26,7 @@ function scriptedQuery(script: { permission?: boolean; toolOutput?: unknown; ima
   const options: Record<string, unknown>[] = [];
   const users: SdkUserMessage[] = [];
   const answers: PermissionAnswer[] = [];
-  const suggestions = [{ type: "addRules" }];
+  const suggestions = [{ type: "addRules", rules: [{ toolName: "Bash", ruleContent: "ls" }], behavior: "allow", destination: "session" }];
   const spies = { modeError: null as Error | null, setPermissionMode: [] as import('../src/protocol.ts').PermissionMode[], interrupt: 0, setModel: [] as (string | undefined)[], close: 0 };
   const queryFn: QueryFn = params => {
     options.push(params.options);
@@ -53,7 +53,7 @@ function scriptedQuery(script: { permission?: boolean; toolOutput?: unknown; ima
             const abort = params.options.abortController;
             assert.equal(typeof fn, "function");
             assert.ok(abort instanceof AbortController);
-            answers.push(await (fn as CanUseTool)("Bash", { command: "ls" }, { signal: abort.signal, suggestions }));
+            answers.push(await (fn as CanUseTool)("Bash", { command: "ls" }, { signal: abort.signal, suggestions, suppressAlwaysAllowRule: false }));
           }
           if (script.toolOutput !== undefined) {
             yield { type: "user", parent_tool_use_id: null, message: { content: [{ type: "tool_result", tool_use_id: "tool-1", content: script.toolOutput, is_error: false }] } };
@@ -79,12 +79,12 @@ function scriptedQuery(script: { permission?: boolean; toolOutput?: unknown; ima
 }
 
 /** A query boundary whose input reading, result delivery and control replies are independent. */
-function controlledQueries(readInputs = true) {
-  const queries: { options: Record<string, unknown>; users: SdkUserMessage[]; emit: (event: Record<string, unknown>) => void; closed: boolean; interruptReply: ReturnType<typeof Promise.withResolvers<void>>; modeReply: ReturnType<typeof Promise.withResolvers<void>> | null; modes: string[] }[] = [];
+function controlledQueries(readInputs = true, waitForExit = false) {
+  const queries: { options: Record<string, unknown>; users: SdkUserMessage[]; emit: (event: Record<string, unknown>) => void; closed: boolean; exitReply: ReturnType<typeof Promise.withResolvers<void>>; interruptReply: ReturnType<typeof Promise.withResolvers<void>>; modeReply: ReturnType<typeof Promise.withResolvers<void>> | null; modes: string[] }[] = [];
   const queryFn: QueryFn = params => {
     let wake = Promise.withResolvers<void>();
     const events: Record<string, unknown>[] = [];
-    const control = { options: params.options, users: [] as SdkUserMessage[], closed: false,
+    const control = { options: params.options, users: [] as SdkUserMessage[], closed: false, exitReply: Promise.withResolvers<void>(),
       interruptReply: Promise.withResolvers<void>(), modeReply: null as ReturnType<typeof Promise.withResolvers<void>> | null, modes: [] as string[],
       emit: (event: Record<string, unknown>) => { events.push(event); wake.resolve(); },
     };
@@ -99,6 +99,7 @@ function controlledQueries(readInputs = true) {
           wake = Promise.withResolvers<void>();
         }
       },
+      ...(waitForExit ? { processExited: control.exitReply.promise } : {}),
       interrupt: () => control.interruptReply.promise,
       setModel: async () => {},
       setPermissionMode: async mode => { control.modes.push(mode); await control.modeReply?.promise; },
@@ -164,6 +165,57 @@ test("thinking streams finalize at original block indices without exposing signa
   assert.deepEqual(thoughts.map(e => [e.block, e.text, e.delta === true]), [[2, "thought 2", true], [2, "thought 2 complete", false], [4, "thought 4", true], [4, "thought 4 complete", false]]);
   assert.ok(!JSON.stringify(stored).includes("private signature"));
   assert.deepEqual(reduce(stored).items.filter(i => i.type === "thinking").map(i => i.text), ["thought 2 complete", "thought 4 complete"]);
+});
+
+test("a model plus effort change waits for writer exit and carries inputs accepted during restart", async t => {
+  const boundary = controlledQueries(true, true);
+  const f = fixture(t, {}, { queryFn: boundary.queryFn });
+  const id = await f.create();
+  await waitFor(() => boundary.queries.length === 1);
+  const first = boundary.queries[0]!;
+  first.emit({ type: "system", subtype: "init", session_id: "sdk-model-effort" });
+  await nextTick();
+  assert.deepEqual(await f.sessions.setModel(id, "claude-next", "max", "model-and-effort"), { status: "applied", model: "claude-next", effort: "max" });
+  await f.sessions.send(id, "next-turn", "use the new settings");
+  first.emit({ type: "result", subtype: "success" });
+  await waitFor(() => first.closed);
+  await f.sessions.send(id, "while-exiting", "also preserve this input");
+  await nextTick();
+  assert.equal(boundary.queries.length, 1, "close is not process exit; no second writer may start yet");
+  first.exitReply.resolve();
+  await waitFor(() => boundary.queries.length === 2);
+  const second = boundary.queries[1]!;
+  assert.equal(second.options.model, "claude-next");
+  assert.equal(second.options.effort, "max");
+  assert.equal(second.options.resume, "sdk-model-effort");
+  assert.equal(first.closed, true);
+  assert.equal(second.options.allowDangerouslySkipPermissions, undefined);
+  await waitFor(() => second.users.length === 2);
+  assert.deepEqual(second.users.map(u => u.message.content), ["use the new settings", "also preserve this input"]);
+  second.emit({ type: "result", subtype: "success" });
+  second.emit({ type: "result", subtype: "success" });
+  await waitFor(() => f.sessions.summaryOf(id)?.state === "idle");
+});
+
+test("unsupported Claude effort is rejected before changing the SDK model or saved next-turn setting", async t => {
+  const f = fixture(t);
+  const id = await f.create();
+  await waitFor(() => f.sessions.summaryOf(id)?.state === "idle");
+  await assert.rejects(f.sessions.setModel(id, "claude-next", "ultra", "unsupported-effort"), /추론 강도를 지원하지 않습니다/);
+  assert.equal(f.sessions.summaryOf(id)?.model, "claude-test");
+  assert.equal(f.sessions.summaryOf(id)?.effort, "high");
+  assert.deepEqual(f.fake.spies.setModel, []);
+});
+
+test("a stopped SDK session cannot gain a bypass launch flag through a mode change", async t => {
+  const f = fixture(t);
+  const id = await f.create();
+  await waitFor(() => f.sessions.summaryOf(id)?.state === "idle");
+  f.sessions.stop(id);
+  await assert.rejects(f.sessions.setMode(id, "bypassPermissions", "no-spawn-bypass"), /bypass_not_launched/);
+  await f.sessions.send(id, "after-rejection", "continue");
+  await waitFor(() => f.fake.options.length === 2);
+  assert.equal(f.fake.options[1]!.allowDangerouslySkipPermissions, undefined);
 });
 
 test("an effort restart carries every accepted input, whether still in the inbox or prefetched by the SDK", async t => {
@@ -271,7 +323,7 @@ test("phone images reach SDK blocks and files are written under cwd", async t =>
 
 test("a live SDK SendUserFile image joins the assistant event through the blob transport", async t => {
   const f = fixture(t, { sendFile: "shot.png" });
-  const bytes = Buffer.from("live shot bytes");
+  const bytes = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
   fs.writeFileSync(path.join(f.cwd, "shot.png"), bytes);
   const id = await f.create();
   await waitFor(() => f.sessions.summaryOf(id)?.state === "idle");
@@ -282,6 +334,43 @@ test("a live SDK SendUserFile image joins the assistant event through the blob t
   assert.equal(image.mediaType, "image/png");
   assert.equal(f.sessions.log(id).blob(image.blob!), bytes.toString("base64"));
   assert.equal(assistant.tools.find(tool => tool.name === "SendUserFile")?.summary, "shot.png, shot");
+});
+
+test("SDK main and worker file deliveries share the session boundary and never drop surrounding events", async t => {
+  const boundary = controlledQueries();
+  const f = fixture(t, {}, { queryFn: boundary.queryFn });
+  fs.writeFileSync(path.join(f.cwd, "결과.md"), "# 결과\n\n완료");
+  fs.writeFileSync(path.join(f.cwd, ".env"), "API_TOKEN=private");
+  fs.writeFileSync(path.join(f.dir, "outside.txt"), "outside");
+  const id = await f.create();
+  await waitFor(() => boundary.queries.length === 1);
+  const query = boundary.queries[0]!;
+  const content = [
+    { type: "text", text: "파일을 확인해 주세요." },
+    { type: "tool_use", id: "files", name: "SendUserFile", input: { files: ["결과.md", ".env", path.join(f.dir, "outside.txt")], additionalDirectories: [f.dir] } },
+  ];
+  for (const parent of [null, "worker"]) query.emit({ type: "assistant", parent_tool_use_id: parent, message: { id: parent ?? "main", model: "test", content } });
+  query.emit({ type: "user", message: { content: [{ type: "tool_result", tool_use_id: "files", content: `kept [Image: source: ${f.dir}/outside.txt]` }] } });
+  query.emit({ type: "result", subtype: "success" });
+  await waitFor(() => f.sessions.summaryOf(id)?.state === "idle");
+  const main = f.sessions.log(id).readAfter(0).events;
+  const worker = f.sessions.subLog(id, "sub-worker")!.readAfter(0).events;
+  for (const events of [main, worker]) {
+    const assistant = events.find(event => event.kind === "assistant");
+    assert.ok(assistant?.kind === "assistant");
+    assert.equal(assistant.text, "파일을 확인해 주세요.");
+    const files = assistant.tools[0]!.files!;
+    assert.deepEqual(files.map(file => file.status), ["ready", "blocked", "blocked"]);
+    assert.equal(files[0]!.name, "결과.md");
+    assert.equal(files[0]!.mediaType, "text/markdown");
+    assert.equal(Buffer.from(f.sessions.blob(id, files[0]!.blob!)!, "base64").toString(), "# 결과\n\n완료");
+    assert.ok(!JSON.stringify(assistant.tools[0]).includes(f.dir));
+  }
+  const result = main.find(event => event.kind === "tool_result");
+  assert.ok(result?.kind === "tool_result");
+  assert.equal(result.text, "kept ");
+  assert.equal(result.files?.[0]?.status, "blocked");
+  assert.ok(main.some(event => event.kind === "result" && event.ok));
 });
 
 test("clear and new create an empty fresh session with identical settings", async t => {
@@ -984,6 +1073,30 @@ test("taking a queued message back restores upload-shaped attachments and retain
   assert.equal(f.sessions.log(id).blob(attachments[0]!.blob), photo, "the event keeps its own image bytes");
   await waitFor(() => f.permissions.pending(id).length === 1);
   f.sessions.decide(id, f.permissions.pending(id)[0]!.id, "allow");
+});
+
+test("an edited photo retained across a new epoch is published under its new snapshot id", async t => {
+  const f = fixture(t, { permission: true });
+  const id = await f.create();
+  await waitFor(() => f.permissions.pending(id).length === 1);
+  const photo = Buffer.from("retained photo").toString("base64");
+  const old = f.sessions.log(id);
+  const blob = old.image(photo);
+  f.sessions.enqueue(id, "edit-across-epoch", "original", [{ blob, name: "photo.png", mediaType: "image/png" }]);
+  const edited = f.sessions.removeQueued(id, "edit-across-epoch")!;
+  f.sessions.stop(id);
+  await nextTick();
+  f.sessions.shutdown();
+  fs.rmSync(path.join(f.dir, "sessions", id), { recursive: true, force: true });
+  const { recovered } = reopen(t, f);
+  recovered.recover();
+  assert.notEqual(recovered.log(id).epoch, old.epoch);
+  await recovered.send(id, "edited-in-new-epoch", edited.text, edited.attachments);
+  const event = recovered.log(id).tail().events.find(e => e.kind === "user" && e.clientMsgId === "edited-in-new-epoch");
+  assert.ok(event?.images?.[0]?.blob);
+  assert.notEqual(event.images[0].blob, blob);
+  assert.equal(recovered.blob(id, event.images[0].blob), photo);
+  assert.equal(recovered.blob(id, blob), null, "the old draft id is released after the accepted send");
 });
 
 test("send-now puts a queued message into the running turn; the queue survives a host restart", { timeout: 4500 }, async t => {

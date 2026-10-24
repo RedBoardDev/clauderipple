@@ -89,6 +89,26 @@ test("the authorize URL carries a PKCE challenge, and the loopback callback comp
   fs.rmSync(home, { recursive: true, force: true });
 });
 
+test("a cancel that arrives while the callback's code is being exchanged does not lose the sign-in", async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "cr-claude-oauth-"));
+  const port = await freePort();
+  let release!: () => void;
+  const held = new Promise<void>((r) => { release = r; });
+  const endpoint = tokenEndpoint();
+  const slow = async (url: string, init: RequestInit): Promise<Response> => { await held; return endpoint.fetchImpl(url, init); };
+  const session = new ClaudeOAuthSession({ home, port, fetch: slow });
+  const state = new URL((await session.start()).url).searchParams.get("state")!;
+
+  const page = await fetch(`http://127.0.0.1:${port}${CLAUDE_OAUTH.callbackPath}?code=the-code&state=${state}`);
+  assert.equal(page.status, 200, "the browser is told it is connected before the exchange ends");
+  session.cancel(); // the dashboard dialog closed meanwhile
+  release();
+  await session.result;
+  assert.equal(session.snapshot.ok, true);
+  assert.equal(readClaudeAccountsFile(home).length, 1, "the account is saved");
+  fs.rmSync(home, { recursive: true, force: true });
+});
+
 test("a taken preferred port falls back to a random loopback port before manual mode", async () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "cr-claude-oauth-"));
   const taken = net.createServer();

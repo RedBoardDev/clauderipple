@@ -54,23 +54,24 @@ test('the default ladder runs each rung at its own effort, whatever effort the j
   assert.deepEqual(pick(DEFAULTS, v('standard', { domain: 'design' })).target, { agent: 'gpt-6-1-sol' })
 })
 
-test('unavailable: one rung up, else the session model; never down', () => {
+test('unavailable: one rung up, else nothing (never the session model); never down', () => {
   const ladder = (rungs: unknown) => normalizeSettings({ ...DEFAULTS, rules: { general: { mode: 'ladder', rungs } } })
   const sol = { agent: 'gpt-6-1-sol' }, astra = { agent: 'gpt-6-astra' }, opus = { agent: 'general-purpose', model: 'opus' }, sonnet = { agent: 'general-purpose', model: 'sonnet' }
   // ChatGPT out of quota: one rung up, at that rung's effort.
   const up = pick(ladder({ standard: { target: sol, effort: 'medium' }, hard: { target: opus, effort: 'high' } }), v('standard'), false)
   assert.deepEqual([up.target, up.effort, up.rung], [opus, 'high', 'hard'])
   assert.match(up.fallbackReason ?? '', /ChatGPT/)
-  // Nothing up there either: the session model, at the wanted rung's effort.
+  // Nothing up there either: no target, the reasons kept for the refusal.
   const none = pick(ladder({ standard: { target: sol, effort: 'low' }, hard: { target: astra, effort: 'high' }, plan: { target: opus, effort: 'high' } }), v('standard'), false)
-  assert.deepEqual([none.target, none.effort], [{ agent: 'general-purpose' }, 'low'])
+  assert.deepEqual([none.target, none.effort], [undefined, 'low'])
+  assert.match(none.fallbackReason ?? '', /ChatGPT/)
   // Only one rung up: Light's trouble never reaches Plan's Opus.
   const one = pick(ladder({ light: { target: { agent: 'gone' }, effort: 'low' }, standard: { target: sol, effort: 'medium' }, plan: { target: opus, effort: 'high' } }), v('light'), false)
-  assert.deepEqual(one.target, { agent: 'general-purpose' })
+  assert.equal(one.target, undefined)
   assert.match(one.fallbackReason ?? '', /gone is not installed/)
-  // Never down: Hard out, Light free, still the session model.
+  // Never down: Hard out, Light free, still nothing.
   const down = pick(ladder({ light: { target: sonnet, effort: 'low' }, hard: { target: astra, effort: 'high' } }), v('deep'), false)
-  assert.deepEqual(down.target, { agent: 'general-purpose' })
+  assert.equal(down.target, undefined)
   // An empty rung says so and moves up.
   const empty = pick(ladder({ standard: { target: sol, effort: 'medium' } }), v('light'))
   assert.deepEqual([empty.target, empty.rung], [sol, 'standard'])
@@ -241,4 +242,46 @@ test('ordered lists skip missing, disabled, unticked and exhausted entries befor
   assert.equal(onlyOpus.skipped?.length, 4)
   s.rules.general.rungs.light!.reverse()
   assert.deepEqual(ladderPick(v('light'), s.rules.general, s, candidates, true, 'en').target, sonnet)
+})
+
+test('a spent quota group skips only its own models: the same provider still runs the others', async () => {
+  const { liveProviders } = await import('../../packages/mod/hooks/workers.ts')
+  // The owner's 2026-10-23 ladder: Standard opens on Antigravity's Opus, then Antigravity's Gemini.
+  const opus = { target: { agent: 'claude-opus-5-5-medium' }, model: 'claude-opus-5-5-medium', provider: 'google-gemini' }
+  const flash = { target: { agent: 'gemini-3-8-flash' }, model: 'gemini-3.8-flash', provider: 'google-gemini' }
+  const workers = [opus, flash, ...candidates]
+  const s = normalizeSettings({ rules: { general: { mode: 'ladder', rungs: { standard: [{ target: opus.target, effort: 'medium' }, { target: flash.target, effort: 'high' }] } } } })
+  const raw = { agents: [
+    { name: 'claude-opus-5-5-medium', model: 'claude-opus-5-5-medium', provider: 'google-gemini', efforts: ['medium'], billing: 'subscription' },
+    { name: 'gemini-3-8-flash', model: 'gemini-3.8-flash', provider: 'google-gemini', efforts: ['high'], billing: 'subscription' },
+  ], providers: [
+    { name: 'google-gemini', usable: true, models: { 'claude-opus-5-5-medium': { reason: 'quota_exhausted', exhaustedUntil: 1_800_000 }, junk: null } },
+  ] }
+  const options = ladderOptionsFrom(raw, 600_000)
+  assert.deepEqual(options.providers?.['google-gemini'], { usable: true, models: { 'claude-opus-5-5-medium': { reason: 'quota_exhausted', exhaustedUntil: 1_800_000 } } })
+  assert.deepEqual(options.choices.filter(c => c.provider === 'google-gemini').map(c => c.target.agent), ['gemini-3-8-flash'], 'the spent model is not offered to a fill')
+  const result = ladderPick(v('standard'), s.rules.general, s, workers, true, 'ko', [], options.providers)
+  assert.deepEqual([result.target, result.effort, result.position], [flash.target, 'high', 2])
+  assert.deepEqual(result.skipped, [{ rung: 'standard', position: 1, model: 'claude-opus-5-5-medium', reason: 'google-gemini: 사용량 한도 소진' }])
+  assert.equal(candidateUsable(opus, s, true, options.providers), false)
+  assert.equal(candidateUsable(flash, s, true, options.providers), true)
+  // Past its stated reset the model is back, even from a cached catalogue.
+  const later = liveProviders(options.providers!, 1_800_000)
+  assert.deepEqual(later['google-gemini'], { usable: true })
+  assert.equal(ladderPick(v('standard'), s.rules.general, s, workers, true, 'ko', [], later).target?.agent, 'claude-opus-5-5-medium')
+})
+
+test('a spent model stays skipped when the rung names it with an effort suffix', () => {
+  // The re-review's repro: gemini-3.8-flash out, a rung of gemini-3.8-flash@high still picked with nothing skipped.
+  const flashHigh = { target: { agent: 'gemini-3-8-flash-high' }, model: 'gemini-3.8-flash@high', provider: 'google-gemini' }
+  const astra = candidates.find(c => c.model === 'gpt-6-astra')!
+  const s = normalizeSettings({ rules: { general: { mode: 'ladder', rungs: { standard: [{ target: flashHigh.target, effort: 'high' }, { target: astra.target, effort: 'high' }] } } } })
+  const providers = { 'google-gemini': { usable: true, models: { 'gemini-3.8-flash': { reason: 'quota_exhausted', exhaustedUntil: 1_800_000 } } } }
+  assert.equal(candidateUsable(flashHigh, s, true, providers), false)
+  const result = ladderPick(v('standard'), s.rules.general, s, [flashHigh, ...candidates], true, 'ko', [], providers)
+  assert.deepEqual([result.target, result.position], [astra.target, 2])
+  assert.deepEqual(result.skipped, [{ rung: 'standard', position: 1, model: 'gemini-3.8-flash@high', reason: 'google-gemini: 사용량 한도 소진' }])
+  // A general-purpose rung naming the model with its effort is looked up the same way.
+  const gp = { target: { agent: 'general-purpose', model: 'gemini-3.8-flash@high' }, model: 'gemini-3.8-flash@high', provider: 'google-gemini' }
+  assert.equal(candidateUsable(gp, s, true, providers), false)
 })

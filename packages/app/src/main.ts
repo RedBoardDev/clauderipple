@@ -14,7 +14,7 @@ import os from "node:os";
 import path from "node:path";
 
 import { claudeStartedAt, reopenClaude } from "./claude-desktop";
-import { readUpdateSeen, rememberUpdate, updateNotice, type RouterUpdate, type UpdateSeen } from "./update-model";
+import { readUpdateSeen, rememberUpdate, updateNotice, TrayReplacement, type RouterUpdate, type UpdateSeen } from "./update-model";
 import { handleScheme, ORIGIN, registerScheme } from "./protocol";
 import { parseJsonOutput, repairDetails, restartStillOwed, shouldNotifyDown, tailLines, trayState, type Action, type ActionResult, type AppState, type Busy, type DirectOutput, type Doctor, type RepairOutput } from "./status-model";
 import { mainWindow, openWindow, sendToWindow, windowVisible, type Bounds } from "./window";
@@ -1154,6 +1154,7 @@ const UPDATE_CHECK_MS = 12 * 60 * 60 * 1000;
 let routerUpdateUntil = 0;
 let updateNotification: Notification | null = null;
 let updateSeen: UpdateSeen | undefined;
+const trayReplacement = new TrayReplacement();
 const updateSeenFile = path.join(home, "update-notifications.json");
 
 function loadUpdateSeen(): UpdateSeen {
@@ -1166,11 +1167,13 @@ function loadUpdateSeen(): UpdateSeen {
 
 async function relaunchTray(): Promise<void> {
   app.releaseSingleInstanceLock();
-  const result = await runCliResult(["tray"]);
-  if (!result.ok) {
-    // Keep a functioning tray if its replacement could not start.
+  try {
+    const result = await runCliResult(["tray"], 30_000);
+    if (!result.ok) throw new Error(result.output || "could not relaunch tray");
+  } catch (error) {
+    // Keep a functioning tray if its replacement could not start, including spawn/timeout failures.
     if (!app.requestSingleInstanceLock()) app.quit();
-    throw new Error(result.output || "could not relaunch tray");
+    throw error;
   }
   app.quit();
 }
@@ -1181,8 +1184,11 @@ async function handleRouterUpdate(status: Status): Promise<void> {
   if (updating) return;
   updateSeen ??= loadUpdateSeen();
   const notice = updateNotice(status.version, app.getVersion(), status.autoUpdate, updateSeen);
-  if (!notice) return;
-  // Memory dedup is immediate; disk dedup must succeed before a relaunch to avoid restart loops.
+  if (!notice) {
+    await replaceUpdatedTray(status);
+    return;
+  }
+  // Notification delivery history is independent of replacement success.
   updateSeen = rememberUpdate(updateSeen, notice);
   fs.mkdirSync(home, { recursive: true });
   const tmp = `${updateSeenFile}.${process.pid}.tmp`;
@@ -1206,10 +1212,14 @@ async function handleRouterUpdate(status: Status): Promise<void> {
     updateNotification = new Notification({ title: "ClaudeRipple", body: L.autoUpdated(notice.version), icon: notifyIcon() });
     updateNotification.show();
   }
-  if (notice.relaunch) {
+  await replaceUpdatedTray(status);
+}
+
+async function replaceUpdatedTray(status: Status): Promise<void> {
+  await trayReplacement.reconcile(status.version, app.getVersion(), status.autoUpdate, async () => {
     updating = true;
     try { await relaunchTray(); } finally { updating = false; }
-  }
+  });
 }
 
 async function checkForUpdate(): Promise<UpdateCheck | null> {
@@ -1370,6 +1380,7 @@ function render(): void {
     { label: headline, click: () => void openDashboard() },
     ...(detail ? [{ label: detail, click: () => void openDashboard() } as Electron.MenuItemConstructorOptions] : []),
     ...claudeLines,
+    ...(s?.autoUpdate?.hostUpdate?.status === "pending" ? [{ label: "호스트 적용 대기", click: () => void openDashboard() }] : []),
     ...(availableUpdate
       ? [{ label: updating ? L.updating(availableUpdate.latest ?? "") : L.updateAvailableItem(availableUpdate.latest ?? ""), enabled: !updating, click: () => void offerUpdate(availableUpdate!) } as Electron.MenuItemConstructorOptions]
       : []),

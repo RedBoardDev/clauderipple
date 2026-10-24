@@ -90,11 +90,31 @@ test('only the general ladder survives loading: Auto is a ladder to fill, field 
   assert.deepEqual(normalizeSettings({ allow: ['gpt-6-1-sol', 'gpt-6-1-sol', 3], rules: { general: { mode: 'auto', allow: ['ignored'] } } }).allow, ['gpt-6-1-sol'])
 })
 test('unrelated valid settings survive and invalid values retain defaults', () => {
-  const s = normalizeSettings({ effortAuto: false, judge: 'jev', judgeModel: ' custom ', bias: 2, floor: 'max', ceiling: 'low', agentAuto: 'all', keepWarmHours: 8, handoffSkill: ' /handoff ', hide: ['route', 'bogus', 'timer', 'route', 4], fallback: { agent: 'custom', model: ' opus ' } })
-  assert.equal(s.effortAuto, false); assert.equal(s.judgeModel, 'custom'); assert.equal(s.handoffSkill, 'handoff')
+  const s = normalizeSettings({ effortAuto: false, judge: 'jev', judgeModel: ' custom ', bias: 2, floor: 'max', ceiling: 'low', agentAuto: 'all', keepWarmHours: 8, hide: ['route', 'bogus', 'timer', 'route', 4], fallback: { agent: 'custom', model: ' opus ' } })
+  assert.equal(s.effortAuto, false); assert.equal(s.judgeModel, 'custom')
   assert.deepEqual(s.hide, ['route', 'timer']); assert.deepEqual(s.fallback, { agent: 'custom', model: 'opus' })
   assert.deepEqual(normalizeSettings({ bias: '2', jevSource: 'bad', rules: [], providers: [], autoTieBand: -1 }), DEFAULTS)
-  for (const n of [-1, 101, NaN, Infinity]) assert.equal(normalizeSettings({ swampAt: n }).swampAt, 50)
+})
+
+test('the compaction model migrates from compactWith and an unknown old choice keeps Haiku', () => {
+  // The old two-way choice: haiku meant the code's Haiku id, session the engine's compactor.
+  assert.equal(normalizeSettings({ compactWith: 'haiku' }).compactModel, 'claude-haiku-5-5')
+  assert.equal(normalizeSettings({ compactWith: 'session' }).compactModel, 'session')
+  // Anything else stored in its place falls back to the default, Haiku.
+  assert.equal(normalizeSettings({ compactWith: 'opus' }).compactModel, 'claude-haiku-5-5')
+  assert.equal(normalizeSettings({ compactWith: 3 }).compactModel, 'claude-haiku-5-5')
+  assert.equal(normalizeSettings({}).compactModel, 'claude-haiku-5-5')
+  // A stored model id (Claude or a router id, with an optional effort) survives as written.
+  assert.equal(normalizeSettings({ compactModel: ' gpt-6.1-sol@high ' }).compactModel, 'gpt-6.1-sol@high')
+  assert.equal(normalizeSettings({ compactModel: 'claude-opus-5-5' }).compactModel, 'claude-opus-5-5')
+  // A successful migration is a real value: a later save no longer carries compactWith.
+  assert.equal(Object.hasOwn(normalizeSettings({ compactWith: 'session' }), 'compactWith'), false)
+})
+
+test('a stored settings file that still names handoff settings loads without them', () => {
+  const s = normalizeSettings({ effortAuto: true, handoffSkill: ' /handoff ', handoffAfter: 'copy', handoffButton: 'always' })
+  for (const key of ['handoffSkill', 'handoffAfter', 'handoffButton']) assert.equal(Object.hasOwn(s, key), false, key)
+  assert.deepEqual(s, normalizeSettings(null))
 })
 test('allow-lists name workers; provider names from old settings migrate to that provider\'s workers', async () => {
   const { allowedWorkers, migrateAllow, toggleAllow } = await import('../../packages/mod/hooks/settings.ts')
@@ -163,31 +183,32 @@ test('stored settings that still held Auto or a field rule say so, once; the des
   assert.equal(hadRetiredRouting(normalizeSettings({ rules: { general: { mode: 'auto', allow: [] }, backend: { mode: 'auto', allow: [] } } })), false)
 })
 
-test('a domain ladder folds into two levels: light work is the light rung, heavy work standard to plan', () => {
+test('a domain ladder folds into two levels: light work is light and standard, heavy work hard and plan', () => {
   const light: Step[] = [{ target: { agent: 'light' }, effort: 'low' }]
   const standard: Step[] = [{ target: { agent: 'standard' }, effort: 'medium' }]
   const hard: Step[] = [{ target: { agent: 'hard' }, effort: 'high' }]
   const plan: Step[] = [{ target: { agent: 'plan' }, effort: 'high' }]
-  // Light keeps its own list; plan's list is heavy work's, ordinary (standard) work included.
-  assert.deepEqual(twoLevelRungs({ light, standard, hard, plan }), { light, standard: plan, hard: plan, plan })
+  // Light's list is light work's, ordinary (standard) work included; plan's list is heavy work's.
+  assert.deepEqual(twoLevelRungs({ light, standard, hard, plan }), { light, standard: light, hard: plan, plan })
   // Heavy falls back plan → hard → standard → light; light falls back to standard.
-  assert.deepEqual(twoLevelRungs({ light, hard }), { light, standard: hard, hard, plan: hard })
+  assert.deepEqual(twoLevelRungs({ light, hard }), { light, standard: light, hard, plan: hard })
   assert.deepEqual(twoLevelRungs({ standard }), { light: standard, standard, hard: standard, plan: standard })
   assert.deepEqual(twoLevelRungs({ light }), { light, standard: light, hard: light, plan: light })
   assert.deepEqual(twoLevelRungs({}), {})
-  // The two-row settings stored before 2026-10-22 (light = standard = Sonnet, hard = plan = Opus) now
-  // send ordinary work to Opus, as the owner meant them.
+  // Rows stored under the 2026-10-22 split (standard in heavy work) read with standard on light
+  // work's Sonnet again; rows stored before it read as they were.
   const sonnet: Step[] = [{ target: { agent: 'general-purpose', model: 'sonnet' }, effort: 'high' }]
   const opus: Step[] = [{ target: { agent: 'general-purpose', model: 'opus' }, effort: 'high' }]
-  assert.deepEqual(twoLevelRungs({ light: sonnet, standard: sonnet, hard: opus, plan: opus }), { light: sonnet, standard: opus, hard: opus, plan: opus })
+  assert.deepEqual(twoLevelRungs({ light: sonnet, standard: opus, hard: opus, plan: opus }), { light: sonnet, standard: sonnet, hard: opus, plan: opus })
+  assert.deepEqual(twoLevelRungs({ light: sonnet, standard: sonnet, hard: opus, plan: opus }), { light: sonnet, standard: sonnet, hard: opus, plan: opus })
   // Folding twice changes nothing.
   const once = twoLevelRungs({ light, standard, hard, plan })
   assert.deepEqual(twoLevelRungs(once), once)
   // The lists are copies, not aliases: editing one rung never touches another.
   const folded = twoLevelRungs({ light, standard })
   folded.standard![0]!.target.agent = 'changed'
-  assert.equal(folded.hard![0]!.target.agent, 'standard')
-  assert.equal(standard[0]!.target.agent, 'standard')
+  assert.equal(folded.light![0]!.target.agent, 'light')
+  assert.equal(light[0]!.target.agent, 'light')
 })
 
 test('optional domain ladders normalize independently, round-trip and never count as retired routing', () => {
@@ -195,10 +216,12 @@ test('optional domain ladders normalize independently, round-trip and never coun
     ui: { mode: 'ladder', rungs: { light: [{ target: { agent: ' ui ' }, effort: 'bad' }, null, { effort: 'high' }], standard: { target: { agent: 'second' }, effort: 'high' } } },
     backend: { mode: 'ladder', rungs: {} }, docs: { mode: 'ladder', rungs: {} },
   } })
-  // The domain ladder is folded on the way in: light keeps its own list, standard's is heavy work's.
+  // The domain ladder is folded on the way in: light's list is light work's, and with nothing above
+  // it standard's is heavy work's.
   const second = [{ target: { agent: 'second' }, effort: 'high' }]
+  const first = [{ target: { agent: 'ui' }, effort: 'low' }]
   assert.deepEqual(s.domainRules, {
-    ui: { mode: 'ladder', rungs: { light: [{ target: { agent: 'ui' }, effort: 'low' }], standard: second, hard: second, plan: second } },
+    ui: { mode: 'ladder', rungs: { light: first, standard: first, hard: second, plan: second } },
     backend: { mode: 'ladder', rungs: {} },
   })
   assert.deepEqual(normalizeSettings(JSON.parse(JSON.stringify(s))), s)
@@ -233,6 +256,7 @@ test('normalization folds the domain ladders only: the general ladder keeps its 
 test('the heavy-context band and optional chips are off unless switched on', () => {
   assert.equal(DEFAULTS.swampAlert, false)
   assert.deepEqual(DEFAULTS.extras, [])
-  assert.equal(normalizeSettings({ swampAt: 50 }).swampAlert, false)
-  assert.deepEqual(normalizeSettings({ swampAlert: true, extras: ['context', 'bogus', 'context'] }), { ...DEFAULTS, swampAlert: true, extras: ['context'] })
+  // The dashboard's old heavy line (swampAt) is gone: stored values are dropped without a word.
+  assert.equal(Object.hasOwn(normalizeSettings({ swampAt: 50 }), 'swampAt'), false)
+  assert.deepEqual(normalizeSettings({ swampAlert: true, swampAt: 70, extras: ['context', 'bogus', 'context'] }), { ...DEFAULTS, swampAlert: true, extras: ['context'] })
 })

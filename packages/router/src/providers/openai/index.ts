@@ -6,7 +6,7 @@ import http from "node:http";
 import type { OpenAiCompatibleProvider } from "../../config.ts";
 import type { Logger } from "../../log.ts";
 import type { RequestUsage } from "../../requestlog.ts";
-import { providerExhaustion, type ProviderExhaustion } from "../../health.ts";
+import { exhaustionHeaders, providerExhaustion, type ProviderExhaustion } from "../../health.ts";
 import { retryAfterMs } from "../../pool.ts";
 import { credentialHeaderValues, redactErrorText } from "../../redact.ts";
 import { SseParser } from "../chatgpt/sse.ts";
@@ -269,8 +269,10 @@ export class OpenAiCompatibleAdapter {
       const out = mapHttpError(upstream.status, text, label, this.hooks.authHint, redact);
       this.log.warn(`${this.tag} ${this.name}: upstream ${upstream.status} for ${model}: ${safeText.slice(0, 400)}`);
       res.off("close", onClose);
-      res.writeHead(out.status, { "content-type": "application/json", "content-length": String(Buffer.byteLength(out.body)) }).end(out.body);
-      return { upstreamStatus: upstream.status, retryAfterMs: retryAfterMs(Object.fromEntries(upstream.headers)), errorBody: safeText, status: out.status, bytes: Buffer.byteLength(out.body), note: `upstream ${upstream.status}`, exhaustion: providerExhaustion(upstream.status, text, retryAfterMs(Object.fromEntries(upstream.headers))) };
+      // A definite exhaustion is answered as such: the client must not retry it (#89).
+      const exhaustion = providerExhaustion(upstream.status, text, retryAfterMs(Object.fromEntries(upstream.headers)));
+      res.writeHead(out.status, { "content-type": "application/json", "content-length": String(Buffer.byteLength(out.body)), ...(exhaustion ? exhaustionHeaders(exhaustion) : {}) }).end(out.body);
+      return { upstreamStatus: upstream.status, retryAfterMs: retryAfterMs(Object.fromEntries(upstream.headers)), errorBody: safeText, status: out.status, bytes: Buffer.byteLength(out.body), note: `upstream ${upstream.status}`, exhaustion };
     }
 
     const wantStream = json.stream === true;
@@ -325,12 +327,13 @@ export class OpenAiCompatibleAdapter {
 
     const failure = mapper.failure;
     const failedStatus = failureStatus(failure);
+    const exhaustion = failure ? providerExhaustion(429, `${failure.code ?? ""} ${failure.message}`, retryAfterMs(Object.fromEntries(upstream.headers))) : undefined;
     if (!wantStream) {
       // A failed turn is an error here too: answering it as a 200 with whatever content had
       // arrived is the same silent truncation the stream path used to commit.
       const body = failure ? anthropicError(failedStatus, failure.type, failure.message).body : JSON.stringify(mapper.message());
       bytes = Buffer.byteLength(body);
-      res.writeHead(failure ? failedStatus : 200, { "content-type": "application/json", "content-length": String(bytes) }).end(body);
+      res.writeHead(failure ? failedStatus : 200, { "content-type": "application/json", "content-length": String(bytes), ...(exhaustion && failedStatus === 429 ? exhaustionHeaders(exhaustion) : {}) }).end(body);
     } else if (!res.writableEnded) {
       res.end();
     }
@@ -338,7 +341,7 @@ export class OpenAiCompatibleAdapter {
     return {
       // A stream has already sent 200; the record still says the turn failed.
       status: failure ? failedStatus : 200,
-      exhaustion: failure ? providerExhaustion(429, `${failure.code ?? ""} ${failure.message}`, retryAfterMs(Object.fromEntries(upstream.headers))) : undefined,
+      exhaustion,
       bytes,
       note: failure
         ? `${wantStream ? "mid-stream " : ""}${failure.type}: ${failure.message} (in=${usage.input_tokens} cached=${usage.cache_read_input_tokens} out=${usage.output_tokens} replayed=${carried.replayed} reasoning=${mapper.reasoningCount})`

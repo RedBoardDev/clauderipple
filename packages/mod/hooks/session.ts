@@ -138,11 +138,25 @@ export function saveUntil(hot: Hot | null, now: number): number {
   return Number.isFinite(reset) && reset > now ? reset : now + 5 * 3600000
 }
 
-/** The context percent when it is at or past `swampAt`, else null. */
-export function swamped(context: SessionContextUsage | null, swampAt: number): number | null {
+/** The context share at which the heavy band turns amber, and its alert opens (a fixed 80%). */
+export const HEAVY_PERCENT = 80
+
+/**
+ * The context percent when it is at or past `HEAVY_PERCENT`, else null. The context atom's percent
+ * is already measured against the compaction window (register.tsx `refreshUsage`).
+ */
+export function swamped(context: SessionContextUsage | null, at: number = HEAVY_PERCENT): number | null {
   if (!context || context.tokens === undefined) return null
   const percent = context.percent ?? (context.window > 0 ? context.tokens / context.window * 100 : undefined)
-  return percent !== undefined && percent >= swampAt ? percent : null
+  return percent !== undefined && percent >= at ? percent : null
+}
+
+/**
+ * The window the context share is measured against: Claude Code's own compaction point
+ * (`autoCompactWindow`) while it is below the model's window, else the model's window.
+ */
+export function contextWindow(window: number, compactAt: number | null | undefined): number {
+  return compactAt !== null && compactAt !== undefined && compactAt > 0 && compactAt < window ? compactAt : window
 }
 
 export function coldAlert(memo: CacheMemo | null, contextTokens: number, now: number, hidden: boolean): boolean {
@@ -188,9 +202,9 @@ export function swampAlert(percent: number | null, hidden: number | null): boole
 
 /** Rendering consumes eligibility, keeping dismissal and idle decisions outside drawing code. */
 export function bandPriority(state: {
-  panel?: 'settings' | 'compact' | 'clear' | 'handoff' | 'setup' | null
+  panel?: 'settings' | 'compact' | 'clear' | 'setup' | null
   judgeDown?: boolean; hot?: boolean; result?: boolean; cold?: boolean; swamp?: boolean; kept?: boolean
-}): 'settings' | 'compact' | 'clear' | 'handoff' | 'setup' | 'judgeDown' | 'hot' | 'result' | 'cold' | 'swamp' | 'kept' | 'dashboard' {
+}): 'settings' | 'compact' | 'clear' | 'setup' | 'judgeDown' | 'hot' | 'result' | 'cold' | 'swamp' | 'kept' | 'dashboard' {
   if (state.panel) return state.panel
   for (const band of ['judgeDown', 'hot', 'result', 'cold', 'swamp', 'kept'] as const) if (state[band]) return band
   return 'dashboard'

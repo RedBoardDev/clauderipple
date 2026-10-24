@@ -2,6 +2,7 @@
 export type RouterUpdate = {
   enabled?: boolean;
   running?: boolean;
+  hostUpdate?: { version: string; status: "pending" | "applied" | "skipped"; error?: string };
   kind?: string;
   available?: string;
   lastUpdatedFrom?: string;
@@ -34,6 +35,30 @@ export function updateNotice(routerVersion: string, trayVersion: string, state: 
   }
   return null;
 }
+/** Replacement completion is not notification history. Failed launches back off, even on the same target. */
+export class TrayReplacement {
+  private active = false;
+  private target = "";
+  private completed = "";
+  private retryAt = 0;
+  private failures = 0;
+  private now: () => number;
+  constructor(now: () => number = Date.now) { this.now = now; }
+
+  async reconcile(routerVersion: string, trayVersion: string, state: RouterUpdate | undefined, replace: () => Promise<void>): Promise<void> {
+    const notice = updateNotice(routerVersion, trayVersion, state, { updated: [], available: [] });
+    if (notice?.kind !== "updated" || !notice.relaunch || this.active || this.completed === routerVersion) return;
+    if (this.target !== routerVersion) { this.target = routerVersion; this.retryAt = 0; this.failures = 0; }
+    if (this.now() < this.retryAt) return;
+    this.active = true;
+    try { await replace(); this.completed = routerVersion; }
+    catch (error) {
+      this.retryAt = this.now() + Math.min(15 * 60_000, 60_000 * 2 ** this.failures++);
+      throw error;
+    } finally { this.active = false; }
+  }
+}
+
 export function rememberUpdate(seen: UpdateSeen, notice: UpdateNotice): UpdateSeen {
   return { ...seen, [notice.kind]: [...new Set([...seen[notice.kind], notice.version])] };
 }

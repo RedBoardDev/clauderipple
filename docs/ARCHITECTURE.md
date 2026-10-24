@@ -264,9 +264,21 @@ request went, and a `Pane` holds the request log.
 
 The router is the single source of the mod's settings, persisted in
 `<homeDir()>/mod-settings.json`. `GET /api/mod-settings` returns
-`{settings:<full normalized Settings>, revision, stored:boolean}`. Before the first
-write it returns normalized defaults, revision 0 and `stored:false`, without creating
-storage. `PUT` accepts `{settings, revision?}`, normalizes with the mod's own pure
+`{settings:<full normalized Settings>, revision, stored:boolean, compactAt:number|null}`.
+`compactAt` is Claude Code's own compaction point, read from `autoCompactWindow`
+in `~/.claude/settings.json` (`CLAUDE_SETTINGS_PATH` overrides the path): the
+top-level key, else the one value `/autocompact <n>` saved under
+`modelSettings.<model>` (a per-model value outranks the top-level one, per the
+2.1.304 settings schema); null means the model's default stands, or models
+disagree. A dashboard save also drops the per-model values, which would
+otherwise hide it. Compaction fires about 33k tokens before the window
+(20k output reserve + 13k buffer), not at it. Before the first write it returns normalized defaults, revision 0 and
+`stored:false`, without creating storage. `PUT` accepts `{settings, revision?,
+compactAt?}`: a `compactAt` writes or removes that settings.json key directly
+(100k–1M tokens, previous bytes backed up, atomic replace, every other key
+kept), so the dashboard and a session's `/autocompact` always agree; a
+`compactAt`-only save returns the same read snapshot instead of touching the
+mod's revision. `settings` is normalized with the mod's own pure
 `hooks/settings.ts:normalizeSettings` (type-only imports, no `claude-code` runtime),
 increments the revision under the account stores' `withFileLock` and `writeJsonAtomic`
 helpers (0600), and returns `{settings, revision, stored:true}`. A stale supplied
@@ -280,10 +292,11 @@ Corrupt storage is an error, never an empty store to overwrite.
 
 The mod reads this endpoint at `session.start` and every 3-second router poll, even
 when its band is hidden. A changed revision replaces the settings atom and redraws
-readers. Only when `stored:false` does it read legacy plugin-store `settings` and
+readers; every read also refreshes `compactAt`, which `/autocompact` changes without
+a revision, and the band measures its context share against it. Only when `stored:false` does it read legacy plugin-store `settings` and
 `setupDone` and migrate them with a revision-checked PUT; a racing first writer wins
 instead of being overwritten. Afterwards settings are never read from or saved to the
-plugin store; unrelated keys such as picks, band visibility and handoff choices remain.
+plugin store; unrelated keys such as picks and band visibility remain.
 Panel/setup saves PUT the last seen revision. On 409 the mod takes the server copy,
 reapplies only the user's changed paths (including sibling rule/provider fields), and
 retries once. A panel keeps its opening baseline so a poll while it is open cannot
@@ -1108,7 +1121,11 @@ from, to}` at hour granularity — buckets whose hour start is in `[from, to)`. 
   sets `accountPool: true`. With that flag and `auth: "claude-code"`, Claude
   Desktop/Code Messages requests stay unmodified except for the routed model and
   selected identity. The runtime pool is ordered current observed/env/Claude Code
-  login first, then ClaudeRipple-owned accounts. A conversation is sticky to the
+  login first, then ClaudeRipple-owned accounts. When none of them is usable, a
+  turn that carries the client's own `Bearer` goes out on it unchanged, as a
+  passthrough would; only a turn without one is refused with 401 (#88,
+  2026-10-24: the observed login aged out unseen behind the pool, and one revoked
+  stored account stopped every main-chat turn). A conversation is sticky to the
   account that answered so its prompt-cache prefix survives, including across that
   account's token refresh. Before response headers reach the client, 401, 429, 402
   and retryable HTTP failures such as 5xx may retry the same request on an untried
@@ -1475,7 +1492,29 @@ They were not live-tested during the original implementation. Files are under `s
   credential refusal) gets one refresh and a replay, a fresh token refused with a 401 again
   marks the account for sign-in; 429/402 rest the account to its `retry-after` (or a default);
   another 403, 5xx or a connect failure rests it briefly; any other 4xx is the request's fault
-  and is not retried. The exception is the model-capacity 503 below, which rests nothing. Refresh is per account, single-flight per token generation, five minutes
+  and is not retried. The exception is the model-capacity 503 below, which rests nothing.
+  **A 429 that proves one quota group spent rests only that group** (`isGroupQuotaExhausted`:
+  an ErrorInfo `reason: "QUOTA_EXHAUSTED"` whose `metadata.model` is in the turn's group;
+  `antigravityQuotaScope`: `gemini` for gemini-*, `3p` for claude-*/gpt-oss*, the two groups
+  `retrieveUserQuotaSummary` reports, usage.ts). Measured 2026-10-23: one such 429 for
+  `claude-opus-5-5-low` ("Individual quota reached … Resets in 4h51m35s"), while the limits row read
+  the 3P weekly window at 100% and Gemini's at 0.3%, rested the whole account, so every
+  `gemini-3.8-flash` turn for the next five hours was refused "every signed-in account is at its
+  limit" without reaching Google, and the same 429 marked the provider exhausted, so the mod's
+  picker skipped the Gemini worker too. Now the pool keeps a per-account rest for the group on the
+  host the turn went to (`CredentialPool` `scope`, `antigravityScopeKey`:
+  `3p@daily-cloudcode-pa.googleapis.com`), because each host counts quota separately (above) and a
+  group spent on daily still answers on prod: a turn picks an account whose group has room, the account stays
+  `ready` for the other group (the dashboard shows the group's rest from `quotaCooldowns` and
+  offers its clear-cooldown button, which clears the groups too), and the refusal names the spent
+  group when the other still answers. Such a 429 is not reported as the provider's exhaustion;
+  `/api/mod-options` lists a model under `providers[].models` while every account in rotation
+  rests that model's group on that model's host (the adapter's `quotaScopeOf`), until the soonest
+  account is back: per account the later of its own rest and the group's, so an account that is
+  only cooling counts. The picker skips only those models, looked up without an `@effort` suffix. A 429 without that proof (a
+  per-minute limit, the generic `RESOURCE_EXHAUSTED`, a detail naming no model), a 402, a refused
+  credential or a broken upstream still rests the whole account, and so does any 429 for a model
+  in no known group. Refresh is per account, single-flight per token generation, five minutes
   ahead; only a structured `invalid_grant` marks an account for sign-in. Only the access token
   and the account email/project id are ever in memory; no token reaches a log or an API response.
 - **No capacity for the model (measured 2026-10-20, daily host, `gemini-3.8-flash-high`, router.log
@@ -1641,6 +1680,7 @@ plan unless marked otherwise.
 | Every GPT request failed with 400 after a Claude Code update added a lookahead regex to the `Artifact` tool schema (2026-09-13; proxenos too) | Tool-schema scrub in the translator (§4). Upstream error bodies are logged, never just the status. |
 | Tool names over 64 characters were forwarded to the Responses API unchanged, so a single connected MCP server — the product's own use case (§2) — failed every request of that turn (found by reading the source, issue #1, 2026-09-17) | Any name a translated provider sends is mangled into the provider's constraint deterministically and restored on the way back (§4). A translator must validate what it forwards against the wire it forwards to, not only what it builds itself. |
 | Unknown-model context window defaulted to 200K, compaction fired at 151K; fixed via `CLAUDE_CODE_MAX_CONTEXT_TOKENS=272000` (applies only to models not in the CLI's built-in table; Claude models unaffected) | Installer sets this env for mapped models; document that it does not affect Claude models. |
+| That 272000 then capped every routed worker: Claude Code compacts a model it does not know at the smaller of this cap and the model's own `auto_compact_windows` entry, so 6.1 Sol's 475000 and DeepSeek's, MiniMax's and Gemini's million all compacted at 272000. Separately, an `auto_compact_windows` value outside the CLI's settings range (100K–1M) is dropped whole, so Gemini's 1,048,576 never applied and it fell back to the session's own setting (read from 2.1.308's resolver, 2026-10-24) | The cap is Claude Code's ceiling for a per-model window (`CLI_WINDOW_MAX`, 1,000,000): `install` writes it unless `--max-context-tokens` names another, and the bootstrap sends each window at most that. Every routed model the CLI can be asked for carries its own entry (picker models, agent-file ids, route aliases; the global `cli.autoCompactWindow` only where none is known), so the raised cap never stands in for a window. |
 | Server tools (`web_search`) were declared to translated providers as ordinary functions: a tool the model can call and nothing can run. Not observed live, because Claude Code currently routes its web search elsewhere (§4) — the failure was one server-side flag away, and its shape is an empty answer with nothing logged (issue #4, 2026-09-17) | A translator declares only what the provider can actually execute, and says in the log what it removed. A capability that silently disappears is worse than one that visibly fails. |
 | Routed workers were told to call the `advisor` after its declaration was dropped: Claude Code explains the tool in a user message the router left in place, so 26 of 28 worker transcripts reported it missing, every turn (issue #47, 2026-10-04) | Removing a capability includes withdrawing what was said about it. A translator that drops a tool adds one stable line saying so, rather than editing the caller's text. |
 | One context window was written to every routed model and every slot, because `cli.autoCompactWindow` is a single number while `auto_compact_windows` and `context_window_by_model` are per-model maps. Routed models do not share a window: set it high and the smaller model overflows before it compacts, set it low and the larger throws away most of its own (issue #2, 2026-09-17) | A window belongs to a model, not to the router. `CliModel.contextWindow` and `Route.contextWindow` win, then whatever the vendor's `/models` reported as `context_length`, then the global value as the fallback it always was. A value the config can only express once must not be injected into a map that is keyed per model. |
@@ -1688,7 +1728,9 @@ plan unless marked otherwise.
 | Android hotspot never recognised (2026-10-20, found by reading the code for an owner with Windows laptops and Android phones in mind): "on the hotspot" was the iPhone range 172.20.10.0/28 alone, on macOS and Windows. An Android hotspot hands out 192.168.43.x (≤ Android 10) or a random /24 (Android 11+; 192.168/16, 172.16/12, 10/8 by Android 14), so after our own failover `join()` saw no hotspot address and reported `join-failed`/`hotspot-not-visible`, while on the phone the controller read Wi-Fi and never planned the way back, and a by-hand join was never recognised | The product does not assume an iPhone. After our own join of the configured SSID is accepted by the OS, a new, non-link-local address within the settle time is the join, and its subnet (address + netmask from `os.networkInterfaces()`: no Location, no elevation) is kept in `<home>/tether.json` for that hotspot name; "on the hotspot" = iPhone range OR that network (§8). Only our own join replaces it, and a subnet equal to the Wi-Fi watched before is not remembered (logged as ambiguous) so home Wi-Fi is never read as the hotspot. Hints name both phones where the step differs. Not yet run with a real Android phone. |
 | An expired Claude login on the Mac wrote `[desktop state] …로그인이 만료되었습니다…` every few seconds per Claude app session and read the keychain (a synchronous child process) for every request, while phones learned of it only by a failed send (2026-10-15) | A login problem is one host state: logged when it starts and ends, sent to phones as `HostInfo.desktopProblem` (a banner), and the keychain is reread at most every 30 s while expired or after a 401. Per-session Remote Control errors log once per change. The host never refreshes the login itself. |
 | OpenCode Go answered **402** for `minimax-m3.1-flash-free` while that model's endpoint was down (`server_error … Upstream request failed: Endpoint is unavailable`); read as billing exhaustion, it parked the whole `opencode-go` account for 30 minutes, DeepSeek with it, and delegated work fell back to Opus while the account had credit (2026-10-22) | A relay's refusal whose body says its upstream failed (`RELAY_UPSTREAM_FAILED`, `pool.ts`) is transient whatever status it carries — 402 as well as 403 — and never a provider exhaustion (`health.ts`). A plain 402 or a body naming balance, billing or quota still is. |
+| A Google 429 for spending-cap exhaustion (`Your project has exceeded its monthly spending cap.`) was classified and recorded in ProviderHealth, so the next delegation skipped the provider — but the worker that received the plain 429 retried it ten times over ~2.5 minutes (08:56:35–08:59:06) before failing (#89, 2026-10-24) | Same status and body, plus `x-should-retry: false` and a `retry-after` to the exhaustion's `until` (min 1s), wherever a definite exhaustion is written: the generic path (`proxy.ts`) and the Google, ChatGPT and OpenAI-compatible adapters. Claude Code reads `x-should-retry` before its 429 rule, so the worker fails at once. A bare rate limit keeps no such header. |
 | A Workflow script sent eight agents with `[[ripple: gemini-3-8-flash@high]]` as the prompt's first line (and `subagent_type`, which `agent()` does not take — its option is `agentType`); all eight ran on the session's Opus. CLI 2.1.308 frames a workflow agent's prompt: a relayed user request, then a `[Workflow harness — computed task] … follows:` header line, then the script's text indented — so no user message started with the marker (2026-10-22) | A text block that starts with that header is read from the line after it: the script's first line is the prompt's top, as a spawned subagent's is (`routing.ts`, `WORKFLOW_TASK`). Only a block that *starts* with the header counts — the harness indents everything inside, so a header quoted lower down is prose. |
+| A closed lid was held awake on battery overnight (2026-10-24, owner-reported, `pmset -g log` + router.log): the lid closed and the Mac slept at 00:59 ("Clamshell Sleep"), but in two maintenance dark wakes (01:09 and 09:51) model calls ran — the mod's cache keep-warm pings (4-token turns on idle sessions) and a Claude app scheduled task — and `working` mode counted them as work: "sleep disabled (working: 1 model call running)" turned a ~45 s dark wake into 72 min (01:09–02:21) and 35 min (09:51–10:26) awake, 6 of the night's 10 battery points | A hold is never **started** in a dark wake: ioreg's IOPMrootDomain `System Capabilities` (read with the clamshell flags, no extra process) without Graphics (2) means the Mac is asleep to its user, and `decideAwake` answers "asleep: …" (logged once). A hold already taken is kept whatever the reading, and mode `on` is unaffected. Measured: 15 in a full wake; a held lid-closed Mac (2026-10-23 18:22–19:32) logged no transition to DarkWake. Tests: `awake.test.ts`. |
 | A new worker could not be spawned in a session that was open when it was added: the router wrote `zai-org-glm-5-3-flash.md` at 10:51:45, the MAMBO session (idle since 10:47) got its next message 26 s later, and the Agent tool answered "not found" at 10:52 and 11:12; after a `/clear` the mod rewrote `ripple:auto` to the worker and the CLI refused that too (11:24). The ClaudeRipple session, in use at the time, listed it by 10:55 (2026-10-23). CLI 2.1.308 polls `~/.claude/agents` every 2 s in use and 30 s after a minute idle; going back to 2 s rebuilds the watcher from the directory as it then is, and the catch-up compares only skills and commands, so a write in the last 30 s of idling is never read, and `/clear` keeps the process's list | Every sync that writes or removes a generated agent touches the generated files again `RETOUCH_AFTER_MS` (45 s) later (`agents.ts` `retouchLater`): any agent file's change makes a session reread all of them, and 45 s is past the idle poll. A session that already missed one is fixed the same way, by touching any file in `~/.claude/agents`. Tests: `agents.test.ts`. |
 
 ### Router-owned automatic updates (2026-10-21)
@@ -1776,7 +1818,9 @@ Windows backends `awake-win.ts`, `tether-win.ts`), `power.ts` (admin contract); 
 external display is `pmset -a disablesleep 1` as root: undocumented (absent from `man pmset`), but it
 is what Insomnia, MacMiniMode, Sleepless, Capsomnia and WiFiGuard all run; `caffeinate`/IOPMAssertion
 cannot do it (KeepingYouAwake README, "Does it work … with a closed lid? No."). Modes: `off`;
-`working` = a model call in flight or one in the last 10 min; `on` (optionally `until`). Evaluated
+`working` = a model call in flight or one in the last 10 min, but a hold is not started in a dark wake
+(ioreg `System Capabilities` without Graphics: calls there are background, §5 2026-10-24); `on`
+(optionally `until`). Evaluated
 every 15s. Forced off by: battery below `batteryFloorPercent` (default 20) on battery (`pmset -g
 batt`), a recorded thermal warning (`pmset -g therm`; measured on macOS 27.0.1 with nothing recorded:
 "No thermal warning level has been recorded" — unrecognised output is reported `unknown` and not

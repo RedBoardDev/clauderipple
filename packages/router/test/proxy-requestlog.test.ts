@@ -26,6 +26,7 @@ async function rig() {
   fs.writeFileSync(path.join(home, "ca.key"), ca.keyPem);
   fs.writeFileSync(path.join(home, "chatgpt-auth.json"), JSON.stringify({ accessToken: "test-token", accountId: "test-account", expiresAt: Date.now() + 3600_000, source: "own" }));
   const seen: Record<string, unknown>[] = [];
+  const seenAuth: (string | undefined)[] = [];
   let responseStatus = 200;
   let imageStatus = 200;
   const respond = (req: http.IncomingMessage, res: http.ServerResponse): void => {
@@ -34,6 +35,7 @@ async function rig() {
     req.on("end", () => {
       const body = JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string, unknown>;
       seen.push(body);
+      seenAuth.push(req.headers.authorization);
       if ((body.tools as { type?: string }[] | undefined)?.some((tool) => tool.type === "image_generation")) {
         if (imageStatus !== 200) {
           res.writeHead(imageStatus, { "content-type": "application/json" }).end(JSON.stringify({ error: { message: "image backend failed" } }));
@@ -117,7 +119,7 @@ async function rig() {
     secure.destroy();
     return { text, record: requests.list(1)[0]! };
   };
-  return { cfg, seen, home, requests, proxy, observed, send, failBackend: () => { responseStatus = 400; }, failImage: () => { imageStatus = 500; }, stop: async () => {
+  return { cfg, seen, seenAuth, home, requests, proxy, observed, send, failBackend: () => { responseStatus = 400; }, failImage: () => { imageStatus = 500; }, stop: async () => {
     proxy.close(); agent.destroy();
     await Promise.all([backend, native].map((server) => new Promise<void>((resolve) => server.close(() => resolve()))));
     fs.rmSync(home, { recursive: true, force: true });
@@ -232,6 +234,17 @@ test("proxy logs native request-id and classifier purpose without configuring cl
     assert.equal(pooled.messageId, undefined);
     assert.equal(pooled.purpose, undefined);
     assert.equal(pooled.requestedTier, undefined);
+  } finally { await r.stop(); }
+});
+
+test("with no usable pool account, a Claude pool turn goes out on the app's own sign-in instead of a 401 (#88)", async () => {
+  const r = await rig();
+  try {
+    const { record } = await r.send("claude-pool", {}, "/v1/messages", undefined, { authorization: "Bearer app-own-token" });
+    assert.equal(record.provider, "claude");
+    assert.equal(record.status, 200);
+    assert.equal(record.refusal, undefined);
+    assert.equal(r.seenAuth.at(-1), "Bearer app-own-token");
   } finally { await r.stop(); }
 });
 

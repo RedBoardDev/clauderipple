@@ -6,7 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import { EventLog } from "./eventlog.ts";
 import { creationDateToFileTime, parseFileTime, processCommands, processSnapshot, sameFileTime, type ProcessSnapshot } from "./processes.ts";
-import { messageContent, sendUserFileImages, type ImageSink } from "./images.ts";
+import { fileImages, messageContent, sessionFileTool, type ImageSink } from "./images.ts";
 import { PERMISSION_MODES, type BackgroundTask, type EventBody, type Figures, type PermissionMode, type PlanStep, type SessionSummary, type ToolCall } from "./protocol.ts";
 import { WRAP_TOOL, wrapUpFields, type WrapUpFields } from "./wrap-up.ts";
 
@@ -177,6 +177,8 @@ export function transcriptEvents(line: string, cwd: string, summarize: Summarize
   const r = record(line);
   const bodies: EventBody[] = [];
   if (!r) return { at: null, bodies };
+  // The session's own temp folder (pasted images, scratchpad) is derived from its id (images.ts).
+  const scope = { cwd, sessionId: str(r.sessionId) };
   const sidechain = r.isSidechain === true;
   if (sidechain && !subs?.allowSidechain) return { at: null, bodies };
   const state = subs?.state;
@@ -204,13 +206,13 @@ export function transcriptEvents(line: string, cwd: string, summarize: Summarize
         state?.delete(toolUseId);
       }
     } else if (p && r.type === "user") {
-      const converted = messageContent(message?.content, sink);
+      const converted = messageContent(message?.content, sink, scope);
       bodies.push({ kind: "user", ...converted, clientMsgId: str(r.uuid) });
     }
     for (const value of Array.isArray(message?.content) ? message.content : []) {
       const b = object(value);
       if (b?.type === "tool_result" && typeof b.tool_use_id === "string") {
-        const converted = messageContent(b.content, sink);
+        const converted = messageContent(b.content, sink, scope);
         bodies.push({ kind: "tool_result", toolUseId: b.tool_use_id, ok: b.is_error !== true, ...converted });
         // A synchronous worker finishes at its tool result; an async one only launches here and ends at its notification.
         const running = state?.get(b.tool_use_id);
@@ -237,7 +239,7 @@ export function transcriptEvents(line: string, cwd: string, summarize: Summarize
       const summary = summarize(b.name, input, cwd);
       tools.push({ id: b.id, name: b.name,
         summary: worker ? [summary || str(input.subagent_type) || b.name, str(input.model)].filter(Boolean).join(" · ") : summary,
-        input: JSON.stringify(input, null, 2) });
+        input: JSON.stringify(input, null, 2), ...sessionFileTool(b.name, input, scope, sink) });
       // Only a top-level worker opens its own log; sidechain records never carry their own subagent event.
       if (worker && !sidechain && state && resolve) {
         const info = resolve(b.id, input);
@@ -246,9 +248,9 @@ export function transcriptEvents(line: string, cwd: string, summarize: Summarize
         bodies.push({ kind: "subagent", toolUseId: b.id, sub: `sub-${b.id}`, description: running.description, model: running.model, status: "running", steps: running.steps });
       }
     }
-    const body = messageContent(message.content, sink);
-    body.images.push(...sendUserFileImages(message.content, cwd, sink));
-    if (body.text || body.images.length || tools.length) bodies.push({ kind: "assistant", msg: str(r.uuid) || str(message.id), model: str(message.model), ...body, tools });
+    const body = messageContent(message.content, sink, scope);
+    body.images.push(...fileImages(tools.flatMap(tool => tool.files ?? [])));
+    if (body.text || body.images.length || body.files.length || tools.length) bodies.push({ kind: "assistant", msg: str(r.uuid) || str(message.id), model: str(message.model), ...body, tools });
   } else if (r.type === "result") {
     const ok = r.subtype === "success" && r.is_error !== true;
     bodies.push({ kind: "result", ok, ...(!ok ? { error: str(r.result) || str(r.subtype) } : {}), ms: typeof r.duration_ms === "number" ? r.duration_ms : 0, turns: typeof r.num_turns === "number" ? r.num_turns : 0 });
@@ -542,7 +544,7 @@ export class DesktopSessions {
       if (!state) { state = new Map(); this.tailSubs.set(id, state); }
       const resolve = (toolUseId: string, input: RecordValue) => this.subInfo(id, toolUseId, input);
       const next = scanLines(fd, size, line => {
-        for (const body of transcriptEvents(line, source.summary.cwd, this.opts.summarize, sink, { state, resolve }).bodies) visit(body);
+        for (const body of transcriptEvents(line, this.liveProcess(id)?.cwd ?? source.summary.cwd, this.opts.summarize, sink, { state, resolve }).bodies) visit(body);
       }, offset);
       // Worker transcripts grow independently of the parent, even once their model is known.
       for (const [toolUseId, running] of state) {
@@ -690,7 +692,7 @@ export class DesktopSessions {
     const log = EventLog.open({ dir, now: () => at });
     try {
       scanLines(fd, fs.fstatSync(fd).size, line => {
-        const parsed = transcriptEvents(line, source.summary.cwd, this.opts.summarize, data => log.image(data), { allowSidechain: true });
+        const parsed = transcriptEvents(line, this.liveProcess(id)?.cwd ?? source.summary.cwd, this.opts.summarize, data => log.image(data), { allowSidechain: true });
         at = parsed.at ?? at;
         for (const body of parsed.bodies) log.append(body.kind === "user" && !body.clientMsgId ? { ...body, clientMsgId: `desktop-${log.lastSeq + 1}` } : body);
       });
@@ -828,7 +830,7 @@ export class DesktopSessions {
     const log = EventLog.open({ dir, now: () => importing ? at : now() });
     try {
       source.size = scanLines(fd, fs.fstatSync(fd).size, line => {
-        const parsed = transcriptEvents(line, source.summary.cwd, this.opts.summarize, data => log.image(data), { state, resolve });
+        const parsed = transcriptEvents(line, this.liveProcess(id)?.cwd ?? source.summary.cwd, this.opts.summarize, data => log.image(data), { state, resolve });
         at = parsed.at ?? at;
         for (const body of parsed.bodies) log.append(body.kind === "user" && !body.clientMsgId ? { ...body, clientMsgId: `desktop-${log.lastSeq + 1}` } : body);
       });

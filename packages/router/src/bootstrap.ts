@@ -15,6 +15,16 @@ import { chatgptModelWindow } from "./providers/chatgpt/windows.ts";
 export const BOOTSTRAP_PATH = "/api/claude_cli/bootstrap";
 
 /**
+ * The largest per-model window Claude Code takes from `auto_compact_windows`. A value outside its
+ * settings range (100K–1M in 2.1.308) is dropped whole and the model falls back to the session's
+ * own setting, so Gemini's 1,048,576 never applied (read from the CLI, 2026-10-24). It is also the
+ * cap `install` writes as `CLAUDE_CODE_MAX_CONTEXT_TOKENS`: Claude Code compacts a model it does
+ * not know at the smaller of that cap and the model's own window, and 272000 there cut 6.1 Sol's
+ * 475000 and DeepSeek's million alike. With the cap at the ceiling, each model's window decides.
+ */
+export const CLI_WINDOW_MAX = 1_000_000;
+
+/**
  * Model ids named in the user's agent definitions (~/.claude/agents/*.md frontmatter `model:`),
  * e.g. `gpt-5.6-terra@high`. The CLI only accepts ids it saw in its bootstrap list; an agent whose
  * model id is unknown silently runs on the parent session's Claude model (measured 2026-09-13 after
@@ -90,10 +100,10 @@ export function injectBootstrap(body: Buffer, cfg: Config, agentDirs?: string[])
     const acw = { ...((j.auto_compact_windows as Record<string, number> | undefined) ?? {}) };
     for (const m of extra) {
       const w = m.contextWindow ?? win;
-      if (w) acw[m.model] = w;
+      if (w) acw[m.model] = Math.min(w, CLI_WINDOW_MAX);
     }
     for (const [alias, w] of routeWindows) {
-      if (w) acw[alias] = w;
+      if (w) acw[alias] = Math.min(w, CLI_WINDOW_MAX);
     }
     j.auto_compact_windows = acw;
   }

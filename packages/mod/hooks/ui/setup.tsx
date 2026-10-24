@@ -11,6 +11,7 @@ import type { RenderNode } from 'claude-code'
 import { RUNGS } from '../settings'
 
 import { CELL_PX } from './art'
+import { DISPLAY, displayText } from './display'
 import { lookOf } from './look'
 import { capsule, pic, pill, ripple } from './kit'
 import { GREET_SIZE, action, actions, canDraw, speak } from './parts'
@@ -29,7 +30,7 @@ export const STEPS = [
 /** `Sol · Astra · …`: the four workers' models, lowest first. */
 export function workersSummary(lang: Frame['lang'], d: SetupView['draft']): string {
   const general = d.rules.general
-  return RUNGS.map(rung => general.rungs[rung]?.map(step => targetLabel(step.target, lang)).join(' → ') || '—').join(' · ')
+  return displayText(RUNGS.map(rung => general.rungs[rung]?.map(step => targetLabel(step.target, lang)).join(' → ') || '—').join(' · '), DISPLAY.detail)
 }
 
 /** The steps as rings, the current one filled: ● ○ ○. */
@@ -48,7 +49,7 @@ export function renderSetup(el: Els, frame: Frame, view: SetupView, a: SetupActi
   const step = done ? null : STEPS[view.step - 1]!
   const body: RenderNode[] = done
     ? [
-        row(el, frame, 'sum-effort', t(frame.lang, 'band.effort'), <Text wrap="wrap">{t(frame.lang, 'setup.effortSummary', { state: t(frame.lang, d.effortAuto ? 'band.on' : 'band.off').toLowerCase(), judge: d.judge === 'haiku' ? t(frame.lang, 'settings.haiku') : d.judge === 'jev' ? t(frame.lang, 'settings.jev') : d.judgeModel })}</Text>),
+        row(el, frame, 'sum-effort', t(frame.lang, 'band.effort'), <Text wrap="wrap">{t(frame.lang, 'setup.effortSummary', { state: t(frame.lang, d.effortAuto ? 'band.on' : 'band.off').toLowerCase(), judge: d.judge === 'haiku' ? t(frame.lang, 'settings.haiku') : d.judge === 'jev' ? t(frame.lang, 'settings.jev') : displayText(d.judgeModel, DISPLAY.name) })}</Text>),
         row(el, frame, 'sum-workers', t(frame.lang, 'settings.workers'), <Text wrap="wrap">{workersSummary(frame.lang, d)}</Text>),
         row(el, frame, 'sum-cache', t(frame.lang, 'band.cache'), <Text wrap="wrap">{d.keepWarm ? t(frame.lang, 'setup.cacheSummary', { hours: d.keepWarmHours }) : t(frame.lang, 'setup.cacheOff')}</Text>),
       ]
@@ -78,7 +79,7 @@ export function renderSetup(el: Els, frame: Frame, view: SetupView, a: SetupActi
     const beads = k.art.beads(view.step, 3)
     const summary = done
       ? [
-          [t(L, 'band.effort'), t(L, 'setup.effortSummary', { state: t(L, d.effortAuto ? 'band.on' : 'band.off').toLowerCase(), judge: d.judge === 'haiku' ? t(L, 'settings.haiku') : d.judge === 'jev' ? t(L, 'settings.jev') : d.judgeModel })],
+          [t(L, 'band.effort'), t(L, 'setup.effortSummary', { state: t(L, d.effortAuto ? 'band.on' : 'band.off').toLowerCase(), judge: d.judge === 'haiku' ? t(L, 'settings.haiku') : d.judge === 'jev' ? t(L, 'settings.jev') : displayText(d.judgeModel, DISPLAY.name) })],
           [t(L, 'settings.workers'), workersSummary(L, d)],
           [t(L, 'band.cache'), d.keepWarm ? t(L, 'setup.cacheSummary', { hours: d.keepWarmHours }) : t(L, 'setup.cacheOff')],
         ]

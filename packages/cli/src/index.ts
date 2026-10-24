@@ -13,6 +13,7 @@ import { fileURLToPath } from "node:url";
 import { execFileSync } from "node:child_process";
 import { ConfigStore, DEFAULTS, homeDir, configPath } from "../../router/src/config.ts";
 import { adminPort } from "../../router/src/admin.ts";
+import { CLI_WINDOW_MAX } from "../../router/src/bootstrap.ts";
 import { certsExist, certPaths, generateCerts } from "./certs.ts";
 import { applyProxyEnv, checkProxyEnv, currentProxyEnv, removeProxyEnv, settingsPath } from "./settings.ts";
 import { agentDefinitionPath, agentState, installAgent, isLinux, isSupported, isWindows, removeAgent, restartAgent, startAgent, stopAgent, supervisorName } from "./supervisor.ts";
@@ -22,7 +23,7 @@ import { nativeSupervisor, registration, writePaths } from "./registration.ts";
 import { installLauncher, uninstallLauncher } from "./launcher.ts";
 import type { RecoveryDeps } from "./doctor.ts";
 import { applyAppProxy, caTrusted, currentAppProxy, nssDb, removeAppProxy, trustCa, untrustCa } from "./picker.ts";
-import { removeClientIntegrations, setPickerEnabled } from "./integrations.ts";
+import { defaultHome, removeClientIntegrations, setPickerEnabled } from "./integrations.ts";
 import { withCommandHelp } from "./help-gate.ts";
 import { runtime } from "./runtime.ts";
 import { codexOff, codexOn } from "./codex.ts";
@@ -33,6 +34,8 @@ import { openBrowser } from "./browser.ts";
 import { electronPath, installTrayRuntime, startTray } from "./tray.ts";
 import { dropPowerShellShim, installKind, isNewer, latestVersion, PACKAGE, runUpdate } from "./update.ts";
 import { ClaudeOAuthSession } from "../../router/src/providers/claude-oauth.ts";
+import { requestHostUpdate } from "../../remote/src/host-update.ts";
+import { purgeHome } from "./purge.ts";
 
 async function pickerOn(): Promise<void> {
   const home = homeDir();
@@ -77,7 +80,9 @@ function describeRestart(r: ReturnType<typeof restartAgent>): string {
 
 function pickerOff(): void {
   const home = homeDir();
-  const removed = removeAppProxy();
+  // Under another CLAUDERIPPLE_HOME only this install's entry and CA go (integrations.ts).
+  const isDefault = path.resolve(home) === path.resolve(defaultHome());
+  const removed = removeAppProxy(isDefault ? undefined : proxyUrlFor(new ConfigStore(configPath()).get().listen.port));
   console.log(removed ? "✓ Claude Desktop config library entry removed (previous entry restored if there was one)" : "✓ no ClaudeRipple config library entry");
   try {
     setPickerEnabled(false);
@@ -87,7 +92,7 @@ function pickerOff(): void {
   }
   if (isWindows) console.log("Removing the CA: Windows will ask you to confirm once more.");
   const store = isWindows ? "your user certificate store" : isLinux ? `your NSS database (${nssDb()})` : "the login keychain";
-  console.log(untrustCa(certPaths(home).caPem) ? `✓ CA removed from ${store}` : `✓ CA was not in ${store}`);
+  console.log(untrustCa(certPaths(home).caPem, { sweep: isDefault }) ? `✓ CA removed from ${store}` : `✓ CA was not in ${store}`);
   console.log("\nQuit and reopen Claude Desktop to apply.");
 }
 
@@ -238,6 +243,8 @@ async function install(): Promise<void> {
   // launchd starts the agent the moment it is bootstrapped (RunAtLoad); a scheduled task waits for
   // its logon trigger, so the router would only appear after the next sign-in. Start it either way,
   // and believe it only once the router's process exists (supervisor.startRouter).
+  // Durable before the successor router starts: its own completion does not imply host application.
+  requestHostUpdate(home, VERSION);
   const started = startAgent({ onProgress: (m) => console.log(`  ${m}`) });
   console.log(
     started === "failed" ? `✗ could not start the router (${supervisorName()})`
@@ -271,7 +278,9 @@ async function install(): Promise<void> {
     console.log(`${settingsPath()} was left as it was, so Claude Code does not depend on a router that is not answering. Fix the router, then run install again.`);
     return;
   }
-  const edit = applyProxyEnv({ proxyUrl, caPath, force: flag("force"), ...(maxCtx ? { maxContextTokens: Number(maxCtx) } : {}), models: cfg.cli.models ?? {}, respectDirect: true });
+  // The cap sits at Claude Code's ceiling for a per-model window, so each routed model compacts at
+  // its own window from the bootstrap (CLI_WINDOW_MAX); a flag still sets another.
+  const edit = applyProxyEnv({ proxyUrl, caPath, force: flag("force"), maxContextTokens: maxCtx ? Number(maxCtx) : CLI_WINDOW_MAX, models: cfg.cli.models ?? {}, respectDirect: true });
   console.log(edit.changed ? `✓ ${settingsPath()} updated (backup: ${edit.backup ?? "none"})` : `✓ ${settingsPath()} already correct`);
   for (const n of edit.notes) console.log(`  note: ${n}`);
   // Something to double-click for the menu-bar app, which is what offers repair when the router is
@@ -288,7 +297,7 @@ async function install(): Promise<void> {
   try {
     execFileSync(installedRuntime.node, [installedRuntime.cli, "remote", "refresh"], { env: { ...process.env, ...installedRuntime.env }, stdio: "inherit" });
   } catch {
-    console.log("  the phone host was not restarted; if you use it, run: clauderipple remote install");
+    console.log("  호스트 적용 대기: 진행 중인 작업을 유지하며 자동으로 다시 시도합니다.");
   }
   console.log(direct ? "\nDone. Claude stays on its default connection (direct on); run \"clauderipple direct off\" to go through ClaudeRipple." : "\nDone. New Claude Desktop Code sessions go through ClaudeRipple. Existing sessions pick up settings.json env changes on their next request.");
 }
@@ -313,27 +322,22 @@ async function uninstall(): Promise<void> {
   } catch (e) {
     console.log(`  could not remove the menu-bar app launcher: ${(e as Error).message}`);
   }
-  removeClientIntegrations(home);
+  const integrationsRemoved = removeClientIntegrations(home, undefined, { port: cfg.listen.port });
+  if (!integrationsRemoved) process.exitCode = 1;
   const edit = removeProxyEnv({ proxyUrl: proxyUrlFor(cfg.listen.port), caPath: certPaths(home).caPem, ...(cfg.cli.models ? { models: cfg.cli.models } : {}) });
   console.log(edit.changed ? `✓ ${settingsPath()} restored (backup: ${edit.backup ?? "none"})` : `✓ ${settingsPath()} had no ClaudeRipple keys`);
   for (const n of edit.notes) console.log(`  note: ${n}`);
   if (flag("purge")) {
-    // Windows releases a file handle a moment after the process holding it exits; one immediate
-    // attempt can still lose the race, so the removal is retried briefly before it is reported.
-    let lastError: unknown = null;
-    for (let attempt = 0; attempt < 10; attempt++) {
-      try {
-        fs.rmSync(home, { recursive: true, force: true, maxRetries: 3, retryDelay: 200 });
-        lastError = null;
-        break;
-      } catch (e) {
-        lastError = e;
-        const until = Date.now() + 300;
-        while (Date.now() < until) { /* the CLI is synchronous here; a short spin is the whole wait */ }
-      }
+    if (!integrationsRemoved) {
+      console.error("일부 등록을 제거하지 못해 설치 폴더를 보존했습니다. 오류를 해결한 뒤 다시 제거해 주세요.");
+      return;
     }
-    if (lastError) console.log(`  could not remove ${home}: ${(lastError as Error).message}`);
-    else console.log(`✓ removed ${home}`);
+    const result = await purgeHome(home);
+    if (result.status === "deferred") {
+      // Exit 0 would certify a deletion that cannot finish until this node.exe exits.
+      process.exitCode = 2;
+      console.log(`실행 중인 Node가 종료된 뒤 설치 폴더를 삭제합니다. 아직 완료되지 않았습니다. 종료 코드 2는 대기 상태이며, 최종 결과는 ${result.resultFile}에서 확인해 주세요 (exitCode 0: 완료, 1: 실패).`);
+    } else console.log(`설치 폴더를 삭제했습니다. ${home}`);
   } else console.log(`  kept ${home} (config, certs, logs). Add --purge to delete it.`);
 }
 

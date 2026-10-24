@@ -44,7 +44,7 @@
     <td colspan="2" align="center"><img src="docs/media/mod-band.png" alt="O mod ripple: esforço, contexto, timer do cache e qual modelo respondeu, com o acerto de cache"><br><sub>O mod ripple: esforço, contexto, timer do cache e qual modelo respondeu, com o acerto de cache</sub></td>
   </tr>
   <tr>
-    <td align="center" width="50%"><img src="docs/media/mod-alerts.png" alt="Avisos quando o cache esfria ou um limite está perto, e passagem para um chat novo"><br><sub>Avisos quando o cache esfria ou um limite está perto, e passagem para um chat novo</sub></td>
+    <td align="center" width="50%"><img src="docs/media/mod-alerts.png" alt="Avisos quando o cache esfria ou um limite está perto, e oferta de compactação"><br><sub>Avisos quando o cache esfria ou um limite está perto, e oferta de compactação</sub></td>
     <td align="center" width="50%"><img src="docs/media/mod-settings.png" alt="Ajustes rápidos: esforço automático, o juiz, modos de workers"><br><sub>Ajustes rápidos: esforço automático, o juiz, modos de workers</sub></td>
   </tr>
 </table>
@@ -315,7 +315,7 @@ que você mapeia vão para o seu provedor, e todo o resto vai para a Anthropic b
   o esforço, de low a max. O trabalho delegado vai para `ripple:auto`, e o juiz manda cada
   tarefa para um worker conforme a dificuldade: o leve para DeepSeek ou GLM, o difícil para
   GPT ou Opus. Cartões avisam quando o cache esfriou, o contexto ficou pesado ou uma janela do
-  plano passou de 80%, e oferecem compactar ou passar para uma sessão nova na mesma pasta.
+  plano passou de 80%, e oferecem compactar a sessão.
   `Log` (ou `/ripple-log`) abre o log de requisições em um painel lateral. Basta um botão na
   tela **Clientes**, ou `clauderipple mod on`.
 - **Imagens pela sua assinatura do ChatGPT.** `clauderipple image "<prompt>"`, com imagens

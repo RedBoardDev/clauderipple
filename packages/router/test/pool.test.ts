@@ -300,3 +300,65 @@ test("a relay's 402 for a failed upstream is transient, not exhaustion", () => {
   assert.deepEqual(classify(402, undefined, '{"error":{"message":"Insufficient balance"}}'), { retryable: true, kind: "exhausted", cooldownMs: 30 * 60_000, quarantine: false });
   assert.equal(providerExhaustion(402, "Insufficient Balance")?.reason, "insufficient_balance");
 });
+
+test("a scoped rate limit rests only that scope of the credential; other failures rest all of it", () => {
+  const c = clock();
+  const pool = new CredentialPool({ now: c.now });
+  const [a, b] = creds("a", "b");
+  // Antigravity's Claude/GPT group spent on `a`: Gemini turns still take `a`.
+  assert.equal(pool.penalise("google", "a", 429, 5_000, "", "3p").retryable, true);
+  assert.equal(pool.pick("google", [a!, b!], "conv", "gemini")?.id, "a");
+  assert.equal(pool.pick("google", [a!, b!], undefined, "3p")?.id, "b");
+  assert.equal(pool.pick("google", [a!])?.id, "a", "no scope asked: the credential itself is fine");
+  assert.equal(pool.hasUsable("google", [a!], "3p"), false);
+  assert.equal(pool.hasUsable("google", [a!], "gemini"), true);
+  assert.deepEqual(pool.report("google", [a!]).map((r) => r.state), ["ready"]);
+  assert.deepEqual(pool.scopeCooldowns("google", "a"), { "3p": 5 });
+  // A conversation held on `a` moves for a 3p turn, and keeps `a` for Gemini.
+  assert.equal(pool.pick("google", [a!, b!], "conv", "3p")?.id, "b");
+  c.advance(5_000);
+  assert.deepEqual(pool.scopeCooldowns("google", "a"), {});
+  assert.equal(pool.hasUsable("google", [a!], "3p"), true);
+  // 402, 401 and a broken upstream are about the credential: a scope does not narrow them.
+  pool.penalise("google", "a", 402, undefined, "", "3p");
+  assert.equal(pool.hasUsable("google", [a!], "gemini"), false);
+  assert.deepEqual(pool.scopeCooldowns("google", "a"), {});
+});
+
+test("an answer in a scope does not cancel its live rest; clearing the credential clears its scopes", () => {
+  const c = clock();
+  const pool = new CredentialPool({ now: c.now });
+  const [a] = creds("a");
+  pool.penalise("google", "a", 429, 60_000, "", "3p");
+  pool.succeed("google", "a", "3p");
+  assert.equal(pool.hasUsable("google", [a!], "3p"), false, "a concurrent 200 does not lift a limit");
+  pool.clear("google", "a");
+  assert.equal(pool.hasUsable("google", [a!], "3p"), true);
+  pool.penalise("google", "a", 429, 60_000, "", "3p");
+  pool.clear("google");
+  assert.deepEqual(pool.scopeCooldowns("google", "a"), {});
+});
+
+test("a quota scope combines with pause and preference: paused is never picked, the preferred one first while its scope has room", () => {
+  const c = clock();
+  const pool = new CredentialPool({ now: c.now });
+  const [a, b, p] = [{ ...creds("a")[0]!, paused: true }, creds("b")[0]!, { ...creds("p")[0]!, preferred: true }];
+  // A paused credential stays out whatever its scopes say, and the preferred one leads.
+  assert.equal(pool.pick("google", [a, b, p], undefined, "3p")?.id, "p");
+  assert.equal(pool.hasUsable("google", [a], "gemini"), false);
+  // The preferred credential's Claude/GPT group is spent: 3p turns go to the next usable one, Gemini still prefers it.
+  pool.penalise("google", "p", 429, 60_000, "", "3p");
+  assert.equal(pool.pick("google", [a, b, p], undefined, "3p")?.id, "b");
+  assert.equal(pool.pick("google", [a, b, p], undefined, "gemini")?.id, "p");
+  // A held conversation leaves a paused credential even when its scope has room.
+  assert.equal(pool.pick("google", [b, p], "conv", "gemini")?.id, "p");
+  assert.equal(pool.pick("google", [b, { ...p, paused: true }], "conv", "gemini")?.id, "b");
+  // Clearing the credential clears its resting scopes too.
+  pool.clear("google", "p");
+  assert.deepEqual(pool.scopeCooldowns("google", "p"), {});
+  assert.equal(pool.pick("google", [a, b, p], undefined, "3p")?.id, "p");
+  // So does clearing a durable owner, whose token generations are `owner:n`.
+  pool.penalise("claude", "owner:1", 429, 60_000, "", "3p");
+  pool.clearOwner("claude", "owner");
+  assert.deepEqual(pool.scopeCooldowns("claude", "owner:1"), {});
+});

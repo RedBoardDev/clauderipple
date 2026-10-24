@@ -24,9 +24,8 @@
 //   native button over each (kit.tsx); a state is in the drawing (a switch's track, a lit flame).
 //
 // No item's width depends on its value: each fact has a slot sized for the widest value its
-// language can show; the route is counted at a fixed room and takes what the row leaves; Handoff
-// is counted whether it shows or not. The controls sit at the right end with the one
-// that comes and goes (Handoff) first, so a changing value never moves a neighbour.
+// language can show; the route is counted at a fixed room and takes what the row leaves. The
+// controls sit at the right end, so a changing value never moves a neighbour.
 
 import { t } from '../i18n'
 import type { Lang } from '../i18n'
@@ -39,6 +38,7 @@ import type { Word } from './look'
 import type { Sea, Tone } from './art'
 import { CLOSE_CELLS, capsule, closeButton, hoverLight, lift, lit, pic, pill, press, ripple, rowsOf, segmented, word, wordCells } from './kit'
 import { textButton } from './parts'
+import { DISPLAY, displayText } from './display'
 import type { Els } from './parts'
 import type { Face } from './ripple'
 import { cacheTone, chOf, clip, contextTone, displayWidth, limitTone, providerColor, textTone } from './theme'
@@ -220,7 +220,7 @@ export function cacheFact(frame: Frame, view: DashboardView): Fact | null {
 export function contextFact(frame: Frame, view: DashboardView): Fact | null {
   const ctx = view.context
   if (!ctx || !view.extras.includes('context')) return null
-  const tone = contextTone(ctx.percent, view.swampAt)
+  const tone = contextTone(ctx.percent)
   const rich = isRich(frame)
   // Desktop: "Context 38%" in the facts' idiom; the terminal keeps its short "ctx 38%".
   const text = rich ? Math.round(ctx.percent) + '%' : t(frame.lang, 'band.footerContext', { percent: Math.round(ctx.percent) })
@@ -287,8 +287,8 @@ export function routeFact(frame: Frame, view: DashboardView, room: number, onPre
 // ---- Controls ----------------------------------------------------------------------------------
 
 /**
- * A control: its label, the hotkey, and whether it is on (a toggle that is on, an open pane, the
- * advised Handoff). The terminal says it in the label (● / ○), as its plain Buttons take no colour.
+ * A control: its label, the hotkey, and whether it is on (a toggle that is on, an open pane). The
+ * terminal says it in the label (● / ○), as its plain Buttons take no colour.
  */
 type Control = { key: string; label: string; hotkey: string; onPress: () => void; on: boolean; count?: string }
 
@@ -296,11 +296,8 @@ function controls(frame: Frame, view: DashboardView, actions: BandActions): Cont
   const L = frame.lang
   const mark = (on: boolean) => (on ? ' ●' : ' ○')
   const out: Control[] = []
-  // Handoff comes and goes; first in the row, it moves nothing when it does.
-  if (view.handoff !== 'off') {
-    const advised = view.handoff === 'advised'
-    out.push({ key: 'handoff', label: t(L, 'band.handoff') + (!isRich(frame) && advised ? ' ◆' : ''), hotkey: 'h', onPress: actions.handoff, on: advised })
-  }
+  // Handoff always shows (2026-10-24: one press, no advice), first in the row as it was.
+  out.push({ key: 'handoff', label: t(L, 'band.handoff'), hotkey: 'h', onPress: actions.handoff, on: false })
   out.push(
     { key: 'auto', label: t(L, 'band.auto') + mark(view.auto), hotkey: 'a', onPress: actions.toggleAuto, on: view.auto },
     { key: 'warm', label: t(L, 'band.warm') + mark(view.warm.on), hotkey: 'w', onPress: actions.toggleWarm, on: view.warm.on },
@@ -322,9 +319,9 @@ function controlCells(frame: Frame, c: Control): number {
   return cells(frame, c.label) + PAD + (c.count !== undefined ? COUNT_CELLS : 0)
 }
 
-/** Every control's cells, Handoff counted whether shown or not, so the route's room stays put. */
+/** Every control's cells, so the route's room stays put. */
 function controlsCells(frame: Frame, view: DashboardView, actions: BandActions): number {
-  const list = controls(frame, { ...view, handoff: 'advised' }, actions)
+  const list = controls(frame, view, actions)
   return list.reduce((n, c) => n + controlCells(frame, c), 0) + CTRL_GAP * (list.length - 1) * (isRich(frame) ? 1 : 2)
 }
 
@@ -338,8 +335,8 @@ function factsFor(frame: Frame, view: DashboardView, actions: BandActions, room:
     (f): f is Fact => f !== null && !drop.includes(f.key),
   )
   const left = room - span(fixed) - (fixed.length ? GAP : 0)
-  // The desktop's route is a flex item: it takes what the row really leaves (the room counted here
-  // keeps Handoff's place, which it mostly does not need) and the host cuts its name past that.
+  // The desktop's route is a flex item: it takes what the row really leaves and the host cuts its
+  // name past that.
   const route = drop.includes('route') ? null : routeFact(frame, view, isRich(frame) ? Math.max(left, RICH_ROUTE_MIN) : left, actions.toggleLog)
   return route ? [...fixed, route] : fixed
 }
@@ -352,8 +349,8 @@ function factsFor(frame: Frame, view: DashboardView, actions: BandActions, room:
 // it, left to right: the effort as five bars rising shallow to deep and its word; a rule; the
 // context ring, the cache clock, the plan limit and the mode when on; a rule; the last route (its
 // model the way into the log); the judge's reason in what is left. Then the controls, each lit
-// under the pointer: Handoff when advised, Auto's switch, keep-warm's flame, the agents, settings,
-// and the way out. Pointing at a fact shows what it means in the reason's place.
+// under the pointer: Handoff, Auto's switch, keep-warm's flame, the agents, settings, and the way out.
+// Pointing at a fact shows what it means in the reason's place.
 // With the `limits` extra on and any window known, a second row under the first (starting where
 // the effort does) gauges every plan window — Claude's, then each ChatGPT account's — and the
 // first row's limit fact steps aside for the route.
@@ -362,7 +359,7 @@ function factsFor(frame: Frame, view: DashboardView, actions: BandActions, room:
 export const BAND_RIPPLE = 24
 /** 리플이's slot at the row's start, in cells: 24 px and its air. */
 export const CREST_CELLS = 4
-/** The row's height, px: a pill's, whether or not one shows, so Handoff never moves the band. */
+/** The row's height, px: a pill's, whether or not one shows, so nothing moves the band. */
 const ROW_H = 26
 // Fact and control widths alone decide the row, never a value, so a changing figure never moves its
 // neighbours. The air between facts and between controls is trimmed below what reads as a whole cell
@@ -394,16 +391,26 @@ function bandSea(mood: BandMood): Omit<Sea, 'at'> {
 /** A fact's hover group: pointing at it shows its tip in the reason's place. */
 const tipScope = (key: string) => 'ripple-tip-' + key
 
-type DrawnFact = { key: string; cells: number; node: RenderNode; tip?: string }
+/** `press`: the fact is a button, so its tip starts past it and leaves its light in sight. */
+type DrawnFact = { key: string; cells: number; node: RenderNode; tip?: string; press?: () => void }
 
-function drawnFact(el: Els, key: string, cells: number, children: RenderNode[], tip?: string): DrawnFact {
+/** The air either side of a fact that is a button, in cells, inside its light as a control's is. */
+const PRESS_PAD = 0.5
+
+/**
+ * A fact's Box. `lit`: the fact is a button, lit under the pointer as the controls are, so it reads
+ * as one before it is pressed (2026-10-24: the context chip opened a pane and nothing said so).
+ */
+function drawnFact(el: Els, key: string, cells: number, children: RenderNode[], tip?: string, lit?: Frame): DrawnFact {
   const { Box } = el
+  const scope = tip ? tipScope(key) : undefined
+  const hover = lit ? { ...hoverLight(lit, scope), paddingX: PRESS_PAD } : scope ? { hover: { scope } } : {}
   return {
     key,
     cells,
     tip,
     node: (
-      <Box key={'fact-' + key} position="relative" flexDirection="row" alignItems="center" columnGap={1} width={cells} flexShrink={0} {...(tip ? { hover: { scope: tipScope(key) } } : {})}>
+      <Box key={'fact-' + key} position="relative" flexDirection="row" alignItems="center" columnGap={1} width={cells} flexShrink={0} {...hover}>
         {children}
       </Box>
     ),
@@ -425,7 +432,7 @@ function effortDrawn(el: Els, frame: Frame, view: DashboardView, actions: BandAc
   const look = mode === 'deciding' ? 'deciding' : mode === 'auto' ? 'auto' : mode === 'manual' ? 'manual' : 'quiet'
   // The word's slot is sized for the widest word (bold Hangul runs ~15% wide of the estimate).
   const wordPx = Math.max(...effortWords(frame.lang, true).map(w => textPx(w) * 1.15))
-  const cells = Math.ceil((METER_W + CELL_PX + wordPx) / CELL_PX)
+  const cells = Math.ceil((METER_W + CELL_PX + wordPx) / CELL_PX + PRESS_PAD * 2)
   const tip = effortFact(frame, view, actions.toggleEffortMenu).card?.join(' · ')
   return drawnFact(
     el,
@@ -439,20 +446,30 @@ function effortDrawn(el: Els, frame: Frame, view: DashboardView, actions: BandAc
       press(el, 'effort', cells * CELL_PX, actions.toggleEffortMenu),
     ],
     tip,
+    frame,
   )
 }
 
-function contextDrawn(el: Els, frame: Frame, view: DashboardView): DrawnFact | null {
+/**
+ * The context ring and its share. With the Context pane to open it is a button (the app dropped the
+ * breakdown its own ring under the composer opened, 2026-10-24): our ring and words, lit under the
+ * pointer, a blank press laid over them, and its tip starting past it (bandDrawn). A tip laid over
+ * the chip took its press and hid its light behind the tip's plate (2026-10-24). The pressable
+ * tip leaves out the share the chip already shows.
+ */
+function contextDrawn(el: Els, frame: Frame, view: DashboardView, onPress?: () => void): DrawnFact | null {
   const ctx = view.context
   if (!ctx || !view.extras.includes('context')) return null
   const { Text } = el
-  const tone = contextTone(ctx.percent, view.swampAt)
-  const tip = contextFact(frame, view)?.card?.join(' · ')
-  const cells = Math.ceil((16 + CELL_PX + textPx('100%')) / CELL_PX)
-  return drawnFact(el, 'context', cells, [
-    pic(el, 'ring', lookOf(frame).art.ring(ctx.percent, tone === 'ink' ? 'ink' : tone === 'warn' ? 'amber' : 'red'), t(frame.lang, 'band.context'), 16, 16),
-    <Text key="ctx-value" {...figure(frame, tone)}>{Math.round(ctx.percent) + '%'}</Text>,
-  ], tip)
+  const tone = contextTone(ctx.percent)
+  const tip = onPress
+    ? t(frame.lang, 'band.contextOpen', { tokens: compactNumber(ctx.tokens), window: compactNumber(ctx.window) })
+    : contextFact(frame, view)?.card?.join(' · ') || undefined
+  const cells = Math.ceil((16 + CELL_PX + textPx('100%')) / CELL_PX + (onPress ? PRESS_PAD * 2 : 0))
+  const ring = pic(el, 'ring', lookOf(frame).art.ring(ctx.percent, tone === 'ink' ? 'ink' : tone === 'warn' ? 'amber' : 'red'), t(frame.lang, 'band.context'), 16, 16)
+  const value = <Text key="ctx-value" {...figure(frame, tone)}>{Math.round(ctx.percent) + '%'}</Text>
+  if (!onPress) return drawnFact(el, 'context', cells, [ring, value], tip)
+  return { ...drawnFact(el, 'context', cells, [ring, value, press(el, 'context', cells * CELL_PX, onPress)], tip, frame), press: onPress }
 }
 
 function cacheDrawn(el: Els, frame: Frame, view: DashboardView): DrawnFact | null {
@@ -719,13 +736,13 @@ function routeDrawn(el: Els, frame: Frame, view: DashboardView, actions: BandAct
  * pointer could never be over it), so each tip reveals through its own `hover.scope`, which the
  * fact's or control's hover lights.
  */
-function whyDrawn(el: Els, frame: Frame, tips: { key: string; text: string }[], at: number, right: number): RenderNode[] {
+function whyDrawn(el: Els, frame: Frame, tips: { key: string; text: string; at?: number }[], at: number, right: number): RenderNode[] {
   const { Box, Text } = el
-  // Placed Box offsets are whole cells; a tip starts at the first cell past 리플이 and the effort.
-  const left = Math.ceil(at)
+  // Placed Box offsets are whole cells; a tip starts at the first cell past 리플이 and the effort,
+  // or past its own fact when that is a button.
   const width = Math.max(40, frame.columns) * CELL_PX
   return tips.map(tip => (
-    <Box position="absolute" top={0} bottom={0} left={left} right={Math.ceil(right)} display="none" hover={{ scope: tipScope(tip.key), display: 'flex' }} overflow="hidden">
+    <Box position="absolute" top={0} bottom={0} left={Math.ceil(tip.at ?? at)} right={Math.ceil(right)} display="none" hover={{ scope: tipScope(tip.key), display: 'flex' }} overflow="hidden">
       <Box position="absolute" top={0} left={0}>
         {pic(el, 'tip-plate-' + tip.key, lookOf(frame).art.plate(width, ROW_PX), tip.text, width, ROW_PX)}
       </Box>
@@ -768,12 +785,9 @@ function controlsDrawn(el: Els, frame: Frame, view: DashboardView, actions: Band
   const out: DrawnControl[] = []
   const k = lookOf(frame)
   const state = (on: boolean) => t(L, on ? 'band.on' : 'band.off')
-  if (view.handoff !== 'off') {
-    const advised = view.handoff === 'advised'
-    const label = t(L, 'band.handoff')
-    const look = advised ? 'primary' : 'ghost'
-    out.push({ key: 'handoff', cells: k.art.pill(label, look, 'violet').cells + 1, node: pill(el, frame, 'handoff', label, look, actions.handoff, 'violet'), tip: t(L, 'alerts.handoffTitle') })
-  }
+  // Handoff, a quiet pill that names itself: always there, so it is counted like any control.
+  const handoffLabel = t(L, 'band.handoff')
+  out.push({ key: 'handoff', cells: k.art.pill(handoffLabel, 'ghost', 'violet').cells + 1, node: pill(el, frame, 'handoff', handoffLabel, 'ghost', actions.handoff, 'violet'), tip: t(L, 'alerts.handoffTitle') })
   // Auto's word is the control (art.ts `wordArt`): lit violet while on, a quiet ghost while off,
   // pulsing while the judge decides. No switch: the state is in the word's own light (2026-10-14).
   const autoLabel = t(L, 'band.auto')
@@ -809,6 +823,86 @@ function effortMenuDrawn(el: Els, frame: Frame, view: DashboardView, actions: Ba
   )
 }
 
+// ---- The delegation pin ------------------------------------------------------------------------
+//
+// A session-only authorization shown as one line of plain words: the pin's name, the person's own
+// sentence that set it (or, without one, how long it holds), and a way to release it. On the desktop
+// it is the capsule's own first row (the app lays a grey plate behind the band, so anything drawn
+// apart from the capsule floats on it, 2026-10-23); on the terminal and in the footer it is a line
+// of text. Not pinned, there is no line and the band draws as it always did.
+
+/** The pin line's height on the desktop, px. */
+const PIN_ROW_PX = 24
+/** The least room the person's sentence gets before it is dropped for the name alone. */
+const PIN_REASON_MIN = 20
+/** A name's place in the pin's label: what lies before it and after it, whatever the language. */
+const PIN_HOLE = String.fromCharCode(1)
+
+type PinWords = { before: string; name: string; after: string; reason: string }
+
+function pinWords(frame: Frame, view: DashboardView): PinWords {
+  const [before = '', after = ''] = t(frame.lang, 'band.delegationPin', { name: PIN_HOLE }).split(PIN_HOLE)
+  const reason = view.delegationSaid ? t(frame.lang, 'band.pinSaid', { said: view.delegationSaid }) : t(frame.lang, 'band.pinKept')
+  return { before, name: view.delegationPin ?? '', after, reason }
+}
+
+/** Cells the sentence has beside the label, or 0 when it would be cut to less than PIN_REASON_MIN. */
+function pinReasonRoom(frame: Frame, words: PinWords, taken: number, columns: number): number {
+  const room = columns - taken - cells(frame, words.before + words.name + words.after) - cells(frame, ' · ') - 1
+  return room >= PIN_REASON_MIN ? room : 0
+}
+
+/** The pin as a line of text (terminal, minimal footer): label, name in the accent, sentence, Unpin. */
+function pinText(el: Els, frame: Frame, view: DashboardView, actions: Pick<BandActions, 'releaseDelegationPin'>, reserve: number): RenderNode {
+  if (!view.delegationPin) return ''
+  const { Box, Text } = el
+  const words = pinWords(frame, view)
+  const release = actions.releaseDelegationPin ? t(frame.lang, 'band.releasePin') : ''
+  const room = pinReasonRoom(frame, words, reserve + (release ? cells(frame, release) + 1 : 0), frame.columns)
+  return (
+    <Box key="delegation-pin" flexDirection="row" flexWrap="wrap" columnGap={1}>
+      <Text>
+        <Text dimColor>{words.before}</Text>
+        <Text color={textTone(frame.appearance).accent}>{words.name}</Text>
+        <Text dimColor>{words.after + (room ? ' · ' + clip(words.reason, room) : '')}</Text>
+      </Text>
+      {actions.releaseDelegationPin ? textButton(el, 'release-pin', release, actions.releaseDelegationPin) : null}
+    </Box>
+  )
+}
+
+/**
+ * The desktop's pin line, the capsule's first row: the pin's mark, the label in soft ink with the
+ * name in violet, the person's sentence quieter, and Unpin lit under the pointer at the right.
+ * Narrow, the sentence goes and only the label, the name and Unpin are left.
+ */
+function pinRowDrawn(el: Els, frame: Frame, view: DashboardView, actions: BandActions, cols: number): RenderNode {
+  if (!view.delegationPin) return ''
+  const { Box, Text } = el
+  const k = lookOf(frame)
+  const words = pinWords(frame, view)
+  const release = actions.releaseDelegationPin
+  const releaseLabel = t(frame.lang, 'band.releasePin')
+  const releaseCells = release ? Math.ceil((textPx(releaseLabel) * 1.05) / CELL_PX + 1.2) : 0
+  // The row's own air: the indent, the mark and its gap, the release control and the gap before it.
+  const taken = CREST_CELLS + Math.ceil((ICON_PX + CELL_PX) / CELL_PX) + (release ? releaseCells + 1 : 0)
+  const room = pinReasonRoom(frame, words, taken, cols)
+  return (
+    <Box key="delegation-pin" flexDirection="row" alignItems="center" columnGap={1} width="100%" minWidth={0} height={rowsOf(PIN_ROW_PX)} paddingLeft={CREST_CELLS}>
+      {pic(el, 'pin-mark', k.art.icon('pin', true, 'violet'), '', ICON_PX, 16)}
+      <Box key="pin-words" flexGrow={1} flexShrink={1} minWidth={0}>
+        <Text wrap="truncate">
+          <Text {...k.sub}>{words.before}</Text>
+          <Text color={k.tone('violet')} bold>{words.name}</Text>
+          <Text {...k.sub}>{words.after}</Text>
+          {room ? <Text {...k.mute}>{' · ' + words.reason}</Text> : ''}
+        </Text>
+      </Box>
+      {release ? lit(el, frame, 'release-pin', releaseCells, [<Text key="release-pin-word" {...k.sub}>{releaseLabel}</Text>, press(el, 'release-pin', releaseCells * CELL_PX, release)], 0.5) : ''}
+    </Box>
+  )
+}
+
 function bandDrawn(el: Els, frame: Frame, view: DashboardView, actions: BandActions): RenderNode {
   const { Box } = el
   // The capsule's air and edge take their share of the frame.
@@ -822,16 +916,15 @@ function bandDrawn(el: Els, frame: Frame, view: DashboardView, actions: BandActi
   // The second row is decided before the first row's budget: when it draws, the first row's limit
   // fact steps aside and the route takes its room.
   const limitsRow = limitsRowDrawn(el, frame, view, cols - CREST_CELLS)
-  const optional = [modeDrawn(el, frame, view), contextDrawn(el, frame, view), cacheDrawn(el, frame, view), ...(limitsRow ? [] : [limitDrawn(el, frame, view)])].filter((f): f is DrawnFact => f !== null)
+  const optional = [modeDrawn(el, frame, view), contextDrawn(el, frame, view, actions.toggleContext), cacheDrawn(el, frame, view), ...(limitsRow ? [] : [limitDrawn(el, frame, view)])].filter((f): f is DrawnFact => f !== null)
   // The Auto word is its control: it never loses its shape, so no word of it is dropped, and the
   // spare words (the icons' beside it) go first when the row narrows.
   let words: readonly string[] = [...WORDLESS]
-  // Counted with Handoff in its place whether it shows or not, and the route at a fixed room
-  // (a long model name is cut, a short one leaves air): what the band holds never depends on a value.
-  // The air between controls is the row's own columnGap (a fraction of a cell, as the facts' air),
-  // and the hide button a half-separator of its own.
+  // Counted at a fixed room (a long model name is cut, a short one leaves air): what the band holds
+  // never depends on a value. The air between controls is the row's own columnGap (a fraction of a
+  // cell, as the facts' air), and the hide button a half-separator of its own.
   const counted = (w: readonly string[]) => {
-    const list = controlsDrawn(el, frame, { ...view, handoff: 'advised' }, actions, w)
+    const list = controlsDrawn(el, frame, view, actions, w)
     return list.reduce((n, c) => n + c.cells, 0) + 0.15 * (list.length - 1) + (actions.hide ? 0.15 : 0)
   }
   let controlCells = counted(words)
@@ -844,7 +937,7 @@ function bandDrawn(el: Els, frame: Frame, view: DashboardView, actions: BandActi
   // Narrow, things go in this order until the row fits: the icons' words (clear, compact,
   // settings, agents, keep-warm), the rules, then the route draws in to its least, then the mode
   // and the context chip, last the cache. The limit and the new icons stay (2026-10-14: the band
-  // sits at its ~100-column maximum and must hold everything there, Handoff with the rest).
+  // sits at its ~100-column maximum and must hold everything there).
   for (const drop of [...WORDLESS, 'rules', 'route', 'mode', 'context', 'cache']) {
     if (need(facts) <= cols) break
     if ((WORDLESS as readonly string[]).includes(drop)) {
@@ -855,8 +948,16 @@ function bandDrawn(el: Els, frame: Frame, view: DashboardView, actions: BandActi
     else facts = facts.filter(f => f.key !== drop)
   }
   const controls = controlsDrawn(el, frame, view, actions, words)
-  const tips = [effort, ...facts].filter(f => f.tip).map(f => ({ key: f.key, text: f.tip! }))
+  // A fact that is a button keeps its light in sight: its tip starts where the next fact does.
+  const past: Record<string, number> = {}
+  let x = CREST_CELLS + DRAWN_GAP + effort.cells + DRAWN_GAP + (ruled && facts.length ? RULE_CELLS + DRAWN_GAP : 0)
+  for (const f of facts) {
+    x += f.cells + DRAWN_GAP
+    if (f.press) past[f.key] = x
+  }
+  const tips = [effort, ...facts].filter(f => f.tip).map(f => ({ key: f.key, text: f.tip!, ...(past[f.key] !== undefined ? { at: past[f.key] } : {}) }))
   if (limitsRow) for (const tip of limitsRow.tips) tips.push(tip)
+  // Handoff names itself in its pill: no tip of its own.
   for (const c of controls) if (c.key !== 'handoff') tips.push({ key: c.key, text: c.tip })
   if (actions.hide) tips.push({ key: 'hide', text: t(frame.lang, 'band.hideBand') })
   const crest = (
@@ -892,13 +993,15 @@ function bandDrawn(el: Els, frame: Frame, view: DashboardView, actions: BandActi
       </Box>
     </Box>
   )
+  // A pinned model adds one line at the top of the capsule; the sea and its glow follow 리플이 down.
+  const pinned = !!view.delegationPin
   return capsule(el, frame, {
     key: 'band',
-    sea: { ...bandSea(mood), reach: 120, at: { x: PAD_X * CELL_PX + (CREST_CELLS * CELL_PX) / 2, y: PAD_Y * ROW_PX * 0.5 + ROW_H / 2 } },
-    rows: view.effortMenu ? (limitsRow ? 4.6 : 3.4) : limitsRow ? 3 : 1.8,
+    sea: { ...bandSea(mood), reach: 120, at: { x: PAD_X * CELL_PX + (CREST_CELLS * CELL_PX) / 2, y: PAD_Y * ROW_PX * 0.5 + ROW_H / 2 + (pinned ? PIN_ROW_PX : 0) } },
+    rows: (view.effortMenu ? (limitsRow ? 4.6 : 3.4) : limitsRow ? 3 : 1.8) + (pinned ? rowsOf(PIN_ROW_PX) : 0),
     paddingX: PAD_X,
     paddingY: PAD_Y,
-    children: [row, ...(limitsRow ? [limitsRow.node] : []), view.effortMenu ? effortMenuDrawn(el, frame, view, actions) : ''],
+    children: [...(pinned ? [pinRowDrawn(el, frame, view, actions, cols)] : []), row, ...(limitsRow ? [limitsRow.node] : []), view.effortMenu ? effortMenuDrawn(el, frame, view, actions) : ''],
   })
 }
 
@@ -983,6 +1086,7 @@ function bandText(el: Els, frame: Frame, view: DashboardView, actions: BandActio
   ) : null
   return (
     <Box flexDirection="column" width="100%">
+      {pinText(el, frame, view, actions, 0)}
       {p.oneRow ? (
         <Box key="row" flexDirection="row" width="100%">
           {factRow}
@@ -1005,21 +1109,38 @@ export function besideBand(frame: Frame): number {
   return isRich(frame) ? 5 : 2 + displayWidth('e: ' + t(frame.lang, 'band.effort')) + 2 + 1
 }
 
+/** Only display copies change; ids and state used by the actions remain untouched. */
+function bandDisplay(view: DashboardView): DashboardView {
+  return {
+    ...view,
+    model: view.model === null ? null : displayText(view.model, DISPLAY.name),
+    notice: view.notice === null ? null : displayText(view.notice),
+    effort: { ...view.effort, ...(view.effort.why ? { why: displayText(view.effort.why) } : {}) },
+    warm: { ...view.warm, ...(view.warm.stopped ? { stopped: displayText(view.warm.stopped) } : {}) },
+    ...(view.mode ? { mode: displayText(view.mode, DISPLAY.name) } : {}),
+    ...(view.delegationPin ? { delegationPin: displayText(view.delegationPin, DISPLAY.name) } : {}),
+    ...(view.delegationSaid ? { delegationSaid: displayText(view.delegationSaid) } : {}),
+    route: view.route ? { ...view.route, model: displayText(view.route.model, DISPLAY.name), provider: displayText(view.route.provider, DISPLAY.name), status: displayText(view.route.status, DISPLAY.name), ...(view.route.effort ? { effort: displayText(view.route.effort, DISPLAY.name) } : {}), ...(view.route.note ? { note: displayText(view.route.note) } : {}) } : null,
+  }
+}
+
 /** The dashboard band, `frame.columns` being its own width (see besideBand). */
 export function renderBand(el: Els, frame: Frame, view: DashboardView, actions: BandActions): RenderNode {
+  view = bandDisplay(view)
   if (!isRich(frame) || !('Svg' in el)) return bandText(el, frame, view, actions)
   return bandDrawn(el, frame, view, actions)
 }
 
 // ---- Minimal: the footer -----------------------------------------------------------------------
 
-export type FooterActions = Pick<BandActions, 'toggleAuto' | 'openSettings'>
+export type FooterActions = Pick<BandActions, 'toggleAuto' | 'openSettings' | 'releaseDelegationPin'>
 
 /**
  * The minimal layout: one quiet line in the footer's mode area (SessionMode), the engine's own
  * modes kept beside it. `engine` is what `next(e)` drew there.
  */
 export function renderFooter(el: Els, frame: Frame, view: DashboardView, actions: FooterActions, engine?: RenderChildren): RenderNode {
+  view = bandDisplay(view)
   const { Box, Text } = el
   const tone = textTone(frame.appearance)
   const { level, mode } = view.effort
@@ -1027,7 +1148,7 @@ export function renderFooter(el: Els, frame: Frame, view: DashboardView, actions
   const effortText =
     mode === 'deciding' ? t(frame.lang, 'band.decidingText') : (idx >= 0 ? RIPPLE_CHAR[idx]! : '○') + ' ' + (level ? effortName(level, frame.lang).toLowerCase() : '—') + (mode === 'auto' ? '' : mode === 'paused' ? t(frame.lang, 'band.footerPaused') : mode === 'off' ? t(frame.lang, 'band.footerOff') : t(frame.lang, 'band.footerManual'))
   const left = view.cache ? view.cache.expiresAt - frame.now : 0
-  const ctxTone = view.context ? contextTone(view.context.percent, view.swampAt) : 'ink'
+  const ctxTone = view.context ? contextTone(view.context.percent) : 'ink'
   return (
     <Box flexDirection="row" flexWrap="wrap" columnGap={2} alignItems="center">
       <Text color={mode === 'deciding' || mode === 'auto' ? tone.accent : undefined} dimColor={mode === 'paused' || mode === 'off'}>
@@ -1043,6 +1164,7 @@ export function renderFooter(el: Els, frame: Frame, view: DashboardView, actions
       {view.limit && view.extras.includes('limits') ? <Text dimColor>{limitName(view.limit.kind, frame.lang) + ' ' + Math.round(view.limit.percent) + '%'}</Text> : null}
       {textButton(el, 'auto', t(frame.lang, 'band.auto') + (view.auto ? ' ●' : ' ○'), actions.toggleAuto)}
       {textButton(el, 'settings', '⚙', actions.openSettings)}
+      {pinText(el, frame, view, actions, 60)}
       {engine ?? null}
     </Box>
   )

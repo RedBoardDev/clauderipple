@@ -1,5 +1,4 @@
-import type { Domain, Effort, JudgeInput, Kind, Level, Pick, Settings, Verdict, WorkerVerdict } from '../types'
-import { DOMAINS, LEVELS } from './settings.ts'
+import type { Effort, JudgeInput, Pick, Settings, Verdict } from '../types'
 import { t } from './i18n.ts'
 import type { Lang } from './i18n.ts'
 
@@ -127,30 +126,6 @@ const effortCriteria = {
   xhigh: 'Debugging with an unknown cause, changes across interacting modules, or planning a feature.',
   max: 'Product or architecture decisions, important plans or strategy, security or data-loss risk, or a problem earlier attempts failed to solve.',
 }
-// Read with the brief, the old wording sent 49 of 64 delegated tasks to deep, against 19 from their
-// one-line descriptions alone: a brief's warnings ("do not restart", "read-only", "no guessing")
-// read as high stakes. Re-judged with this wording the same briefs give 28 (2026-10-15, pick log).
-const levelCriteria = {
-  light: 'Mechanical chores, repeated edits, simple lookups, or one small fix.',
-  standard: 'Carry out a designed change, even across several files; research, summarize, or review read-only.',
-  deep: 'Subtle debugging, security review, or architecture where a wrong call is costly. Size, file count, or warnings and prohibitions in the brief do not by themselves make work deep.',
-}
-const domainCriteria: Record<Domain, string> = {
-  design: 'Visual composition, branding, taste, look and voice of copy.',
-  frontend: 'Frontend UI implementation, components, styles and interactions.',
-  backend: 'Server application logic, APIs and authentication.', infra: 'Infrastructure, deployment, networks and operations.',
-  data: 'Data processing, schemas, queries and analysis.', test: 'Tests, quality assurance and verification.',
-  docs: 'Documentation, technical writing and summaries.', research: 'Investigation and research.', general: 'Other or cross-domain work.',
-}
-/** Plan decides what to build; do carries it out. The ladder sends plans at standard or deep to its Plan rung. */
-export const kindCriteria: Record<Kind, string> = {
-  plan: 'Decide what to build: architecture, design decisions, specifications, or a review whose verdict decides.',
-  do: 'Carry out what is decided: implement, fix, run, look up, rename, write, or check.',
-}
-export function kindOf(value: unknown): Kind | undefined {
-  return value === 'plan' || value === 'do' ? value : undefined
-}
-
 function jevBody(input: JudgeInput, task: string) {
   return {
     model: 'jev-latest' as const,
@@ -162,16 +137,6 @@ function jevBody(input: JudgeInput, task: string) {
 
 export function jevEffortRequest(input: JudgeInput) {
   return jevBody(input, EFFORT_JUDGE_SYSTEM)
-}
-
-/** Capability and kind of work are independent; the judge never chooses a provider. */
-export function jevWorkerRequest(input: { description: string; prompt: string }) {
-  const body = jevBody({ messages: [], next: `${input.description}\n${input.prompt.slice(0, 3000)}` }, 'Choose the domain, capability level, kind of work and reasoning effort for a delegated coding task. Judge scope and risk independently of the domain.')
-  return { ...body, questions: { ...body.questions,
-    domain: { type: 'choice' as const, instructions: 'Select the domain of this task.', criteria: { ...domainCriteria } },
-    level: { type: 'choice' as const, instructions: 'Select the capability level needed.', criteria: { ...levelCriteria } },
-    kind: { type: 'choice' as const, instructions: 'Select whether this task decides what to build or carries it out.', criteria: { ...kindCriteria } },
-  } }
 }
 
 function answers(json: unknown): Record<string, unknown> | undefined {
@@ -193,23 +158,6 @@ export function parseJevEffort(json: unknown, current?: { effort: Effort } | nul
   const plausible = current && (!odds || (confidence(odds[current.effort]) ?? 0) >= 0.25)
   if (sure !== undefined && sure < 0.5 && current && current.effort !== level && plausible) return { effort: current.effort, sure, why: t(lang, 'judge.keptUnsure') }
   return { effort: level, ...(sure !== undefined ? { sure } : {}), why: '' }
-}
-
-export function parseJevWorker(json: unknown): WorkerVerdict | undefined {
-  const reply = answers(json)
-  const domainAnswer = record(reply?.domain)
-  const levelAnswer = record(reply?.level)
-  const effortAnswer = record(reply?.effort)
-  const selectedEffort = effort(effortAnswer?.choice)
-  if (!domainAnswer || !DOMAINS.includes(domainAnswer.choice as Domain) || !levelAnswer || !LEVELS.includes(levelAnswer.choice as Level) || !effortAnswer || !selectedEffort) return undefined
-  // Confidence moves a task up the ladder, so it is the level's question that counts. The lowest of
-  // all three counted before: torn only between frontend and backend, or high and xhigh, a task
-  // judged standard was sent a rung up (4 of 16 standard verdicts, pick log 2026-10-12..15).
-  const kindAnswer = record(reply?.kind)
-  const kind = kindOf(kindAnswer?.choice) ?? 'do'
-  const odds = { domain: answerSure(domainAnswer), level: answerSure(levelAnswer), kind: kindAnswer ? answerSure(kindAnswer) : undefined, effort: answerSure(effortAnswer) }
-  const known = Object.fromEntries(Object.entries(odds).filter(([, score]) => score !== undefined)) as WorkerVerdict['odds']
-  return { domain: domainAnswer.choice as Domain, level: levelAnswer.choice as Level, kind, effort: selectedEffort, ...(odds.level !== undefined ? { sure: odds.level } : {}), ...(Object.keys(known!).length ? { odds: known } : {}), why: '' }
 }
 
 export function jevUsage(json: unknown): number {

@@ -128,7 +128,7 @@ export function runUpdate(target: InstallKind & { kind: "script" | "npm" }, rt: 
     // A local path stands in for the published script when checking an update before release.
     const script = process.env.CLAUDERIPPLE_INSTALLER;
     if ((opts.platform ?? process.platform) === "win32") {
-      const result = run("powershell.exe", ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", `$ErrorActionPreference = 'Stop'; ${script ? `& ${psQuote(script)}` : `irm ${SCRIPT_BASE}/install.ps1 | iex`}`], { env: { ...windowsPowerShellEnv(), ...env }, stdio: "inherit", windowsHide: true });
+      const result = run("powershell.exe", ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", `$ErrorActionPreference = 'Stop'; ${script ? `& ${psQuote(script)}` : `irm ${SCRIPT_BASE}/install.ps1 | iex`}`], { env: windowsPowerShellEnv(env), stdio: "inherit", windowsHide: true });
       return result.status === 0 ? { ok: true, message: "✓ updated" } : { ok: false, message: `the installer exited with ${result.status ?? result.signal}` };
     }
     const temp = script ? null : fs.mkdtempSync(path.join(opts.tempDir ?? os.tmpdir(), "clauderipple-update-"));

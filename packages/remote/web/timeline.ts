@@ -1,15 +1,15 @@
 // Events → what the timeline shows. Pure, so the same reduction runs in tests and in the app.
-import type { PermissionContent, Effort, Figures, ImagePart, SessionEvent, SessionState, Text, ToolCall } from "../src/protocol.ts";
+import type { PermissionContent, RuleStatus, Effort, Figures, ImagePart, SessionFile, SessionEvent, SessionState, Text, ToolCall } from "../src/protocol.ts";
 import { WRAP_TOOL, wrapUpFields, type WrapUpReply } from "../src/wrap-up.ts";
 
-export interface ToolView extends ToolCall { result?: { ok: boolean; text: Text; images?: ImagePart[] } }
+export interface ToolView extends ToolCall { result?: { ok: boolean; text: Text; images?: ImagePart[]; files?: SessionFile[] } }
 
 export type Item =
-  | { type: "user"; key: string; ver: string; text: string; images?: ImagePart[]; at: number; queued?: "pending" | "sending" }
-  | { type: "assistant"; key: string; ver: string; text: Text; images?: ImagePart[]; streaming: boolean; tools: ToolView[]; model: string; at: number }
+  | { type: "user"; key: string; ver: string; text: string; images?: ImagePart[]; files?: SessionFile[]; at: number; queued?: "pending" | "sending" }
+  | { type: "assistant"; key: string; ver: string; text: Text; images?: ImagePart[]; files?: SessionFile[]; streaming: boolean; tools: ToolView[]; model: string; at: number }
   | { type: "thinking"; key: string; ver: string; text: Text; streaming: boolean; msg: string; at: number }
   | { type: "subagent"; key: string; ver: string; toolUseId: string; sub: string; description: string; model: string | null; status: "running" | "done" | "failed"; steps: number }
-  | (PermissionContent & { type: "permission"; key: string; ver: string; id: string; tool: string; title: string; summary: string; input: Text; canAlways: boolean; decision: null | "allow" | "allow_always" | "deny" | "expired"; reason?: string; at: number })
+  | (PermissionContent & { type: "permission"; key: string; ver: string; id: string; tool: string; title: string; summary: string; input: Text; canAlways: boolean; decision: null | "allow" | "allow_always" | "deny" | "expired"; ruleStatus?: RuleStatus; reason?: string; at: number })
   | { type: "result"; key: string; ver: string; ok: boolean; error?: string; ms: number; model: string; effort: Effort | null }
   | { type: "notice"; key: string; ver: string; code: string; text?: string }
   | { type: "start"; key: string; ver: string };
@@ -58,7 +58,7 @@ export function reduce(events: readonly SessionEvent[], outbox: readonly Outgoin
         seenUser.add(e.clientMsgId);
         // The app counts "working for" from the person's message; Mac sessions have no turn event to say so.
         turnStartedAt = e.at;
-        put({ type: "user", key: `u${e.clientMsgId}`, ver: `u${e.seq}`, text: e.text, ...(e.images ? { images: e.images } : {}), at: e.at });
+        put({ type: "user", key: `u${e.clientMsgId}`, ver: `u${e.seq}`, text: e.text, ...(e.images ? { images: e.images } : {}), ...(e.files ? { files: e.files } : {}), at: e.at });
         break;
       case "turn":
         model = e.model; effort = e.effort; turnStartedAt = e.at;
@@ -82,7 +82,7 @@ export function reduce(events: readonly SessionEvent[], outbox: readonly Outgoin
         const previous = byKey.has(key) ? items[byKey.get(key)!] : undefined;
         const results = new Map(previous?.type === "assistant" ? previous.tools.map(tc => [tc.id, tc.result]) : []);
         const tools: ToolView[] = e.tools.map(tc => ({ ...tc, ...(results.get(tc.id) ? { result: results.get(tc.id)! } : {}) }));
-        put({ type: "assistant", key, ver: `f${e.seq}`, text: e.text, ...(e.images ? { images: e.images } : {}), streaming: false, tools, model: e.model, at: e.at });
+        put({ type: "assistant", key, ver: `f${e.seq}`, text: e.text, ...(e.images ? { images: e.images } : {}), ...(e.files ? { files: e.files } : {}), streaming: false, tools, model: e.model, at: e.at });
         const idx = byKey.get(key)!;
         tools.forEach((tc, i) => toolOwner.set(tc.id, { item: idx, tool: i }));
         break;
@@ -92,7 +92,7 @@ export function reduce(events: readonly SessionEvent[], outbox: readonly Outgoin
         const item = owner ? items[owner.item] : undefined;
         if (owner && item?.type === "assistant") {
           const tools = item.tools.slice();
-          tools[owner.tool] = { ...tools[owner.tool]!, result: { ok: e.ok, text: e.text, ...(e.images ? { images: e.images } : {}) } };
+          tools[owner.tool] = { ...tools[owner.tool]!, result: { ok: e.ok, text: e.text, ...(e.images ? { images: e.images } : {}), ...(e.files ? { files: e.files } : {}) } };
           items[owner.item] = { ...item, tools, ver: `${item.ver}r${e.seq}` };
         }
         break;
@@ -101,12 +101,12 @@ export function reduce(events: readonly SessionEvent[], outbox: readonly Outgoin
         put({ type: "subagent", key: `s${e.toolUseId}`, ver: `${e.seq}`, toolUseId: e.toolUseId, sub: e.sub, description: e.description, model: e.model, status: e.status, steps: e.steps });
         break;
       case "permission":
-        put({ type: "permission", key: `p${e.id}`, ver: `${e.seq}`, id: e.id, tool: e.tool, title: e.title, summary: e.summary, input: e.input, canAlways: e.canAlways, ...(e.requestKind ? { requestKind: e.requestKind } : {}), ...(e.questions ? { questions: e.questions } : {}), decision: null, at: e.at });
+        put({ type: "permission", key: `p${e.id}`, ver: `${e.seq}`, id: e.id, tool: e.tool, title: e.title, summary: e.summary, input: e.input, canAlways: e.canAlways, ...(e.alwaysAllow ? { alwaysAllow: e.alwaysAllow } : {}), ...(e.requestKind ? { requestKind: e.requestKind } : {}), ...(e.questions ? { questions: e.questions } : {}), decision: null, at: e.at });
         break;
       case "permission_decided": {
         const at = byKey.get(`p${e.id}`);
         const item = at === undefined ? undefined : items[at];
-        if (item?.type === "permission") items[at!] = { ...item, decision: e.decision, ...(e.reason ? { reason: e.reason } : {}), ver: `${item.ver}d${e.seq}` };
+        if (item?.type === "permission") items[at!] = { ...item, decision: e.decision, ...(e.ruleStatus ? { ruleStatus: e.ruleStatus } : {}), ...(e.reason ? { reason: e.reason } : {}), ver: `${item.ver}d${e.seq}` };
         break;
       }
       case "result":
@@ -124,6 +124,11 @@ export function reduce(events: readonly SessionEvent[], outbox: readonly Outgoin
         break;
       case "figures":
         figures = e.figures;
+        break;
+      case "settings":
+        // One durable row per operation: a late answer replaces its earlier unknown result.
+        put({ type: "notice", key: `settings:${e.reqId}`, ver: `${e.seq}`, code: `settings_${e.status}`,
+          text: [e.model, e.effort, e.permissionMode, ...Object.values(e.errors ?? {})].filter(Boolean).join(" · ") });
         break;
       case "notice":
         put({ type: "notice", key: `n${e.seq}`, ver: "1", code: e.code, ...(e.text ? { text: e.text } : {}) });
@@ -209,7 +214,7 @@ export function timelineItems(view: Pick<SessionView, "items" | "state">): Timel
       continue;
     }
     if (item.type === "assistant") {
-      if (typeof item.text !== "string" || item.text.trim() || item.images?.length || item.streaming) {
+      if (typeof item.text !== "string" || item.text.trim() || item.images?.length || item.files?.length || item.streaming) {
         group = null;
         result.push({ ...item, tools: [] });
       }
@@ -229,7 +234,7 @@ export function timelineItems(view: Pick<SessionView, "items" | "state">): Timel
         // A widget is something to look at, not activity: it stands on its own instead of folding away.
         if (isWidgetTool(tool.name)) {
           group = null;
-          result.push({ ...item, key: `${item.key}:${tool.id}`, text: "", images: [], streaming: false, tools: [tool] });
+          result.push({ ...item, key: `${item.key}:${tool.id}`, text: "", images: [], files: [], streaming: false, tools: [tool] });
           continue;
         }
         const worker = workers.get(tool.id);

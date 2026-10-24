@@ -44,7 +44,7 @@
     <td colspan="2" align="center"><img src="docs/media/mod-band.png" alt="ripple 模组：推理强度、上下文、缓存计时，以及实际作答的模型和缓存命中率"><br><sub>ripple 模组：推理强度、上下文、缓存计时，以及实际作答的模型和缓存命中率</sub></td>
   </tr>
   <tr>
-    <td align="center" width="50%"><img src="docs/media/mod-alerts.png" alt="缓存变冷或额度将满时提醒，并可交接到新的对话"><br><sub>缓存变冷或额度将满时提醒，并可交接到新的对话</sub></td>
+    <td align="center" width="50%"><img src="docs/media/mod-alerts.png" alt="缓存变冷或额度将满时提醒，并可压缩会话"><br><sub>缓存变冷或额度将满时提醒，并可压缩会话</sub></td>
     <td align="center" width="50%"><img src="docs/media/mod-settings.png" alt="快速设置：自动推理强度、判定模型、工作者模式"><br><sub>快速设置：自动推理强度、判定模型、工作者模式</sub></td>
   </tr>
 </table>
@@ -178,7 +178,7 @@ Claude Code 的系统提示词和工具描述是为 Claude 编写的，所以其
 - **从设计上保证正确。** 保留提示缓存（Anthropic 缓存断点和稳定的 OpenAI 前缀），处理 Claude Code 的服务端线程，完整保留双向传递的工具调用和图片，将推理强度限定在各模型接受的范围内，并为兼容厂商去除 Anthropic 专有的请求字段。
 - **真正的请求日志。** 逐条记录谁发起了请求、哪个模型作答、输入 / 缓存 / 输出 token、延迟和状态，并附最近一小时的汇总。
 - **子代理名称标签。** 后台任务面板显示 `Terra·high · Review`，而不是笼统的“Agent”。
-- **输入框上方的 ripple 模组。** 一条横栏显示推理强度、上下文、缓存计时，以及上一个请求实际由哪个模型作答和缓存命中率。一个小型判定模型（Haiku 5.5 或 Jev）会结合最近的对话阅读每条提示词，在 low 到 max 之间设定推理强度。委派的工作交给 `ripple:auto`，由判定模型按难度挑选 worker：轻活交给 DeepSeek 或 GLM，难活交给 GPT 或 Opus。缓存变冷、上下文变重或套餐额度超过 80% 时会弹出卡片提醒，并提供压缩或交接到同一文件夹的新会话。`Log`（或 `/ripple-log`）会在侧边窗格中打开请求日志。在“客户端”页面上打开一个开关即可启用，或运行 `clauderipple mod on`。
+- **输入框上方的 ripple 模组。** 一条横栏显示推理强度、上下文、缓存计时，以及上一个请求实际由哪个模型作答和缓存命中率。一个小型判定模型（Haiku 5.5 或 Jev）会结合最近的对话阅读每条提示词，在 low 到 max 之间设定推理强度。委派的工作交给 `ripple:auto`，由判定模型按难度挑选 worker：轻活交给 DeepSeek 或 GLM，难活交给 GPT 或 Opus。缓存变冷、上下文变重或套餐额度超过 80% 时会弹出卡片提醒，并提供压缩。`Log`（或 `/ripple-log`）会在侧边窗格中打开请求日志。在“客户端”页面上打开一个开关即可启用，或运行 `clauderipple mod on`。
 - **用 ChatGPT 订阅生成图片。** `clauderipple image "<prompt>"`，支持参考图和透明背景。子代理会被告知用法，因此 GPT 或 DeepSeek worker 无需图像工具也能生成图片并查看结果。
 - **合上笔记本，Claude 照样干活。** 在 macOS 和 Windows 上，Claude 工作期间（以及结束后 10 分钟内）笔记本合盖也不睡眠，所以你从手机发起的任务能做完。Wi-Fi 断了网，它会转到手机热点（iPhone 或 Android），之后再回到已知的 Wi-Fi。该功能默认关闭，需要在控制面板的“笔记本管理”中打开；见[合盖与手机热点](#合盖与手机热点)。
 - **按需精简 worker。** 打开一个开关，生成的子代理就只获得 worker 会用到的工具，而不是会话中的所有 MCP 服务器和插件：某个 worker 的首个请求因此从 33k token 降到了 9k token。

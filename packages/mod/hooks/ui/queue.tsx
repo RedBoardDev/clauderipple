@@ -9,6 +9,7 @@ import { t } from '../i18n'
 import type { RenderNode } from 'claude-code'
 
 import { CELL_PX, ROW_PX } from './art'
+import { displayText } from './display'
 import { capsule } from './kit'
 import { lookOf } from './look'
 import type { Els } from './parts'
@@ -23,7 +24,7 @@ export const PHONE_QUEUE_ROWS = 1
 export function renderPhoneQueue(el: Els, frame: Frame, queue: PhoneQueue): RenderNode {
   const { Box, Text } = el
   const title = t(frame.lang, 'band.phoneQueue', { count: queue.count })
-  const first = queue.first.replace(/\s+/g, ' ').trim()
+  const first = displayText(queue.first.replace(/\s+/g, ' ').trim())
   const when = t(frame.lang, 'band.phoneQueueWhen')
   if (!isRich(frame) || !('Svg' in el)) {
     return (

@@ -7,6 +7,7 @@ import os from "node:os";
 import path from "node:path";
 import { saveClaudeAuthFile } from "../../router/src/providers/anthropic-token-file.ts";
 import { removeAllClaudeAccounts } from "../../router/src/providers/anthropic-accounts.ts";
+import { windowsDesktopRoots } from "../../remote/src/desktop-paths.ts";
 
 function isSetupToken(value: string): boolean {
   return /^sk-ant-oat01-[A-Za-z0-9._~-]{16,}$/.test(value);
@@ -33,7 +34,9 @@ export function desktopClaudeCodeDirs(): string[] {
     process.env.LOCALAPPDATA ?? path.join(os.homedir(), "AppData", "Local"),
     process.env.APPDATA ?? path.join(os.homedir(), "AppData", "Roaming"),
   ];
-  return roots.map((root) => path.join(root, "Claude", "claude-code"));
+  const desktops = windowsDesktopRoots(roots[0]);
+  if (desktops.length > 1) return []; // Do not silently fall back to an unrelated legacy account.
+  return [...desktops.map(root => path.join(root, "claude-code")), ...roots.map(root => path.join(root, "Claude", "claude-code"))];
 }
 
 /** Launcher inside one cached version directory. The macOS build nests an .app bundle. */

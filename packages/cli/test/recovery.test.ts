@@ -17,6 +17,8 @@ import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import { posixModes, posixPaths } from "../../../test/capabilities.ts";
+import { syncAgentFiles } from "../../router/src/agents.ts";
+import { DEFAULTS } from "../../router/src/config.ts";
 
 const root = fs.mkdtempSync(path.join(os.tmpdir(), "cr-recovery-"));
 const label = `com.clauderipple.check-${crypto.randomBytes(4).toString("hex")}`;
@@ -153,14 +155,27 @@ test("uninstall clears picker and Codex settings before purge, even if trust rem
   process.env.CLAUDERIPPLE_HOME = ctx.home;
   process.env.CODEX_HOME = path.join(ctx.home, "codex");
   applyAppProxy(ctx.proxyUrl);
-  codexOn(18793);
+  codexOn(18791);
   try {
+    const modDir = path.join(ctx.home, "mod");
+    const otherMod = path.join(ctx.home, "other-plugin");
+    for (const [dir, name] of [[modDir, "ripple"], [otherMod, "someone-else"]] as const) {
+      fs.mkdirSync(path.join(dir, ".claude-plugin"), { recursive: true });
+      fs.writeFileSync(path.join(dir, ".claude-plugin", "plugin.json"), JSON.stringify({ name }));
+    }
+    fs.writeFileSync(ctx.settings, JSON.stringify({ env: { CLAUDE_CODE_PLUGIN_DIRS: [modDir, otherMod].join(path.delimiter), KEEP: "1" } }));
+    const agents = path.join(path.dirname(ctx.settings), "agents");
+    syncAgentFiles({ ...DEFAULTS, providers: { test: { type: "openai-compatible", url: "http://unused", models: [{ id: "owned-worker" }] } } }, agents, undefined, { manifestPath: path.join(ctx.home, "generated-agents.json") });
+    fs.writeFileSync(path.join(agents, "manual.md"), "hand-written worker");
     let untrusted = false;
     removeClientIntegrations(ctx.home, (ca) => {
       assert.equal(ca, ctx.ca);
       untrusted = true;
       throw new Error("confirmation declined");
-    });
+    }, { modDir, agentDir: agents });
+    assert.deepEqual(JSON.parse(fs.readFileSync(ctx.settings, "utf8")).env, { CLAUDE_CODE_PLUGIN_DIRS: otherMod, KEEP: "1" });
+    assert.equal(fs.existsSync(path.join(agents, "owned-worker.md")), false);
+    assert.equal(fs.readFileSync(path.join(agents, "manual.md"), "utf8"), "hand-written worker");
     assert.equal(currentAppProxy().egressProxyUrl, null);
     assert.equal(codexEnabled(), false);
     assert.equal(fs.existsSync(path.join(process.env.CODEX_HOME, "clauderipple.config.toml")), false);
@@ -169,6 +184,39 @@ test("uninstall clears picker and Codex settings before purge, even if trust rem
   } finally {
     if (oldHome === undefined) delete process.env.CLAUDERIPPLE_HOME;
     else process.env.CLAUDERIPPLE_HOME = oldHome;
+    if (oldCodex === undefined) delete process.env.CODEX_HOME;
+    else process.env.CODEX_HOME = oldCodex;
+  }
+});
+
+test("uninstalling a second home leaves the default install's proxy, Codex provider, CA and workers", () => {
+  // A release check runs under its own CLAUDERIPPLE_HOME and port while the real install keeps
+  // ~/.clauderipple; on 2026-10-24 its uninstall reached the shared Desktop proxy, Codex config, CA.
+  const real = scratch();
+  const check = scratch({ listen: { host: "127.0.0.1", port: 18890 } });
+  const oldCodex = process.env.CODEX_HOME;
+  process.env.CODEX_HOME = path.join(real.home, "codex");
+  applyAppProxy(real.proxyUrl);
+  codexOn(18791);
+  try {
+    const agents = path.join(path.dirname(check.settings), "agents");
+    const worker = { ...DEFAULTS, providers: { test: { type: "openai-compatible" as const, url: "http://unused", models: [{ id: "shared-worker" }] } } };
+    syncAgentFiles(worker, agents, undefined, { manifestPath: path.join(real.home, "generated-agents.json") });
+    syncAgentFiles(worker, agents, undefined, { manifestPath: path.join(check.home, "generated-agents.json") });
+    let sweep: boolean | undefined;
+    assert.equal(removeClientIntegrations(check.home, (_ca, opts) => { sweep = opts.sweep; return true; }, { agentDir: agents, defaultHome: real.home }), true);
+    assert.equal(currentAppProxy().egressProxyUrl, real.proxyUrl);
+    assert.equal(codexEnabled(), true);
+    assert.equal(fs.existsSync(path.join(agents, "shared-worker.md")), true);
+    assert.equal(sweep, false, "only the check's own CA, by fingerprint");
+
+    // The same call from the default home still removes all of it, and sweeps leftover CAs.
+    assert.equal(removeClientIntegrations(real.home, (_ca, opts) => { sweep = opts.sweep; return true; }, { agentDir: agents, defaultHome: real.home }), true);
+    assert.equal(currentAppProxy().egressProxyUrl, null);
+    assert.equal(codexEnabled(), false);
+    assert.equal(fs.existsSync(path.join(agents, "shared-worker.md")), false);
+    assert.equal(sweep, true);
+  } finally {
     if (oldCodex === undefined) delete process.env.CODEX_HOME;
     else process.env.CODEX_HOME = oldCodex;
   }
@@ -578,7 +626,13 @@ test("Linux launcher: a desktop entry; Windows: shortcuts through a hidden Power
   assert.match(scripts[0]!, /WScript\.Shell/);
   assert.match(scripts[0]!, /conhost\.exe/);
   assert.ok(scripts[0]!.includes(path.join(process.env.CLAUDERIPPLE_LAUNCHER_DIR!, "Desktop", "ClaudeRipple.lnk")));
-  assert.match(fs.readFileSync(path.join(home, "clauderipple-tray.ps1"), "utf8"), /tray --ensure/);
+  const trayScript = fs.readFileSync(path.join(home, "clauderipple-tray.ps1"), "utf8");
+  assert.match(trayScript, /tray --ensure/);
+  // The router holds logs\launcher.log open for its whole life, so the tray's launcher writes
+  // elsewhere — and still runs the tray when even that file is unavailable (#87).
+  assert.ok(trayScript.includes(`'${path.join(home, "logs", "tray-launcher.log")}'`));
+  assert.ok(!trayScript.includes(`'${path.join(home, "logs", "launcher.log")}'`));
+  assert.match(trayScript, /try \{ & .* tray --ensure \*>> .*tray-launcher\.log' \} catch \{ & .* tray --ensure \}/);
 
   assert.deepEqual(installLauncher({ rt: { ...rt, packaged: true }, home, version: "1", platform: "darwin" }).paths, []);
 });

@@ -6,6 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import { bundlePath, launcherPath, launcherScript, writeBundle } from "../src/bundle.ts";
 import { targetsExist } from "../src/registration.ts";
+import { needsPosixModes } from "../../../test/capabilities.ts";
 
 function snapshot(dir: string) {
   return Object.fromEntries(fs.readdirSync(dir, { recursive: true, withFileTypes: true }).filter(entry => entry.isFile()).map(entry => {
@@ -15,7 +16,7 @@ function snapshot(dir: string) {
   }));
 }
 
-test("bundle is unchanged and not re-signed on identical writes or package version updates", () => {
+test("bundle is unchanged and not re-signed on identical writes or package version updates", { skip: needsPosixModes }, () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "cr-bundle-"));
   try {
     const script = path.join(root, "package", "dist", "router", "src", "index.js");

@@ -40,6 +40,14 @@ export function providerExhaustion(status: number, body = "", retryMs?: number, 
   return { reason, at: now, until: now + wait };
 }
 
+/** A definite exhaustion is not a rate limit: asking again inside the same minute fails the same
+ * way. Claude Code reads `x-should-retry` before its own 429 rule, so `false` fails the turn at
+ * once; `retry-after` says when the provider is back, rounded up so a wait is never zero (#89).
+ */
+export function exhaustionHeaders(exhaustion: ProviderExhaustion, now = Date.now()): Record<string, string> {
+  return { "x-should-retry": "false", "retry-after": String(Math.max(1, Math.ceil((exhaustion.until - now) / 1000))) };
+}
+
 /** Per router instance, advisory only: manual traffic can prove a topped-up provider healthy. */
 export class ProviderHealth {
   private readonly exhausted = new Map<string, ProviderExhaustion>();

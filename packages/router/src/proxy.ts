@@ -22,7 +22,7 @@ import zlib from "node:zlib";
 import type { Duplex } from "node:stream";
 import type { Config, ProviderModel } from "./config.ts";
 import type { Logger } from "./log.ts";
-import { ProviderHealth, providerExhaustion, UpstreamHealth } from "./health.ts";
+import { exhaustionHeaders, ProviderHealth, providerExhaustion, UpstreamHealth } from "./health.ts";
 import type { HoldGate } from "./hold.ts";
 import { BOOTSTRAP_PATH, injectBootstrap } from "./bootstrap.ts";
 import { THREAD_UNSUPPORTED, continuesTranslatedTurn, effortOf, isAutoModeClassifier, resolve, rewriteBody, stripThreadFields, threadDecision, unroutableReason, type Resolved } from "./routing.ts";
@@ -483,6 +483,12 @@ export class Proxy {
   }
 
   /** Dashboard action: put one resting Google account back into rotation now. */
+  /** The pool scope a turn for `model` rests in on one antigravity provider (its quota group on its host). */
+  googleQuotaScope(name: string, model: string): string | undefined {
+    const p = this.deps.config().providers[name];
+    return p?.type === "google" && p.auth === "antigravity" ? this.google(name, p).quotaScopeOf(model) : undefined;
+  }
+
   googleClearCooldown(ownerId: string): void {
     for (const [name, p] of Object.entries(this.deps.config().providers)) {
       if (p.type === "google" && p.auth === "antigravity") this.google(name, p).clearCooldown(ownerId);
@@ -1201,7 +1207,13 @@ export class Proxy {
             // Native Messages need no translation. Only authentication changes, so server-side threads,
             // prompt caching, beta features and the client's exact tool contract remain first-party.
             const credentials = await this.claudeAccounts.credentials();
-            if (credentials.length === 0) {
+            // With no account of the pool usable, the app's own sign-in still is: the turn goes out on
+            // it, as it did before the provider was added. A pool whose only stored account lost its
+            // grant refused every main-chat turn with this 401 until the provider was deleted, the
+            // current login having aged out of the observed source unseen (#88, 2026-10-24).
+            const clientAuth = req.headers.authorization;
+            const ownSignIn = credentials.length === 0 && typeof clientAuth === "string" && /^Bearer\s+\S+$/i.test(clientAuth);
+            if (credentials.length === 0 && !ownSignIn) {
               const out = JSON.stringify({ type: "error", error: { type: "authentication_error", message: "ClaudeRipple: no usable Claude account; sign in or reauthenticate an account" } });
               res.writeHead(401, { "content-type": "application/json", "content-length": String(Buffer.byteLength(out)) }).end(out);
               finish("401", out.length, "no usable Claude account", true, { ...(!searchAttempted ? { upstreamCalled: false as const } : {}), refusal: "no-account" });
@@ -1209,6 +1221,13 @@ export class Proxy {
             }
             dropForeignThinking(json);
             body = Buffer.from(JSON.stringify(json));
+            if (ownSignIn) {
+              target = { protocol: "https:", host: cfg.upstream, port: this.deps.upstreamPort ?? 443, agent: this.deps.upstreamAgent ?? this.agentFor(route.provider, "https:"), extraHeaders: {} };
+              const routeEffort = effortOf(json);
+              if (routeEffort) record.effort = routeEffort;
+              tag = `CLAUDE ${route.tag} account=app (no usable pool account)`;
+              break;
+            }
             chosen = this.pool.pick(route.provider, credentials, conversationKey(json as AnthropicRequest));
             const using = chosen ?? credentials[0]!;
             chosen = using;
@@ -1474,7 +1493,11 @@ export class Proxy {
         // must not be charged to the credential — that is what made one working key answer every turn
         // with an authentication error for a minute (2026-09-21). Every other status is judged from
         // the status alone, and its body is left for the forward below, untouched.
-        if (status === 403) {
+        // 402 and 429 are read ahead as well: a definite billing/quota exhaustion must be answered
+        // with `x-should-retry: false` before the headers go out, and only its body says whether a
+        // 429 is exhausted or an ordinary rate limit (#89). A bootstrap response is never a model
+        // turn and is forwarded as it arrives.
+        if (status === 403 || (!isBootstrap && (status === 402 || status === 429))) {
           bufferBody(upRes, ERROR_HEAD_MAX).then((whole) => onUpstreamJudged(upRes, status, whole)).catch((e: Error) => {
             log.warn(`upstream ${status}: could not read the body: ${e.message}`);
             finish(String(status), 0, `upstream ${status}: body read failed`);
@@ -1491,7 +1514,8 @@ export class Proxy {
        * A 403's meaning is in its body and cannot be judged before it arrives, so the bytes are read
        * and handed back as the head: `unshift` after a stream has ended throws, and reading a head and
        * forwarding the rest mid-flow is where a body can be lost to a pause nothing resumes. A 403 is
-       * a refusal, so its body is small.
+       * a refusal, so its body is small. A 402/429 is read the same way, because the headers that tell
+       * the client to stop retrying must be decided before they go out (#89).
        *
        * What is returned is the body **decoded for reading**, because the judgement is about what the
        * body says. The bytes themselves are kept in `errRaw` for the client: a compressed body is
@@ -1618,6 +1642,24 @@ export class Proxy {
           });
           return;
         }
+        // A definite exhaustion (a spending cap, a used-up quota) is not worth asking again in the
+        // same minute, and a worker that does retries the plain 429 for about two and a half minutes
+        // before failing (#89, 2026-10-24). Its body was read ahead for 402/429, so the answer is
+        // known before the headers go out; a bare rate limit is left exactly as it was.
+        if (headFilled) {
+          const exhaustion = providerExhaustion(status, errBody, retryAfterMs(upRes.headers));
+          if (exhaustion) {
+            for (let i = outHeaders.length - 2; i >= 0; i -= 2) {
+              const name = outHeaders[i]!.toLowerCase();
+              if (name === "retry-after" || name === "x-should-retry") outHeaders.splice(i, 2);
+            }
+            for (const [name, value] of Object.entries(exhaustionHeaders(exhaustion))) outHeaders.push(name, value);
+          }
+          // The stream forward below cannot reach its own end handler when the body is already here.
+          if (route && path.startsWith("/v1/messages") && !path.startsWith("/v1/messages/count_tokens")) {
+            this.providerHealth.observe(route.provider, status, exhaustion);
+          }
+        }
         res.writeHead(status, outHeaders);
         // This observer is deliberately side-band: it sees the exact chunks after they are written
         // to the client, retains only a 64 KiB line/object fragment, and never changes backpressure.
@@ -1630,10 +1672,10 @@ export class Proxy {
         // code was recorded (2026-09-15).
         const errorHead: Buffer[] = [];
         let errorHeadBytes = 0;
-        // The 403 body was read to judge it, so it is written here instead of read again from a
-        // stream that has already ended. The bytes go back exactly as they arrived, so a compressed
-        // body still matches the `content-encoding` and `content-length` the upstream stated; only a
-        // truncated one is sent decoded, and both headers were dropped above for it.
+        // A buffered body (a 403, or a 402/429 read for its verdict) is written here instead of read
+        // again from a stream that has already ended. The bytes go back exactly as they arrived, so a
+        // compressed body still matches the `content-encoding` and `content-length` the upstream
+        // stated; only a truncated one is sent decoded, and both headers were dropped above for it.
         if (headFilled) {
           const body = errTruncated ? Buffer.from(errBody, "utf8") : errRaw;
           bytes = body.length;
@@ -1797,7 +1839,7 @@ export class Proxy {
     if (this.targetUsable(resolved, cfg)) return resolved;
     for (const f of resolved.fallbacks) {
       if (f.provider === resolved.provider && f.model === resolved.model) continue;
-      if (!this.targetUsable(f, cfg)) continue;
+      if (!this.targetUsable({ ...f, effort: f.effort ?? resolved.effort }, cfg)) continue;
       log.info(`FAILOVER ${resolved.provider}/${resolved.model} exhausted → ${f.provider}/${f.model}`);
       // The tag names the model that answers, not the one that could not: a log line saying `->m1`
       // for a turn that ran on m2 is the kind of thing that costs an hour to disbelieve.
@@ -1816,7 +1858,7 @@ export class Proxy {
   private unwrittenFallback(resolved: Resolved, attempted: Resolved, cfg: Config, why: "prompt" | "capacity"): Resolved | null {
     for (const f of resolved.fallbacks ?? []) {
       if (f.provider === attempted.provider && f.model === attempted.model) continue;
-      if (!this.targetUsable(f, cfg)) continue;
+      if (!this.targetUsable({ ...f, effort: f.effort ?? resolved.effort }, cfg)) continue;
       return {
         provider: f.provider, model: f.model, effort: f.effort ?? resolved.effort,
         tag: `${resolved.tag.split("->")[0] ?? resolved.model}->${f.model} (${why} fallback from ${attempted.provider})`,
@@ -1825,7 +1867,7 @@ export class Proxy {
     return null;
   }
 
-  private targetUsable(target: Pick<Resolved, "provider" | "model">, cfg: Config): boolean {
+  private targetUsable(target: Pick<Resolved, "provider" | "model"> & { effort?: string | undefined }, cfg: Config): boolean {
     const configured = cfg.providers[target.provider];
     if (!configured) return false;
     const provider = providerFor(configured, target.model);
@@ -1835,7 +1877,7 @@ export class Proxy {
       return accounts.length > 0 && this.pool.hasUsable(target.provider, accounts);
     }
     if (provider.type === "chatgpt") return this.chatgpt(target.provider, provider).hasUsable();
-    if (provider.type === "google" && provider.auth === "antigravity") return this.google(target.provider, provider).hasUsable();
+    if (provider.type === "google" && provider.auth === "antigravity") return this.google(target.provider, provider).hasUsable(target.model, target.effort);
     return this.pool.hasUsable(target.provider, this.credentialsOf(target.provider, provider));
   }
 

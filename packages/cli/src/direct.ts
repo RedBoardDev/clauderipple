@@ -14,6 +14,7 @@ import path from "node:path";
 import { ConfigStore, adminPort, type Config } from "../../router/src/config.ts";
 import { certPaths } from "./certs.ts";
 import { classifyMode, cliProxyState, desktopProxyState, fetchRouterStatus, proxyUrlFor, repair, type Mode, type RecoveryDeps } from "./doctor.ts";
+import { defaultHome } from "./integrations.ts";
 import { applyAppProxy, currentAppProxy, removeAppProxy } from "./picker.ts";
 import { MODEL_SLOT_ENV, editSettingsEnv, settingsEnv } from "./settings.ts";
 
@@ -90,7 +91,8 @@ export function directOn(home: string): DirectResult {
 
   let desktop: DirectState["desktop"] = null;
   const ap = currentAppProxy();
-  if (ap.ours && ap.egressProxyUrl) {
+  // Another home's entry stays: only the default home takes one pointing at an older port.
+  if (ap.ours && ap.egressProxyUrl && (path.resolve(home) === path.resolve(defaultHome()) || ap.egressProxyUrl === proxyUrl)) {
     removeAppProxy();
     desktop = { egressProxyUrl: ap.egressProxyUrl, appliedAfter: currentAppProxy().appliedId };
   } else if (ap.egressProxyUrl === proxyUrl) notes.push(`Claude Desktop's applied configuration ${ap.appliedId} points at ClaudeRipple but was not written by it; left as it is`);

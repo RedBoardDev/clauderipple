@@ -96,20 +96,34 @@ export function refreshPlan(o: { installed: boolean; definition: string | null; 
   if (!o.installed || o.definition === null) return "absent";
   const xml = o.script.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
   if (![o.script, xml, o.script.replace(/'/g, "''")].some(form => o.definition!.includes(form))) return "foreign";
-  // An older host does not report it; its update came while the router sat idle, so most likely idle too.
-  return o.busy ? "busy" : "restart";
+  // Missing status is not proof of idle; retain the application intent instead of stopping it.
+  return o.busy === false ? "restart" : "busy";
 }
 
-/** The running host's own answer; undefined when it does not answer or predates the field. */
-export async function hostBusy(dir = remoteHome()): Promise<boolean | undefined> {
+/** Unknown liveness is not permission to stop a host. Callers retain a pending update. */
+export async function hostStatus(dir = remoteHome()): Promise<{ busy?: boolean; version?: string } | null> {
   try {
     const cfg = loadConfig(dir, false);
     const secret = fs.readFileSync(path.join(dir, "local.secret"), "utf8").trim();
     const response = await fetch(`http://127.0.0.1:${cfg.port}/local/status`, { headers: { "x-ripple-local": secret }, redirect: "error", signal: AbortSignal.timeout(2000) });
-    if (!response.ok) { await response.body?.cancel(); return undefined; }
-    const body = await response.json() as { busy?: unknown };
-    return typeof body.busy === "boolean" ? body.busy : undefined;
-  } catch { return undefined; }
+    if (!response.ok) { await response.body?.cancel(); return null; }
+    const body = await response.json() as { busy?: unknown; version?: unknown };
+    return { ...(typeof body.busy === "boolean" ? { busy: body.busy } : {}), ...(typeof body.version === "string" ? { version: body.version } : {}) };
+  } catch { return null; }
+}
+/** The live host reserves idle and exits itself with a retryable status; never kill via a supervisor. */
+export async function refreshRunningHost(version: string, dir = remoteHome()): Promise<void> {
+  const cfg = loadConfig(dir, false);
+  const secret = fs.readFileSync(path.join(dir, "local.secret"), "utf8").trim();
+  const response = await fetch(`http://127.0.0.1:${cfg.port}/local/refresh`, { method: "POST", headers: { "x-ripple-local": secret }, redirect: "error", signal: AbortSignal.timeout(2000) });
+  await response.body?.cancel();
+  if (!response.ok) throw new Error(response.status === 404 ? "안전한 자동 교체를 지원하지 않는 호스트입니다. 작업이 끝난 뒤 호스트를 다시 시작해 주세요." : `host refresh deferred (${response.status})`);
+  const deadline = Date.now() + 25_000;
+  while (Date.now() < deadline) {
+    await delay(200);
+    if ((await hostStatus(dir))?.version === version) return;
+  }
+  throw new Error("host did not start the target version; application remains pending");
 }
 
 export async function installService(spec: Spec): Promise<string[]> {

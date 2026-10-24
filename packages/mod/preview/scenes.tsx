@@ -2,13 +2,15 @@
 // renderer with fixed data, drawn on the desktop surface and printed as `@@SCENE {...}`.
 
 import { test } from 'claude-code/testing'
-import type { RenderElement, RenderPropsOf } from 'claude-code'
+import type { ContextGridSquare, RenderElement, RenderPropsOf, SessionContextBreakdown } from 'claude-code'
 
-import type { AgentRec, LimitItem, Settings, Skin } from '../types'
+import type { AgentRec, BgTask, LimitItem, Settings, Skin } from '../types'
 import { normalizeSettings } from '../hooks/settings'
 import { renderAgents, talkOf } from '../hooks/ui/agents'
 import { renderAlert } from '../hooks/ui/alerts'
 import { renderBand } from '../hooks/ui/band'
+import { renderContext } from '../hooks/ui/context'
+import type { ContextView } from '../hooks/ui/context'
 import { renderPhoneQueue } from '../hooks/ui/queue'
 import { renderLog } from '../hooks/ui/log'
 import { renderSettings } from '../hooks/ui/settings'
@@ -34,13 +36,11 @@ const DASH: DashboardView = {
   route: { model: 'gpt-6.1-sol', provider: 'chatgpt', ok: true, resent: false, status: '200', effort: 'high', cachePct: 96, seconds: 2.1 },
   notice: null,
   auto: true,
-  handoff: 'off',
   agents: { live: 0, total: 0 },
   compactions: 0,
   logOpen: false,
   agentsOpen: false,
   effortMenu: false,
-  swampAt: 50,
   hide: [],
   extras: ['context'],
   isWorking: false,
@@ -126,6 +126,12 @@ const CARDS: AgentRec[] = [HOSTED, AGENTS[2]!, AGENTS[3]!]
 const at = (ms: number): AgentRec[] => [{ ...HOSTED, startedAt: NOW - ms }]
 
 /** One running agent and eight finished: the list shows the latest four and "more". */
+const TASKS: BgTask[] = [
+  { id: 'b-dev', kind: 'shell', title: '개발 서버 실행', command: 'npm run dev -- --port 5173', state: 'running', startedAt: NOW - 420_000 },
+  { id: 'm-log', kind: 'monitor', title: '라우터 로그에서 오류 감시', command: 'tail -f ~/.clauderipple/logs/router.log | grep --line-buffered ERROR', state: 'running', startedAt: NOW - 130_000 },
+  { id: 'b-test', kind: 'shell', title: 'npm test', command: 'npm test', state: 'failed', startedAt: NOW - 400_000, endedAt: NOW - 300_000, summary: 'Background command "npm test" failed with exit code 1' },
+  { id: 'b-wait', kind: 'shell', title: '5분 대기', command: 'sleep 300', state: 'stopped', startedAt: NOW - 900_000, endedAt: NOW - 800_000 },
+]
 const MANY: AgentRec[] = [AGENTS[0]!, ...Array.from({ length: 8 }, (_, i): AgentRec => ({ ...AGENTS[i % 2 ? 2 : 4]!, id: 'm' + i, description: ['문서 링크 점검', '타입 오류 정리', 'i18n 키 대조', '빌드 로그 요약', '테스트 이름 정리', '캐시 적중률 확인', '라우터 로그 검색', '설정 스키마 비교'][i]!, endedAt: NOW - 60_000 * (i + 1), startedAt: NOW - 60_000 * (i + 2) }))]
 
 /** The Sol worker's conversation so far: its task, its words, its tools, one still running. */
@@ -177,6 +183,30 @@ const TALK_TOOLS: AgentEntry[] = talkOf([
   ] },
 ], { cwd: '/Users/pbj/Documents/tabripple', home: '/Users/pbj' })
 
+/**
+ * The owner's side-by-side of 2026-10-24: a worker removing a feature, its long delegated prompt,
+ * a run of twenty commands and fifteen reads, then seven commands, nine edits and three reads.
+ */
+const NATIVE_PROMPT = [
+  'Remove the "handoff" feature from the mod entirely — its settings and its functions. Compaction stays (it will be reworked in a later step, so keep `compactWith` and the heavy-context `swampAt`/`swampAlert` settings as they are for now).',
+  '',
+  'Remove:',
+  '- `hooks/handoff.ts` and its test',
+  '- the band\'s handoff button and its advised state (`band.tsx`, `alerts.tsx`)',
+  '- Dashboard (packages/ui/app.js, packages/ui/i18n.js): `modHandoffCard` becomes a compaction card; remove the handoff rows, defaults and unused i18n keys in every language.',
+  '- Docs: where docs/ARCHITECTURE.md, docs/specs/*, README or docs/HANDOFF mention it.',
+].join('\n')
+const step = (prefix: string, n: number, tool: string, extra: Partial<AgentEntry> = {}): AgentEntry[] =>
+  Array.from({ length: n }, (_, i) => ({ kind: 'tool', id: prefix + i, tool, detail: tool === 'Bash' ? 'grep -rn handoff packages/mod' : 'packages/mod/hooks/file' + i + '.ts', state: 'ok', ...extra }) as AgentEntry)
+const TALK_NATIVE: AgentEntry[] = [
+  { kind: 'prompt', text: NATIVE_PROMPT },
+  { kind: 'text', text: 'I’ll start by mapping every handoff reference.' },
+  ...step('a', 20, 'Bash'), ...step('b', 15, 'Read'),
+  { kind: 'text', text: 'Now I’ll make the changes. First, remove the handoff module and its test.' },
+  ...step('c', 7, 'Bash'), ...step('d', 9, 'Edit', { added: 6, removed: 42 }), ...step('e', 3, 'Read'),
+]
+const NATIVE_AGENT: AgentRec = { ...HOSTED, id: 'n1', description: 'deepseek-v4.1-flash·high · Remove the handoff feature from the mod', state: 'running', startedAt: NOW - 252_000, tools: 54, usage: { input: 22_000, cached: 410_000, cacheWrite: 0, output: 9_100 }, effort: 'high' }
+
 const AGENT_ACTIONS = { toggleDone: () => undefined, open: () => undefined, back: () => undefined, earlier: () => undefined, toggleRun: () => undefined }
 
 /** The AbovePrompt site as register.tsx composes it on the desktop: the band, its × inside. */
@@ -194,34 +224,95 @@ function queued(el: Els, frame: Frame, view: DashboardView, first: string): Rend
   return (<Box flexDirection="column" rowGap={0.5} width="100%" minWidth={0}>{renderPhoneQueue(el, frame, { count: 2, first })}{renderBand(el, frame, view, noop)}</Box>) as RenderElement
 }
 
+/** A session's context as `$.session.usage({ breakdown })` reports it (2.1.304's category names and theme keys). */
+const CONTEXT: SessionContextBreakdown = (() => {
+  const max = 160_000
+  const categories: SessionContextBreakdown['categories'] = [
+    { name: 'System prompt', tokens: 3100, color: 'promptBorder', isDeferred: false, kind: 'used' },
+    { name: 'System tools', tokens: 14_800, color: 'inactive', isDeferred: false, kind: 'used' },
+    { name: 'MCP tools', tokens: 6200, color: 'cyan_FOR_SUBAGENTS_ONLY', isDeferred: false, kind: 'used' },
+    { name: 'MCP tools (deferred)', tokens: 21_000, color: 'inactive', isDeferred: true, kind: 'deferred' },
+    { name: 'Custom agents', tokens: 1900, color: 'permission', isDeferred: false, kind: 'used' },
+    { name: 'Memory files', tokens: 4100, color: 'claude', isDeferred: false, kind: 'used' },
+    { name: 'Skills', tokens: 2600, color: 'warning', isDeferred: false, kind: 'used' },
+    { name: 'Messages', tokens: 41_200, color: 'purple_FOR_SUBAGENTS_ONLY', isDeferred: false, kind: 'used' },
+    { name: 'Free space', tokens: 70_100, color: 'promptBorder', isDeferred: false, kind: 'free' },
+    { name: 'Autocompact buffer', tokens: 16_000, color: 'inactive', isDeferred: false, kind: 'buffer' },
+  ]
+  const squares: ContextGridSquare[] = []
+  for (const c of categories.filter(c => c.kind !== 'deferred')) {
+    const exact = c.tokens / (max / 100)
+    const count = Math.max(1, Math.round(exact))
+    for (let i = 0; i < count && squares.length < 100; i++) squares.push({ color: c.color, isFilled: c.kind !== 'free', categoryName: c.name, tokens: c.tokens, percentage: Math.round((c.tokens / max) * 100), squareFullness: i === count - 1 && exact % 1 > 0 ? exact % 1 : 1 })
+  }
+  return {
+    categories, totalTokens: 73_900, maxTokens: max, rawMaxTokens: max, autocompactSource: 'model-default', percentage: 46,
+    gridRows: Array.from({ length: 10 }, (_, y) => squares.slice(y * 10, y * 10 + 10)),
+    model: 'claude-opus-5-5',
+    memoryFiles: [
+      { path: '/work/CLAUDE.md', type: 'Project', tokens: 1800 },
+      { path: '/home/me/.claude/CLAUDE.md', type: 'User', tokens: 2100 },
+      { path: '/home/me/.claude/projects/work/memory/MEMORY.md', type: 'AutoMem', tokens: 200 },
+    ],
+    mcpTools: [
+      ...Array.from({ length: 8 }, (_, i) => ({ name: 'mcp__linear__t' + i, serverName: 'linear', tokens: 500, isLoaded: true })),
+      ...Array.from({ length: 6 }, (_, i) => ({ name: 'mcp__browser__t' + i, serverName: 'browser', tokens: 366, isLoaded: true })),
+      ...Array.from({ length: 20 }, (_, i) => ({ name: 'mcp__gmail__t' + i, serverName: 'gmail', tokens: 1050, isLoaded: false })),
+    ],
+    agents: ['gpt-6-1-sol', 'gpt-6-astra', 'deepseek-v4-1-flash', 'gemini-3-8-flash', 'ripple:auto', 'statusline-setup'].map((agentType, i) => ({ agentType, source: i < 4 ? 'userSettings' : 'plugin', tokens: 420 - i * 30 })),
+    slashCommands: { totalCommands: 34, includedCommands: 30, tokens: 1100 },
+    skills: {
+      totalSkills: 9, includedSkills: 8, tokens: 2600,
+      skillFrontmatter: ['code-discipline', 'seo-os', 'store-release', 'plugin-authoring', 'dataviz', 'docs', 'pdf', 'xlsx'].map((name, i) => ({ name, source: i % 3 ? 'userSettings' : 'plugin', ...(i % 3 ? {} : { pluginName: 'anthropic-skills' }), tokens: 520 - i * 40 })),
+    },
+    autoCompactThreshold: 144_000, isAutoCompactEnabled: true, apiUsage: null,
+  }
+})()
+const CONTEXT_VIEW: ContextView = { breakdown: CONTEXT, basis: 'summary', busy: false, open: [], place: { cwd: '/work', home: '/home/me' } }
+
 const SCENES: Scene[] = [
+  // The Context pane the band's context chip opens (2026-10-24): an estimate, a precise count under
+  // way with a section opened, a narrow pane, the flat skin, and nothing to show yet.
+  { name: 'context', columns: PANE, draw: (el, f) => renderContext(el, f, CONTEXT_VIEW, noop) },
+  { name: 'context-busy-open', columns: PANE, draw: (el, f) => renderContext(el, f, { ...CONTEXT_VIEW, busy: true, open: ['skills'] }, noop) },
+  { name: 'context-narrow', columns: PANE_NARROW, draw: (el, f) => renderContext(el, f, CONTEXT_VIEW, noop) },
+  { name: 'context-wide', columns: 100, draw: (el, f) => renderContext(el, f, { ...CONTEXT_VIEW, basis: 'full' }, noop) },
+  { name: 'flat-context', columns: PANE, skin: 'flat', draw: (el, f) => renderContext(el, f, CONTEXT_VIEW, noop) },
+  { name: 'context-none', columns: PANE, draw: (el, f) => renderContext(el, f, { ...CONTEXT_VIEW, breakdown: null, error: 'count_tokens 529 overloaded' }, noop) },
   { name: 'band', draw: (el, f) => site(el, f, DASH) },
+  // The delegation pin's line at the top of the capsule (2026-10-23): with the person's sentence, without, narrow, flat.
+  { name: 'band-pinned', draw: (el, f) => site(el, f, { ...DASH, delegationPin: 'Sol', delegationSaid: '앞으로 솔로 해' }) },
+  { name: 'band-pinned-limits', draw: (el, f) => site(el, f, { ...DASH, delegationPin: 'Sol', delegationSaid: '이 세션은 솔로 고정해서 진행해 줘', limits: LIMITS, extras: ['context', 'limits'] }) },
+  { name: 'band-pinned-nosaid', draw: (el, f) => site(el, f, { ...DASH, delegationPin: 'Sol' }) },
+  { name: 'band-pinned-narrow', columns: 70, draw: (el, f) => site(el, f, { ...DASH, delegationPin: 'Sol', delegationSaid: '앞으로 솔로 해' }) },
+  { name: 'band-pinned-tiny', columns: 40, draw: (el, f) => site(el, f, { ...DASH, delegationPin: 'GPT-6.1 Sol', delegationSaid: '앞으로 솔로 해' }) },
+  { name: 'flat-band-pinned', skin: 'flat', draw: (el, f) => site(el, f, { ...DASH, delegationPin: 'Sol', delegationSaid: '앞으로 솔로 해' }) },
   { name: 'band-phone-queue', draw: (el, f) => queued(el, f, { ...DASH, isWorking: true }, '홈 카드 제목이랑 점수 알약도 같이 정리해 줘') },
   { name: 'band-phone-queue-long', columns: 70, draw: (el, f) => queued(el, f, { ...DASH, isWorking: true }, '이 날의 흐름 이것도 한국어가 좀 어색한데 사람마다 달라지는 리포트 같은 건 빼고 모든 한국어를 정리해서 자연스럽게') },
   { name: 'band-phone-queue-flat', skin: 'flat', draw: (el, f) => queued(el, f, { ...DASH, isWorking: true }, '홈 카드 제목이랑 점수 알약도 같이 정리해 줘') },
   { name: 'band-deciding', draw: (el, f) => site(el, f, { ...DASH, effort: { level: null, mode: 'deciding', since: NOW - 500 } }) },
-  { name: 'band-working-handoff', draw: (el, f) => site(el, f, { ...DASH, isWorking: true, handoff: 'advised', warm: { on: true, pings: 2, cost: 9000 }, agents: { live: 2, total: 3 }, context: { percent: 64, tokens: 128_000, window: 200_000 }, mode: 'GPT 우선' }) },
+  { name: 'band-working', draw: (el, f) => site(el, f, { ...DASH, isWorking: true, warm: { on: true, pings: 2, cost: 9000 }, agents: { live: 2, total: 3 }, context: { percent: 64, tokens: 128_000, window: 200_000 }, mode: 'GPT 우선' }) },
   { name: 'band-compacted', draw: (el, f) => site(el, f, { ...DASH, agents: { live: 1, total: 1 }, compactions: 3 }) },
   { name: 'band-drowsy-off', draw: (el, f) => site(el, f, { ...DASH, auto: false, effort: { level: 'medium', mode: 'off' }, cache: { expiresAt: NOW + 60_000, ttlMs: 3_600_000 }, limit: { kind: 'five_hour', percent: 86, resetsAt: '2026-10-12T15:40:00', save: false }, extras: ['context', 'limits'] }) },
   { name: 'band-warm-here', draw: (el, f) => site(el, f, { ...DASH, warm: { on: false, pings: 0, cost: 0, here: true } }) },
   { name: 'band-asleep', draw: (el, f) => site(el, f, { ...DASH, cache: { expiresAt: NOW - 1, ttlMs: 3_600_000 } }) },
   { name: 'band-menu', draw: (el, f) => site(el, f, { ...DASH, effortMenu: true, effort: { level: 'xhigh', mode: 'manual' } }) },
   { name: 'band-narrow', columns: 70, draw: (el, f) => site(el, f, DASH) },
-  { name: 'band-700-busy', columns: 79, draw: (el, f) => site(el, f, { ...DASH, effort: { level: 'xhigh', mode: 'manual' }, handoff: 'advised', agents: { live: 2, total: 3 }, warm: { on: true, pings: 3, cost: 0 } }) },
+  { name: 'band-700-busy', columns: 79, draw: (el, f) => site(el, f, { ...DASH, effort: { level: 'xhigh', mode: 'manual' }, agents: { live: 2, total: 3 }, warm: { on: true, pings: 3, cost: 0 } }) },
   // The band's two real widths, at its new maximum (2026-10-14): everything on — context, limits, a
-  // limit, Handoff advised, a route and every control — must hold at both.
-  { name: 'band-94-full', columns: 94, draw: (el, f) => site(el, f, { ...DASH, limit: { kind: 'seven_day', percent: 42, resetsAt: '2026-10-15T15:40:00', save: false }, handoff: 'advised', extras: ['context', 'limits'] }) },
-  { name: 'band-100-full', columns: 100, draw: (el, f) => site(el, f, { ...DASH, limit: { kind: 'seven_day', percent: 42, resetsAt: '2026-10-15T15:40:00', save: false }, handoff: 'advised', extras: ['context', 'limits'] }) },
+  // limit, a route and every control — must hold at both.
+  { name: 'band-94-full', columns: 94, draw: (el, f) => site(el, f, { ...DASH, limit: { kind: 'seven_day', percent: 42, resetsAt: '2026-10-15T15:40:00', save: false }, extras: ['context', 'limits'] }) },
+  { name: 'band-100-full', columns: 100, draw: (el, f) => site(el, f, { ...DASH, limit: { kind: 'seven_day', percent: 42, resetsAt: '2026-10-15T15:40:00', save: false }, extras: ['context', 'limits'] }) },
   // The limits row (2026-10-15): every plan window gauges the second row, and the first row's
   // limit fact steps aside for the route. Narrow, the GPT accounts go first, then Fable.
-  { name: 'band-limits-94', columns: 94, draw: (el, f) => site(el, f, { ...DASH, limit: { kind: 'seven_day', percent: 88, resetsAt: '2026-10-12T18:20:00', save: false }, handoff: 'advised', extras: ['context', 'limits'], limits: LIMITS }) },
-  { name: 'band-limits-100', columns: 100, draw: (el, f) => site(el, f, { ...DASH, limit: { kind: 'seven_day', percent: 88, resetsAt: '2026-10-12T18:20:00', save: false }, handoff: 'advised', extras: ['context', 'limits'], limits: LIMITS }) },
-  { name: 'band-limits-70', columns: 70, draw: (el, f) => site(el, f, { ...DASH, limit: { kind: 'seven_day', percent: 88, resetsAt: '2026-10-12T18:20:00', save: false }, handoff: 'advised', extras: ['context', 'limits'], limits: LIMITS }) },
+  { name: 'band-limits-94', columns: 94, draw: (el, f) => site(el, f, { ...DASH, limit: { kind: 'seven_day', percent: 88, resetsAt: '2026-10-12T18:20:00', save: false }, extras: ['context', 'limits'], limits: LIMITS }) },
+  { name: 'band-limits-100', columns: 100, draw: (el, f) => site(el, f, { ...DASH, limit: { kind: 'seven_day', percent: 88, resetsAt: '2026-10-12T18:20:00', save: false }, extras: ['context', 'limits'], limits: LIMITS }) },
+  { name: 'band-limits-70', columns: 70, draw: (el, f) => site(el, f, { ...DASH, limit: { kind: 'seven_day', percent: 88, resetsAt: '2026-10-12T18:20:00', save: false }, extras: ['context', 'limits'], limits: LIMITS }) },
   // Every readable provider (2026-10-15): Claude, GPT, Gemini and OpenCode Go in one row, at the
   // two real widths. Narrow, the scoped windows go first, then a later provider's group.
-  { name: 'band-limits-all-100', columns: 100, draw: (el, f) => site(el, f, { ...DASH, limit: { kind: 'seven_day', percent: 88, resetsAt: '2026-10-12T18:20:00', save: false }, handoff: 'advised', extras: ['context', 'limits'], limits: LIMITS_ALL }) },
-  { name: 'band-limits-all-140', columns: 140, draw: (el, f) => site(el, f, { ...DASH, limit: { kind: 'seven_day', percent: 88, resetsAt: '2026-10-12T18:20:00', save: false }, handoff: 'advised', extras: ['context', 'limits'], limits: LIMITS_ALL }) },
-  { name: 'band-limits-all-94', columns: 94, draw: (el, f) => site(el, f, { ...DASH, limit: { kind: 'seven_day', percent: 88, resetsAt: '2026-10-12T18:20:00', save: false }, handoff: 'advised', extras: ['context', 'limits'], limits: LIMITS_ALL }) },
+  { name: 'band-limits-all-100', columns: 100, draw: (el, f) => site(el, f, { ...DASH, limit: { kind: 'seven_day', percent: 88, resetsAt: '2026-10-12T18:20:00', save: false }, extras: ['context', 'limits'], limits: LIMITS_ALL }) },
+  { name: 'band-limits-all-140', columns: 140, draw: (el, f) => site(el, f, { ...DASH, limit: { kind: 'seven_day', percent: 88, resetsAt: '2026-10-12T18:20:00', save: false }, extras: ['context', 'limits'], limits: LIMITS_ALL }) },
+  { name: 'band-limits-all-94', columns: 94, draw: (el, f) => site(el, f, { ...DASH, limit: { kind: 'seven_day', percent: 88, resetsAt: '2026-10-12T18:20:00', save: false }, extras: ['context', 'limits'], limits: LIMITS_ALL }) },
   { name: 'settings', draw: (el, f) => renderSettings(el, f, SETTINGS_VIEW, noop) },
   { name: 'settings-off', draw: (el, f) => renderSettings(el, f, { ...SETTINGS_VIEW, settings: { ...SETTINGS, effortAuto: false, judge: 'haiku', keepWarm: true, activeMode: undefined } }, noop) },
   { name: 'settings-key', draw: (el, f) => renderSettings(el, f, { settings: { ...SETTINGS, jevSource: 'typesafe', judge: 'jev' }, jev: { source: null, test: { state: 'fail', message: 'key rejected (401)' } } }, noop) },
@@ -232,9 +323,8 @@ const SCENES: Scene[] = [
   { name: 'alert-hot', draw: alert({ kind: 'hot', limitKind: 'five_hour', percent: 86, resetsAt: '2026-10-12T15:40:00', save: false }) },
   { name: 'alert-judge', draw: alert({ kind: 'judgeDown', judge: 'jev', reason: 'key rejected (401)' }) },
   { name: 'alert-compact', draw: alert({ kind: 'compactNote', draft: '' }) },
-  { name: 'alert-handoff', draw: alert({ kind: 'handoffChoice', handoffKind: 'quick', after: 'continue' }) },
-  { name: 'alert-handing', draw: alert({ kind: 'result', stage: 'handingOff', handoffKind: 'full' }) },
-  { name: 'alert-ready', draw: alert({ kind: 'result', stage: 'handoffReady', handoffKind: 'quick' }) },
+  { name: 'alert-handing', draw: alert({ kind: 'result', stage: 'handingOff' }) },
+  { name: 'alert-handed', draw: alert({ kind: 'result', stage: 'handoffDone', detail: '새 대화를 열고 입력창에 인수인계 내용을 넣었습니다. 새 대화에서 Enter를 누르면 이어갑니다.' }) },
   { name: 'alert-compacted', draw: alert({ kind: 'result', stage: 'compacted' }) },
   { name: 'setup', draw: (el, f) => renderSetup(el, f, { step: 1, draft: SETTINGS, jev: { source: null, test: { state: 'idle' } } }, noop) },
   { name: 'setup-2', draw: (el, f) => renderSetup(el, f, { step: 2, draft: SETTINGS, jev: { source: 'env', test: { state: 'idle' } } }, noop) },
@@ -246,12 +336,13 @@ const SCENES: Scene[] = [
   { name: 'flat-settings', skin: 'flat', draw: (el, f) => renderSettings(el, f, SETTINGS_VIEW, noop) },
   { name: 'flat-settings-key', skin: 'flat', draw: (el, f) => renderSettings(el, f, { settings: { ...SETTINGS, jevSource: 'typesafe', judge: 'jev', effortAuto: false, keepWarm: true }, jev: { source: null, test: { state: 'fail', message: 'key rejected (401)' } } }, noop) },
   { name: 'flat-alert-swamp', skin: 'flat', draw: (el, f) => renderAlert(el, f, { kind: 'swamp', percent: 63, tokens: 126_000 }, noop) },
-  { name: 'flat-alert-handoff', skin: 'flat', draw: (el, f) => renderAlert(el, f, { kind: 'handoffChoice', handoffKind: 'quick', after: 'continue' }, noop) },
   { name: 'flat-setup', skin: 'flat', draw: (el, f) => renderSetup(el, f, { step: 1, draft: SETTINGS, jev: { source: null, test: { state: 'idle' } } }, noop) },
   { name: 'agents', columns: 90, draw: (el, f) => renderAgents(el, f, { agents: [], now: NOW, showDone: false }, noop) },
   { name: 'agents-empty', columns: PANE, draw: (el, f) => renderAgents(el, f, { agents: [], now: NOW, showDone: false }, AGENT_ACTIONS) },
   { name: 'agents-live', columns: PANE, draw: (el, f) => renderAgents(el, f, { agents: AGENTS, now: NOW, showDone: false }, AGENT_ACTIONS) },
   { name: 'agents-live-narrow', columns: PANE_NARROW, draw: (el, f) => renderAgents(el, f, { agents: AGENTS, now: NOW, showDone: false }, AGENT_ACTIONS) },
+  { name: 'agents-tasks', columns: PANE, draw: (el, f) => renderAgents(el, f, { agents: AGENTS, tasks: TASKS, now: NOW, showDone: true }, AGENT_ACTIONS) },
+  { name: 'agents-tasks-narrow', columns: PANE_NARROW, draw: (el, f) => renderAgents(el, f, { agents: AGENTS.slice(2), tasks: TASKS, now: NOW, showDone: true }, AGENT_ACTIONS) },
   { name: 'agents-idle', columns: PANE, draw: (el, f) => renderAgents(el, f, { agents: AGENTS.slice(2), now: NOW, showDone: false }, AGENT_ACTIONS) },
   { name: 'agents-many', columns: PANE, draw: (el, f) => renderAgents(el, f, { agents: MANY, now: NOW, showDone: false }, AGENT_ACTIONS) },
   ...(['deep', 'flat'] as const).map(skin => ({
@@ -281,6 +372,11 @@ const SCENES: Scene[] = [
   { name: 'agents-tools-open-narrow', columns: PANE_NARROW, draw: (el, f) => renderAgents(el, f, { agents: AGENTS, now: NOW, showDone: false, open: { id: 'g1', talk: { entries: TALK_TOOLS }, earlier: 0, runsOpen: ['r1', 's1'] } }, AGENT_ACTIONS) },
   { name: 'flat-agents-live', columns: PANE, skin: 'flat', draw: (el, f) => renderAgents(el, f, { agents: AGENTS, now: NOW, showDone: false }, AGENT_ACTIONS) },
   { name: 'flat-agents-talk', columns: PANE, skin: 'flat', draw: (el, f) => renderAgents(el, f, { agents: AGENTS, now: NOW, showDone: false, open: { id: 'g1', talk: { entries: TALK }, earlier: 0 } }, AGENT_ACTIONS) },
+  // The conversation as the Claude app draws an agent's (2026-10-24): folded, unfolded, scrolled, flat.
+  { name: 'agents-native', columns: 50, draw: (el, f) => renderAgents(el, f, { agents: [NATIVE_AGENT], now: NOW, showDone: false, open: { id: 'n1', talk: { entries: TALK_NATIVE } } }, AGENT_ACTIONS) },
+  { name: 'agents-native-open', columns: 50, draw: (el, f) => renderAgents(el, f, { agents: [NATIVE_AGENT], now: NOW, showDone: false, open: { id: 'n1', talk: { entries: TALK_NATIVE }, runsOpen: ['prompt:first', 'c0'] } }, AGENT_ACTIONS) },
+  { name: 'agents-native-scrolled', columns: 50, draw: (el, f) => renderAgents(el, { ...f, offset: 6 }, { agents: [NATIVE_AGENT], now: NOW, showDone: false, open: { id: 'n1', talk: { entries: TALK_NATIVE } } }, AGENT_ACTIONS) },
+  { name: 'flat-agents-native', columns: 50, skin: 'flat', draw: (el, f) => renderAgents(el, f, { agents: [NATIVE_AGENT], now: NOW, showDone: false, open: { id: 'n1', talk: { entries: TALK_NATIVE } } }, AGENT_ACTIONS) },
   { name: 'log', columns: 90, draw: (el, f) => renderLog(el, f, { rows: [], mineOnly: true }, noop) },
 ]
 

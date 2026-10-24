@@ -88,7 +88,7 @@ test('old modes copy the actual base ladder; single steps become independent ord
   assert.deepEqual(normalizeSettings(s), s)
 })
 
-test('active modes route their own ordered rungs, then one rung up, then session; base stays unchanged', () => {
+test('active modes route their own ordered rungs, then one rung up, then nothing; base stays unchanged', () => {
   const rungs = { light: [{ target: { agent: 'gpt-6-luna' }, effort: 'low' }, { target: sonnet, effort: 'high' }], standard: [{ target: opus, effort: 'max' }] }
   const s = normalizeSettings({ modes: [{ id: 'work', name: 'Work', rungs }], activeMode: 'work', activeSince: 5 })
   const routing = routingSettings(s)
@@ -98,7 +98,7 @@ test('active modes route their own ordered rungs, then one rung up, then session
   assert.deepEqual([pick(routing, false).target, pick(routing, false).position], [sonnet, 2])
   const unticked = { ...routing, allow: ['general-purpose:opus'] }
   assert.deepEqual([pick(unticked, false).target, pick(unticked, false).rung], [opus, 'standard'])
-  assert.deepEqual(pick({ ...routing, allow: ['missing'] }, false).target, { agent: 'general-purpose' })
+  assert.equal(pick({ ...routing, allow: ['missing'] }, false).target, undefined)
   assert.deepEqual(s.rules.general.rungs, USER)
   assert.equal(routingSettings({ ...s, activeMode: undefined }).rules.general, s.rules.general)
 })
@@ -135,7 +135,7 @@ test('a mode\'s domain ladders fold into two levels, the general ladder of the m
     hard: [{ target: { agent: 'h' }, effort: 'high' }], plan: [{ target: { agent: 'p' }, effort: 'high' }],
   })
   assert.deepEqual(mode.domainRules!.ui!.rungs, {
-    light: [{ target: { agent: 'u' }, effort: 'low' }], standard: [{ target: { agent: 'uh' }, effort: 'high' }],
+    light: [{ target: { agent: 'u' }, effort: 'low' }], standard: [{ target: { agent: 'u' }, effort: 'low' }],
     hard: [{ target: { agent: 'uh' }, effort: 'high' }], plan: [{ target: { agent: 'uh' }, effort: 'high' }],
   })
 })
@@ -176,18 +176,17 @@ test('a mode ends at its time, or the first known quota reset after activation',
   assert.deepEqual(quotaWindows({}), [])
 })
 
-test('the eager note goes with the first prompt after the mode turns on and after each compaction, not every turn', () => {
+test('the eager note goes with every prompt while eager, not once per activation or compaction', () => {
   const modes = normalizeModes([{ id: 'burn', name: 'Burn GPT', targets: ['chatgpt'], delegation: 'eager' }, { id: 'calm', name: 'Calm', targets: ['chatgpt'] }])
   const on = { modes, activeMode: 'burn', activeSince: 5 }
   const first = eagerNote(on, null)
   assert.equal(first.note, modeNote('Burn GPT'))
   assert.equal(first.note, 'ClaudeRipple mode Burn GPT: delegate everything except judgment and final review to ripple:auto.')
   assert.equal(first.noted, modeKey(on))
-  // The next turn: nothing.
-  assert.deepEqual(eagerNote(on, first.noted), { noted: first.noted })
-  // A compaction clears what was noted: the next prompt carries it again.
+  // The next turn carries it too: one sent only once is buried in a long context.
+  assert.equal(eagerNote(on, first.noted).note, first.note)
   assert.equal(eagerNote(on, null).note, first.note)
-  // Turned off and on again is a new turning-on.
+  // Turned off and on again, still every prompt.
   assert.equal(eagerNote({ ...on, activeSince: 9 }, first.noted).note, first.note)
   // A normal mode, or none, adds nothing and clears what was noted (Base's delegation is normal).
   assert.deepEqual(eagerNote({ modes, activeMode: 'calm', activeSince: 5 }, null), { noted: null })

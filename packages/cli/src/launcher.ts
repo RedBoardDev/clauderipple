@@ -121,12 +121,20 @@ export function desktopEntry(rt: Runtime, home: string): string {
 }
 
 export function windowsTrayLauncher(rt: Runtime, home: string): string {
-  const log = path.join(home, "logs", "launcher.log");
+  // Its own log, not logs\launcher.log: the router's launcher holds that file open for as long as
+  // the router runs (schtasks.ts's Start-Process -RedirectStandardOutput), and a second writer
+  // failed to open it and died before node started — the shortcut did nothing, with no window to
+  // say why (#87). The tray can do without a log, so if this one cannot be opened either the
+  // command runs again without it. Windows PowerShell runs the command only after the redirection
+  // has opened its file (measured in the Windows 11 VM, 2026-10-24), so the fallback never runs
+  // the command twice.
+  const log = path.join(home, "logs", "tray-launcher.log");
+  const command = `& ${ps(rt.node)} ${ps(rt.cli)} tray --ensure`;
   // -File is read by Windows PowerShell 5.1, which needs a BOM to recognise UTF-8.
   return String.fromCharCode(0xFEFF) + [
     ...Object.entries(launchEnv(rt, home)).map(([k, v]) => `$env:${k} = ${ps(v)}`),
     `New-Item -ItemType Directory -Force -Path ${ps(path.dirname(log))} | Out-Null`,
-    `& ${ps(rt.node)} ${ps(rt.cli)} tray --ensure *>> ${ps(log)}`,
+    `try { ${command} *>> ${ps(log)} } catch { ${command} }`,
   ].join("\r\n") + "\r\n";
 }
 

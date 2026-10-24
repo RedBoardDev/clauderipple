@@ -116,9 +116,9 @@ export function cacheTone(percent: number): 'ok' | 'warn' | 'bad' {
   return percent >= 90 ? 'ok' : percent >= 50 ? 'warn' : 'bad'
 }
 
-/** Context fill: neutral until the swamp line, amber past it, red from 85%. */
-export function contextTone(percent: number, swampAt: number): 'ink' | 'warn' | 'bad' {
-  return percent >= 85 ? 'bad' : percent >= swampAt ? 'warn' : 'ink'
+/** Context fill: neutral until 80% of the compaction window, amber past it, red from 95%. */
+export function contextTone(percent: number): 'ink' | 'warn' | 'bad' {
+  return percent >= 95 ? 'bad' : percent >= 80 ? 'warn' : 'ink'
 }
 
 /** Plan window: neutral under 80%, amber to 95%, red above. */

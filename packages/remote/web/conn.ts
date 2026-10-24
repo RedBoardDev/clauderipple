@@ -4,7 +4,7 @@
 // caught by the app-level ping, not by TCP. Only a refused token stops it, because retrying a
 // token the host rejects would just say "connecting" forever — which would be a lie.
 import { BACKOFF_CAP_MS, PING_MS, READY_MS, STALE_MS } from "../src/protocol.ts";
-import type { ClientMsg, HostMsg } from "../src/protocol.ts";
+import type { ClientFeature, ClientMsg, HostMsg } from "../src/protocol.ts";
 
 /** A socket that opens but never says `ready` is as good as down (through the relay: the handshake counts too). */
 export { READY_MS };
@@ -37,6 +37,8 @@ export interface LinkDeps {
   url: string;
   token: string;
   clientId: string;
+  /** Explicit opt-in by a client that understands the feature's full response contract. */
+  features?: ClientFeature[];
   makeSocket: (url: string) => SocketLike;
   now: () => number;
   setTimer: (fn: () => void, ms: number) => unknown;
@@ -124,7 +126,7 @@ export class Link {
     sock.onopen = () => {
       if (this.sock !== sock) return;
       this.status.lastRx = this.deps.now();
-      sock.send(JSON.stringify({ t: "hello", token: this.deps.token, clientId: this.deps.clientId } satisfies ClientMsg));
+      sock.send(JSON.stringify({ t: "hello", token: this.deps.token, clientId: this.deps.clientId, ...(this.deps.features ? { features: this.deps.features } : {}) } satisfies ClientMsg));
       this.armPing();
     };
     // From creation, not from open: a connect that hangs (a dead address after a network switch)

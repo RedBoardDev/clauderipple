@@ -59,10 +59,17 @@ function fixture(t: import("node:test").TestContext, rejected = false, resumed: 
     stateReads: () => stateReads, advance: () => { now += 3000; }, status: (value: string) => { workerStatus = value; }, failState: () => { stateFailure = true; } };
 }
 
-test("Mac bridge mode switching reports not supported without posting controls", async t => {
+test("Mac bridge mode switching waits for the worker before confirming the next turn", async t => {
   const f = fixture(t);
-  await assert.rejects(f.sessions.setMode(id, 'plan'), /not supported yet/);
-  assert.equal(f.posts.length, 0);
+  const changing = f.sessions.setMode(id, 'plan', 'mode-plan');
+  await tick(); await tick();
+  const payload = (f.posts[0] as { events: { payload: { request_id: string; request: unknown } }[] }).events[0]!.payload;
+  assert.deepEqual(payload.request, { subtype: 'set_permission_mode', mode: 'plan' });
+  assert.notEqual(f.sessions.summaryOf(id)?.permissionMode, 'plan');
+  f.emit({ type: 'control_response', response: { request_id: payload.request_id, subtype: 'success', response: {} } });
+  assert.deepEqual(await changing, { status: 'applied', permissionMode: 'plan' });
+  assert.equal(f.sessions.summaryOf(id)?.permissionMode, 'plan');
+  assert.equal(f.queries(), 0);
 });
 
 test("a desktop bridge summary carries the Claude app transcript's permission mode", async t => {

@@ -32,16 +32,18 @@ import { RouterClient } from "./router.ts";
 import { HostServer } from "./server.ts";
 import { LocalControl } from "./local-control.ts";
 import { findClaude, specFor, cliLoginWarning } from "./service.ts";
-import { installService, uninstallService, serviceStatus, servicePaths, renderService, supervisorName, controlShutdown, refreshPlan, hostBusy } from "./host-service.ts";
+import { installService, uninstallService, serviceStatus, servicePaths, renderService, supervisorName, controlShutdown, refreshPlan, hostStatus, refreshRunningHost } from "./host-service.ts";
 import { Sessions } from "./sessions.ts";
 import { REMOTE_USAGE } from "./usage.ts";
 import { desktopHandoff } from "./handoff.ts";
 import { windowsSidebarRoot } from "./sidebar.ts";
 import type { QueryFn } from "./sessions.ts";
 import { claudeBinary, claudeCodeLogin } from "../../cli/src/claude-auth.ts";
+import { homeDir } from "../../router/src/config.ts";
+import { VERSION } from "../../router/src/version.ts";
+import { requestHostUpdate, refreshHostUpdate } from "./host-update.ts";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
-const VERSION = (JSON.parse(fs.readFileSync(path.join(here, "..", "package.json"), "utf8")) as { version: string }).version;
 const out = (s: string): void => { process.stdout.write(s); };
 
 function arg(name: string): string | undefined {
@@ -139,6 +141,7 @@ async function runHost(): Promise<void> {
     dir, send: webPushSender(vapid), log,
     seenRecently: (id) => server?.sessionSeenRecently(id) ?? false,
     summary: (id) => sessions?.summaryOf(id),
+    context: (id, event) => sessions?.pushContext(id, event) ?? {},
   });
   const expoNotifier = new ExpoNotifier({ dir, send: expoSender(), log,
     seenRecently: (id) => server?.sessionSeenRecently(id) ?? false,
@@ -173,7 +176,7 @@ async function runHost(): Promise<void> {
     onDesktopProblem: (problem) => server?.setDesktopProblem(problem),
   });
   const live = sessions;
-  const host = new HostServer({
+  const host: HostServer = new HostServer({
     listen: where.listen, port: cfg.port, token: cfg.token, webDir: path.resolve(here, "..", "web"), sessions: live, router,
     hostName: os.hostname().replace(/\.local$/, ""), version: VERSION,
     recentCli: async () => (await listSessions({ limit: 300, includeProgrammatic: false })).flatMap((s) => (s.cwd ? [{ path: s.cwd, lastUsed: s.lastModified }] : [])),
@@ -191,6 +194,8 @@ async function runHost(): Promise<void> {
       rotate: token => { server?.rotateToken(token); },
       shutdown: () => stop(),
       busy: () => live.busy(),
+      prepareRefresh: () => host.prepareRefresh(),
+      refresh: () => stop(75),
     }),
   });
   server = host;
@@ -215,15 +220,15 @@ async function runHost(): Promise<void> {
   if (process.stdout.isTTY) printPairing(cfg, dir);
   else out("Pairing QR: run `ripple-host pair` (npm run remote -- pair) in a terminal.\n");
 
-  const stop = (): void => {
+  const stop = (code = 0): void => {
     power.release();
     relay?.stop();
     live.shutdown();
-    void host.close().then(() => process.exit(0));
-    setTimeout(() => process.exit(0), 3000).unref();
+    void host.close().then(() => process.exit(code));
+    setTimeout(() => process.exit(code), 3000).unref();
   };
-  process.on("SIGTERM", stop);
-  process.on("SIGINT", stop);
+  process.on("SIGTERM", () => stop());
+  process.on("SIGINT", () => stop());
 }
 
 async function status(): Promise<void> {
@@ -264,17 +269,24 @@ function hostSpec(claudePath: string | undefined): ReturnType<typeof specFor> {
   return specFor({ script: fileURLToPath(import.meta.url), claudePath, ...(process.env.RIPPLE_REMOTE_HOME ? { remoteHome: process.env.RIPPLE_REMOTE_HOME } : {}) });
 }
 
-/** Run by `clauderipple update` from the new files: restarts a host this installation registered (refreshPlan). */
+/** Run from the new files. A busy/unknown host stays pending for the router's independent retry. */
 async function refreshCmd(): Promise<void> {
-  const p = servicePaths();
-  let definition: string | null = null;
-  try { definition = fs.readFileSync(p.definition, "utf8"); } catch { /* not registered */ }
-  const plan = refreshPlan({ installed: serviceStatus().installed, definition, script: fileURLToPath(import.meta.url), busy: definition === null ? undefined : await hostBusy() });
-  if (plan === "absent") return;
-  if (plan === "foreign") { out(`phone host: runs from other files (${p.definition}); left as it is\n`); return; }
-  if (plan === "busy") { out("phone host: a turn is in progress, so it keeps the old code; restart it afterwards with: clauderipple remote install\n"); return; }
-  const spec = hostSpec(findClaude(loadConfig(remoteHome(), false).claudePath));
-  for (const line of await installService(spec)) out(`phone host: ${line}\n`);
+  const home = homeDir();
+  if (!process.argv.includes("--pending")) requestHostUpdate(home, VERSION);
+  const state = await refreshHostUpdate(home, VERSION, {
+    plan: async () => {
+      const p = servicePaths();
+      let definition: string | null = null;
+      try { definition = fs.readFileSync(p.definition, "utf8"); }
+      catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+      const status = definition === null ? null : await hostStatus();
+      return refreshPlan({ installed: serviceStatus().installed, definition, script: fileURLToPath(import.meta.url), busy: status?.busy });
+    },
+    apply: () => refreshRunningHost(VERSION),
+    version: async () => (await hostStatus())?.version ?? null,
+  });
+  if (state?.status === "pending") out(`호스트 적용 대기: ${state.error ?? "진행 중인 작업이 끝나면 자동으로 다시 시도합니다."}\n`);
+  else if (state?.status === "applied") out(`휴대폰 호스트에 ${VERSION} 버전을 적용했습니다.\n`);
 }
 
 async function main(): Promise<void> {

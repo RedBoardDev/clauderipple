@@ -51,7 +51,7 @@
     <td colspan="2" align="center"><img src="docs/media/mod-band.png" alt="리플 모드: 추론 강도, 컨텍스트, 캐시 타이머, 실제로 답한 모델과 캐시 적중률"><br><sub>리플 모드: 추론 강도, 컨텍스트, 캐시 타이머, 실제로 답한 모델과 캐시 적중률</sub></td>
   </tr>
   <tr>
-    <td align="center" width="50%"><img src="docs/media/mod-alerts.png" alt="캐시가 식거나 한도가 가까우면 경고, 새 대화로 인수인계"><br><sub>캐시가 식거나 한도가 가까우면 경고, 새 대화로 인수인계</sub></td>
+    <td align="center" width="50%"><img src="docs/media/mod-alerts.png" alt="캐시가 식거나 한도가 가까우면 경고하고 압축을 제안합니다"><br><sub>캐시가 식거나 한도가 가까우면 경고하고 압축을 제안합니다</sub></td>
     <td align="center" width="50%"><img src="docs/media/mod-settings.png" alt="빠른 설정: 자동 추론 강도, 판정 모델, 워커 모드"><br><sub>빠른 설정: 자동 추론 강도, 판정 모델, 워커 모드</sub></td>
   </tr>
 </table>
@@ -259,7 +259,7 @@ ClaudeRipple은 Claude Code 프로세스만 신뢰하는 작은 HTTPS 프록시�
   적중률이 보입니다. 작은 판정 모델(Haiku 5.5 또는 Jev)이 프롬프트마다 최근 대화와 함께 읽고 low부터 max까지 추론
   강도를 정합니다. 맡긴 일은 `ripple:auto`로 가고, 판정 모델이 난이도에 따라 워커를 고릅니다. 가벼운 일은 DeepSeek·GLM,
   어려운 일은 GPT·Opus로. 캐시가 식었을 때, 컨텍스트가 무거워졌을 때, 요금제 한도가 80%를 넘었을 때 카드로 알려 주고,
-  압축이나 같은 폴더 새 세션으로의 인수인계를 제안합니다. `Log`(또는 `/ripple-log`)로 요청 로그를 옆 패널에 엽니다.
+  압축을 제안합니다. `Log`(또는 `/ripple-log`)로 요청 로그를 옆 패널에 엽니다.
   클라이언트 화면의 스위치 하나, 또는 `clauderipple mod on`.
 - **ChatGPT 구독으로 이미지 생성.** `clauderipple image "<프롬프트>"`. 참고 이미지와 투명 배경도 됩니다. 서브에이전트에도
   방법이 적혀 있어, GPT나 DeepSeek 워커가 이미지 도구 없이 이미지를 만들고 직접 확인합니다.

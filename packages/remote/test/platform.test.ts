@@ -165,8 +165,8 @@ test("an update restarts only the phone host this installation registered, and n
   assert.equal(refreshPlan({ installed: true, definition: "<string>/Users/me/src/clauderipple/packages/remote/src/main.ts</string>", script, busy: false }), "foreign");
   assert.equal(refreshPlan({ installed: true, definition: ours, script, busy: true }), "busy");
   assert.equal(refreshPlan({ installed: true, definition: ours, script, busy: false }), "restart");
-  // A host from before the busy field, or one not answering, is restarted.
-  assert.equal(refreshPlan({ installed: true, definition: ours, script, busy: undefined }), "restart");
+  // A host from before the busy field, or one not answering, must stay pending.
+  assert.equal(refreshPlan({ installed: true, definition: ours, script, busy: undefined }), "busy");
   // The plist escapes XML; the Windows launcher doubles single quotes.
   const odd = "/Users/a&b/cr's/main.js";
   assert.equal(refreshPlan({ installed: true, definition: "<string>/Users/a&amp;b/cr's/main.js</string>", script: odd, busy: false }), "restart");

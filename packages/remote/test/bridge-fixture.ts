@@ -41,7 +41,7 @@ export function bridgeFixture(t: import("node:test").TestContext, opts: { stream
       posts.push(JSON.parse(String(options.body)));
       return new Response("{}", { status: opts.failSend ? 503 : 200 });
     }
-    if (String(url).endsWith("/sessions/bridge")) {
+    if (/\/sessions\/[^/]+$/.test(String(url))) {
       stateReads++;
       return opts.stateResponse ? opts.stateResponse() : Response.json({ worker_status: workerStatus });
     }

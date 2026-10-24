@@ -49,6 +49,24 @@ async function hello(t: import("node:test").TestContext, port: number, token: st
   return { ws, frame: JSON.parse(String(frame)) as { t: string } };
 }
 
+test("refresh is authenticated, refuses a busy host and only requests self-exit after idle reservation", async t => {
+  const f = await fixture(t);
+  let busy = true, reservations = 0, exits = 0;
+  const local = new LocalControl({ dir: f.dir, config: f.cfg, version: "old", hostPublicKey: "public", phones: () => [], rotate() {},
+    prepareRefresh: () => { reservations++; return !busy; }, refresh: () => { exits++; } });
+  const server = http.createServer((req, res) => { void local.handle(req, res); });
+  await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise<void>(resolve => server.close(() => resolve())));
+  const address = server.address(); assert.ok(address && typeof address !== "string");
+  const url = `http://127.0.0.1:${address.port}/local/refresh`;
+  assert.equal((await fetch(url, { method: "POST" })).status, 403);
+  assert.equal(reservations, 0);
+  const refresh = () => fetch(url, { method: "POST", headers: { "x-ripple-local": f.secret } });
+  assert.equal((await refresh()).status, 409); assert.equal(exits, 0);
+  busy = false;
+  assert.equal((await refresh()).status, 200); assert.equal(exits, 1);
+});
+
 test("local control requires both a loopback socket and the one persistent 0600 secret", async t => {
   const f = await fixture(t);
   assert.equal(localSecret(f.dir), f.secret);

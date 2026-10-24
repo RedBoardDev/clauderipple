@@ -3,6 +3,7 @@
 // content from register.tsx's own drawing.
 
 import { t } from '../i18n'
+import { DISPLAY, displayChars, displayText } from './display'
 import type { RenderNode } from 'claude-code'
 
 import type { JudgeRun, StatusRequest } from '../../types'
@@ -25,7 +26,7 @@ function entry(el: Els, frame: Frame, record: StatusRequest, mineOnly: boolean):
   const cache = cachePercent(record.usage)
   if (record.resent && STATELESS_SWITCH.test(record.note ?? '')) {
     return (
-      <Box key={record.at + '-' + record.target} flexDirection="row" flexWrap="wrap" columnGap={1}>
+      <Box key={record.at + '-' + displayText(record.target, DISPLAY.name)} flexDirection="row" flexWrap="wrap" columnGap={1}>
         {mineOnly ? null : <Text dimColor>{record.mine ? '●' : '○'}</Text>}
         <Text dimColor>{clockTime(record.at)}</Text>
         <Text dimColor wrap="wrap">{modelOf(record)}</Text>
@@ -34,7 +35,7 @@ function entry(el: Els, frame: Frame, record: StatusRequest, mineOnly: boolean):
     )
   }
   return (
-    <Box key={record.at + '-' + record.target} flexDirection="column">
+    <Box key={record.at + '-' + displayText(record.target, DISPLAY.name)} flexDirection="column">
       <Box flexDirection="row" flexWrap="wrap" columnGap={1}>
         {mineOnly ? null : (
           <Text color={record.mine ? tone.accent : undefined} dimColor={!record.mine}>
@@ -101,7 +102,21 @@ function judgeEntry(el: Els, frame: Frame, run: JudgeRun): RenderNode {
 export function renderLog(el: Els, frame: Frame, view: LogView, actions: LogActions): RenderNode {
   const { Box, Text } = el
   const judges = view.mineOnly ? (view.judges ?? []) : []
-  const items = [...view.rows.map(record => ({ at: Date.parse(record.at), node: () => entry(el, frame, record, view.mineOnly) })), ...judges.map(run => ({ at: run.at, node: () => judgeEntry(el, frame, run) }))].sort((a, b) => b.at - a.at)
+  // Share the content allowance across all entries, not just the first few long errors.
+  // First reserve room per entry for names and chrome, giving every error a preview.
+  // Then count the actual drawn content against the shared allowance, newest first.
+  const count = view.rows.length + judges.length
+  const detail = Math.max(0, Math.min(DISPLAY.detail, Math.floor(DISPLAY.log / Math.max(1, count)) - 400))
+  const items = [...view.rows.map(record => ({ at: Date.parse(record.at), node: () => entry(el, frame, { ...record, provider: displayText(record.provider, 60), effort: displayText(record.effort ?? '', 40), status: displayText(String(record.status), 40), note: displayText(record.note ?? '', detail) }, view.mineOnly) })), ...judges.map(run => ({ at: run.at, node: () => judgeEntry(el, frame, { ...run, error: displayText(run.error ?? '', detail) }) }))].sort((a, b) => b.at - a.at)
+  const shown: RenderNode[] = []
+  let remaining: number = DISPLAY.log
+  for (const item of items) {
+    const node = item.node()
+    const chars = displayChars(node)
+    if (chars > remaining) break
+    shown.push(node)
+    remaining -= chars
+  }
   const scopeName = view.mineOnly ? t(frame.lang, 'log.thisSession') : t(frame.lang, 'log.allSessions')
   const scope = action(el, frame, 'scope', view.mineOnly ? t(frame.lang, 'log.showAll') : t(frame.lang, 'log.onlySession'), actions.toggleScope, { hotkey: 'a' })
   const legend = !view.mineOnly ? <Text key="legend" dimColor wrap="wrap">{t(frame.lang, 'log.legend')}</Text> : ''
@@ -115,7 +130,8 @@ export function renderLog(el: Els, frame: Frame, view: LogView, actions: LogActi
         {scope}
       </Box>
       {legend}
-      {items.map(item => item.node())}
+      {shown}
+      {shown.length < items.length ? <Text dimColor>{t(frame.lang, 'agents.dropped', { count: items.length - shown.length })}</Text> : null}
     </Box>
   )
 }

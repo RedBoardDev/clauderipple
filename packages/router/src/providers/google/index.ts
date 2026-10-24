@@ -19,7 +19,7 @@ import { setTimeout as sleep } from "node:timers/promises";
 import type { GoogleProvider, ProviderModel } from "../../config.ts";
 import type { Logger } from "../../log.ts";
 import type { RequestUsage } from "../../requestlog.ts";
-import { providerExhaustion, type ProviderExhaustion } from "../../health.ts";
+import { exhaustionHeaders, providerExhaustion, type ProviderExhaustion } from "../../health.ts";
 import { CredentialPool, retryAfterMs } from "../../pool.ts";
 import { credentialHeaderValues, redactErrorText } from "../../redact.ts";
 import { SseParser } from "../chatgpt/sse.ts";
@@ -30,7 +30,7 @@ import { ThoughtSignatureStore, type ThoughtSignatureSink } from "./thoughtSigna
 import { conversationKey, serverToolNames, toolNameRestoreMap, type AnthropicRequest } from "../chatgpt/translate.ts";
 import { GoogleAccountPool, type GoogleAccountSummary, type GoogleCredential, type FetchLike } from "./accounts.ts";
 import { fetchAvailableModels, hostForModel, resolveAntigravityWireModel, staticAntigravityModels, GOOGLE_OAUTH, type HostMap, type MergedCatalogue } from "./antigravity.ts";
-import { GoogleUsage, type QuotaGroup } from "./usage.ts";
+import { antigravityQuotaScope, GoogleUsage, type QuotaGroup } from "./usage.ts";
 import { ANTIGRAVITY_PROMPT_REFUSAL_MESSAGE, isAntigravityPromptRefusal } from "./prompt-refusal.ts";
 
 const PING_MS = 15_000;
@@ -118,6 +118,44 @@ export function googleRetryDelayMs(text: string): number | undefined {
 }
 
 /**
+ * Whether a 429 says one quota group of the account is spent, not the account: an ErrorInfo with
+ * `reason: "QUOTA_EXHAUSTED"` naming a `metadata.model` in the same group as the turn's model.
+ * Measured 2026-10-23 for claude-opus-5-5-low ("Individual quota reached … Resets in 4h51m35s",
+ * `quotaResetDelay` beside it), while the account's Gemini group read 0.3% used. A 429 without that
+ * proof (a per-minute limit, the generic RESOURCE_EXHAUSTED, a detail naming no model) is still read
+ * as the whole account's.
+ */
+export function isGroupQuotaExhausted(status: number, text: string, scope: string): boolean {
+  if (status !== 429) return false;
+  try {
+    const details = (JSON.parse(text) as { error?: { details?: unknown } } | null)?.error?.details;
+    if (!Array.isArray(details)) return false;
+    return details.some((d) => {
+      const detail = d as { reason?: unknown; metadata?: { model?: unknown } } | null;
+      const model = detail?.metadata?.model;
+      return detail?.reason === "QUOTA_EXHAUSTED" && typeof model === "string" && antigravityQuotaScope(model) === scope;
+    });
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * The pool scope (pool.ts) a quota group rests in: the group on one Cloud Code Assist host, as
+ * `3p@daily-cloudcode-pa.googleapis.com`. Each host counts its own quota (usage.ts reads them apart),
+ * so a group spent on one host still answers on the other.
+ */
+export function antigravityScopeKey(group: string, host: string): string {
+  return `${group}@${new URL(host).host}`;
+}
+
+/** The group's name in a refusal: what is spent, and what still answers. */
+const GROUP_NAMES: Record<string, { spent: string; other: string }> = {
+  "3p": { spent: "Claude/GPT", other: "Gemini" },
+  gemini: { spent: "Gemini", other: "Claude/GPT" },
+};
+
+/**
  * The page Google sends an account to when it wants the person behind it checked before Cloud
  * Code Assist will answer: a 403 `PERMISSION_DENIED` whose ErrorInfo reason is
  * `VALIDATION_REQUIRED`, with the page in `metadata.validation_url` (measured 2026-10-02 on a newly
@@ -154,6 +192,12 @@ function write(res: http.ServerResponse, value: string): number {
 export type GoogleAccountStatus = GoogleAccountSummary & {
   state: "ready" | "cooling" | "quarantined" | "paused" | "needs-login" | "needs-verification";
   cooldownSeconds?: number;
+  /**
+   * Seconds until each resting quota group is usable again, keyed by group and host
+   * (`antigravityScopeKey`, e.g. `3p@daily-cloudcode-pa.googleapis.com`), while the account itself
+   * stays in rotation for the others. Absent when no group rests.
+   */
+  quotaCooldowns?: Record<string, number>;
   /** Google's page for finishing the check, while the account is `needs-verification`. */
   verifyUrl?: string;
   active: boolean;
@@ -165,8 +209,9 @@ type SendResult =
   | { kind: "ok"; upstream: Response; credential: GoogleCredential }
   | { kind: "prompt-refused" }
   | { kind: "no-capacity"; text: string; asks: number }
-  | { kind: "refused"; status: number; text: string; retryAfterSeconds?: number; verify?: { url: string; account: string } }
-  | { kind: "all-resting"; backMs?: number }
+  | { kind: "refused"; status: number; text: string; retryAfterSeconds?: number; verify?: { url: string; account: string }; group?: string }
+  /** `group`: only that quota group rests everywhere; the accounts still answer the other one. */
+  | { kind: "all-resting"; backMs?: number; group?: string }
   | { kind: "no-account" }
   | { kind: "unreachable"; error: Error }
   | { kind: "aborted" };
@@ -246,9 +291,25 @@ export class GoogleAdapter {
     return `accounts=${all.length} usable=${usable}`;
   }
 
-  /** Whether any account could answer now, for the proxy's choice between this provider and a fallback. */
-  hasUsable(): boolean {
-    return this.pool.hasUsable(this.name, this.accounts.peekCredentials());
+  /**
+   * Whether any account could answer now, for the proxy's choice between this provider and a fallback.
+   * With a model, that model's quota group must have room on the account, on the host it goes to.
+   */
+  hasUsable(model?: string, effort?: string): boolean {
+    return this.pool.hasUsable(this.name, this.accounts.peekCredentials(), model ? this.quotaScopeOf(model, effort) : undefined);
+  }
+
+  /**
+   * The pool scope a turn for `model` rests in: its quota group on the host it would be sent to
+   * (`antigravityScopeKey`). A `model@effort` id takes its effort from the suffix. Undefined for a
+   * model outside the two groups.
+   */
+  quotaScopeOf(model: string, effort?: string): string | undefined {
+    const at = model.lastIndexOf("@");
+    const base = at > 0 ? model.slice(0, at) : model;
+    const group = antigravityQuotaScope(base);
+    if (!group) return undefined;
+    return antigravityScopeKey(group, this.hostFor(base, (at > 0 ? model.slice(at + 1) : effort) ?? this.cfg.defaultEffort));
   }
 
   signedIn(): boolean {
@@ -264,11 +325,13 @@ export class GoogleAdapter {
       const report = credential ? reports.get(credential.id) : undefined;
       const verifyUrl = this.verifyUrls.get(summary.id);
       const state: GoogleAccountStatus["state"] = summary.paused ? "paused" : !credential ? "needs-login" : verifyUrl ? "needs-verification" : report?.state ?? "ready";
+      const quotaCooldowns = credential ? this.pool.scopeCooldowns(this.name, credential.id) : {};
       return {
         ...summary,
         state,
         ...(state === "needs-verification" && verifyUrl ? { verifyUrl } : {}),
         ...(report?.cooldownSeconds ? { cooldownSeconds: report.cooldownSeconds } : {}),
+        ...(Object.keys(quotaCooldowns).length ? { quotaCooldowns } : {}),
         active: summary.id === this.activeOwner,
         inUse: report?.inUse === true,
       };
@@ -498,8 +561,10 @@ export class GoogleAdapter {
       const out = mapHttpError(upstream.status, safeText);
       this.log.warn(`google ${this.name}: upstream ${upstream.status} for ${model}: ${safeText.slice(0, 400)}`);
       res.off("close", onClose);
-      res.writeHead(out.status, { "content-type": "application/json", "content-length": String(Buffer.byteLength(out.body)) }).end(out.body);
-      return { status: out.status, bytes: Buffer.byteLength(out.body), note: `upstream ${upstream.status}`, exhaustion: providerExhaustion(upstream.status, text, retryAfterMs(Object.fromEntries(upstream.headers)) ?? googleRetryDelayMs(text)) };
+      // A spending cap or a used-up quota: the client is told not to retry, in the same answer.
+      const exhaustion = providerExhaustion(upstream.status, text, retryAfterMs(Object.fromEntries(upstream.headers)) ?? googleRetryDelayMs(text));
+      res.writeHead(out.status, { "content-type": "application/json", "content-length": String(Buffer.byteLength(out.body)), ...(exhaustion ? exhaustionHeaders(exhaustion) : {}) }).end(out.body);
+      return { status: out.status, bytes: Buffer.byteLength(out.body), note: `upstream ${upstream.status}`, exhaustion };
     }
 
     return this.streamBack(res, upstream, transport, json, model, wantStream, key, startInput, controller, onClose);
@@ -561,7 +626,10 @@ export class GoogleAdapter {
         note = "no credentials";
       } else if (sent.kind === "all-resting") {
         const when = sent.backMs ? ` The first is usable again at ${new Date(Date.now() + sent.backMs).toLocaleTimeString()}.` : "";
-        err = anthropicError(429, "rate_limit_error", `Google Antigravity: every signed-in account is at its limit.${when}`);
+        const names = sent.group ? GROUP_NAMES[sent.group] : undefined;
+        err = anthropicError(429, "rate_limit_error", names
+          ? `Google Antigravity: the ${names.spent} quota is spent on every signed-in account; ${names.other} models still answer.${when}`
+          : `Google Antigravity: every signed-in account is at its limit.${when}`);
         if (sent.backMs) retryAfterSeconds = Math.ceil(sent.backMs / 1000);
         note = "all accounts resting";
       } else if (sent.verify) {
@@ -575,10 +643,15 @@ export class GoogleAdapter {
         retryAfterSeconds = sent.retryAfterSeconds;
         note = `upstream ${sent.status}`;
       }
-      res.writeHead(err.status, { "content-type": "application/json", ...(retryAfterSeconds ? { "retry-after": String(retryAfterSeconds) } : {}) }).end(err.body);
+      // A spent quota group is not the provider's exhaustion: the pool rests that group on the account
+      // and the mod reads it from there (admin.ts), so the provider's other models stay in the ladder.
+      const exhaustion = sent.kind === "refused" && !sent.group
+        ? providerExhaustion(sent.status, sent.text, sent.retryAfterSeconds === undefined ? undefined : sent.retryAfterSeconds * 1000)
+        : undefined;
+      res.writeHead(err.status, { "content-type": "application/json", ...(retryAfterSeconds ? { "retry-after": String(retryAfterSeconds) } : {}), ...(exhaustion ? exhaustionHeaders(exhaustion) : {}) }).end(err.body);
       return { status: err.status, bytes: Buffer.byteLength(err.body), note,
         ...(sent.kind === "no-account" ? { upstreamCalled: false as const, refusal: "no-account" as const } : {}),
-        ...(sent.kind === "refused" ? { exhaustion: providerExhaustion(sent.status, sent.text, sent.retryAfterSeconds === undefined ? undefined : sent.retryAfterSeconds * 1000) } : {}),
+        ...(exhaustion ? { exhaustion } : {}),
       };
     }
 
@@ -654,17 +727,18 @@ export class GoogleAdapter {
 
     const failure = mapper.failure;
     const failedStatus = failureStatus(failure);
+    const exhaustion = failure ? providerExhaustion(429, failure.message, retryAfterMs(Object.fromEntries(upstream.headers))) : undefined;
     if (!wantStream) {
       const body = failure ? anthropicError(failedStatus, failure.type, failure.message).body : JSON.stringify(mapper.message());
       bytes = Buffer.byteLength(body);
-      res.writeHead(failure ? failedStatus : 200, { "content-type": "application/json", "content-length": String(bytes) }).end(body);
+      res.writeHead(failure ? failedStatus : 200, { "content-type": "application/json", "content-length": String(bytes), ...(exhaustion && failedStatus === 429 ? exhaustionHeaders(exhaustion) : {}) }).end(body);
     } else if (!res.writableEnded) {
       res.end();
     }
     const usage = mapper.usage;
     return {
       status: failure ? failedStatus : 200,
-      exhaustion: failure ? providerExhaustion(429, failure.message, retryAfterMs(Object.fromEntries(upstream.headers))) : undefined,
+      exhaustion,
       bytes,
       note: failure
         ? `${wantStream ? "mid-stream " : ""}${failure.type}: ${failure.message} (in=${usage.input_tokens} cached=${usage.cache_read_input_tokens} out=${usage.output_tokens})`
@@ -681,6 +755,9 @@ export class GoogleAdapter {
    * - 401, or a 403 that reads as a credential refusal: one refresh of that account and a replay;
    *   refused again with a 401, the account is marked for sign-in.
    * - 429 and 402: the account rests until its stated reset (or a default), and the next takes over.
+   *   A 429 that proves one quota group spent (`isGroupQuotaExhausted`) rests only that group of the
+   *   account: Google counts Gemini and Claude/GPT models separately, and a spent Claude group used to
+   *   refuse Gemini turns with "all accounts resting" for hours while Gemini's quota sat unused.
    * - A 503 `MODEL_CAPACITY_EXHAUSTED`: no rest and no other account — the model is out of capacity
    *   on Google's side, not this account. The same account is asked again after `capacityRetry`'s
    *   waits, then the turn ends unwritten so the proxy can try a route fallback (§5, 2026-10-20).
@@ -704,14 +781,18 @@ export class GoogleAdapter {
     let last: Extract<SendResult, { kind: "refused" }> | null = null;
     let lastThrown: Error | null = null;
     let capacityAsks = 0;
+    // The model's quota group on the host this turn goes to: each host counts its own quota.
+    const group = antigravityQuotaScope(spec.model);
+    const scope = group ? antigravityScopeKey(group, spec.host) : undefined;
     for (;;) {
-      const credential = await this.pickAccount(spec.conversation, tried);
+      const credential = await this.pickAccount(spec.conversation, tried, scope);
       if (credential === "none") return { kind: "no-account" };
       if (credential === null) {
         if (last) return last;
         if (lastThrown) return { kind: "unreachable", error: lastThrown };
-        const backMs = this.soonestBackMs();
-        return { kind: "all-resting", ...(backMs ? { backMs } : {}) };
+        const backMs = this.soonestBackMs(scope);
+        const resting = group && this.pool.hasUsable(this.name, this.accounts.peekCredentials()) ? group : undefined;
+        return { kind: "all-resting", ...(backMs ? { backMs } : {}), ...(resting ? { group: resting } : {}) };
       }
 
       const { built, secrets } = spec.build(credential);
@@ -735,7 +816,7 @@ export class GoogleAdapter {
       }
 
       if (upstream.ok && upstream.body) {
-        this.pool.succeed(this.name, credential.id);
+        this.pool.succeed(this.name, credential.id, scope);
         this.verifyUrls.delete(credential.ownerId);
         this.activeOwner = credential.ownerId;
         return { kind: "ok", upstream, credential };
@@ -795,25 +876,38 @@ export class GoogleAdapter {
 
       const retryHeader = upstream.headers.get("retry-after");
       const waitMs = retryHeader ? retryAfterMs({ "retry-after": retryHeader }) : googleRetryDelayMs(text);
-      const verdict = this.pool.penalise(this.name, credential.id, credentialRefused ? 403 : status, waitMs, text);
-      last = { kind: "refused", status, text: safeText, ...(status === 429 && waitMs ? { retryAfterSeconds: Math.ceil(waitMs / 1000) } : {}) };
+      const spent = group && isGroupQuotaExhausted(status, text, group) ? group : undefined;
+      const verdict = this.pool.penalise(this.name, credential.id, credentialRefused ? 403 : status, waitMs, text, spent ? scope : undefined);
+      last = { kind: "refused", status, text: safeText, ...(status === 429 && waitMs ? { retryAfterSeconds: Math.ceil(waitMs / 1000) } : {}), ...(spent ? { group: spent } : {}) };
       if (!verdict.retryable) return last;
       tried.add(credential.ownerId);
     }
   }
 
-  /** An account for one turn: the conversation's own while it is healthy, else the first usable one. */
-  private async pickAccount(conversation: string | undefined, tried: ReadonlySet<string> = new Set()): Promise<GoogleCredential | "none" | null> {
+  /**
+   * An account for one turn: the conversation's own while it is healthy, else the first usable one.
+   * With a quota scope, an account whose quota for that group rests is passed over too.
+   */
+  private async pickAccount(conversation: string | undefined, tried: ReadonlySet<string> = new Set(), scope?: string): Promise<GoogleCredential | "none" | null> {
     const all = await this.accounts.credentials();
     if (all.length === 0) return "none";
     const rest = all.filter((c) => !tried.has(c.ownerId));
-    return this.pool.pick(this.name, rest, conversation) as GoogleCredential | null;
+    return this.pool.pick(this.name, rest, conversation, scope) as GoogleCredential | null;
   }
 
-  private soonestBackMs(): number | undefined {
-    const reports = this.pool.report(this.name, this.accounts.peekCredentials());
-    const cooling = reports.filter((r) => r.state === "cooling" && r.cooldownSeconds).map((r) => r.cooldownSeconds! * 1000);
-    return cooling.length ? Math.min(...cooling) : undefined;
+  /** When the first account can take a turn in `scope` again: the later of its own rest and the scope's. */
+  private soonestBackMs(scope?: string): number | undefined {
+    const credentials = this.accounts.peekCredentials();
+    const reports = new Map(this.pool.report(this.name, credentials).map((r) => [r.id, r]));
+    const waits = credentials.flatMap((c) => {
+      const report = reports.get(c.id);
+      if (report?.state === "quarantined") return [];
+      const own = report?.state === "cooling" ? report.cooldownSeconds ?? 0 : 0;
+      const scoped = scope ? this.pool.scopeCooldowns(this.name, c.id)[scope] ?? 0 : 0;
+      const seconds = Math.max(own, scoped);
+      return seconds > 0 ? [seconds * 1000] : [];
+    });
+    return waits.length ? Math.min(...waits) : undefined;
   }
 
   /** Convenience for tests and diagnostics. */

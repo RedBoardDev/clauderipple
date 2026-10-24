@@ -39,6 +39,25 @@ test("available and completed notifications have independent version deduplicati
   assert.deepEqual(rememberUpdate(both, notice), both);
   assert.equal(updateNotice("1.1.0", "1.0.0", { enabled: false, available: "1.1.0" }, empty()), null);
 });
+test("failed tray replacement retries the same version independently of an already delivered notice", async () => {
+  const module = await import("../src/update-model.ts");
+  assert.equal(typeof module.TrayReplacement, "function", "replacement is separate from notification deduplication");
+  let now = 0, calls = 0;
+  const replacement = new module.TrayReplacement(() => now);
+  const seen = rememberUpdate(empty(), updateNotice("1.1.0", "1.0.0", completed, empty())!);
+  assert.equal(updateNotice("1.1.0", "1.0.0", completed, seen), null);
+  const run = async () => { if (++calls === 1) throw new Error("launcher failed"); };
+  await assert.rejects(replacement.reconcile("1.1.0", "1.0.0", completed, run), /launcher failed/);
+  await replacement.reconcile("1.1.0", "1.0.0", completed, run);
+  assert.equal(calls, 1, "polls do not cause a tight retry loop");
+  now += 60_000;
+  await replacement.reconcile("1.1.0", "1.0.0", completed, run);
+  assert.equal(calls, 2);
+  now += 60_000;
+  await replacement.reconcile("1.1.0", "1.0.0", completed, run);
+  assert.equal(calls, 2, "only a successful launch is complete");
+});
+
 test("malformed notification history is rejected at the file boundary", () => {
   for (const value of [null, {}, { updated: [1], available: [] }, { updated: [], available: "1.0.0" }]) assert.throws(() => readUpdateSeen(value));
 });

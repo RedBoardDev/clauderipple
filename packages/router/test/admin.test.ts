@@ -221,6 +221,63 @@ test("mod options with a Claude account pool still follow the pool's own state",
   }, { credentials: () => ({ native: [row] }), modelScoresFetch: async () => new Response("{}") });
 });
 
+test("mod options take a spent Antigravity quota group's models out, not the provider", async () => {
+  const models = ['gemini-3.8-flash', 'claude-opus-5-5-medium', 'claude-sonnet-5-5-low'].map(id => ({ id }));
+  const cfg = makeCfg({ providers: { google: { type: 'google', auth: 'antigravity', models } } });
+  const ready = { id: 'a', label: 'a', email: 'a@example.test', projectId: 'p', expiresAt: 0, needsReauth: false, paused: false, state: 'ready', active: true } as GoogleAccountStatus;
+  // The adapter's own answer for where each model's quota is counted: its group on the host it goes to.
+  const DAILY_3P = '3p@daily-cloudcode-pa.googleapis.com';
+  const scopes: Record<string, string> = { 'gemini-3.8-flash': 'gemini@daily-cloudcode-pa.googleapis.com', 'claude-opus-5-5-medium': DAILY_3P, 'claude-sonnet-5-5-low': DAILY_3P };
+  let accounts: GoogleAccountStatus[] = [{ ...ready, quotaCooldowns: { [DAILY_3P]: 600 } }];
+  await withAdmin(cfg, async ({ port }) => {
+    const read = async () => (await (await fetch(`${base()}:${port}/api/mod-options`)).json() as ModOptions).providers.find(p => p.name === 'google')!;
+    const google = await read();
+    assert.equal(google.usable, true, 'Gemini still answers, so the provider stays in the ladder');
+    assert.equal(google.reason, undefined);
+    assert.deepEqual(Object.keys(google.models ?? {}).sort(), ['claude-opus-5-5-medium', 'claude-sonnet-5-5-low']);
+    assert.equal(google.models?.['claude-opus-5-5-medium']?.reason, 'quota_exhausted');
+    assert.ok((google.models?.['claude-opus-5-5-medium']?.exhaustedUntil ?? 0) > Date.now() + 590_000);
+    // Only when every account in rotation rests the group: a second account with Claude quota keeps it.
+    accounts = [{ ...ready, quotaCooldowns: { [DAILY_3P]: 600 } }, { ...ready, id: 'b' }];
+    assert.equal((await read()).models, undefined);
+    // A paused account is not in rotation, so it neither keeps nor spends the group.
+    accounts = [{ ...ready, quotaCooldowns: { [DAILY_3P]: 600 } }, { ...ready, id: 'b', state: 'paused', paused: true }];
+    assert.ok((await read()).models?.['claude-sonnet-5-5-low']);
+    // Cleared on the dashboard (or reset): the models are back at once.
+    accounts = [ready];
+    assert.equal((await read()).models, undefined);
+  }, { google: () => ({ accounts: () => ({ google: accounts }), quotaScope: (_name: string, model: string) => scopes[model] }), modelScoresFetch: async () => new Response('{}') });
+});
+
+test("a quota group spent on one host leaves the models that go to the other host in the ladder", async () => {
+  const models = ['claude-opus-5-5-medium', 'claude-sonnet-5-5-low'].map(id => ({ id }));
+  const cfg = makeCfg({ providers: { google: { type: 'google', auth: 'antigravity', models } } });
+  const ready = { id: 'a', label: 'a', email: 'a@example.test', projectId: 'p', expiresAt: 0, needsReauth: false, paused: false, state: 'ready', active: true } as GoogleAccountStatus;
+  const scopes: Record<string, string> = { 'claude-opus-5-5-medium': '3p@daily-cloudcode-pa.googleapis.com', 'claude-sonnet-5-5-low': '3p@cloudcode-pa.googleapis.com' };
+  const accounts = [{ ...ready, quotaCooldowns: { '3p@daily-cloudcode-pa.googleapis.com': 600 } }];
+  await withAdmin(cfg, async ({ port }) => {
+    const google = (await (await fetch(`${base()}:${port}/api/mod-options`)).json() as ModOptions).providers.find(p => p.name === 'google')!;
+    assert.deepEqual(Object.keys(google.models ?? {}), ['claude-opus-5-5-medium'], "prod's Claude/GPT quota is counted apart from daily's");
+  }, { google: () => ({ accounts: () => ({ google: accounts }), quotaScope: (_name: string, model: string) => scopes[model] }), modelScoresFetch: async () => new Response('{}') });
+});
+
+test("a group's return counts an account that is only cooling: the soonest of each account's later rest", async () => {
+  const cfg = makeCfg({ providers: { google: { type: 'google', auth: 'antigravity', models: [{ id: 'claude-opus-5-5-medium' }] } } });
+  const ready = { id: 'a', label: 'a', email: 'a@example.test', projectId: 'p', expiresAt: 0, needsReauth: false, paused: false, state: 'ready', active: true } as GoogleAccountStatus;
+  const DAILY_3P = '3p@daily-cloudcode-pa.googleapis.com';
+  // A's group rests four hours; B still has Claude quota but its own account rests ten seconds.
+  let accounts: GoogleAccountStatus[] = [{ ...ready, quotaCooldowns: { [DAILY_3P]: 14_400 } }, { ...ready, id: 'b', state: 'cooling', cooldownSeconds: 10 }];
+  await withAdmin(cfg, async ({ port }) => {
+    const until = async () => ((await (await fetch(`${base()}:${port}/api/mod-options`)).json()) as ModOptions).providers.find(p => p.name === 'google')!.models?.['claude-opus-5-5-medium']?.exhaustedUntil;
+    const back = (await until()) ?? 0;
+    assert.ok(back > Date.now() && back <= Date.now() + 10_000, `back with B in about ten seconds, not four hours (${back - Date.now()} ms)`);
+    // B cooling longer than its own group rest: the later of the two is when B takes the group again.
+    accounts = [{ ...ready, quotaCooldowns: { [DAILY_3P]: 14_400 } }, { ...ready, id: 'b', state: 'cooling', cooldownSeconds: 60, quotaCooldowns: { [DAILY_3P]: 300 } }];
+    const later = (await until()) ?? 0;
+    assert.ok(later > Date.now() + 290_000 && later <= Date.now() + 300_000, `B's group rest outlasts its own (${later - Date.now()} ms)`);
+  }, { google: () => ({ accounts: () => ({ google: accounts }), quotaScope: () => DAILY_3P }), modelScoresFetch: async () => new Response('{}') });
+});
+
 const putModSettings = (port: number, body: unknown) => fetch(`${base()}:${port}/api/mod-settings`, {
   method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ schemaVersion: MOD_SETTINGS_SCHEMA_VERSION, ...(body as Record<string, unknown>) }),
 });
@@ -274,7 +331,7 @@ test("admin mod-settings keeps ten exact previous files and refuses unsupported 
 
 test("admin mod-settings returns full defaults before storage, normalizes writes and persists revisions", async () => {
   await withAdmin(makeCfg(), async ({ port, home }) => {
-    const defaults = { settings: normalizeSettings(null), revision: 0, stored: false };
+    const defaults = { settings: normalizeSettings(null), revision: 0, stored: false, compactAt: null };
     assert.deepEqual(await (await fetch(`${base()}:${port}/api/mod-settings`)).json(), defaults);
     const input = { effortAuto: false, judge: "invalid", layout: "invalid", language: "invalid", keepWarmMinTokens: 1234, rules: { general: { mode: "auto", allow: [] } }, future: [1, null, { nested: true }] };
     // Auto is a ladder with no rung set; saving fills it from the connected models (here only Claude's own).
@@ -282,7 +339,7 @@ test("admin mod-settings returns full defaults before storage, normalizes writes
     const settings = normalizeSettings({ ...input, rules: { general: { mode: "ladder", rungs: { light: claude("haiku", "low"), standard: claude("sonnet", "medium"), hard: claude("opus", "high"), plan: claude("opus", "high") } } } });
     const saved = await putModSettings(port, { settings: input, revision: 0 });
     assert.equal(saved.status, 200);
-    const snapshot = { settings, revision: 1, stored: true };
+    const snapshot = { settings, revision: 1, stored: true, compactAt: null };
     assert.deepEqual(await saved.json(), snapshot);
     assert.deepEqual(await (await fetch(`${base()}:${port}/api/mod-settings`)).json(), snapshot);
     assert.equal(settings.judge, defaults.settings.judge);
@@ -290,7 +347,7 @@ test("admin mod-settings returns full defaults before storage, normalizes writes
     assert.equal(settings.language, defaults.settings.language);
     assert.equal(settings.keepWarmMinTokens, 1234);
     const file = path.join(home, "mod-settings.json");
-    assert.deepEqual(JSON.parse(fs.readFileSync(file, "utf8")), snapshot);
+    assert.deepEqual(JSON.parse(fs.readFileSync(file, "utf8")), { settings, revision: 1, stored: true });
     if (process.platform !== "win32") assert.equal(fs.statSync(file).mode & 0o777, 0o600);
     assert.equal((await (await putModSettings(port, { settings })).json() as ModSettingsSnapshot).revision, 2);
     assert.deepEqual(fs.readdirSync(home).filter(name => /mod-settings.*(tmp|lock)/.test(name)), []);
@@ -301,7 +358,7 @@ test("admin mod-settings empty-store conflicts include normalized defaults and s
   await withAdmin(makeCfg(), async ({ port, home }) => {
     const response = await putModSettings(port, { settings: { language: "ko" }, revision: 1 });
     assert.equal(response.status, 409);
-    assert.deepEqual(await response.json(), { settings: normalizeSettings(null), revision: 0, stored: false });
+    assert.deepEqual(await response.json(), { settings: normalizeSettings(null), revision: 0, stored: false, compactAt: null });
     assert.equal(fs.existsSync(path.join(home, "mod-settings.json")), false);
   });
 });
@@ -311,7 +368,7 @@ test("admin mod-settings normalizes legacy stored settings on GET without rewrit
     const old = { settings: { layout: "invalid", language: "pt", tiers: { light: { agent: "legacy" } } }, revision: 7 };
     const file = path.join(home, "mod-settings.json");
     fs.writeFileSync(file, JSON.stringify(old));
-    assert.deepEqual(await (await fetch(`${base()}:${port}/api/mod-settings`)).json(), { settings: normalizeSettings(old.settings), revision: 7, stored: true });
+    assert.deepEqual(await (await fetch(`${base()}:${port}/api/mod-settings`)).json(), { settings: normalizeSettings(old.settings), revision: 7, stored: true, compactAt: null });
     assert.deepEqual(JSON.parse(fs.readFileSync(file, "utf8")), old);
   });
 });
@@ -365,15 +422,16 @@ test("admin fills Base and mode domain ladders even when every general rung is a
       for (const rule of Object.values(set.domainRules!)) {
         assert.deepEqual(Object.keys(rule.rungs).sort(), ['hard', 'light', 'plan', 'standard']);
         assert.ok(Object.values(rule.rungs).every(steps => steps.length > 0));
-        // A domain ladder has two levels: the fill leaves heavy work (standard to plan) one list.
-        assert.deepEqual(rule.rungs.standard, rule.rungs.hard);
+        // A domain ladder has two levels: the fill leaves light work (light, standard) one list and
+        // heavy work (hard, plan) another.
+        assert.deepEqual(rule.rungs.light, rule.rungs.standard);
         assert.deepEqual(rule.rungs.hard, rule.rungs.plan);
       }
     }
     assert.equal(Object.hasOwn(saved.settings.modes[1]!, 'domainRules'), false);
     assert.equal(saved.legacy, undefined);
     assert.deepEqual(await (await fetch(`${base()}:${port}/api/mod-settings`)).json(), saved);
-    assert.deepEqual(JSON.parse(fs.readFileSync(path.join(home, 'mod-settings.json'), 'utf8')), saved);
+    assert.deepEqual(JSON.parse(fs.readFileSync(path.join(home, 'mod-settings.json'), 'utf8')), { settings: saved.settings, revision: saved.revision, stored: saved.stored });
   });
 });
 
@@ -389,9 +447,9 @@ test("admin folds a domain ladder into two levels and leaves the general ladder'
     const saved = await (await putModSettings(port, { settings: input, revision: 0 })).json() as ModSettingsSnapshot;
     // The general ladder keeps its four rungs.
     assert.deepEqual(saved.settings.rules.general.rungs, { light, standard, hard, plan });
-    // Light work keeps light's list; plan's runs everything from standard up.
+    // Light's list runs light and ordinary work; plan's runs hard work and plans.
     assert.deepEqual(saved.settings.domainRules!.ui!.rungs.light, light);
-    assert.deepEqual(saved.settings.domainRules!.ui!.rungs.standard, plan);
+    assert.deepEqual(saved.settings.domainRules!.ui!.rungs.standard, light);
     assert.deepEqual(saved.settings.domainRules!.ui!.rungs.hard, plan);
     assert.deepEqual(saved.settings.domainRules!.ui!.rungs.plan, plan);
   });
@@ -436,7 +494,7 @@ test("admin mod-settings refuses nonobjects, invalid revisions and secrets at an
     for (const revision of [-1, 0.5, null, "0"]) assert.equal((await putModSettings(port, { settings: {}, revision })).status, 400);
     const malformed = await fetch(`${base()}:${port}/api/mod-settings`, { method: "PUT", body: "{" });
     assert.equal(malformed.status, 400);
-    assert.deepEqual(await (await fetch(`${base()}:${port}/api/mod-settings`)).json(), { settings: normalizeSettings(null), revision: 0, stored: false });
+    assert.deepEqual(await (await fetch(`${base()}:${port}/api/mod-settings`)).json(), { settings: normalizeSettings(null), revision: 0, stored: false, compactAt: null });
     // A count named for tokens is a setting the mod has, not a credential.
     assert.equal((await putModSettings(port, { settings: { keepWarmMinTokens: 30000, rules: { general: { mode: "pin" } } } })).status, 200);
   });

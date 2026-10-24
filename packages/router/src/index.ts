@@ -267,6 +267,7 @@ proxy
         accounts: () => proxy.googleAccounts(),
         models: (name: string) => proxy.googleFetchModels(name),
         usage: (name: string) => proxy.googleUsage(name),
+        quotaScope: (name: string, model: string) => proxy.googleQuotaScope(name, model),
         clearCooldown: (id: string) => proxy.googleClearCooldown(id),
         recheckVerification: (id: string) => proxy.googleRecheckVerification(id),
       }),

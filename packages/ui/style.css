@@ -655,6 +655,12 @@ a.cell { color: inherit; text-decoration: none; }
 .mode-until .segmented { display: flex; flex-wrap: wrap; gap: 4px; max-width: 100%; }
 .mode-reset-reason { flex: 1 1 100%; color: var(--label-2); font-size: var(--fs-cap); padding: 4px 6px; text-align: left; }
 .mode-until button:disabled { opacity: 0.45; cursor: not-allowed; }
+/* Beside its label the compaction point keeps its presets and field on one line; narrow, it wraps. */
+@media (min-width: 721px) {
+  .cell-value:has(> .compact-at) { flex-shrink: 0; }
+  .compact-at, .compact-at .segmented { flex-wrap: nowrap; }
+  .compact-at .text-field { width: 112px; }
+}
 .offer-row { background: var(--accent-soft); }
 .offer-row .cell-label { font-size: var(--fs-sub); }
 

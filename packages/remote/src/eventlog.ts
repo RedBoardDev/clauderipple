@@ -250,10 +250,10 @@ export class EventLog {
     return "";
   }
 
-  /** Content-addressed, so repeated SDK snapshots do not duplicate large image bytes. */
+  /** Content-addressed within this epoch: a rebase expires every old file/image reference. */
   image(base64: string): string {
     this.assertOpen();
-    const hash = createHash("sha256").update(base64).digest("hex");
+    const hash = createHash("sha256").update(this.epoch).update("\0").update(base64).digest("hex");
     const id = `${hash.slice(0, 8)}-${hash.slice(8, 12)}-${hash.slice(12, 16)}-${hash.slice(16, 20)}-${hash.slice(20, 32)}`;
     writeFileAtomic(join(this.dir, "blobs", `${id}.txt`), base64);
     return id;

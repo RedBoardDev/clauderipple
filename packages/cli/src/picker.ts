@@ -109,9 +109,9 @@ export function nssTrust(caPem: string): void {
   }
 }
 
-/** Removes every ClaudeRipple CA, current or left over from an earlier install. */
-export function nssUntrust(): boolean {
-  const names = nssOurNicknames();
+/** Removes every ClaudeRipple CA, current or left over from an earlier install, or with `caPem` only that one. */
+export function nssUntrust(caPem?: string): boolean {
+  const names = caPem ? nssOurNicknames().filter(name => name === nssNickname(caPem)) : nssOurNicknames();
   for (const name of names) {
     try {
       certutil(["-D", "-n", name]);
@@ -185,14 +185,27 @@ export function trustCa(caPem: string): void {
   execFileSync("security", ["add-trusted-cert", "-r", "trustRoot", "-k", loginKeychain(), caPem], { stdio: "inherit" });
 }
 
-export function untrustCa(caPem: string): boolean {
-  if (isLinux) return nssUntrust();
+/**
+ * `sweep` also removes CAs an earlier install of the same home left behind, found by name. Without
+ * it only this `caPem` goes, by fingerprint: a second install (a release check under its own
+ * CLAUDERIPPLE_HOME) shares the user's trust store with the real one, whose CA has the same name.
+ */
+export function untrustCa(caPem: string, opts: { sweep?: boolean } = {}): boolean {
+  if (isLinux) return nssUntrust(opts.sweep ? undefined : caPem);
   const trusted = caTrusted(caPem);
+  let fingerprint: string;
+  try {
+    fingerprint = new X509Certificate(fs.readFileSync(caPem)).fingerprint.replace(/:/g, "");
+  } catch {
+    if (!opts.sweep) return false;
+    fingerprint = "";
+  }
   if (isWindows) {
     if (!trusted) return false;
+    const match = opts.sweep ? `$_.Subject -eq 'CN=${CA_NAME}'` : `$_.Thumbprint -eq '${fingerprint}'`;
     try {
       powershell(
-        `Get-ChildItem Cert:\\CurrentUser\\Root | Where-Object { $_.Subject -eq 'CN=${CA_NAME}' } | ForEach-Object { Remove-Item -Path $_.PSPath -Force }`,
+        `Get-ChildItem Cert:\\CurrentUser\\Root | Where-Object { ${match} } | ForEach-Object { Remove-Item -Path $_.PSPath -Force }`,
         { stdio: "inherit", interactive: true },
       );
     } catch {
@@ -209,7 +222,7 @@ export function untrustCa(caPem: string): boolean {
     }
   }
   try {
-    execFileSync("security", ["delete-certificate", "-c", CA_NAME, loginKeychain()], { stdio: "ignore" });
+    execFileSync("security", ["delete-certificate", ...(opts.sweep ? ["-c", CA_NAME] : ["-Z", fingerprint]), loginKeychain()], { stdio: "ignore" });
     return true;
   } catch {
     return trusted;
@@ -259,11 +272,13 @@ export function applyAppProxy(proxyUrl: string): { id: string; replaced: string 
   return { id, replaced: previous };
 }
 
-export function removeAppProxy(): boolean {
+/** With `proxyUrl`, only an entry pointing there goes: another install's entry is not ours to remove. */
+export function removeAppProxy(proxyUrl?: string): boolean {
   const dir = configLibraryDir();
   const meta = readMeta();
   const cur = currentAppProxy();
   if (!cur.ours || !cur.appliedId) return false;
+  if (proxyUrl !== undefined && cur.egressProxyUrl !== proxyUrl) return false;
   const previous = meta.clauderipple?.previousAppliedId ?? null;
   const next: Meta = { ...meta };
   delete next.clauderipple;

@@ -2,9 +2,10 @@
 // callbacks it hands in. Every renderer in ./ is a pure function of (elements, view, actions);
 // none of them calls the engine, so they can be drawn and tested anywhere.
 
-import type { AgentRec, Effort, HandoffKind, JudgeKind, JudgeRun, LadderOptions, LimitItem, Pick, Settings, Skin, StatusRequest, TierTarget } from '../../types'
+import type { AgentRec, BgTask, Effort, JudgeKind, JudgeRun, LadderOptions, LimitItem, Pick as EffortPick, Settings, Skin, StatusRequest, TierTarget } from '../../types'
 import type { Appearance } from './theme'
 import { t } from '../i18n'
+import { DISPLAY, displayText } from './display'
 import type { Lang } from '../i18n'
 
 export type Surface = 'terminal' | 'desktop' | 'vscode' | 'mobile'
@@ -60,7 +61,7 @@ export type DashboardView = {
     /** The judge's reason, a few words. */
     why?: string
     /** Who gave it. */
-    by?: Pick['by']
+    by?: EffortPick['by']
     /** When the judge started (deciding): keeps the glow's phase across redraws. */
     since?: number
   }
@@ -79,8 +80,6 @@ export type DashboardView = {
   /** A line from the router side ("router not answering"), shown in place of the route. */
   notice: string | null
   auto: boolean
-  /** Compact turns into a lit Handoff when advice says so, or always with handoffButton 'always'. */
-  handoff: 'off' | 'advised' | 'always'
   agents: { live: number; total: number }
   /** Times this chat was compacted (manual, automatic or by the band), shown on the Compact icon. */
   compactions: number
@@ -88,8 +87,6 @@ export type DashboardView = {
   agentsOpen: boolean
   /** The manual effort row is open. */
   effortMenu: boolean
-  /** Context percent at which the swamp colour starts (settings.swampAt). */
-  swampAt: number
   /** Band parts switched off: 'timer' | 'reason' | 'route'. */
   hide: readonly string[]
   /** Optional chips switched on: 'context' | 'limits'. */
@@ -97,6 +94,10 @@ export type DashboardView = {
   isWorking: boolean
   /** The active operating mode's name; absent when none is on. */
   mode?: string
+  /** Short name of this session's user-pinned delegation model. */
+  delegationPin?: string
+  /** The person's own sentence that pinned it, already cut short. */
+  delegationSaid?: string
 }
 
 export type BandActions = {
@@ -104,6 +105,7 @@ export type BandActions = {
   toggleWarm: () => void
   compact: () => void
   clear: () => void
+  /** Has the session's model write a handoff and opens a new session in this folder with it. */
   handoff: () => void
   toggleLog: () => void
   toggleAgents: () => void
@@ -114,11 +116,15 @@ export type BandActions = {
   pickEffort: (effort: Effort) => void
   /** Hides the band (desktop: its × is drawn inside the band). */
   hide?: () => void
+  /** Releases the session-only delegation pin. */
+  releaseDelegationPin?: () => void
+  /** Opens or closes the Context pane (desktop: the context chip is its press). */
+  toggleContext?: () => void
 }
 
 // ---- Alerts and cards ------------------------------------------------------------------------
 
-export type ResultStage = 'handingOff' | 'handoffReady' | 'handoffDone' | 'compacting' | 'compacted' | 'failed'
+export type ResultStage = 'handingOff' | 'handoffDone' | 'compacting' | 'compacted' | 'failed'
 
 export type AlertView =
   /** The cache expired on a big chat: the next prompt re-reads it all. */
@@ -131,32 +137,23 @@ export type AlertView =
   | { kind: 'hot'; limitKind: string; percent: number; resetsAt?: string; save: boolean }
   /** The judge failed and Auto fell back. */
   | { kind: 'judgeDown'; judge: JudgeKind; reason: string; network?: boolean }
-  | { kind: 'result'; stage: ResultStage; handoffKind?: HandoffKind; detail?: string }
+  | { kind: 'result'; stage: ResultStage; detail?: string }
   /** Compact with an optional note of what to keep. */
   | { kind: 'compactNote'; draft: string }
   /** The band's Clear asks before the conversation is started over. */
   | { kind: 'clear' }
-  /** Quick or full handoff, and what happens after. */
-  | { kind: 'handoffChoice'; handoffKind: HandoffKind; after: Settings['handoffAfter'] }
 
 export type AlertActions = {
   compact: (note?: string) => void
   /** Runs the conversation's clear, from the Clear confirm card. */
   clear: () => void
-  /** Opens the handoff choice bar. */
-  handoff: () => void
   dismiss: () => void
   toggleSave: () => void
   openSettings: () => void
   /** Each change of the compact note's field. */
   noteInput: (text: string) => void
-  setHandoffKind: (kind: HandoffKind) => void
-  setHandoffAfter: (after: Settings['handoffAfter']) => void
-  go: () => void
-  /** Copies a handoff's text again (result card, after: copy). */
+  /** Copies a written handoff again (its done card). */
   copy: () => void
-  /** Opens a new session in this folder with the written handoff (Confirm first's card). */
-  openNew: () => void
 }
 
 // ---- Settings and setup ----------------------------------------------------------------------
@@ -215,18 +212,23 @@ export type AgentEntry =
   | { kind: 'prompt'; text: string }
   /** Its own words. */
   | { kind: 'text'; text: string }
-  /** A tool it called: the tool, a short line of its input, and how it stands. */
-  | { kind: 'tool'; id: string; tool: string; detail: string; state: 'running' | 'ok' | 'error' }
+  /** A tool it called: the tool, a short line of its input, how it stands, and an edit's lines added and removed. */
+  | { kind: 'tool'; id: string; tool: string; detail: string; state: 'running' | 'ok' | 'error'; added?: number; removed?: number }
 
 /** An agent's conversation as read (`$.session.messages({ agentId })`), or why it could not be. */
 export type AgentTalk = { entries: readonly AgentEntry[] } | { deny: string }
 
 export type AgentsView = {
   agents: readonly AgentRec[]
+  /** Commands and watches left running in the background, listed with the agents (tasks.ts). */
+  tasks?: readonly BgTask[]
   now: number
   /** Every finished agent, not only the latest few. */
   showDone: boolean
-  /** The agent whose conversation is open, what of it was read, and the runs of calls unfolded. */
+  /**
+   * The agent whose conversation is open, what of it was read, and what is unfolded: runs of calls
+   * by their first call's id, long prompts by `prompt:<n>` (agents.tsx).
+   */
   open?: { id: string; talk: AgentTalk; runsOpen?: readonly string[] }
 }
 
@@ -236,7 +238,7 @@ export type AgentsActions = {
   open: (id: string) => void
   /** Back to the list. */
   back: () => void
-  /** Folds or unfolds a run of tool calls, named by its first call's id. */
+  /** Folds or unfolds a run of tool calls, named by its first call's id, or a long prompt (`prompt:<n>`). */
   toggleRun: (id: string) => void
 }
 
@@ -265,12 +267,12 @@ export function effortName(effort: Effort, lang: Lang): string {
 
 /** Route records can contain unknown effort ids; translate only the known display values. */
 export function effortLabel(value: string, lang: Lang): string {
-  return EFFORTS.includes(value as Effort) ? effortName(value as Effort, lang).toLowerCase() : value
+  return EFFORTS.includes(value as Effort) ? effortName(value as Effort, lang).toLowerCase() : displayText(value, DISPLAY.name)
 }
 
 /** "claude-opus-5-5[1m]" → "Opus 5.5"; ids it does not know pass through, trimmed. */
 export function modelName(id: string): string {
-  const bare = id.replace(/\[.*?\]/g, '').replace(/^claude-/, '')
+  const bare = displayText(id, DISPLAY.name).replace(/\[.*?\]/g, '').replace(/^claude-/, '')
   const m = /^(opus|sonnet|haiku|fable|mythos)-(\d+)(?:-(\d{1,2}))?/.exec(bare)
   if (m) return m[1]!.charAt(0).toUpperCase() + m[1]!.slice(1) + ' ' + m[2] + (m[3] ? '.' + m[3] : '')
   // A bare alias ("sonnet") reads as its family's name.
@@ -294,7 +296,7 @@ export function targetOf(value: string): TierTarget {
  */
 export function targetLabel(target: TierTarget, lang?: Lang): string {
   if (target.model) return 'Claude ' + modelName(target.model)
-  return lang && target.agent === 'general-purpose' ? t(lang, 'workers.sessionModel') : target.agent
+  return lang && target.agent === 'general-purpose' ? t(lang, 'workers.sessionModel') : displayText(target.agent, DISPLAY.name)
 }
 
 type Usage = NonNullable<StatusRequest['usage']>
@@ -318,7 +320,7 @@ export function modelOf(record: StatusRequest): string {
   // the provider is named beside it.
   const bare = (id: string) => id.replace(/^.*\//, '')
   // A dated id of the same model (claude-haiku-5-5-20260815 for claude-haiku-5-5) says nothing new.
-  return source.startsWith(record.target) || record.target.startsWith(source) ? bare(record.target) : bare(record.target) + ' (' + bare(source) + ')'
+  return displayText(source.startsWith(record.target) || record.target.startsWith(source) ? bare(record.target) : bare(record.target) + ' (' + bare(source) + ')', DISPLAY.name)
 }
 
 export function routeOf(record: StatusRequest): RouteView {
@@ -407,7 +409,7 @@ export function resetsLabel(resetsAt: string | undefined, now: number, lang: Lan
 export function limitName(kind: string, lang: Lang): string {
   if (kind === 'five_hour') return t(lang, 'band.fiveHour')
   if (kind === 'seven_day') return t(lang, 'band.weekly')
-  return kind.replace(/_/g, ' ')
+  return displayText(kind.replace(/_/g, ' '), DISPLAY.name)
 }
 
 // ---- Limits row ----------------------------------------------------------------------------------
@@ -415,7 +417,7 @@ export function limitName(kind: string, lang: Lang): string {
 /** A plan window's short name as the limits row shows it: the window, or the model's own name. */
 export function limitItemName(item: Pick<LimitItem, 'kind' | 'label' | 'windowMinutes'>, lang: Lang): string {
   if (item.kind === 'five_hour' || item.kind === 'seven_day') return limitName(item.kind, lang)
-  if (item.kind === 'scoped') return item.label || item.kind
+  if (item.kind === 'scoped') return displayText(item.label || item.kind, DISPLAY.name)
   const minutes = item.windowMinutes
   if (minutes === 300) return limitName('five_hour', lang)
   if (minutes === 10080) return limitName('seven_day', lang)
@@ -424,7 +426,7 @@ export function limitItemName(item: Pick<LimitItem, 'kind' | 'label' | 'windowMi
     if (minutes % 60 === 0) return t(lang, 'units.hours', { n: minutes / 60 })
     return t(lang, 'units.minutes', { n: minutes })
   }
-  return item.label || item.kind.replace(/_/g, ' ')
+  return displayText(item.label || item.kind.replace(/_/g, ' '), DISPLAY.name)
 }
 
 /** One limits group as the row heads it: a provider's own, or one of its accounts ("GPT", "GPT 1", …). */
@@ -463,7 +465,7 @@ function groupTitle(group: Pick<LimitGroup, 'provider' | 'type' | 'title'>): str
 
 /** A group's head: "Claude", "GPT", "Gemini", or its config name; "GPT 1"/"GPT 2" when numbered. */
 export function limitGroupName(group: Pick<LimitGroup, 'provider' | 'type' | 'title' | 'account'>, numbered: boolean): string {
-  const title = groupTitle(group)
+  const title = displayText(groupTitle(group), DISPLAY.name)
   return numbered ? title + ' ' + (group.account + 1) : title
 }
 

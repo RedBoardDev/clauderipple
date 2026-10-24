@@ -6,6 +6,25 @@ import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
 import type { InputBlock } from "./images.ts";
+import type { Effort, PermissionMode } from "./protocol.ts";
+import { OutcomeUnknownError } from "./receipts.ts";
+
+/** CLI wire uses snake_case; older bridge shapes used camelCase. Conflicts fail closed. */
+export function permissionSuppression(request: Record<string, unknown>): unknown {
+  const wire = request.suppress_always_allow_rule, legacy = request.suppressAlwaysAllowRule;
+  if (wire === true || legacy === true) return true;
+  return wire ?? legacy;
+}
+
+export interface BridgePermissionRequest {
+  requestId: string; tool: string; input: Record<string, unknown>; toolUseId: string;
+  permissionSuggestions?: unknown;
+  suppressAlwaysAllowRule?: unknown;
+}
+type SettingRequest = { subtype: "set_model"; model: string }
+  | { subtype: "apply_flag_settings"; settings: { effortLevel: Effort | null } }
+  | { subtype: "set_permission_mode"; mode: PermissionMode };
+interface ControlWaiter { sessionId: string; fingerprint: string; promise: Promise<void>; resolve: () => void; reject: (error: Error) => void }
 
 export const DESKTOP_BLOCKED = "Claude 앱에서 열려 있는 세션에 지금은 보낼 수 없습니다.";
 export const LOGIN_EXPIRED = "이 컴퓨터의 Claude 로그인이 만료되었습니다. Claude 앱을 한 번 열어 주십시오.";
@@ -20,6 +39,13 @@ export function isCliNotLoggedIn(text: string): boolean {
 }
 export interface BridgeAuth { accessToken: string; organizationUuid: string; expiresAt: number }
 class BridgeNetworkError extends Error {}
+class BridgeHttpError extends Error {
+  status: number;
+  constructor(status: number) { super(status >= 500 ? `Claude 앱 요청 중 오류가 발생했습니다 (${status}).` : `Claude 앱이 메시지를 받지 않았습니다 (${status}).`); this.status = status; }
+}
+export function bridgeWriteUnknown(error: unknown): boolean {
+  return error instanceof BridgeNetworkError || error instanceof BridgeHttpError && error.status >= 500;
+}
 /**
  * This Mac's Claude login cannot be used (expired, unreadable, or refused): nothing reaches any
  * Claude app session until Claude Code refreshes it, which the host never does itself. A state of
@@ -172,7 +198,7 @@ export class BridgeClient {
         throw new BridgeAuthError(LOGIN_REFUSED);
       }
       // Do not expose server bodies (which may echo credentials), or retry rejected writes.
-      throw new Error(`Claude 앱이 메시지를 받지 않았습니다 (${response.status}).`);
+      throw new BridgeHttpError(response.status);
     }
     return response;
   }
@@ -186,6 +212,53 @@ export class BridgeClient {
   interrupt(id: string): Promise<void> {
     return this.post(id, { type: "control_request", request_id: randomUUID(), request: { subtype: "interrupt" } });
   }
+  private controls = new Map<string, ControlWaiter>();
+
+  /** Register before POST: a worker may answer before the HTTP acknowledgement arrives.
+   * Ambiguous network failures keep waiting. No write here is ever retried. */
+  control(id: string, requestId: string, request: SettingRequest): Promise<void> {
+    const key = JSON.stringify([id, requestId]);
+    const fingerprint = JSON.stringify(request);
+    const previous = this.controls.get(key);
+    if (previous) return previous.fingerprint === fingerprint ? previous.promise : Promise.reject(new Error("Control request id reused"));
+    let resolve!: () => void, reject!: (error: Error) => void;
+    const promise = new Promise<void>((yes, no) => { resolve = yes; reject = no; });
+    this.controls.set(key, { sessionId: id, fingerprint, promise, resolve, reject });
+    void this.post(id, { type: "control_request", request_id: requestId, request }).catch((error: unknown) => {
+      // A reset/timeout does not prove the CLI did not apply the setting. Reconnect reads
+      // its durable response; a definite HTTP refusal can reject immediately.
+      if (!bridgeWriteUnknown(error)) reject(error instanceof Error ? error : new Error(String(error)));
+    });
+    return promise;
+  }
+
+  /** True only for OUR setting request, from the worker. Approval answers are separate. */
+  controlResponse(id: string, source: unknown, payload: Record<string, unknown>): boolean {
+    if (source !== "worker" || payload.type !== "control_response") return false;
+    const response = object(payload.response);
+    if (typeof response?.request_id !== "string") return false;
+    const waiter = this.controls.get(JSON.stringify([id, response.request_id]));
+    if (!waiter) return false;
+    const body = object(response.response);
+    if (response.verdict_pending === true || body?.verdict_pending === true || response.subtype === "verdict_pending" || body?.status === "verdict_pending") return true;
+    if (response.subtype === "success") waiter.resolve();
+    else if (response.subtype === "error") {
+      const error = object(response.error);
+      const detail = typeof response.error === "string" ? response.error : typeof error?.code === "string" ? error.code : typeof error?.message === "string" ? error.message : "설정 변경이 거절되었습니다";
+      waiter.reject(new Error(detail.slice(0, 1000)));
+    }
+    return true;
+  }
+
+  /** A replaced worker's unanswered writes are unknown, never replayed on its replacement.
+   * Keep their settled promises until shutdown so reusing an id cannot send the write again. */
+  closeControls(id?: string): void {
+    for (const waiter of this.controls.values()) {
+      if (id === undefined || waiter.sessionId === id) waiter.reject(new OutcomeUnknownError());
+    }
+    if (id === undefined) this.controls.clear();
+  }
+
   async session(id: string): Promise<{ worker_status: "running" | "idle" | "requires_action"; status?: string; status_bucket?: string; connection_status?: string }> {
     const response = object(await (await this.request(id, "", { method: "GET", signal: AbortSignal.timeout(3000) })).json());
     // CLI 2.1.296's single-session read uses response_shape ?? session.
@@ -217,7 +290,7 @@ export class BridgeClient {
    * Null when the answer carried no event list: that is not "nothing is open", and a caller
    * must not close pending cards on it.
    */
-  async openRequests(id: string): Promise<{ requestId: string; tool: string; input: Record<string, unknown>; toolUseId: string }[] | null> {
+  async openRequests(id: string): Promise<BridgePermissionRequest[] | null> {
     return (await this.requests(id))?.open ?? null;
   }
   /**
@@ -225,15 +298,16 @@ export class BridgeClient {
    * from the list proves nothing (the list may not reach that far), so only `closed` may close a
    * card the phone still shows.
    */
-  async requests(id: string): Promise<{ open: { requestId: string; tool: string; input: Record<string, unknown>; toolUseId: string }[]; closed: Set<string> } | null> {
+  async requests(id: string): Promise<{ open: BridgePermissionRequest[]; closed: Set<string> } | null> {
     const list = (await this.events(id)).data;
     if (!Array.isArray(list)) return null;
-    const open = new Map<string, { requestId: string; tool: string; input: Record<string, unknown>; toolUseId: string }>();
+    const open = new Map<string, BridgePermissionRequest>();
     const closed = new Set<string>();
     for (const value of list) {
       const item = object(value);
       const payload = object(item?.payload);
       if (!payload) continue;
+      if (this.controlResponse(id, item?.source, payload)) continue;
       // A control_request names its request at the top; a control_response posted by this host (or
       // by the desktop app) carries it under `response`. Reading only the top-level id left every
       // answered request listed as open, so a replay an hour later carded it again (issue #82).
@@ -247,7 +321,9 @@ export class BridgeClient {
         const request = object(payload.request);
         const input = object(request?.input);
         if (request?.subtype === "can_use_tool" && typeof request.tool_name === "string" && input && typeof request.tool_use_id === "string") {
-          open.set(requestId, { requestId, tool: request.tool_name, input, toolUseId: request.tool_use_id });
+          open.set(requestId, { requestId, tool: request.tool_name, input, toolUseId: request.tool_use_id,
+            ...(request.permission_suggestions !== undefined ? { permissionSuggestions: request.permission_suggestions } : {}),
+            ...(permissionSuppression(request) !== undefined ? { suppressAlwaysAllowRule: permissionSuppression(request) } : {}) });
         }
       } else if (payload.type === "control_response" || payload.type === "control_cancel_request") {
         // Any client's answer or withdrawal closes it: this host's own answer is stored with the

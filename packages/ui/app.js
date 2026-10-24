@@ -2208,11 +2208,28 @@ function accountPoolActions(account, patch) {
   return actions;
 }
 
-/** Runtime use is independent of first place, pauses and cooldowns. */
+/**
+ * A resting Antigravity quota group as the limits row names it, with the host it rests on: the key is
+ * `group@host` (`3p@daily-cloudcode-pa.googleapis.com` → "3P daily"), because each host counts its own.
+ */
+function quotaGroupLabel(key) {
+  const [group, host] = key.split("@");
+  const name = group === "3p" ? "3P" : group === "gemini" ? "Gemini" : group;
+  if (!host) return name;
+  return `${name} ${/^daily-/.test(host) ? "daily" : host === "cloudcode-pa.googleapis.com" ? "prod" : host}`;
+}
+
+/**
+ * Runtime use is independent of first place, pauses and cooldowns. A resting quota group
+ * (`quotaCooldowns`, Antigravity) is shown beside the account's own state: the account still answers
+ * the other group.
+ */
 function accountPoolBadges(account) {
   return [
     account.preferred ? el("span", { class: "badge first", text: t("providers.preferBadge") }) : null,
     chatgptStateBadge(account),
+    ...Object.entries(account.quotaCooldowns || {}).map(([group, seconds]) =>
+      el("span", { class: "badge warn", text: `${quotaGroupLabel(group)} · ${t("pool.coolingFor", { duration: durationText(seconds) })}` })),
     account.inUse && account.state && account.state !== "ready" ? el("span", { class: "badge ok", text: t("providers.chatgptInUse") }) : null,
   ];
 }
@@ -2502,6 +2519,19 @@ function renderGoogleAccountRows(target, data, name, generation) {
       actions.push(link, recheck);
     }
     actions.push(...accountPoolActions(account, (change) => patchGoogleAccount(name, account.id, change)));
+    // The account answers while a quota group rests (`quotaCooldowns`), so the shared actions show no
+    // clear button for it; this one clears all of the account's resting groups at once. A failed
+    // request leaves the row as it was, so the button comes back for another try.
+    const resting = Object.keys(account.quotaCooldowns || {});
+    if (resting.length && account.state !== "cooling" && !(account.cooldownSeconds > 0)) {
+      const clear = el("button", { class: "btn secondary compact", type: "button", text: `${resting.map(quotaGroupLabel).join(", ")} · ${t("providers.chatgptClearCooldown")}` });
+      clear.addEventListener("click", async () => {
+        clear.disabled = true;
+        try { await patchGoogleAccount(name, account.id, { clearCooldown: true }); }
+        finally { clear.disabled = false; }
+      });
+      actions.push(clear);
+    }
     const rename = el("button", { class: "btn secondary compact", type: "button", text: t("common.edit") });
     rename.addEventListener("click", () => {
       const label = prompt(t("providers.anthropicRenamePrompt"), account.label);
@@ -3787,8 +3817,8 @@ const MOD_CLAUDE_IDS = { haiku: "claude-haiku-5-5", sonnet: "claude-sonnet-5-5",
 const MOD_RUNGS = ["light", "standard", "hard", "plan"];
 // A domain ladder has two levels: light work (the light rung) and heavy work (standard, hard, plan).
 const MOD_DOMAIN_LEVELS = [
-  { key: "light", rungs: ["light"] },
-  { key: "heavy", rungs: ["standard", "hard", "plan"] },
+  { key: "light", rungs: ["light", "standard"] },
+  { key: "heavy", rungs: ["hard", "plan"] },
 ];
 const modClaude = (model, effort) => ({ target: { agent: "general-purpose", model }, effort });
 /** The mod's defaults (packages/mod/hooks/settings.ts), for a router that has stored nothing yet. */
@@ -3804,12 +3834,18 @@ const MOD_DEFAULTS = {
   allow: [], allowKnown: [], modes: [], delegation: "normal", providers: {},
   fallback: { agent: "general-purpose", model: "sonnet" },
   keepWarm: false, keepWarmHours: 2, keepWarmMinTokens: 30000,
-  compactWith: "haiku", handoffSkill: "", handoffAfter: "continue", handoffButton: "advised",
-  swampAt: 50, layout: "dashboard", appearance: "auto", skin: "deep", language: "auto", hide: ["reason"], extras: [], setupDone: false,
+  compactModel: "claude-haiku-5-5",
+  swampAlert: false, layout: "dashboard", appearance: "auto", skin: "deep", language: "auto", hide: ["reason"], extras: [], setupDone: false,
 };
 
+// The compaction point presets, in tokens (Claude Code's own `autoCompactWindow`), and its range.
+const MOD_COMPACT_PRESETS = [400000, 500000, 600000];
+const MOD_COMPACT_MIN = 100000;
+const MOD_COMPACT_MAX = 1000000;
+
 // `base` is the router's copy `settings` was edited from: what differs between them is this page's own change.
-let modState = { settings: null, base: null, revision: 0, options: null, retiredNote: false };
+// `compactAt` is Claude Code's own compaction window (settings.json `autoCompactWindow`), saved apart.
+let modState = { settings: null, base: null, revision: 0, options: null, compactAt: null, retiredNote: false };
 let modSaveTimer = null;
 let modSaving = false;
 let modSaveAgain = false;
@@ -3893,6 +3929,7 @@ function modAdopt(snapshot, drop) {
   modState.base = modNormalize(snapshot.settings);
   modState.settings = modApply(modState.base, changes);
   modState.revision = Number(snapshot.revision) || 0;
+  modState.compactAt = typeof snapshot.compactAt === "number" && Number.isFinite(snapshot.compactAt) ? snapshot.compactAt : null;
 }
 
 function modCap(text) { return text ? text.charAt(0).toLocaleUpperCase() + text.slice(1) : text; }
@@ -4018,6 +4055,26 @@ async function saveMod() {
     if (modSaveAgain) { modSaveAgain = false; void saveMod(); }
   }
 }
+/**
+ * Claude Code's compaction point is `autoCompactWindow` in settings.json, a file of its own: saving
+ * it here writes the same key `/autocompact <n>` does (or removes it for the model's default), so a
+ * session and this page always agree. It is not part of the mod's settings revision.
+ */
+async function saveCompactAt(value) {
+  const previous = modState.compactAt;
+  modState.compactAt = value;
+  modRefresh();
+  modStatus(t("slots.saving"));
+  try {
+    const out = await api("/api/mod-settings", { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ schemaVersion: 1, compactAt: value }) });
+    modState.compactAt = out && typeof out.compactAt === "number" && Number.isFinite(out.compactAt) ? out.compactAt : null;
+    modStatus(t("mod.saved"));
+  } catch (error) {
+    modState.compactAt = previous;
+    modStatus(`${t("common.saveFailed")} ${error.message}`, true);
+  }
+  modRefresh();
+}
 async function loadMod() {
   // A save on its way brings back the router's copy itself.
   if (modSaveTimer || modSaving) return;
@@ -4049,7 +4106,7 @@ document.addEventListener("visibilitychange", () => {
 function modRefresh() {
   if (!modState.settings) return;
   renderModNotice();
-  modRedraw($("#mod-content"), [modEffortCard(), modWorkersCard(), modJudgeCard(), modCacheCard(), modHandoffCard(), modLookCard()]);
+  modRedraw($("#mod-content"), [modEffortCard(), modWorkersCard(), modJudgeCard(), modCacheCard(), modCompactCard(), modLookCard()]);
 }
 /** Settings for a mod that is switched off do nothing until it is on; the switch lives in Clients. */
 function renderModNotice() {
@@ -4099,7 +4156,8 @@ function modChoices() {
     return {
       value: agent.name, label: agent.model, model: agent.model, provider: agent.provider,
       billing: /(?::|-)free$/i.test(agent.model) ? "free" : agent.billing || (info && info.billing) || null,
-      usable: !info || info.usable !== false,
+      // A spent quota group lists its models under `models` while the provider still answers others.
+      usable: !info || (info.usable !== false && !(info.models && info.models[agent.model])),
       efforts: Array.isArray(agent.efforts) ? agent.efforts : effortLevelsFor(agent.provider, agent.model),
     };
   });
@@ -4189,14 +4247,14 @@ function modRungs() {
   return general && general.mode === "ladder" && general.rungs ? general.rungs : {};
 }
 /** A domain ladder folded into two levels, as the mod folds it (settings.ts twoLevelRungs): light
- * work is the light rung, heavy work standard+hard+plan. */
+ * work is light+standard, heavy work hard+plan. */
 function modTwoLevelRungs(rungs) {
   const out = {};
   const filled = (list) => list && list.length;
   const light = filled(rungs.light) ? rungs.light : rungs.standard;
   const heavy = [rungs.plan, rungs.hard, rungs.standard, rungs.light].find(filled);
-  if (filled(light)) out.light = clone(light);
-  if (heavy) { out.standard = clone(heavy); out.hard = clone(heavy); out.plan = clone(heavy); }
+  if (filled(light)) { out.light = clone(light); out.standard = clone(light); }
+  if (heavy) { out.hard = clone(heavy); out.plan = clone(heavy); }
   return out;
 }
 /** One menu of `model · effort` for the ticked models, effort limited to what each model takes; the session's model too. */
@@ -4510,16 +4568,55 @@ function modCacheCard() {
   ], [t("mod.warmCost")])]);
 }
 
-function modHandoffCard() {
+/**
+ * The compaction model choices: the app's own compactor, Claude's three models, then the router's
+ * models grouped by provider. Values are model ids, as a worker's are.
+ */
+function modCompactModelItems() {
+  const claude = ["haiku", "sonnet", "opus"].map((name) => ({ value: MOD_CLAUDE_IDS[name], label: `Claude ${modCap(name)}` }));
+  const seen = new Set(claude.map((item) => item.value));
+  const groups = new Map();
+  for (const model of (modState.options && modState.options.models) || []) {
+    if (!model || model.judgeOnly || typeof model.model !== "string" || !model.model || seen.has(model.model)) continue;
+    seen.add(model.model);
+    if (!groups.has(model.provider)) groups.set(model.provider, []);
+    groups.get(model.provider).push({ value: model.model, label: model.name || model.model });
+  }
+  return [
+    { value: "session", label: t("mod.compactSession") },
+    { group: "Claude", items: claude },
+    ...[...groups].map(([provider, items]) => ({ group: provider, items })),
+  ];
+}
+
+function modCompactCard() {
   const s = modState.settings;
-  const skill = el("input", { type: "text", class: "text-field", value: s.handoffSkill, placeholder: t("mod.noSkill"), spellcheck: "false", autocomplete: "off", "data-key": "handoff-skill", "aria-label": t("mod.fullHandoff") });
-  skill.addEventListener("change", () => modPatch({ handoffSkill: skill.value.trim() }));
-  return modCard("handoff", t("mod.handoff"), t("mod.handoffBlurb"), [modSection(null, [
-    cell(t("mod.compactWith"), modSegmented("compact-with", [{ value: "haiku", label: t("mod.haiku") }, { value: "session", label: t("mod.sessionCompactor") }], s.compactWith, t("mod.compactWith"), (compactWith) => modPatch({ compactWith })), null, "wide"),
-    cell(t("mod.afterHandoff"), modSegmented("handoff-after", [{ value: "continue", label: t("mod.continue") }, { value: "confirm", label: t("mod.confirm") }, { value: "copy", label: t("mod.copy") }], s.handoffAfter, t("mod.afterHandoff"), (handoffAfter) => modPatch({ handoffAfter })), null, "wide"),
-    cell(t("mod.handoffButton"), modSegmented("handoff-button", [{ value: "advised", label: t("mod.whenAdvised") }, { value: "always", label: t("mod.always") }], s.handoffButton, t("mod.handoffButton"), (handoffButton) => modPatch({ handoffButton })), null, "wide"),
-    cell(t("mod.fullHandoff"), skill, null, "wide"),
-    cell(t("mod.heavyAt"), modSegmented("swamp-at", [40, 50, 60, 70].map((n) => ({ value: n, label: `${n}%` })), s.swampAt, t("mod.heavyAt"), (n) => modPatch({ swampAt: Number(n) })), modCap(t("mod.context")), "wide"),
+  const at = modState.compactAt;
+  const choice = at === null ? "default" : MOD_COMPACT_PRESETS.includes(at) ? String(at) : "custom";
+  const preset = modSegmented("compact-at", [
+    ...MOD_COMPACT_PRESETS.map((tokens) => ({ value: String(tokens), label: `${tokens / 1000}k` })),
+    { value: "default", label: t("mod.compactAtDefault") },
+  ], choice, t("mod.compactAt"), (value) => { void saveCompactAt(value === "default" ? null : Number(value)); });
+  const custom = el("input", {
+    type: "number", class: "text-field", "data-key": "compact-at-custom",
+    min: String(MOD_COMPACT_MIN / 1000), max: String(MOD_COMPACT_MAX / 1000), step: "10",
+    value: at !== null && choice === "custom" ? String(at / 1000) : "",
+    placeholder: t("mod.compactAtCustom"), "aria-label": t("mod.compactAtCustom"),
+  });
+  custom.addEventListener("change", () => {
+    const tokens = Math.round(Number(custom.value) * 1000);
+    if (!custom.value.trim() || !Number.isFinite(tokens) || tokens < MOD_COMPACT_MIN || tokens > MOD_COMPACT_MAX) {
+      modStatus(t("mod.compactAtRange"), true);
+      custom.value = at !== null && choice === "custom" ? String(at / 1000) : "";
+      return;
+    }
+    void saveCompactAt(tokens);
+  });
+  const outOfRange = at !== null && (at < MOD_COMPACT_MIN || at > MOD_COMPACT_MAX);
+  const hint = outOfRange ? t("mod.compactAtRange") : modCap(t("mod.compactAtHint"));
+  return modCard("compact", t("mod.compaction"), t("mod.compactionBlurb"), [modSection(null, [
+    cell(t("mod.compactModel"), modSelect("compact-model", modCompactModelItems(), s.compactModel, t("mod.compactModel"), (compactModel) => modPatch({ compactModel })), null, "wide"),
+    cell(t("mod.compactAt"), el("div", { class: "mode-until compact-at" }, [preset, custom]), el("span", { class: outOfRange ? "cell-sub warn-text" : undefined, text: hint }), "wide"),
   ])]);
 }
 

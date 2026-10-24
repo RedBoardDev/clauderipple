@@ -248,8 +248,13 @@ export class ClaudeOAuthSession {
     await this.exchange(code);
   }
 
-  /** Abandons the attempt (a new one may start). */
+  /**
+   * Abandons the attempt (a new one may start). A code already being exchanged is not abandoned:
+   * the browser has been told the subscription is connected, and a user who then returned to the
+   * dashboard and closed its dialog lost that sign-in to the cancel it sent (issue #88, 2026-10-24).
+   */
   cancel(): void {
+    if (this.exchanging) return;
     this.fail(new Error("Claude sign-in cancelled"));
   }
 

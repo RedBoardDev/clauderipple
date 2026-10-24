@@ -9,17 +9,25 @@ import path from "node:path";
 import { EventLog } from "./eventlog.ts";
 import type { PushContext } from "./push-content.ts";
 import type { PushEvent } from "./protocol.ts";
-import { attachmentContent, messageContent, sendUserFileImages, type InputBlock } from "./images.ts";
-import { ATTACHMENT_CAP, ATTACHMENT_COUNT, type Attachment, type ImagePart, type SendBehavior } from "./protocol.ts";
+import { attachmentContent, fileImages, messageContent, sessionFileTool, type InputBlock } from "./images.ts";
+import { ATTACHMENT_CAP, ATTACHMENT_COUNT, type Attachment, type ImagePart, type SessionFile, type SendBehavior } from "./protocol.ts";
 import { DesktopSessions, type DesktopProcess, type TurnWrapUp } from "./desktop.ts";
 import { firstSentence, STATUS_CAP } from "./wrap-up.ts";
 import { DesktopSidebar, PHONE_GROUP, type SidebarOptions } from "./sidebar.ts";
-import { BridgeAuthError, BridgeClient, CLI_NOT_LOGGED_IN, DESKTOP_BLOCKED, isCliNotLoggedIn, object, slashCommands, type BridgeFrame } from "./bridge-client.ts";
+import { BridgeAuthError, BridgeClient, bridgeWriteUnknown, CLI_NOT_LOGGED_IN, DESKTOP_BLOCKED, isCliNotLoggedIn, object, permissionSuppression, slashCommands, type BridgeFrame } from "./bridge-client.ts";
 import type { HandoffRunner } from "./handoff.ts";
 import { isDirectory, macConsent, readableFolder } from "./folders.ts";
 import { readJson, writeFileAtomic } from "./fsutil.ts";
 import { createWorktree } from "./worktree.ts";
 import { MessageReceipts, OutcomeUnknownError } from "./receipts.ts";
+import { SessionSettings, sessionPermissionRules } from "./session-controls.ts";
+import type { BridgePermissionRequest } from "./bridge-client.ts";
+import type { SessionControls, SettingsResult } from "./protocol.ts";
+
+interface BridgePending {
+  id: string; input: Record<string, unknown>; toolUseId: string;
+  rules: ReturnType<typeof sessionPermissionRules>;
+}
 import { SendQueue, type QueueItem } from "./queue.ts";
 import type { Decision, PermissionQueue } from "./permissions.ts";
 import { PERMISSION_MODES, type AlertBody, type Attention, type AttentionReason, type PermissionMode, type Question, type Effort, type EventBody, type Figures, type Isolation, type SessionEvent, type SessionState, type SessionSummary, type ToolCall } from "./protocol.ts";
@@ -39,7 +47,7 @@ export interface SdkQuery extends AsyncIterable<Record<string, unknown>> {
 export type PermissionAnswer =
   | { behavior: "allow"; updatedInput?: Record<string, unknown>; updatedPermissions?: unknown[] }
   | { behavior: "deny"; message: string; interrupt?: boolean };
-export type CanUseTool = (tool: string, input: Record<string, unknown>, opts: { signal: AbortSignal; suggestions?: unknown[]; title?: string; decisionReason?: string; toolUseID?: string }) => Promise<PermissionAnswer>;
+export type CanUseTool = (tool: string, input: Record<string, unknown>, opts: { signal: AbortSignal; suggestions?: unknown[]; suppressAlwaysAllowRule?: boolean; title?: string; decisionReason?: string; toolUseID?: string }) => Promise<PermissionAnswer>;
 export type QueryFn = (params: { prompt: AsyncIterable<SdkUserMessage>; options: Record<string, unknown> }) => SdkQuery;
 
 interface SessionRecord {
@@ -50,6 +58,10 @@ interface SessionRecord {
   effort: Effort | null;
   permissionMode?: PermissionMode;
   prePlanMode?: PermissionMode;
+  /** The initial launch allowance is immutable; mode changes must not add a bypass flag. */
+  bypassAllowed?: boolean;
+  /** Confirmed next-turn settings outrank historical assistant/user transcript metadata. */
+  confirmedSettings?: Omit<SettingsResult, "status" | "errors">;
   title: string;
   createdAt: number;
   updatedAt: number;
@@ -73,7 +85,7 @@ interface Live {
   buffer: { msg: string; text: string; thinking?: { block: number; text: string } } | null;
   flushTimer: ReturnType<typeof setTimeout> | null;
   /** Content blocks of the API message being streamed, merged across the SDK's per-block messages. */
-  current: { msg: string; text: string; images?: ImagePart[]; tools: ToolCall[]; model: string; thinkingBlocks: number[]; nextThinkingBlock: number } | null;
+  current: { msg: string; text: string; images?: ImagePart[]; files?: SessionFile[]; tools: ToolCall[]; model: string; thinkingBlocks: number[]; nextThinkingBlock: number } | null;
   /** Task/Agent tool ids → their subagent while it runs */
   subs: Map<string, { description: string; model: string | null; steps: number }>;
   turnStart: number;
@@ -140,10 +152,12 @@ class Inbox implements AsyncIterable<SdkUserMessage> {
 }
 
 /** Routed models take their effort as `model@level`, which the router reads (ARCHITECTURE §3a); Claude models take the SDK's own option. */
+function isClaudeModel(model: string): boolean { return model.startsWith("claude-") || /^(opus|sonnet|haiku)(\[1m\])?$/.test(model); }
+
 export function modelArg(model: string, effort: Effort | null): { model: string; effort?: Effort } {
   // Claude Code's own aliases (router.ts offers them when no anthropic provider is declared) are
   // Claude models too: `opus@high` would reach Anthropic as a model nobody has.
-  if (model.startsWith("claude-") || /^(opus|sonnet|haiku)(\[1m\])?$/.test(model)) return effort && ["low", "medium", "high", "xhigh", "max"].includes(effort) ? { model, effort } : { model };
+  if (isClaudeModel(model)) return effort && ["low", "medium", "high", "xhigh", "max"].includes(effort) ? { model, effort } : { model };
   return { model: effort ? `${model}@${effort}` : model };
 }
 
@@ -173,6 +187,9 @@ export function summarize(tool: string, input: Record<string, unknown>, cwd: str
       const files = (Array.isArray(input.files) ? input.files : []).filter((f): f is string => typeof f === "string").map(rel);
       return oneLine([...files, str(input.caption)].filter(Boolean).join(", "));
     }
+    case "AskUserQuestion": return oneLine(str(object(Array.isArray(input.questions) ? input.questions[0] : null)?.question));
+    case "ExitPlanMode": return oneLine(str(input.plan));
+    case "EnterPlanMode": return "";
     case "TodoWrite": return Array.isArray(input.todos) ? `${input.todos.length}` : "";
     default: {
       const first = Object.values(input).find((v) => typeof v === "string") as string | undefined;
@@ -280,6 +297,8 @@ export class Sessions {
   private listFile: string;
   private now: () => number;
   private receipts: MessageReceipts;
+  private settings: SessionSettings;
+  private permissionRules = new Map<string, ReturnType<typeof sessionPermissionRules>>();
   private sendQueue: SendQueue;
   /** In-flight turns keyed by receipt key, so a concurrent resend rides the first attempt. */
   private sending = new Map<string, Promise<string>>();
@@ -379,7 +398,7 @@ export class Sessions {
     if (this.bridgeErrors.size > 200) this.bridgeErrors.delete(this.bridgeErrors.keys().next().value!);
     log(`[${label}] ${bridgeId}: ${message}`);
   }
-  private bridges = new Map<string, { bridgeId: string; abort: AbortController; failed: boolean; permissions: Map<string, { id: string; input: Record<string, unknown>; toolUseId: string }> }>();
+  private bridges = new Map<string, { bridgeId: string; abort: AbortController; failed: boolean; permissions: Map<string, BridgePending> }>();
   private bridgeSends = new Map<string, Promise<string>>();
   /** uuids of prompts sent over Remote Control, so their transcript echo is not shown twice. */
   private bridgeEchoes = new Set<string>();
@@ -409,6 +428,7 @@ export class Sessions {
       for (const [model, window] of Object.entries(readJson<Record<string, unknown>>(this.windowsFile) ?? {})) if (typeof window === "number" && window > 0) this.windows.set(model, window);
     } catch { /* a damaged file only means the windows are learned again */ }
     this.receipts = MessageReceipts.open(path.join(opts.dir, "receipts.json"), this.now);
+    this.settings = new SessionSettings(path.join(opts.dir, "settings-operations.json"));
     this.sendQueue = SendQueue.open(opts.dir);
     for (const r of readJson<SessionRecord[]>(this.file) ?? []) this.records.set(r.id, r);
     const listState = readJson<ListState>(this.listFile);
@@ -440,6 +460,9 @@ export class Sessions {
         (this.opts.log ?? console.error)(`[session recovery] skipped ${r.id}: ${error instanceof Error ? error.message : String(error)}; session files preserved at ${path.join(this.opts.dir, "sessions", r.id)}`);
       }
     }
+    for (const operation of this.settings.unresolved()) {
+      if (this.has(operation.session)) this.append(operation.session, { kind: "settings", reqId: operation.reqId, status: "unknown" }, false);
+    }
     for (const p of this.opts.permissions.expiredOnOpen) {
       if (this.records.has(p.session)) this.append(p.session, { kind: "permission_decided", id: p.id, decision: "expired", reason: "host_restarted" });
     }
@@ -457,7 +480,7 @@ export class Sessions {
     const sessions = [...host, ...(this.desktop?.list() ?? []).filter(s => !this.records.has(s.id) && !hostCliIds.has(s.id)).map(s => {
       const process = this.desktop?.liveProcess(s.id);
       const status = this.statusLine(s.id);
-      return { ...s, ...this.desktopModels.get(s.id), ...(process?.bridgeSessionId ? { state: this.bridgeState(process), desktopBridge: true, background: this.background(process) } : {}), ...(this.archived.has(s.id) ? { archived: true } : {}), attention: this.attention.get(s.id) ?? null, ...(status ? { status } : {}), ...this.sendQueue.summary(s.id) };
+      return { ...s, ...this.desktopModels.get(s.id), controls: this.sessionControls(s.id), ...(process?.bridgeSessionId ? { state: this.bridgeState(process), desktopBridge: true, background: this.background(process) } : {}), ...(this.archived.has(s.id) ? { archived: true } : {}), attention: this.attention.get(s.id) ?? null, ...(status ? { status } : {}), ...this.sendQueue.summary(s.id) };
     })];
     return this.sidebar?.join(sessions, id => this.records.get(id)?.sdkSessionId ?? id) ?? sessions;
   }
@@ -467,6 +490,7 @@ export class Sessions {
   }
 
   async pollDesktop(): Promise<void> {
+    if (this.shuttingDown) return;
     if (this.desktop?.poll()) this.opts.onSessions();
     this.refreshStatuses();
     const sessions = this.list();
@@ -516,6 +540,7 @@ export class Sessions {
       } catch (error) { this.bridgeFailure(r.id, error); }
     }
     await Promise.all(reads);
+    if (this.shuttingDown) return;
     for (const r of this.records.values()) {
       if (!r.desktopBridge) continue;
       const process = this.desktop?.liveProcess(r.sdkSessionId ?? r.id);
@@ -830,10 +855,19 @@ export class Sessions {
     return r;
   }
 
-  /** A turn is in progress somewhere (including one waiting on the phone for a permission). */
+  /** Includes accepted work whose running state is not recorded yet. */
   busy(): boolean {
-    for (const r of this.records.values()) if (r.state === "starting" || r.state === "running" || r.state === "waiting") return true;
+    if (this.creating.size || this.sending.size || this.draining.size || this.handingOff.size) return true;
+    for (const r of this.records.values()) if (BUSY.has(r.state)) return true;
     return false;
+  }
+
+  /** Reserve idle synchronously; deferred desktop/queue callbacks may not start another turn. */
+  prepareRefresh(): boolean {
+    if (this.shuttingDown || this.busy()) return false;
+    this.shuttingDown = true;
+    this.closeQueueWatch();
+    return true;
   }
 
   summaryOf(id: string): SessionSummary | undefined {
@@ -866,6 +900,15 @@ export class Sessions {
     return context;
   }
 
+  private sessionControls(id: string): SessionControls {
+    const r = this.records.get(id);
+    const desktopId = r?.sdkSessionId ?? id;
+    const process = this.desktop?.liveProcess(desktopId);
+    const desktop = r?.desktopBridge || this.desktop?.isOpen(desktopId);
+    const enabled = !desktop || !!process?.bridgeSessionId && !this.bridgeProblem && !this.bridges.get(id)?.failed;
+    return { model: enabled, effort: enabled, permissionModes: enabled ? [...PERMISSION_MODES] : [] };
+  }
+
   private summary(r: SessionRecord): SessionSummary {
     const log = this.log(r.id);
     const process = r.desktopBridge ? this.desktop?.liveProcess(r.sdkSessionId ?? r.id) : undefined;
@@ -877,9 +920,9 @@ export class Sessions {
     const turnStartedAt = working ? this.desktop?.turnStartedAt(r.sdkSessionId ?? r.id) ?? null : null;
     const plan = working ? this.desktop?.plan(r.sdkSessionId ?? r.id) ?? [] : [];
     // A desktop session's mode is the Claude app's; it lives in the transcript, not the record.
-    const mode = r.desktopBridge ? this.desktop?.permissionMode(r.sdkSessionId ?? r.id) : (r.permissionMode ?? "auto");
+    const mode = r.confirmedSettings?.permissionMode ?? (r.desktopBridge ? this.desktop?.permissionMode(r.sdkSessionId ?? r.id) : (r.permissionMode ?? "auto"));
     const status = r.desktopBridge ? this.statusLine(r.id) : null;
-    return { ...(r.desktopBridge ? { desktopBridge: true, tasks: taskList.length, taskList, turnStartedAt, plan, ...(process ? { background: this.background(process) } : {}) } : {}), origin: "host", readOnly: false, id: r.id, title: r.title, cwd: r.cwd, model: r.model, effort: r.effort, ...(mode ? { permissionMode: mode } : {}), ...(status ? { status } : {}), state, pending: this.opts.permissions.pending(r.id).length, ...this.sendQueue.summary(r.id), ...(this.archived.has(r.id) ? { archived: true } : {}), attention: this.attention.get(r.id) ?? null, createdAt: r.createdAt, updatedAt: r.updatedAt, lastSeq: log.lastSeq, epoch: log.epoch };
+    return { ...(r.desktopBridge ? { desktopBridge: true, tasks: taskList.length, taskList, turnStartedAt, plan, ...(process ? { background: this.background(process) } : {}) } : {}), origin: "host", readOnly: false, controls: this.sessionControls(r.id), id: r.id, title: r.title, cwd: r.cwd, model: r.model, effort: r.effort, ...(mode ? { permissionMode: mode } : {}), ...(status ? { status } : {}), state, pending: this.opts.permissions.pending(r.id).length, ...this.sendQueue.summary(r.id), ...(this.archived.has(r.id) ? { archived: true } : {}), attention: this.attention.get(r.id) ?? null, createdAt: r.createdAt, updatedAt: r.updatedAt, lastSeq: log.lastSeq, epoch: log.epoch };
   }
 
   log(id: string): EventLog {
@@ -920,13 +963,6 @@ export class Sessions {
     if (data !== null) return data;
     const desktopId = this.records.get(id)?.sdkSessionId ?? id;
     return this.desktop?.workerBlob(desktopId, blob) ?? this.sendQueue.editingBlob(id, blob);
-  }
-
-  private attachmentData(id: string, blob: string): string | null {
-    const data = this.blob(id, blob);
-    // A draft can outlive a desktop rebase; copy it into this epoch before releasing its files.
-    if (data !== null) this.log(id).image(data);
-    return data;
   }
 
   recentSources(): { path: string; lastUsed: number; model: string }[] {
@@ -1069,7 +1105,7 @@ export class Sessions {
   }
 
   private async drainQueue(id: string, registryIdle = false): Promise<void> {
-    if (this.draining.has(id) || this.sendQueue.held(id)) return;
+    if (this.shuttingDown || this.draining.has(id) || this.sendQueue.held(id)) return;
     const head = this.sendQueue.items(id)[0];
     if (!head) return;
     if (!registryIdle) {
@@ -1224,7 +1260,7 @@ export class Sessions {
   private sendAccepted(id: string, clientMsgId: string, text: string, attachments: Attachment[]): string | Promise<string> {
     const existing = this.records.get(id);
     const desktopId = existing?.sdkSessionId ?? id;
-    if (this.desktop && !this.live.has(id) && (existing?.sdkSessionId || this.desktop.has(id))) {
+    if (this.desktop && !this.live.has(id) && !this.handingOff.has(id) && (existing?.sdkSessionId || this.desktop.has(id))) {
       const process = this.desktop.liveProcess(desktopId);
       if (process?.bridgeSessionId) {
         const key = `${id}/${clientMsgId}`;
@@ -1241,7 +1277,7 @@ export class Sessions {
     id = r.id;
     if (this.seen(id, clientMsgId)) return id;
     this.personMessage(id);
-    const converted = attachmentContent(r.cwd, text, attachments, blob => this.attachmentData(id, blob));
+    const converted = attachmentContent(r.cwd, text, attachments, blob => this.blob(id, blob), data => this.log(id).image(data));
     this.opts.permissions.denySession(id, "superseded by a new message from the user");
     this.append(id, { kind: "user", text, clientMsgId, images: converted.images });
     this.rememberClientMsgId(id, clientMsgId);
@@ -1267,7 +1303,7 @@ export class Sessions {
     }
     const r = this.records.get(id) ?? this.continueDesktop(id, clientMsgId, true);
     // Rebase deletes this log's blobs too: validate and retain the bytes before it can run.
-    const converted = attachmentContent(r.cwd, text, attachments, blob => this.attachmentData(id, blob));
+    const converted = attachmentContent(r.cwd, text, attachments, blob => this.blob(id, blob), data => this.log(id).image(data));
     if (Array.isArray(converted.content)) {
       const blocks = converted.content;
       const images = blocks.filter(block => block.type === "image");
@@ -1330,6 +1366,7 @@ export class Sessions {
     this.seenIds.delete(r.id);
     fs.rmSync(dir, { recursive: true, force: true });
     this.logs.set(r.id, this.desktop.importInto(r.sdkSessionId ?? r.id, dir, this.now));
+    for (const outcome of this.settings.replay(r.id)) this.append(r.id, { kind: "settings", ...outcome });
     r.desktopBridge = true;
     r.transcriptOffset = this.desktop.transcriptSize(r.sdkSessionId ?? r.id);
     this.save();
@@ -1354,7 +1391,7 @@ export class Sessions {
       const meta = this.desktop.metadataOf(transcript);
       if (meta && (meta.title !== r.title || meta.model && meta.model !== r.model)) {
         r.title = meta.title;
-        if (meta.model) r.model = meta.model;
+        if (meta.model && !r.confirmedSettings?.model) r.model = meta.model;
         this.save();
         this.opts.onSessions();
       }
@@ -1368,7 +1405,7 @@ export class Sessions {
     // A failed stream is retried on the next poll or send rather than blocking the session for good.
     if (previous?.bridgeId === bridgeId && !previous.failed) { this.watchDesktop(id); return previous; }
     this.closeBridge(id, previous?.bridgeId === bridgeId);
-    const connection = { bridgeId, abort: new AbortController(), failed: false, permissions: new Map<string, { id: string; input: Record<string, unknown>; toolUseId: string }>() };
+    const connection = { bridgeId, abort: new AbortController(), failed: false, permissions: new Map<string, BridgePending>() };
     this.bridges.set(id, connection);
     const replay = (): void => {
       // After every stream (re)connect, re-read approvals already waiting: the stream starts at
@@ -1387,8 +1424,12 @@ export class Sessions {
     this.unwatchDesktop(id);
     const connection = this.bridges.get(id);
     if (!connection) return;
-    // Reconnecting the permission stream says nothing about whether an accepted turn started.
-    if (!preserveRunning) this.bridgeRunning.delete(connection.bridgeId);
+    // A stream reconnect is still the same worker: durable replies may settle its writes later.
+    // A replacement/removal cannot confirm the old worker's writes and must release its lane.
+    if (!preserveRunning) {
+      this.bridgeRunning.delete(connection.bridgeId);
+      this.bridge.closeControls(connection.bridgeId);
+    }
     connection.abort.abort();
     this.opts.permissions.expireSession(id, "aborted");
     this.bridges.delete(id);
@@ -1412,6 +1453,8 @@ export class Sessions {
     const payload = object(frame.data.payload);
     const connection = this.bridges.get(id);
     if (!payload || !connection) return;
+    // Worker setting replies never settle approval cards; client echoes never apply settings.
+    if (this.bridge.controlResponse(connection.bridgeId, frame.data.source, payload)) return;
     // Responses from another client close a pending card during replay or live delivery.
     if (payload.type === "control_response") {
       const response = object(payload.response);
@@ -1437,23 +1480,27 @@ export class Sessions {
     if (payload.type !== "control_request" || request?.subtype !== "can_use_tool" || typeof request.tool_name !== "string" || !input || typeof request.tool_use_id !== "string" || connection.permissions.has(requestId)) return;
     const r = this.records.get(id);
     if (!r) return;
-    this.openBridgePermission(id, connection, r, { requestId, tool: request.tool_name, input, toolUseId: request.tool_use_id });
+    this.openBridgePermission(id, connection, r, { requestId, tool: request.tool_name, input, toolUseId: request.tool_use_id,
+      permissionSuggestions: request.permission_suggestions, suppressAlwaysAllowRule: permissionSuppression(request) });
   }
 
   /** A permission prompt from Remote Control, live or replayed: one record, one card, one decision. */
-  private openBridgePermission(id: string, connection: { bridgeId: string; abort: AbortController; failed: boolean; permissions: Map<string, { id: string; input: Record<string, unknown>; toolUseId: string }> }, r: SessionRecord, req: { requestId: string; tool: string; input: Record<string, unknown>; toolUseId: string }): void {
+  private openBridgePermission(id: string, connection: { bridgeId: string; abort: AbortController; failed: boolean; permissions: Map<string, BridgePending> }, r: SessionRecord, req: BridgePermissionRequest): void {
     if (connection.permissions.has(req.requestId) || this.wasAnsweredBridge(id, req.requestId)) return;
     const { record, decision } = this.opts.permissions.request({ session: id, tool: req.tool, title: "", summary: summarize(req.tool, req.input, r.cwd), input: req.input }, connection.abort.signal);
-    connection.permissions.set(req.requestId, { id: record.id, input: req.input, toolUseId: req.toolUseId });
+    const rules = sessionPermissionRules(req.tool, req.permissionSuggestions, req.suppressAlwaysAllowRule);
+    this.permissionRules.set(record.id, rules);
+    connection.permissions.set(req.requestId, { id: record.id, input: req.input, toolUseId: req.toolUseId, rules });
     // Remote Control's can_use_tool carries the same input the host path gets, so a question or a
     // plan is carded as one here too (a JSON tool approval cannot answer either, issue #82).
     const card = bridgeRequest(req.tool, req.input);
-    this.append(id, { kind: "permission", id: record.id, tool: record.tool, title: "", summary: record.summary, input: permissionDetail(record.tool, req.input, r.cwd), canAlways: false, requestKind: card.requestKind, ...(card.questions ? { questions: card.questions } : {}) });
+    this.append(id, { kind: "permission", id: record.id, tool: record.tool, title: "", summary: record.summary, input: permissionDetail(record.tool, req.input, r.cwd), canAlways: rules.length > 0, ...(rules.length ? { alwaysAllow: { scope: "session" as const, summary: rules.flatMap(update => update.rules.map(rule => `${rule.toolName}(${rule.ruleContent})`)).join("\n") } } : {}), requestKind: card.requestKind, ...(card.questions ? { questions: card.questions } : {}) });
     this.setState(r, "waiting");
     void decision.then(answer => {
       // Shutdown expires every open request after its logs are closed; there is nobody left to read it.
       if (this.shuttingDown) return;
-      this.append(id, { kind: "permission_decided", id: record.id, decision: answer.decision, ...(answer.reason ? { reason: answer.reason } : {}) });
+      this.append(id, { kind: "permission_decided", id: record.id, decision: answer.decision, ...(answer.decision === "allow_always" ? { ruleStatus: "sent" as const } : {}), ...(answer.reason ? { reason: answer.reason } : {}) });
+      this.permissionRules.delete(record.id);
       if (answer.decision === "expired") connection.permissions.delete(req.requestId);
       this.clearPermissionAttention(id);
       this.opts.onSessions();
@@ -1550,29 +1597,55 @@ export class Sessions {
     return false;
   }
 
-  decide(id: string, permId: string, decision: "allow" | "allow_always" | "deny", message?: string, answers?: Record<string, string>): boolean | Promise<boolean> {
+  decide(id: string, permId: string, decision: "allow" | "allow_always" | "deny", message?: string, answers?: Record<string, string>, reqId?: string): boolean | Promise<boolean> {
+    // The CLI request id survives host/card recreation. Neither a new phone reqId nor a
+    // new local permission id may repeat a write whose first outcome remains unknown.
+    const localKey = `decide:${id}:${permId}`;
+    if (this.receipts.status(localKey) === "completed") return reqId !== undefined;
+    const connection = this.bridges.get(id);
+    const request = connection && [...connection.permissions].find(([, value]) => value.id === permId);
+    const key = request ? JSON.stringify(["decide_bridge", id, connection!.bridgeId, request[0]]) : localKey;
+    if (this.receipts.status(key) === "completed") {
+      this.opts.permissions.expire(permId, "cancelled");
+      return reqId !== undefined;
+    }
+    if (this.receipts.status(key) === "pending") {
+      const pending = this.bridgeDecisions.get(permId);
+      if (pending) return pending;
+      throw new OutcomeUnknownError();
+    }
+    const result = this.decideOnce(id, permId, decision, message, answers, key);
+    return result;
+  }
+
+  private decideOnce(id: string, permId: string, decision: "allow" | "allow_always" | "deny", message: string | undefined, answers: Record<string, string> | undefined, key: string): boolean | Promise<boolean> {
     if (decision !== "allow" && decision !== "allow_always" && decision !== "deny") throw new Error("invalid decision");
+    if (decision === "allow_always" && !this.permissionRules.get(permId)?.length) throw new Error("이 요청에는 안전한 세션 허용 규칙이 없습니다");
     const connection = this.bridges.get(id);
     const pending = connection && [...connection.permissions].find(([, value]) => value.id === permId);
     if (connection && pending) {
       const sending = this.bridgeDecisions.get(permId);
       if (sending) return sending;
-      const answer = this.decideBridge(id, permId, decision, pending[0], pending[1], message, answers)
-        .then(ok => { if (ok) this.clearPermissionAttention(id); return ok; })
+      const answer = this.decideBridge(id, permId, decision, pending[0], pending[1], key, message, answers)
+        .then(ok => {
+          if (ok) { this.receipts.complete(key); this.receipts.complete(`decide:${id}:${permId}`, id); this.clearPermissionAttention(id); }
+          else this.receipts.abandon(key);
+          return ok;
+        })
         .finally(() => this.bridgeDecisions.delete(permId));
       this.bridgeDecisions.set(permId, answer);
       return answer;
     }
     const p = this.opts.permissions.get(permId);
     if (!p || p.session !== id || p.state !== "pending") return false;
-    if (p.tool === "ExitPlanMode" && decision !== "deny") return this.implementPlan(id, permId);
+    if (p.tool === "ExitPlanMode" && decision !== "deny") return this.implementPlan(id, permId).then(ok => { if (ok) this.receipts.complete(key, id); return ok; });
     if (p.tool === "AskUserQuestion" && decision !== "deny") {
       const questions = questionInputs(object(p.input) ?? {});
       if (!answers || !questions.length || questions.some(q => typeof answers[q.question] !== "string" || !answers[q.question]!.trim())) throw new Error("Answer every question before submitting.");
       if (Object.values(answers).some(value => typeof value !== "string")) throw new Error("Invalid question answers.");
     }
     const decided = this.opts.permissions.decide(permId, decision, message, answers) !== null;
-    if (decided) this.clearPermissionAttention(id);
+    if (decided) { this.receipts.complete(key, id); this.clearPermissionAttention(id); }
     return decided;
   }
 
@@ -1609,14 +1682,14 @@ export class Sessions {
   }
 
   /** The control_response the Remote Control side accepts for a permission answer (bridge-client.ts post). */
-  private bridgeDecisionPayload(requestId: string, pending: { input: Record<string, unknown>; toolUseId: string }, decision: "allow" | "deny", message?: string, updatedInput: Record<string, unknown> = pending.input): Record<string, unknown> {
-    return { type: "control_response", uuid: randomUUID(), response: { subtype: "success", request_id: requestId, response: { behavior: decision, updatedInput, toolUseID: pending.toolUseId, ...(message ? { message } : {}) } } };
+  private bridgeDecisionPayload(requestId: string, pending: { input: Record<string, unknown>; toolUseId: string }, decision: "allow" | "deny", message?: string, updatedInput: Record<string, unknown> = pending.input, rules?: ReturnType<typeof sessionPermissionRules>): Record<string, unknown> {
+    return { type: "control_response", uuid: randomUUID(), response: { subtype: "success", request_id: requestId, response: { behavior: decision, updatedInput, toolUseID: pending.toolUseId, ...(rules?.length ? { updatedPermissions: rules } : {}), ...(message ? { message } : {}) } } };
   }
 
-  private async decideBridge(id: string, permId: string, decision: "allow" | "allow_always" | "deny", requestId: string, pending: { input: Record<string, unknown>; toolUseId: string }, message?: string, answers?: Record<string, string>): Promise<boolean> {
+  private async decideBridge(id: string, permId: string, decision: "allow" | "allow_always" | "deny", requestId: string, pending: BridgePending, receiptKey: string, message?: string, answers?: Record<string, string>): Promise<boolean> {
     const connection = this.bridges.get(id);
     if (!connection || connection.failed || this.opts.permissions.get(permId)?.state !== "pending") return false;
-    if (decision === "allow_always") throw new Error("Remote Control supports allow once only.");
+    if (decision === "allow_always" && !pending.rules.length) throw new Error("이 요청에는 안전한 세션 허용 규칙이 없습니다");
     // The phone answers AskUserQuestion the way the host path does: every question filled in, and
     // the answers merged into the tool input the Remote Control side is told to run (#82).
     const record = this.opts.permissions.get(permId);
@@ -1631,9 +1704,15 @@ export class Sessions {
     const updatedInput = answers ? { ...pending.input, answers } : pending.input;
     // A plan card's "keep planning" sends the person's feedback as the denial, as the host path does.
     const denial = message || "The user denied this from their phone.";
+    this.receipts.begin(receiptKey, id);
     try {
-      await this.bridge.post(connection.bridgeId, this.bridgeDecisionPayload(requestId, pending, decision, decision === "deny" ? denial : undefined, updatedInput));
-    } catch (error) { this.bridgeFailure(id, error); throw error; }
+      await this.bridge.post(connection.bridgeId, this.bridgeDecisionPayload(requestId, pending, decision === "deny" ? "deny" : "allow", decision === "deny" ? denial : undefined, updatedInput, decision === "allow_always" ? pending.rules : undefined));
+    } catch (error) {
+      this.bridgeFailure(id, error);
+      if (bridgeWriteUnknown(error)) throw new OutcomeUnknownError();
+      this.receipts.abandon(receiptKey);
+      throw error;
+    }
     connection.permissions.delete(requestId);
     this.rememberAnsweredBridge(id, requestId);
     return this.opts.permissions.decide(permId, decision, undefined, answers) !== null;
@@ -1645,7 +1724,7 @@ export class Sessions {
    * the deny control_response the Remote Control side accepts, and the local record resolves
    * denied the same way the host path's denySession resolves it.
    */
-  private supersedeBridge(id: string, connection: { bridgeId: string; abort: AbortController; failed: boolean; permissions: Map<string, { id: string; input: Record<string, unknown>; toolUseId: string }> }): void {
+  private supersedeBridge(id: string, connection: { bridgeId: string; abort: AbortController; failed: boolean; permissions: Map<string, BridgePending> }): void {
     const reason = "superseded by a new message from the user";
     for (const [requestId, pending] of [...connection.permissions]) {
       connection.permissions.delete(requestId);
@@ -1694,8 +1773,31 @@ export class Sessions {
 
   private modeChanges = new Map<string, Promise<unknown>>();
 
-  setMode(id: string, mode: PermissionMode): Promise<void> {
-    return this.scheduleModeChange(id, () => this.changeMode(id, mode));
+  setMode(id: string, mode: PermissionMode, reqId: string = randomUUID()): Promise<SettingsResult> {
+    if (!this.has(id)) return Promise.reject(new Error("no such session"));
+    return this.settings.run(id, reqId, JSON.stringify(["mode", mode]), "permissionMode", () => this.scheduleModeChange(id, async () => {
+      await this.changeMode(id, mode);
+      return { status: "applied", permissionMode: mode };
+    }), result => { if (!this.shuttingDown) this.append(id, { kind: "settings", reqId, ...result }); });
+  }
+
+  /** Import the desktop log before controlling it, but never start or restart its worker. */
+  private settingsBridge(id: string): string | null {
+    if (this.shuttingDown) throw new OutcomeUnknownError();
+    // Adoption waits for the SDK's accepted turns to finish (pollDesktop). A settings
+    // change cannot rebase its log out from under that still-active transcript writer.
+    if (this.live.has(id) || this.handingOff.has(id)) return null;
+    const r = this.records.get(id);
+    const desktopId = r?.sdkSessionId ?? id;
+    const bridgeId = this.desktop?.liveProcess(desktopId)?.bridgeSessionId;
+    if (bridgeId) {
+      this.log(id);
+      if (r && !r.desktopBridge) this.rebaseDesktop(r);
+      this.ensureBridge(id, bridgeId);
+      return bridgeId;
+    }
+    if (r?.desktopBridge || this.desktop?.isOpen(desktopId)) throw new Error(DESKTOP_BLOCKED);
+    return null;
   }
 
   private scheduleModeChange<T>(id: string, work: () => Promise<T>): Promise<T> {
@@ -1708,11 +1810,16 @@ export class Sessions {
 
   private async changeMode(id: string, mode: PermissionMode): Promise<void> {
     if (!PERMISSION_MODES.includes(mode)) throw new Error("invalid permission mode");
-    const existing = this.records.get(id);
-    const desktopId = existing?.sdkSessionId ?? id;
-    if (existing?.desktopBridge || this.bridges.has(id) || this.desktop?.liveProcess(desktopId)?.bridgeSessionId || this.desktop?.isOpen(desktopId)) throw new Error("Permission mode switching for Mac Remote Control is not supported yet.");
-    const r = existing ?? this.continueDesktop(id, "");
+    const bridgeId = this.settingsBridge(id);
+    const r = this.records.get(id) ?? this.continueDesktop(id, "");
+    if (bridgeId) {
+      await this.bridge.control(bridgeId, randomUUID(), { subtype: "set_permission_mode", mode });
+      if (this.shuttingDown) throw new OutcomeUnknownError();
+      this.recordMode(r, mode);
+      return;
+    }
     const live = this.live.get(id);
+    if (!live && mode === "bypassPermissions" && !(r.bypassAllowed ?? r.permissionMode === "bypassPermissions")) throw new Error("bypass_not_launched");
     if (live) {
       await live.ready;
       if (this.live.get(id) !== live) throw new Error("The session stopped before its mode changed. Try again.");
@@ -1724,33 +1831,76 @@ export class Sessions {
   private recordMode(r: SessionRecord, mode: PermissionMode): void {
     if (mode === "plan" && r.permissionMode !== "plan") r.prePlanMode = r.permissionMode ?? "auto";
     if (mode !== "plan") delete r.prePlanMode;
+    r.bypassAllowed ??= r.permissionMode === "bypassPermissions";
     r.permissionMode = mode;
+    r.confirmedSettings = { ...r.confirmedSettings, permissionMode: mode };
     this.save();
     this.append(r.id, { kind: "mode", mode });
     this.opts.onSessions();
   }
 
-  async setModel(id: string, model: string, effort: Effort | null): Promise<void> {
-    if (this.desktop?.isOpen(this.records.get(id)?.sdkSessionId ?? id)) throw new Error("열려 있는 세션의 모델은 Claude 앱에서 변경해 주십시오. / Change this live session's model in the Claude app.");
+  setModel(id: string, model: string, effort: Effort | null, reqId: string = randomUUID()): Promise<SettingsResult> {
+    if (!this.has(id)) return Promise.reject(new Error("no such session"));
+    if (typeof model !== "string" || !model.trim() || model.length > 300 || /[@\s]/.test(model)) return Promise.reject(new Error("Invalid model"));
+    if (effort !== null && !["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"].includes(effort)) return Promise.reject(new Error("Invalid effort"));
+    return this.settings.run(id, reqId, JSON.stringify(["model", model, effort]), "model", () => this.scheduleModeChange(id, () => this.changeModel(id, model, effort)),
+      result => { if (!this.shuttingDown) this.append(id, { kind: "settings", reqId, ...result }); });
+  }
+
+  private async changeModel(id: string, model: string, effort: Effort | null): Promise<SettingsResult> {
+    const bridgeId = this.settingsBridge(id);
+    const m = modelArg(model, effort);
+    if (bridgeId) {
+      const r = this.records.get(id)!;
+      await this.bridge.control(bridgeId, randomUUID(), { subtype: "set_model", model: m.model });
+      if (this.shuttingDown) throw new OutcomeUnknownError();
+      r.model = model;
+      r.confirmedSettings = { ...r.confirmedSettings, model };
+      this.save();
+      this.opts.onSessions();
+      // Claude's effort is a distinct CLI setting, never a thinking-token budget. Routed
+      // models carry it ONLY in modelArg, so there cannot be a second conflicting setting.
+      if (isClaudeModel(model)) {
+        try { await this.bridge.control(bridgeId, randomUUID(), { subtype: "apply_flag_settings", settings: { effortLevel: effort } }); }
+        catch (error) {
+          if (error instanceof OutcomeUnknownError) throw error;
+          return { status: "partial", model, errors: { effort: error instanceof Error ? error.message : String(error) } };
+        }
+      }
+      if (this.shuttingDown) throw new OutcomeUnknownError();
+      r.effort = effort;
+      r.confirmedSettings = { ...r.confirmedSettings, effort };
+      this.save();
+      this.opts.onSessions();
+      return { status: "applied", model, effort };
+    }
+    if (isClaudeModel(model) && effort !== null && m.effort === undefined) throw new Error("이 SDK 경로에서는 해당 Claude 추론 강도를 지원하지 않습니다");
     if (!this.records.has(id) && this.desktop?.has(id)) {
       this.desktopModels.set(id, { model, effort });
       this.opts.onSessions();
-      return;
+      return { status: "applied", model, effort };
     }
     const r = this.records.get(id);
     if (!r) throw new Error("no such session");
     const changedModel = r.model !== model;
+    const changedEffort = r.effort !== effort;
     const live = this.live.get(id);
-    if (live && changedModel) { await live.ready; await live.query.setModel(modelArg(model, effort).model); }
+    if (live && (changedModel || changedEffort && !isClaudeModel(model))) {
+      await live.ready;
+      if (this.live.get(id) !== live) throw new Error("The session stopped before its model changed. Try again.");
+      await live.query.setModel(m.model);
+    }
     r.model = model;
     r.effort = effort;
     this.save();
     this.append(id, { kind: "notice", code: "model_changed", text: effort ? `${model} · ${effort}` : model });
-    if (!live) { this.opts.onSessions(); return; }
-    // Effort-only changes resume a fresh process after this turn, for routed and Claude models alike.
-    if (!changedModel) live.restartAfterTurn = true;
-    if (live.restartAfterTurn && (r.state === "idle" || r.state === "error")) this.stop(id);
+    if (live) {
+      // Even when the model also changed, Claude's effort must reach a fresh SDK query.
+      if ((changedModel || changedEffort) && isClaudeModel(model)) live.restartAfterTurn = true;
+      if (live.restartAfterTurn && (r.state === "idle" || r.state === "error")) this.restartSettings(r, live);
+    }
     this.opts.onSessions();
+    return { status: "applied", model, effort };
   }
 
   stop(id: string, expected?: Live): void {
@@ -1767,6 +1917,7 @@ export class Sessions {
     this.closeQueueWatch();
     for (const id of this.transcriptWatches.keys()) this.unwatchDesktop(id);
     this.bridgeRunning.clear();
+    this.bridge.closeControls();
     for (const id of Array.from(this.live.keys())) this.stop(id);
     for (const id of this.bridges.keys()) this.closeBridge(id);
     for (const log of this.logs.values()) log.close();
@@ -1792,7 +1943,7 @@ export class Sessions {
       includePartialMessages: true,
       settingSources: ["user", "project", "local"],
       permissionMode: r.permissionMode ?? "auto",
-      ...(r.permissionMode === "bypassPermissions" ? { allowDangerouslySkipPermissions: true } : {}),
+      ...((r.bypassAllowed ?? r.permissionMode === "bypassPermissions") ? { allowDangerouslySkipPermissions: true } : {}),
       abortController: abort,
       env,
       canUseTool: this.canUseTool(r.id),
@@ -1902,13 +2053,16 @@ export class Sessions {
           const streamedIndex = cur.thinkingBlocks[cur.nextThinkingBlock++] ?? index;
           this.append(r.id, { kind: "thinking", msg: id, block: streamedIndex, text: block.thinking });
         });
-        const converted = messageContent(message.content, data => this.log(r.id).image(data));
+        const converted = messageContent(message.content, data => this.log(r.id).image(data), { cwd: r.cwd, ...(r.sdkSessionId ? { sessionId: r.sdkSessionId } : {}) });
         if (converted.text) cur.text += (cur.text ? "\n\n" : "") + converted.text;
-        cur.images = [...(cur.images ?? []), ...converted.images, ...sendUserFileImages(message.content, r.cwd, data => this.log(r.id).image(data))];
+        cur.images = [...(cur.images ?? []), ...converted.images];
+        cur.files = [...(cur.files ?? []), ...converted.files];
         for (const b of message.content ?? []) {
           if (b.type === "tool_use" && b.id && b.name) {
             const input = b.input ?? {};
-            cur.tools.push({ id: b.id, name: b.name, summary: summarize(b.name, input, r.cwd), input: JSON.stringify(input, null, 2) });
+            const tool: ToolCall = { id: b.id, name: b.name, summary: summarize(b.name, input, r.cwd), input: JSON.stringify(input, null, 2), ...sessionFileTool(b.name, input, { cwd: r.cwd, ...(r.sdkSessionId ? { sessionId: r.sdkSessionId } : {}) }, data => this.log(r.id).image(data)) };
+            cur.tools.push(tool);
+            cur.images.push(...fileImages(tool.files ?? []));
             if (b.name === "Task" || b.name === "Agent") {
               const sub = { description: summarize(b.name, input, r.cwd), model: typeof input.model === "string" ? input.model : null, steps: 0 };
               live.subs.set(b.id, sub);
@@ -1919,22 +2073,22 @@ export class Sessions {
         if (message.model) cur.model = message.model;
         // Thinking-only SDK block completions must not reserve the answer's position
         // before subsequent thinking blocks have arrived.
-        if (cur.text || cur.images.length || cur.tools.length) this.append(r.id, { kind: "assistant", msg: cur.msg, model: cur.model, text: cur.text, images: cur.images, tools: cur.tools });
+        if (cur.text || cur.images.length || cur.files.length || cur.tools.length) this.append(r.id, { kind: "assistant", msg: cur.msg, model: cur.model, text: cur.text, images: cur.images, files: cur.files, tools: cur.tools });
         return;
       }
       case "user": {
         const message = msg.message as { content?: unknown } | undefined;
         const blocks = Array.isArray(message?.content) ? (message!.content as { type?: string; tool_use_id?: string; content?: unknown; is_error?: boolean }[]) : [];
-        const converted = messageContent(message?.content, data => this.log(r.id).image(data));
-        // SDK user echoes normally already have a phone event; retain image-bearing echoes only.
-        if (converted.images.length) {
+        const converted = messageContent(message?.content, data => this.log(r.id).image(data), { cwd: r.cwd, ...(r.sdkSessionId ? { sessionId: r.sdkSessionId } : {}) });
+        // SDK user echoes normally already have a phone event; retain attachment-bearing echoes only.
+        if (converted.images.length || converted.files.length) {
           const body: EventBody = { kind: "user", ...converted, clientMsgId: typeof msg.uuid === "string" ? msg.uuid : randomUUID() };
           if (parent) this.subLog(r.id, `sub-${parent}`)?.append(body);
           else this.append(r.id, body);
         }
         for (const b of blocks) {
           if (b.type !== "tool_result" || !b.tool_use_id) continue;
-          const body: EventBody = { kind: "tool_result", toolUseId: b.tool_use_id, ok: !b.is_error, ...messageContent(b.content, data => this.log(r.id).image(data)) };
+          const body: EventBody = { kind: "tool_result", toolUseId: b.tool_use_id, ok: !b.is_error, ...messageContent(b.content, data => this.log(r.id).image(data), { cwd: r.cwd, ...(r.sdkSessionId ? { sessionId: r.sdkSessionId } : {}) }) };
           if (parent) { this.subLog(r.id, `sub-${parent}`)?.append(body); continue; }
           this.append(r.id, body);
           const sub = live.subs.get(b.tool_use_id);
@@ -1963,15 +2117,7 @@ export class Sessions {
         for (const [model, u] of Object.entries(usage ?? {})) if (typeof u.contextWindow === "number") this.learnWindow(model, u.contextWindow);
         const error = ok ? undefined : this.failureText(r.id, String(msg.result ?? (Array.isArray(msg.errors) ? msg.errors.join("; ") : msg.subtype ?? "error"))).slice(0, 500);
         this.append(r.id, { kind: "result", ok, ...(error ? { error } : {}), ms: typeof msg.duration_ms === "number" ? msg.duration_ms : this.now() - live.turnStart, turns: typeof msg.num_turns === "number" ? msg.num_turns : 0 });
-        if (live.restartAfterTurn) {
-          const messages = live.pendingMessages;
-          this.stop(r.id, live);
-          if (messages.length) {
-            const next = this.start(r);
-            next.pendingMessages.push(...messages);
-            for (const message of messages) next.input.push(message);
-          }
-        }
+        if (live.restartAfterTurn) this.restartSettings(r, live);
         this.setState(r, live.pendingMessages.length > 0 ? "running" : ok ? "idle" : "error");
         if (live.pendingMessages.length === 0) this.handoff(r, live);
         void this.refreshFigures(r, true);
@@ -1982,9 +2128,29 @@ export class Sessions {
     }
   }
 
+  /** A settings restart shares the handoff inbox: preserve even prefetched accepted inputs,
+   * and do not create another transcript writer until the old process has actually exited. */
+  private restartSettings(r: SessionRecord, live: Live): void {
+    const transfer = { messages: live.pendingMessages };
+    this.handingOff.set(r.id, transfer);
+    this.stop(r.id, live);
+    void Promise.resolve(live.query.processExited).then(async () => {
+      this.handingOff.delete(r.id);
+      if (this.shuttingDown) return;
+      if (transfer.messages.length) await this.resumeAfterHandoff(r, transfer.messages);
+      else this.handoff(r, live);
+    }).catch(error => {
+      this.handingOff.delete(r.id);
+      if (this.shuttingDown) return;
+      const text = error instanceof Error ? error.message : String(error);
+      this.append(r.id, { kind: "result", ok: false, error: text, ms: 0, turns: 0 });
+      this.setState(r, "error", text);
+    });
+  }
+
   /** Shared with app-bridge adoption: never stop a query still owed an accepted turn. */
   private sdkIdle(r: SessionRecord, live = this.live.get(r.id)): boolean {
-    return !BUSY.has(r.state) && (!live || live.pendingMessages.length === 0);
+    return !this.handingOff.has(r.id) && !BUSY.has(r.state) && (!live || live.pendingMessages.length === 0);
   }
 
   private handoff(r: SessionRecord, live: Live): void {
@@ -2053,9 +2219,9 @@ export class Sessions {
     (message.content ?? []).forEach((block, index) => {
       if (block.type === "thinking" && typeof block.thinking === "string") log.append({ kind: "thinking", msg: message.id ?? parent, block: index, text: block.thinking });
     });
-    const converted = messageContent(message.content, data => this.log(r.id).image(data));
-    converted.images.push(...sendUserFileImages(message.content, r.cwd, data => this.log(r.id).image(data)));
-    const tools = (message.content ?? []).filter((b) => b.type === "tool_use" && b.id && b.name).map((b) => ({ id: b.id!, name: b.name!, summary: summarize(b.name!, b.input ?? {}, r.cwd), input: JSON.stringify(b.input ?? {}, null, 2) }));
+    const converted = messageContent(message.content, data => this.log(r.id).image(data), { cwd: r.cwd, ...(r.sdkSessionId ? { sessionId: r.sdkSessionId } : {}) });
+    const tools = (message.content ?? []).filter((b) => b.type === "tool_use" && b.id && b.name).map((b): ToolCall => ({ id: b.id!, name: b.name!, summary: summarize(b.name!, b.input ?? {}, r.cwd), input: JSON.stringify(b.input ?? {}, null, 2), ...sessionFileTool(b.name!, b.input ?? {}, { cwd: r.cwd, ...(r.sdkSessionId ? { sessionId: r.sdkSessionId } : {}) }, data => log.image(data)) }));
+    converted.images.push(...fileImages(tools.flatMap(tool => tool.files ?? [])));
     log.append({ kind: "assistant", msg: message.id ?? randomUUID(), model: message.model ?? "", ...converted, tools });
     const sub = live.subs.get(parent);
     if (!sub) return;
@@ -2098,14 +2264,17 @@ export class Sessions {
       }
       const questions = tool === "AskUserQuestion" ? questionInputs(input) : undefined;
       const { record, decision } = this.opts.permissions.request({ session: id, tool, title: opts.title ?? "", summary: summarize(tool, input, r.cwd), input }, opts.signal);
-      this.append(id, { kind: "permission", id: record.id, tool, title: opts.title ?? "", summary: record.summary, input: detail, canAlways: tool !== "ExitPlanMode" && tool !== "AskUserQuestion" && Array.isArray(opts.suggestions) && opts.suggestions.length > 0, requestKind: tool === "ExitPlanMode" ? "plan" : tool === "AskUserQuestion" ? "question" : "tool", ...(questions ? { questions } : {}) });
+      const rules = sessionPermissionRules(tool, opts.suggestions, opts.suppressAlwaysAllowRule);
+      this.permissionRules.set(record.id, rules);
+      this.append(id, { kind: "permission", id: record.id, tool, title: opts.title ?? "", summary: record.summary, input: detail, canAlways: rules.length > 0, ...(rules.length ? { alwaysAllow: { scope: "session" as const, summary: rules.flatMap(update => update.rules.map(rule => `${rule.toolName}(${rule.ruleContent})`)).join("\n") } } : {}), requestKind: tool === "ExitPlanMode" ? "plan" : tool === "AskUserQuestion" ? "question" : "tool", ...(questions ? { questions } : {}) });
       this.setState(r, "waiting");
       const answer = await decision;
-      this.append(id, { kind: "permission_decided", id: record.id, decision: answer.decision, ...(answer.reason ? { reason: answer.reason } : {}) });
+      this.append(id, { kind: "permission_decided", id: record.id, decision: answer.decision, ...(answer.decision === "allow_always" ? { ruleStatus: "sent" as const } : {}), ...(answer.reason ? { reason: answer.reason } : {}) });
+      this.permissionRules.delete(record.id);
       if (this.live.has(id) && this.opts.permissions.pending(id).length === 0) this.setState(r, "running");
       else this.opts.onSessions();
       if (answer.decision === "allow") return { behavior: "allow", updatedInput: answer.answers ? { ...input, answers: answer.answers } : input };
-      if (answer.decision === "allow_always") return { behavior: "allow", updatedInput: answer.answers ? { ...input, answers: answer.answers } : input, ...(opts.suggestions ? { updatedPermissions: opts.suggestions } : {}) };
+      if (answer.decision === "allow_always") return { behavior: "allow", updatedInput: answer.answers ? { ...input, answers: answer.answers } : input, ...(rules.length ? { updatedPermissions: rules } : {}) };
       if (answer.decision === "deny") return { behavior: "deny", message: answer.reason ?? "The user denied this from their phone." };
       return { behavior: "deny", message: "This permission request expired before anyone answered.", interrupt: true };
     };

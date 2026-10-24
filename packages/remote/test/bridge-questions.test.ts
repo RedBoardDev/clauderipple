@@ -1,6 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { approval, bridgeFixture, bridgeId, tick } from "./bridge-fixture.ts";
+import { summarize } from "../src/sessions.ts";
+import { pushContent } from "../src/push-content.ts";
 
 const input = {
   questions: [
@@ -34,6 +36,35 @@ test("a Remote Control AskUserQuestion cards as a question, not a JSON tool appr
   assert.equal(card.tool, "AskUserQuestion");
   assert.equal(card.requestKind, "question");
   assert.deepEqual(card.questions, input.questions);
+  assert.equal(card.summary, 'Which runner?');
+  f.history.push({ source: 'worker', payload: question });
+  const context = await f.sessions.pushContext(bridgeId, { kind: 'permission' });
+  assert.equal(context.tool, 'AskUserQuestion');
+  assert.equal(context.summary, 'Which runner?');
+  assert.equal(pushContent({ kind: 'permission' }, 'ko', context, '').body, '답변이 필요합니다 · Which runner?');
+  for (const lang of ['ko', 'en'] as const) {
+    assert.equal(pushContent(card, lang, {}, '').body, `${lang === 'ko' ? '답변이 필요합니다' : 'Answer needed'} · Which runner?`);
+  }
+});
+
+test('special tool summaries never serialize metadata, options or permission schemas', () => {
+  assert.equal(summarize('AskUserQuestion', { metadata: { source: 'modhotreload' }, ...input }, ''), 'Which runner?');
+  assert.equal(summarize('AskUserQuestion', { questions: [] }, ''), '');
+  assert.equal(summarize('ExitPlanMode', { allowedPrompts: [{ tool: 'Bash', prompt: 'npm test' }], plan: '# Ship the fix\n\nDetails' }, ''), '# Ship the fix');
+  assert.equal(summarize('ExitPlanMode', { allowedPrompts: [] }, ''), '');
+  assert.equal(summarize('EnterPlanMode', { metadata: { source: 'modhotreload' } }, ''), '');
+});
+
+test('permission alerts and card events use localized question and plan copy within the push limit', () => {
+  for (const lang of ['ko', 'en'] as const) {
+    const context = { tool: 'AskUserQuestion', summary: 'Which runner?' };
+    assert.equal(pushContent({ kind: 'permission' }, lang, context, '').body, `${lang === 'ko' ? '답변이 필요합니다' : 'Answer needed'} · Which runner?`);
+    assert.equal(pushContent({ kind: 'permission' }, lang, { tool: 'AskUserQuestion', summary: '' }, '').body, lang === 'ko' ? '답변이 필요합니다' : 'Answer needed');
+    assert.equal(pushContent({ kind: 'permission' }, lang, { tool: 'ExitPlanMode', summary: '' }, '').body, lang === 'ko' ? '계획 검토가 필요합니다' : 'Plan review needed');
+    const long = pushContent({ kind: 'permission' }, lang, { tool: 'AskUserQuestion', summary: '질문😀'.repeat(100) }, '');
+    assert.equal(Array.from(long.body).length, 180);
+    assert.ok(!long.body.includes('�'));
+  }
 });
 
 test("the phone's answers reach the tool input the Remote Control side runs", async t => {

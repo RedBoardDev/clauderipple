@@ -208,6 +208,26 @@ test("large text fields externalize and round-trip, and blob ids cannot escape",
   assert.deepEqual(reopened.readAfter(0).events[0], assistant);
 });
 
+test("file snapshots are session-and-epoch scoped, persist on reopen and expire on rebase", t => {
+  const dir = directory(t), otherDir = directory(t);
+  const first = open(t, dir), other = open(t, otherDir);
+  const data = Buffer.from("같은 내용").toString("base64");
+  const id = first.image(data);
+  assert.equal(first.image(data), id, "repeated snapshots in one epoch are deduplicated");
+  assert.notEqual(other.image(data), id, "even identical bytes do not authorize another session's id");
+  assert.equal(other.blob(id), null);
+  first.close();
+  const reopened = open(t, dir);
+  assert.equal(reopened.image(data), id);
+  assert.equal(reopened.blob(id), data);
+  reopened.close();
+  rmSync(dir, { recursive: true, force: true });
+  const rebased = open(t, dir);
+  assert.notEqual(rebased.epoch, first.epoch);
+  assert.notEqual(rebased.image(data), id);
+  assert.equal(rebased.blob(id), null, "a discarded file card cannot fetch a new epoch's bytes");
+});
+
 test("oversize display strings are truncated to the line cap; one event still fits a tiny page", t => {
   const log = open(t, directory(t));
   const user = log.append({ kind: "user", text: "😀\n\"".repeat(40000), clientMsgId: "keep-me" });

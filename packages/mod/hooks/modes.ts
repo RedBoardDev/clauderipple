@@ -23,17 +23,16 @@ export function modeNote(name: string): string {
 const BASE_NOTE = 'ClaudeRipple: delegate everything except judgment and final review to ripple:auto.'
 
 /**
- * The eager note for this prompt: Base's while no mode is on, the active mode's otherwise. Sent on
- * the first prompt after that turned eager (a mode turning on, or Base made eager), and again on
- * the first after a compaction (which clears `noted`), never on the turns between. When the
- * effective delegation is not eager, nothing is said and `noted` becomes null, so making it eager
- * again later sends the note afresh.
+ * The eager note for this prompt: Base's while no mode is on, the active mode's otherwise. Sent
+ * with every prompt while the effective delegation is eager: a note sent once is buried in a long
+ * context, and the operator saw main chats doing the work themselves (2026-10-24). When
+ * it is not eager, nothing is said and `noted` becomes null. `_noted` is what was noted last time;
+ * it stays in the signature for callers and no longer changes the answer.
  */
-export function eagerNote(s: Pick<Settings, 'modes' | 'activeMode' | 'activeSince' | 'delegation'>, noted: string | null): { note?: string; noted: string | null } {
+export function eagerNote(s: Pick<Settings, 'modes' | 'activeMode' | 'activeSince' | 'delegation'>, _noted: string | null): { note?: string; noted: string | null } {
   const mode = activeModeOf(s)
   if ((mode?.delegation ?? s.delegation) !== 'eager') return { noted: null }
-  const key = mode ? modeKey(s) : 'base'
-  return noted === key ? { noted } : { note: mode ? modeNote(mode.name) : BASE_NOTE, noted: key }
+  return { note: mode ? modeNote(mode.name) : BASE_NOTE, noted: mode ? modeKey(s) : 'base' }
 }
 
 /** Modes replace the base worker set, without changing fallback, allow-list or provider policy. */

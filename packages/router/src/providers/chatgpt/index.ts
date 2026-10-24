@@ -13,7 +13,7 @@ import { looksLikeAuth } from "../openai/index.ts";
 import { StreamMapper, conversationKey, estimateTokens, formatSse, serverToolNames, toResponsesRequest, toolNameRestoreMap, type AnthropicRequest, type TranslateOptions } from "./translate.ts";
 import { refusesReplayedReasoning } from "../../reasoning.ts";
 import type { RequestUsage } from "../../requestlog.ts";
-import { providerExhaustion, type ProviderExhaustion } from "../../health.ts";
+import { exhaustionHeaders, providerExhaustion, type ProviderExhaustion } from "../../health.ts";
 import type { SearchBackend, SearchHit, WebSearchQuery } from "../../websearch.ts";
 import { credentialHeaderValues, redactErrorText } from "../../redact.ts";
 import { codexClientVersion, latestCodexVersion, parseCodexCatalog } from "./catalog.ts";
@@ -946,8 +946,10 @@ export class ChatGptAdapter {
         }
         // The backend's own refusal, as Codex would have seen it without us (secrets masked).
         const text = sent.text || JSON.stringify({ error: { message: `HTTP ${sent.status}` } });
-        res.writeHead(sent.status, { "content-type": sent.headers.get("content-type") ?? "application/json", ...(sent.retryAfterSeconds ? { "retry-after": String(sent.retryAfterSeconds) } : {}) }).end(text);
-        return { status: sent.status, bytes: Buffer.byteLength(text), note: `upstream ${sent.status}` };
+        // A used-up quota (`usage_limit_reached` and its kin) is definite: the client is told so.
+        const exhaustion = providerExhaustion(sent.status, sent.text, sent.retryAfterSeconds === undefined ? undefined : sent.retryAfterSeconds * 1000);
+        res.writeHead(sent.status, { "content-type": sent.headers.get("content-type") ?? "application/json", ...(sent.retryAfterSeconds ? { "retry-after": String(sent.retryAfterSeconds) } : {}), ...(exhaustion ? exhaustionHeaders(exhaustion) : {}) }).end(text);
+        return { status: sent.status, bytes: Buffer.byteLength(text), note: `upstream ${sent.status}`, exhaustion };
       }
     }
 
@@ -1123,11 +1125,14 @@ export class ChatGptAdapter {
         note = `upstream ${sent.status}`;
         if (this.cfg.debugDump) this.dump(sent.status, json, upstreamReq, sent.text);
       }
-      res.writeHead(err.status, { "content-type": "application/json", ...(retryAfterSeconds ? { "retry-after": String(retryAfterSeconds) } : {}) }).end(err.body);
+      const exhaustion = sent.kind === "refused"
+        ? providerExhaustion(sent.status, sent.text, sent.retryAfterSeconds === undefined ? undefined : sent.retryAfterSeconds * 1000)
+        : undefined;
+      res.writeHead(err.status, { "content-type": "application/json", ...(retryAfterSeconds ? { "retry-after": String(retryAfterSeconds) } : {}), ...(exhaustion ? exhaustionHeaders(exhaustion) : {}) }).end(err.body);
       return { status: err.status, bytes: err.body.length, note,
         ...(sent.kind === "no-account" ? { upstreamCalled: false as const, refusal: "no-account" as const } : {}),
         ...(sent.kind === "refused" && upstreamReq.service_tier !== undefined ? { requestedTier: upstreamReq.service_tier } : {}),
-        ...(sent.kind === "refused" ? { exhaustion: providerExhaustion(sent.status, sent.text, sent.retryAfterSeconds === undefined ? undefined : sent.retryAfterSeconds * 1000) } : {}),
+        ...(exhaustion ? { exhaustion } : {}),
       };
     }
     const { upstream, credential } = sent;
@@ -1231,7 +1236,7 @@ export class ChatGptAdapter {
     if (!wantStream || (failure && !res.headersSent)) {
       // A failed turn is an error here too, not a 200 carrying whatever arrived before it failed.
       const msg = failure ? anthropicError(failedStatus, failure.type, failure.message).body : JSON.stringify(mapper.message());
-      res.writeHead(failure ? failedStatus : 200, { "content-type": "application/json", "content-length": String(Buffer.byteLength(msg)) }).end(msg);
+      res.writeHead(failure ? failedStatus : 200, { "content-type": "application/json", "content-length": String(Buffer.byteLength(msg)), ...(exhaustion && failedStatus === 429 ? exhaustionHeaders(exhaustion) : {}) }).end(msg);
       bytes = msg.length;
     } else if (!res.writableEnded) {
       res.end();

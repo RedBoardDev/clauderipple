@@ -9,6 +9,6 @@
 // Windows PowerShell rebuilds its own default from the registry.
 
 /** process.env minus PSModulePath, matched without regard to case as Windows does. */
-export function windowsPowerShellEnv(): NodeJS.ProcessEnv {
-  return Object.fromEntries(Object.entries(process.env).filter(([k]) => k.toLowerCase() !== "psmodulepath"));
+export function windowsPowerShellEnv(env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  return Object.fromEntries(Object.entries(env).filter(([k]) => k.toLowerCase() !== "psmodulepath"));
 }

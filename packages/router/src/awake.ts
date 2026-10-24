@@ -104,22 +104,32 @@ export function parseThermal(text: string): Thermal {
   return "unknown";
 }
 
-export type Clamshell = { lidClosed: boolean | null; causesSleep: boolean | null; sleepDisabled: boolean | null };
+export type Clamshell = { lidClosed: boolean | null; causesSleep: boolean | null; sleepDisabled: boolean | null; darkWake: boolean | null };
 
 /**
  * `ioreg -r -k AppleClamshellState -d 4` (no privilege needed):
+ *   |   "System Capabilities" = 15
  *   |   "AppleClamshellCausesSleep" = No
  *   |   "AppleClamshellState" = Yes
  *   |   "SleepDisabled" = No
  * `AppleClamshellCausesSleep` is No while an external display keeps a closed Mac in closed-display
  * mode — the state in which a closed lid must never be put to sleep by us.
+ * `System Capabilities` is IOPM.h's kIOPMSystemCapability mask (CPU 1, Graphics 2, Audio 4, Network 8):
+ * 15 in a full wake (measured 2026-10-24). A dark wake — the Mac up in the background while asleep to
+ * its user — has no Graphics (`pmset -g log`: "DarkWake … [CDNP]" against a full "Wake … [CDNVA]").
  */
 export function parseClamshell(text: string): Clamshell {
   const flag = (key: string): boolean | null => {
     const m = new RegExp(`"${key}"\\s*=\\s*(Yes|No)`).exec(text);
     return m ? m[1] === "Yes" : null;
   };
-  return { lidClosed: flag("AppleClamshellState"), causesSleep: flag("AppleClamshellCausesSleep"), sleepDisabled: flag("SleepDisabled") };
+  const caps = /"System Capabilities"\s*=\s*(\d+)/.exec(text)?.[1];
+  return {
+    lidClosed: flag("AppleClamshellState"),
+    causesSleep: flag("AppleClamshellCausesSleep"),
+    sleepDisabled: flag("SleepDisabled"),
+    darkWake: caps === undefined ? null : (Number(caps) & 2) === 0,
+  };
 }
 
 // ---- The decision -----------------------------------------------------------------------------
@@ -134,6 +144,10 @@ export type AwakeInput = {
   lastActivityAt?: number;
   battery: Battery | null;
   thermal: Thermal;
+  /** macOS: the Mac is in a dark wake (see parseClamshell). */
+  darkWake?: boolean;
+  /** We hold the Mac awake now. */
+  held?: boolean;
   /** A guard reading failed. */
   error?: string;
 };
@@ -149,6 +163,10 @@ export function decideAwake(i: AwakeInput): { wanted: boolean; reason: string } 
   else if (i.inFlight > 0) reason = `working: ${i.inFlight} model call${i.inFlight === 1 ? "" : "s"} running`;
   else if (i.lastActivityAt !== undefined && i.now - i.lastActivityAt < WORKING_GRACE_MS) reason = `working: last model call ${Math.round((i.now - i.lastActivityAt) / 1000)}s ago`;
   else return { wanted: false, reason: "idle: no model call in the last 10 min" };
+  // A Mac that went to sleep runs calls in its maintenance wakes (cache keep-warm pings, a scheduled
+  // task); holding it then kept a closed lid awake on battery for an hour (§5). Only work
+  // begun while the Mac was awake to its user takes a hold; one already taken is kept.
+  if (mode === "working" && i.darkWake && !i.held) return { wanted: false, reason: "asleep: a model call in a dark wake does not hold the Mac awake" };
   // Guards only matter when something wants the Mac awake.
   if (i.error) return { wanted: false, reason: `error: ${i.error}` };
   if (i.battery?.onBattery && i.battery.percent !== null && i.battery.percent < batteryFloorPercent) {
@@ -218,7 +236,7 @@ export type AwakeStatus = {
   until: string | null;
 };
 
-export type Guards = { battery: Battery | null; thermal: Thermal | null; lidClosed: boolean | null; error?: string };
+export type Guards = { battery: Battery | null; thermal: Thermal | null; lidClosed: boolean | null; darkWake?: boolean; error?: string };
 export type HoldOutcome = { ok: true } | { ok: false; refused: boolean; message: string };
 
 /** What one OS does for the controller. Every method that runs a command goes through the Runner. */
@@ -415,6 +433,8 @@ export class AwakeController {
         ...(this.lastActivityAt !== undefined ? { lastActivityAt: this.lastActivityAt } : {}),
         battery: g?.battery ?? null,
         thermal: g?.thermal ?? "unknown",
+        ...(g?.darkWake ? { darkWake: true } : {}),
+        held: this.applied,
         ...(g?.error ? { error: g.error } : {}),
       });
     // Whether anything wants the machine awake before the guards are read: a backend may skip
@@ -433,6 +453,7 @@ export class AwakeController {
     }
     const d = decide(guards);
     this.reason = d.reason;
+    if (d.reason.startsWith("asleep:")) this.logOnce(`awake: ${d.reason}`);
     if (d.wanted && !this.applied) await this.set(true, d.reason);
     else if (!d.wanted && this.applied) {
       if (await this.set(false, d.reason)) await backend.afterRelease();
@@ -500,7 +521,7 @@ class MacAwakeBackend implements AwakeBackend {
     if (therm.code === 0) thermal = parseThermal(therm.stdout);
     else error ??= `pmset -g therm failed (${therm.code})`;
     this.clamshell = await this.readClamshell();
-    return { battery, thermal, lidClosed: this.clamshell?.lidClosed ?? null, ...(error ? { error } : {}) };
+    return { battery, thermal, lidClosed: this.clamshell?.lidClosed ?? null, darkWake: this.clamshell?.darkWake === true, ...(error ? { error } : {}) };
   }
 
   async stillHeld(): Promise<boolean> {

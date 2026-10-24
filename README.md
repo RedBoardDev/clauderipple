@@ -52,7 +52,7 @@
     <td colspan="2" align="center"><img src="docs/media/mod-band.png" alt="The ripple mod: effort, context, cache timer, and which model answered with its cache hit"><br><sub>The ripple mod: effort, context, cache timer, and which model answered with its cache hit</sub></td>
   </tr>
   <tr>
-    <td align="center" width="50%"><img src="docs/media/mod-alerts.png" alt="Warnings when the cache goes cold or a limit is near, and a handoff to a fresh chat"><br><sub>Warnings when the cache goes cold or a limit is near, and a handoff to a fresh chat</sub></td>
+    <td align="center" width="50%"><img src="docs/media/mod-alerts.png" alt="Warnings when the cache goes cold or a limit is near, and a compaction offer"><br><sub>Warnings when the cache goes cold or a limit is near, and a compaction offer</sub></td>
     <td align="center" width="50%"><img src="docs/media/mod-settings.png" alt="Quick settings: automatic effort, the judge, worker modes"><br><sub>Quick settings: automatic effort, the judge, worker modes</sub></td>
   </tr>
 </table>
@@ -310,7 +310,7 @@ you map go to your provider, everything else goes to Anthropic byte for byte.
   low through max. Delegated work goes to `ripple:auto`, and the judge sends each task to
   a worker by difficulty: light work to DeepSeek or GLM, hard work to GPT or Opus. Cards
   warn when the cache has gone cold, the context gets heavy or a plan window passes 80%,
-  and offer compact or a handoff to a fresh session in the same folder. `Log` (or
+  and offer a compaction in place. `Log` (or
   `/ripple-log`) opens the request log in a side pane. One switch on the Clients screen,
   or `clauderipple mod on`.
 - **Images from your ChatGPT subscription.** `clauderipple image "<prompt>"`, with

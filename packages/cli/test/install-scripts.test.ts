@@ -9,6 +9,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 
 const scripts = path.resolve(import.meta.dirname, "../../../scripts");
 const read = (name: string): string => fs.readFileSync(path.join(scripts, name), "utf8");
@@ -23,7 +24,7 @@ test("the pinned-Node cmd wrapper switches to UTF-8 before non-ASCII paths, with
 });
 
 test("Windows npm build commands use a shell for npm.cmd", async () => {
-  const module = await import(path.join(scripts, "build-npm.mjs")) as { npmBuildSteps: (platform: NodeJS.Platform, run: (file: string, args: string[], opts: { shell: boolean }) => void) => void };
+  const module = await import(pathToFileURL(path.join(scripts, "build-npm.mjs")).href) as { npmBuildSteps: (platform: NodeJS.Platform, run: (file: string, args: string[], opts: { shell: boolean }) => void) => void };
   for (const platform of ["win32", "darwin"] as const) {
     const calls: string[][] = [];
     module.npmBuildSteps(platform, (file, args, opts) => {

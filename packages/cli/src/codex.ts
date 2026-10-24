@@ -237,6 +237,21 @@ export function codexOff(home = codexHome()): CodexEdit {
   return { changed: true, ...(configBackup ? { backup: configBackup } : {}), ...(profileBackup ? { profileBackup } : {}), config, profile };
 }
 
+/** The router port our provider block points at, or null when there is no block. */
+export function codexPort(home = codexHome()): number | null {
+  let text: string;
+  try {
+    text = fs.readFileSync(configFile(home), "utf8");
+  } catch {
+    return null;
+  }
+  const startAt = text.indexOf(START);
+  const endAt = startAt < 0 ? -1 : text.indexOf(END, startAt);
+  if (endAt < 0) return null;
+  const port = /base_url\s*=\s*"http:\/\/127\.0\.0\.1:(\d+)\//.exec(text.slice(startAt, endAt))?.[1];
+  return port ? Number(port) : null;
+}
+
 /** True when `codex on` is in effect for this Codex home. */
 export function codexEnabled(home = codexHome()): boolean {
   try {

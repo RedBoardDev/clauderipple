@@ -39,7 +39,7 @@ the base URL cannot be changed inside the app's sessions, but a process we spawn
 | omnara-ai/omnara | 2.9k | Apache-2.0 | pivoted to a managed agent platform |
 
 Nobody mixes workers inside one Claude session with cache kept, and nobody shows the mod's
-figures (effort judge, cache keep-warm, context/limit gauges, handoff/compact) remotely. The
+figures (effort judge, cache keep-warm, context/limit gauges, compact) remotely. The
 complaints in Paseo's 1,170 and Happy's 1,061 open issues cluster on four failures, which become
 our requirements below.
 

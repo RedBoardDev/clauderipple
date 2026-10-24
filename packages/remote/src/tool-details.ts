@@ -81,47 +81,75 @@ export function changeCount(name: string, input: Record<string, unknown> | null)
 
 export interface ActivityTool extends ToolCall { result?: { ok: boolean } }
 export type SummaryRow = { type: "tool"; tool: ActivityTool } | { type: "subagent"; status: "running" | "done" | "failed" };
-type Category = "command" | "read" | "edit" | "search" | "web" | "agent" | "other";
-function category(name: string): Category {
+// The kinds and their words follow the Claude desktop app's transcript bundle (read 2026-10-24),
+// as the desktop mod's Agents pane does (packages/mod/hooks/ui/tools.ts `runSummary`). A Write is
+// "created": a call's result does not tell a file it replaced.
+type Kind = "command" | "read" | "write" | "edit" | "notebook" | "grep" | "glob" | "browse" | "fetch" | "agent" | "todo" | "other";
+function kindOf(name: string): Kind {
   if (["Bash", "BashOutput", "KillShell"].includes(name)) return "command";
   if (name === "Read") return "read";
-  if (["Edit", "MultiEdit", "Write", "NotebookEdit"].includes(name)) return "edit";
-  if (["Grep", "Glob", "LS"].includes(name)) return "search";
-  if (["WebSearch", "WebFetch"].includes(name)) return "web";
+  if (name === "Write") return "write";
+  if (["Edit", "MultiEdit"].includes(name)) return "edit";
+  if (name === "NotebookEdit") return "notebook";
+  if (name === "Grep") return "grep";
+  if (name === "Glob") return "glob";
+  if (name === "WebSearch") return "browse";
+  if (name === "WebFetch") return "fetch";
   if (["Task", "Agent"].includes(name)) return "agent";
+  if (name === "TodoWrite") return "todo";
   return "other";
 }
-const completed = {
-  ko: { command: (n: number) => `명령어 ${n}개 실행함`, read: (n: number) => `파일 ${n}개 읽음`, edit: (n: number) => `파일 ${n}개를 편집함`, search: (n: number) => `검색 ${n}회`, web: (n: number) => `웹 ${n}회`, agent: (n: number) => `에이전트 ${n}개`, other: (n: number) => `도구 ${n}개 사용함` },
-  en: { command: (n: number) => `Ran ${n} command${n === 1 ? "" : "s"}`, read: (n: number) => `Read ${n} file${n === 1 ? "" : "s"}`, edit: (n: number) => `Edited ${n} file${n === 1 ? "" : "s"}`, search: (n: number) => `${n} search${n === 1 ? "" : "es"}`, web: (n: number) => `${n} web request${n === 1 ? "" : "s"}`, agent: (n: number) => `${n} agent${n === 1 ? "" : "s"}`, other: (n: number) => `Used ${n} tool${n === 1 ? "" : "s"}` },
+/** Kinds counted by what they acted on (a file, a page), not by call. */
+const byTarget: ReadonlySet<Kind> = new Set(["read", "write", "edit", "notebook", "fetch"]);
+const plural = (n: number, one: string, many: string) => n === 1 ? one : `${n} ${many}`;
+// The kinds the app words with no count ("검색함 코드") take none.
+const completed: Record<"ko" | "en", Record<Kind, (n: number) => string>> = {
+  ko: {
+    command: n => `실행됨 명령 ${n}개`, read: n => `읽음 파일 ${n}개`, write: n => `생성됨 파일 ${n}개`, edit: n => `편집함 파일 ${n}개`,
+    notebook: n => `편집함 노트북 ${n}개`, grep: () => "검색함 코드", glob: () => "찾음 파일", browse: () => "탐색함 웹",
+    fetch: n => `가져옴 페이지 ${n}개`, agent: n => `실행됨 에이전트 ${n}개`, todo: () => "업데이트됨 할 일", other: n => `사용함 도구 ${n}개`,
+  },
+  en: {
+    command: n => `ran ${plural(n, "a command", "commands")}`, read: n => `read ${plural(n, "a file", "files")}`,
+    write: n => `created ${plural(n, "a file", "files")}`, edit: n => `edited ${plural(n, "a file", "files")}`,
+    notebook: n => `edited ${plural(n, "a notebook", "notebooks")}`, grep: () => "searched code", glob: () => "found files",
+    browse: () => "browsed the web", fetch: n => `fetched ${plural(n, "a page", "pages")}`, agent: n => `ran ${plural(n, "an agent", "agents")}`,
+    todo: () => "updated todos", other: n => `used ${plural(n, "a tool", "tools")}`,
+  },
 };
 const active = {
   ko: { command: "명령어 실행 중…", read: "파일 읽는 중…", edit: "파일 편집 중…", search: "검색 중…", web: "웹 검색 중…", agent: "에이전트 실행 중…", other: "도구 실행 중…" },
   en: { command: "Running command…", read: "Reading file…", edit: "Editing file…", search: "Searching…", web: "Searching the web…", agent: "Running agent…", other: "Running tool…" },
 };
-const more = { ko: (n: number) => `그 외 작업 ${n}개`, en: (n: number) => `and ${n} more action${n === 1 ? "" : "s"}` };
-/** Like the Claude app: kinds in the order they first appear, files counted once per path, five or more kinds cut to three. */
+const activeOf: Record<Kind, keyof typeof active.ko> = {
+  command: "command", read: "read", write: "edit", edit: "edit", notebook: "edit", grep: "search", glob: "search",
+  browse: "web", fetch: "web", agent: "agent", todo: "other", other: "other",
+};
+/**
+ * Like the Claude app: kinds in the order they first appear but the unnamed tools ("사용함 도구 N개")
+ * last, every kind shown, a file or page counted once, the first word capitalised.
+ */
 export function activitySummary(rows: readonly SummaryRow[], running: boolean, language: "ko" | "en"): ChangeCount & { text: string; failed: boolean } {
-  const counts = new Map<Category, number>();
-  const paths = new Set<string>();
-  let added = 0, removed = 0, failed = false, pending: Category | null = null;
-  for (const row of rows) {
-    const kind = row.type === "subagent" ? "agent" : category(row.tool.name);
+  const targets = new Map<Kind, Set<string>>();
+  let added = 0, removed = 0, failed = false, pending: Kind | null = null;
+  rows.forEach((row, i) => {
+    const kind = row.type === "subagent" ? "agent" : kindOf(row.tool.name);
     const input = row.type === "tool" ? toolInput(row.tool.input) : null;
-    const path = stringField(input, "file_path") || stringField(input, "path") || (row.type === "tool" ? row.tool.summary : "");
-    const file = (kind === "edit" || kind === "read") && path ? `${kind}:${path}` : "";
-    if (!file || !paths.has(file)) counts.set(kind, (counts.get(kind) ?? 0) + 1);
-    if (file) paths.add(file);
-    if (row.type === "subagent") { failed ||= row.status === "failed"; if (row.status === "running") pending = kind; continue; }
+    const target = row.type === "tool" && byTarget.has(kind)
+      ? stringField(input, "file_path") || stringField(input, "notebook_path") || stringField(input, "path") || stringField(input, "url") || row.tool.summary : "";
+    const seen = targets.get(kind) ?? new Set<string>();
+    seen.add(target || `#${i}`);
+    targets.set(kind, seen);
+    if (row.type === "subagent") { failed ||= row.status === "failed"; if (row.status === "running") pending = kind; return; }
     failed ||= row.tool.result?.ok === false;
     if (!row.tool.result) pending = kind;
     const changes = row.tool.changes ?? changeCount(row.tool.name, input);
     added += changes.added; removed += changes.removed;
-  }
-  const parts = [...counts];
-  const shown = parts.length >= 5 ? parts.slice(0, 3) : parts;
-  const rest = parts.slice(shown.length).reduce((sum, [, n]) => sum + n, 0);
-  const text = running && pending ? active[language][pending] : [...shown.map(([kind, n]) => completed[language][kind](n)), ...(rest ? [more[language](rest)] : [])].join(", ");
+  });
+  // A stable sort: the named kinds keep the order they came in, the unnamed tools go after them.
+  const kinds = [...targets.keys()].sort((a, b) => Number(a === "other") - Number(b === "other"));
+  const line = kinds.map(kind => completed[language][kind](targets.get(kind)!.size)).join(", ");
+  const text = running && pending ? active[language][activeOf[pending]] : line.charAt(0).toLocaleUpperCase(language) + line.slice(1);
   return { text, added, removed, failed };
 }
 

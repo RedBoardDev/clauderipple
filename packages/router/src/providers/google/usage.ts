@@ -175,10 +175,21 @@ function strictQuotaGroups(body: unknown): QuotaGroup[] | null {
 const GEMINI_GROUP = { name: "gemini models", ids: { "5h": "gemini-5h", weekly: "gemini-weekly" } };
 const THIRD_PARTY_GROUP = { name: "claude and gpt models", ids: { "5h": "3p-5h", weekly: "3p-weekly" } };
 
+/**
+ * The quota group a model draws on, as a pool scope (pool.ts): `gemini` for gemini-*, `3p` for
+ * claude-* and gpt-oss*, undefined for anything else. A spent group rests only its own models.
+ */
+export function antigravityQuotaScope(model: string): "gemini" | "3p" | undefined {
+  const id = model.toLowerCase().replace(/@[^@]*$/, "");
+  if (/^gemini-/.test(id)) return "gemini";
+  if (/^claude-/.test(id) || /^gpt-oss(-|$)/.test(id)) return "3p";
+  return undefined;
+}
+
 /** gemini-* draws on "Gemini Models"; claude-* and gpt-oss* on "Claude and GPT models"; else unknown. */
 function groupFor(groups: readonly QuotaGroup[], model: string): { group: QuotaGroup; ids: Record<"5h" | "weekly", string> } | undefined {
-  const id = model.toLowerCase();
-  const known = /^gemini-/.test(id) ? GEMINI_GROUP : /^claude-/.test(id) || /^gpt-oss(-|$)/.test(id) ? THIRD_PARTY_GROUP : undefined;
+  const scope = antigravityQuotaScope(model);
+  const known = scope === "gemini" ? GEMINI_GROUP : scope === "3p" ? THIRD_PARTY_GROUP : undefined;
   if (!known) return undefined;
   const found = groups.filter((g) => g.displayName.trim().toLowerCase() === known.name);
   return found.length === 1 ? { group: found[0]!, ids: known.ids } : undefined;

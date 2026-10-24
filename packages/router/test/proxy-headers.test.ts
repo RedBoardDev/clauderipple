@@ -49,7 +49,7 @@ async function roundTrip(
   providerHeaders: Record<string, string>,
   reply: ProviderReply,
   options: { provider?: Partial<Provider>; system?: unknown; body?: Record<string, unknown>; exhausted?: boolean } = {},
-): Promise<{ seen: http.IncomingHttpHeaders; seenBody: Record<string, unknown>; records: RequestRecord[]; clientStatus: number; clientBody: string; providerCalls: number; health: Record<string, ProviderExhaustion> }> {
+): Promise<{ seen: http.IncomingHttpHeaders; seenBody: Record<string, unknown>; records: RequestRecord[]; clientStatus: number; clientBody: string; clientHeaders: http.IncomingHttpHeaders; providerCalls: number; health: Record<string, ProviderExhaustion> }> {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "cr-proxy-headers-"));
   const ca = createCa({ cn: "clauderipple test" });
   fs.writeFileSync(path.join(home, "ca.pem"), ca.certPem);
@@ -116,13 +116,19 @@ async function roundTrip(
   const firstText = first.toString("latin1");
   const clientStatus = Number(/^HTTP\/1\.1 (\d{3})/.exec(firstText)?.[1] ?? 0);
   const clientBody = firstText.slice(firstText.indexOf("\r\n\r\n") + 4);
+  const headEnd = firstText.indexOf("\r\n\r\n");
+  const clientHeaders: http.IncomingHttpHeaders = {};
+  for (const line of firstText.slice(0, headEnd >= 0 ? headEnd : firstText.length).split("\r\n").slice(1)) {
+    const at = line.indexOf(":");
+    if (at > 0) clientHeaders[line.slice(0, at).trim().toLowerCase()] = line.slice(at + 1).trim();
+  }
 
   secure.destroy();
   proxy.close();
   await new Promise<void>((r) => provider.close(() => r()));
   const records = requests.list(10);
   fs.rmSync(home, { recursive: true, force: true });
-  return { seen, seenBody, records, clientStatus, clientBody, providerCalls, health: proxy.providerHealth.snapshot() };
+  return { seen, seenBody, records, clientStatus, clientBody, clientHeaders, providerCalls, health: proxy.providerHealth.snapshot() };
 }
 
 test("routed 402 and billing 429 teach provider health, but transient 429 does not; success clears it", async () => {
@@ -142,6 +148,31 @@ test("routed 402 and billing 429 teach provider health, but transient 429 does n
     const streamed = await roundTrip({}, { status: 200, headers: { 'content-type': 'text/event-stream' }, body: Buffer.from(`data: ${JSON.stringify({ error: { code, message: 'request refused' } })}\n\n`) }, { provider: { type: 'openai-compatible' } });
     assert.equal(!!streamed.health.p, code === 'insufficient_quota');
   }
+});
+
+// Claude Code retries a plain 429 ten times over ~2.5 minutes. A definite spending-cap exhaustion
+// cannot succeed on any of those retries, so it is answered with the header the CLI reads before its
+// 429 rule; an ordinary rate limit keeps no such header (#89, 2026-10-24).
+test("a definite exhaustion tells the worker not to retry; a bare rate limit does not", async () => {
+  const cap = await roundTrip({}, {
+    status: 429,
+    headers: { "content-type": "application/json", "retry-after": "120" },
+    body: Buffer.from(JSON.stringify({ error: { code: 429, message: "Your project has exceeded its monthly spending cap." } })),
+  });
+  assert.equal(cap.clientStatus, 429);
+  assert.equal(cap.clientHeaders["x-should-retry"], "false");
+  assert.equal(cap.clientHeaders["retry-after"], "120");
+  assert.equal(cap.health.p?.reason, "billing_exhausted");
+
+  const rate = await roundTrip({}, {
+    status: 429,
+    headers: { "content-type": "application/json", "retry-after": "2" },
+    body: Buffer.from(JSON.stringify({ error: { message: "rate_limit_exceeded" } })),
+  });
+  assert.equal(rate.clientStatus, 429);
+  assert.equal(rate.clientHeaders["x-should-retry"], undefined);
+  assert.equal(rate.clientHeaders["retry-after"], "2", "the provider's own wait is passed through");
+  assert.deepEqual(rate.health, {});
 });
 
 test("an x-api-key provider never receives the caller's authorization header", async () => {

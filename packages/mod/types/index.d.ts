@@ -5,6 +5,10 @@ export type Lang = 'ko' | 'en' | 'zh' | 'ja' | 'es' | 'pt'
 
 export type StatusLine = string | null
 
+/** A user's standing delegation choice, held only for this session. */
+/** `said` is the sentence that pinned it, cut short, shown beside the pin and never stored. */
+export type DelegationPin = { model: string; provider?: string; said?: string }
+
 export type StatusRequest = {
   at: string
   source: string
@@ -21,6 +25,8 @@ export type StatusRequest = {
   session?: string
   /** Sent by the session this mod runs in. */
   mine?: boolean
+  /** Sent from inside a subagent (the router reads Claude Code's agent-id header). */
+  subagent?: true
 }
 
 export type Effort = 'low' | 'medium' | 'high' | 'xhigh' | 'max'
@@ -77,7 +83,7 @@ export type Level = 'light' | 'standard' | 'deep'
 export type Kind = 'plan' | 'do'
 /**
  * The worker ladder's rungs (docs/specs/2026-10-11-worker-ladder.md): the judge's level picks
- * light, standard or hard regardless of kind; only an explicit max tier selects plan.
+ * light, standard or hard for execution; standard/deep planning selects plan (2026-10-24).
  */
 export type Rung = 'light' | 'standard' | 'hard' | 'plan'
 /** One rung: what runs there and how hard it thinks. */
@@ -111,7 +117,8 @@ export type LadderChoice = {
 export type PresetId = 'claude' | 'claudeGpt' | 'gpt' | 'cheap'
 /** The fill as computed from the ticked models: the rungs, and the ones it had to fill otherwise. */
 export type Preset = { rungs: Record<Rung, Step>; substituted: Rung[] }
-export type ProviderAvailability = { usable: boolean; reason?: string; exhaustedUntil?: number }
+/** `models`: models out while the provider answers others (a spent Antigravity quota group). */
+export type ProviderAvailability = { usable: boolean; reason?: string; exhaustedUntil?: number; models?: Record<string, { reason?: string; exhaustedUntil?: number }> }
 export type LadderOptions = { until: number; choices: LadderChoice[]; providers?: Record<string, ProviderAvailability> }
 export type RouterModel = { value: string; label: string; provider: string; name?: string }
 export type WorkerCandidate = { target: TierTarget; model: string; provider: string }
@@ -144,7 +151,7 @@ export type Settings = {
   bias: -2 | -1 | 0 | 1 | 2
   floor: Effort
   ceiling: Effort
-  /** off: never; auto: spawns of ripple:auto; all: also general-purpose spawns with no model. */
+  /** off: never; auto: ripple:auto/auto; all: non-plugin workers except host helpers and native Explore/Plan (2026-10-24). */
   agentAuto: 'off' | 'auto' | 'all'
   jevSource: 'typesafe' | 'zen'
   /** Only the general ladder: the four workers replaced the per-field rules (2026-10-12). */
@@ -186,12 +193,11 @@ export type Settings = {
   keepWarm: boolean
   keepWarmHours: 1 | 2 | 4 | 8
   keepWarmMinTokens: number
-  compactWith: 'haiku' | 'session'
-  handoffSkill: string
-  handoffAfter: 'continue' | 'confirm' | 'copy'
-  handoffButton: 'advised' | 'always'
-  /** Context percent at which the context reads heavy (and the swamp band shows, when on). */
-  swampAt: number
+  /**
+   * The model that writes a compaction summary: 'session' for the engine's own compactor, else a
+   * model id (a Claude id or a router id) with an optional `@effort`. Defaults to Haiku.
+   */
+  compactModel: string
   /** The heavy-context band; off unless switched on. */
   swampAlert: boolean
   layout: 'dashboard' | 'minimal'
@@ -211,6 +217,12 @@ export type ModSettingsSnapshot = {
   settings: Settings
   revision: number
   stored: boolean
+  /**
+   * Claude Code's own `autoCompactWindow` from ~/.claude/settings.json, in tokens (what
+   * `/autocompact <n>` writes); null when the model's default stands. The one source the dashboard,
+   * the band and a session's `/autocompact` share.
+   */
+  compactAt?: number | null
   /** The stored settings still held field overrides or Auto, which the four workers replaced; true until the next save. */
   legacy?: boolean
 }
@@ -227,9 +239,9 @@ export type Pick = Verdict & { by: JudgeKind | 'manual' | 'followup'; at: number
 /** A judge's answer for a delegated task; a judge that names no kind means do. */
 export type WorkerVerdict = {
   domain: Domain; level: Level; kind?: Kind; effort: Effort
-  /** Confidence in the level, the one that moves a task up the ladder. */
+  /** Picks made while a worker judge ran (until 2026-10-24) keep its confidence in the level. */
   sure?: number
-  /** Jev's confidence in each answer, kept in the pick log so a rubric change can be compared. */
+  /** That judge's confidence in each answer, as kept in older pick-log rows. */
   odds?: { domain?: number; level?: number; kind?: number; effort?: number }
   why: string
 }
@@ -244,8 +256,11 @@ export type WorkerPick = WorkerVerdict & {
   position?: number
   skipped?: { rung: Rung; position: number; model: string; reason: string }[]
   target: TierTarget
-  /** Who named the tier: the judge, the main chat's tier marker (`session`), a model marker, or the default. */
-  by: JudgeKind | 'session' | 'marker' | 'default'
+  /**
+   * The session's tier marker, the default with none, a model the user asked for or pinned, or one
+   * a written rule assigns. Records from before 2026-10-24 can name the worker judge or a marker.
+   */
+  by: JudgeKind | 'user' | 'rule' | 'session' | 'marker' | 'default'
   ms: number
   /** Set when the tier's own agent could not run and the fallback did. */
   fallbackReason?: string
@@ -285,6 +300,31 @@ export type AgentRec = {
   usage?: { input: number; cached: number; cacheWrite: number; output: number }
   /** Tool calls it started. */
   tools?: number
+}
+
+/**
+ * Work Claude left running in the background, as the Claude app lists it beside the agents: a
+ * command (Bash `run_in_background`, or one the person or a timeout sent there) or a watch (Monitor).
+ */
+export type BgTask = {
+  /** The engine's task id: Bash's `backgroundTaskId`, Monitor's `taskId`, what its notification names. */
+  id: string
+  kind: 'shell' | 'monitor'
+  /** What it does in the call's own words (its `description`), else its command. */
+  title: string
+  /** The command line, or a watch's WebSocket address. */
+  command?: string
+  /** The agent whose call started it; absent for the main conversation's. */
+  agentId?: string
+  /** It ends with that agent's final response (Bash `backgroundEndsWithFinalResponse`): no notification follows. */
+  endsWithAgent?: true
+  state: 'running' | 'done' | 'failed' | 'stopped'
+  startedAt: number
+  endedAt?: number
+  /** Its notification's own line on how it ended ("… completed (exit code 0)"). */
+  summary?: string
+  /** Ended by a Stop that no longer listed it in flight, before any notification said how. */
+  settled?: true
 }
 
 /** The main chat's prompt cache as far as its responses show it. */
@@ -346,11 +386,10 @@ export type Stats = {
   warm: { pings: number; cost: number }
 }
 
-export type HandoffKind = 'quick' | 'full'
-/** `ready`: written, waiting on Confirm first's card; `opened`: a new session was opened with it. */
-export type HandoffStage = 'writing' | 'clearing' | 'done' | 'ready' | 'opened' | 'copied' | 'failed'
+/** `writing`: the fork is (or will be) writing the note; `opened`: a new session was opened with it; `copied`: no session could be opened, so it was copied. */
+export type HandoffStage = 'writing' | 'opened' | 'copied' | 'failed'
 export type SetupStep = 1 | 2 | 3 | 4
-export type ResultStage = 'handingOff' | 'handoffReady' | 'handoffDone' | 'compacting' | 'compacted' | 'failed'
+export type ResultStage = 'handingOff' | 'handoffDone' | 'compacting' | 'compacted' | 'failed'
 export type JevState = {
   source: 'env' | 'file' | 'pasted' | 'zen' | null
   test: { state: 'idle' | 'testing' | 'ok' | 'fail'; message?: string }
@@ -375,11 +414,21 @@ declare module 'claude-code' {
       deciding: boolean
       paused: boolean
       agents: AgentRec[]
+      /** Commands and watches left running in the background, and the latest that ended (tasks.ts). */
+      bgTasks: BgTask[]
+      /** Running (or waiting) and all agents, for the band: written only when a count moves. */
+      agentCounts: { live: number; total: number }
       cache: CacheMemo | null
       warm: WarmState
       /** Keep-warm for this chat alone, set by the band's flame; null follows Settings. */
       warmHere: boolean | null
-      context: { percent: number; tokens: number; window: number } | null
+      /**
+       * The context share the band and the Context pane both show (register.tsx `contextShare`);
+       * `basis`, the last response's input tokens, is what a precise count is kept against.
+       */
+      context: { percent: number; tokens: number; window: number; basis?: number } | null
+      /** Claude Code's own compaction point (settings.json `autoCompactWindow`), tokens or null. */
+      compactAt: number | null
       hot: Hot | null
       hotHidden: number | null
       /** The window the hot card was put off for: the put-off lasts until that window moves on. */
@@ -389,9 +438,10 @@ declare module 'claude-code' {
       coldHidden: boolean
       kept: { pings: number; tokens: number } | null
       judgeDown: string | null
-      advice: string | null
-      handoff: { stage: HandoffStage; kind: HandoffKind; text?: string } | null
-      panel: 'settings' | 'setup' | 'compact' | 'clear' | 'handoff' | null
+      handoff: { stage: HandoffStage; text?: string } | null
+      /** The band's Handoff was pressed and its fork has not started: the tick starts it when the session is idle. */
+      handoffQueued: boolean
+      panel: 'settings' | 'setup' | 'compact' | 'clear' | null
       busy: boolean
       decidingSince: number | null
       heldPick: Pick | null
@@ -401,12 +451,6 @@ declare module 'claude-code' {
       lastSpawn: WorkerPick | null
       lastRealReplyAt: number | null
       stats: Stats
-      promptCount: number
-      adviceQueue: string | null
-      handoffQueued: boolean
-      handoffWaiting: boolean
-      handoffChoiceKind: HandoffKind
-      handoffChoiceAfter: 'continue' | 'confirm' | 'copy'
       result: { stage: ResultStage; detail?: string } | null
       settingsDraft: Settings | null
       setupStep: SetupStep
@@ -422,8 +466,16 @@ declare module 'claude-code' {
       agentRunsOpen: string[]
       /** Counts the Agents pane's seconds while an agent runs: a write redraws its clocks. */
       agentsTick: number
-      /** The person's last two prompts as submitted, mid-turn ones included (userNamed). */
+      /**
+       * The Context pane's precise count (the token-count API's), kept against the context's tokens
+       * when it was asked for (`basis`); `busy` while it runs, `error` when it failed.
+       */
+      contextFull: { basis: number | null; breakdown?: import('claude-code').SessionContextBreakdown; busy?: boolean; error?: string } | null
+      /** The Context pane's sections shown whole. */
+      contextShowAll: ('memory' | 'mcp' | 'skills' | 'agents')[]
+      /** The person's last two prompts as submitted, mid-turn ones included for the judge (2026-10-24). */
       heardPrompts: string[]
+      delegationPin: DelegationPin | null
       jev: JevState
       routerModels: RouterModel[]
       /** The router's rung choices and presets (GET /api/mod-options), for the quick settings. */

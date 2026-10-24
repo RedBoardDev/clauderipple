@@ -1,5 +1,6 @@
 // The router, not the optional tray, owns update scheduling. All process/time boundaries are injected.
 import fs from "node:fs";
+import { readHostUpdate, type HostUpdate } from "../../remote/src/host-update.ts";
 import path from "node:path";
 import { writeJsonAtomic } from "./locked-file.ts";
 import { parseUpdateCheck, type CliResult, type DetachedCli, type UpdateCheck } from "./cli-control.ts";
@@ -17,6 +18,7 @@ type Saved = {
   lastError?: string;
 };
 export type AutoUpdateStatus = {
+  hostUpdate?: HostUpdate;
   enabled: boolean;
   running: boolean;
   kind?: string;
@@ -80,6 +82,8 @@ export class AutoUpdater {
   private cancel: (() => void) | undefined;
   private waiting: { check: UpdateCheck; until: number } | undefined;
   private childRunning = false;
+  private cancelHost: (() => void) | undefined;
+  private hostRefreshing = false;
 
   constructor(deps: AutoUpdateDeps) {
     this.deps = deps;
@@ -136,7 +140,10 @@ export class AutoUpdater {
   }
   status(): AutoUpdateStatus {
     const completed = this.saved.completed;
+    const hostUpdate = this.hostState();
+    if (this.active && hostUpdate?.status === "pending" && !this.cancelHost) this.scheduleHost();
     return {
+      ...(hostUpdate ? { hostUpdate } : {}),
       enabled: this.deps.enabled(), running: !!this.saved.pending || this.completedInstallerRunning(),
       ...(this.saved.kind ? { kind: this.saved.kind } : {}),
       ...(this.saved.available ? { available: this.saved.available } : {}),
@@ -211,8 +218,28 @@ export class AutoUpdater {
     this.active = true;
     this.info("first check in 10 minutes");
     this.schedule(UPDATE_TIMING.first);
+    this.scheduleHost();
   }
-  stop(): void { this.active = false; this.cancel?.(); this.waiting = undefined; this.info("scheduler stopped"); }
+  stop(): void { this.active = false; this.cancel?.(); this.cancelHost?.(); this.cancelHost = undefined; this.waiting = undefined; this.info("scheduler stopped"); }
+  private hostState(): HostUpdate | null {
+    try { return readHostUpdate(this.deps.home); }
+    catch (error) { return { version: this.deps.version, status: "pending", retryAt: 0, error: `cannot read host update state: ${error}` }; }
+  }
+  private scheduleHost(): void {
+    if (!this.active || this.cancelHost || this.hostRefreshing || this.hostState()?.status !== "pending") return;
+    this.cancelHost = this.clock.later(() => { this.cancelHost = undefined; void this.refreshHost(); }, MINUTE);
+  }
+  private async refreshHost(): Promise<void> {
+    this.hostRefreshing = true;
+    try {
+      const host = readHostUpdate(this.deps.home);
+      if (host?.status === "pending" && host.version === this.deps.version && this.clock.now() >= host.retryAt && !this.pendingRunning()) {
+        const result = await this.deps.runCli(["remote", "refresh", "--pending"], 45_000);
+        if (!result.ok) this.info(`host application pending: ${result.output.slice(-1000)}`);
+      }
+    } catch (error) { this.info(`host application pending: ${error}`); }
+    finally { this.hostRefreshing = false; this.scheduleHost(); }
+  }
   private schedule(ms: number): void {
     this.cancel?.();
     if (this.active) this.cancel = this.clock.later(() => { void this.tick(); }, ms);

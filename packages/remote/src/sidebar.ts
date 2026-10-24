@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { object } from "./bridge-client.ts";
 import { SidebarStorage } from "./sidebar-storage.ts";
+import { windowsDesktopRoot } from "./desktop-paths.ts";
 import type { SessionSummary } from "./protocol.ts";
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -20,14 +21,7 @@ export interface SidebarOptions { root?: string; now?: () => number; onError?: (
 /** Verified on Windows with bundled CLI 2.1.304: app data moved out of Roaming/Claude.
  * Enable only a single on-disk layout we recognize, never a guessed AppData path. */
 export function windowsSidebarRoot(localAppData = process.env.LOCALAPPDATA): string | undefined {
-  if (!localAppData) return undefined;
-  const parent = path.join(localAppData, "Claude-Data");
-  let entries: fs.Dirent[];
-  try { entries = fs.readdirSync(parent, { withFileTypes: true }); }
-  catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined; throw error; }
-  const roots = entries.filter(entry => entry.isDirectory() && /^claude_/i.test(entry.name)).map(entry => path.join(parent, entry.name))
-    .filter(root => ["config.json", "claude_desktop_config.json", "claude-code-sessions", path.join("Local Storage", "leveldb")].every(name => fs.existsSync(path.join(root, name))));
-  return roots.length === 1 ? roots[0] : undefined;
+  return windowsDesktopRoot(localAppData);
 }
 
 export class DesktopSidebar {
