@@ -89,7 +89,9 @@ type UsageOptions = {
 export class ClaudeUsage {
   private readonly last = new Map<string, Record<string, unknown>>();
   private inFlight: Promise<Record<string, Record<string, unknown>>> | null = null;
-  private fetchedAt = Number.NEGATIVE_INFINITY;
+  private nextFetchAt = Number.NEGATIVE_INFINITY;
+  private readonly schedule = new Map<string, { at: number; retrying: boolean }>();
+  private sourceRetrying = false;
   private readonly source: UsageSource;
   private readonly opts: UsageOptions;
 
@@ -99,32 +101,47 @@ export class ClaudeUsage {
   }
 
   /** Snapshots by account owner id ("current" for the Claude Code login). */
-  snapshot(): Promise<Record<string, Record<string, unknown>>> {
+  snapshot(force = false): Promise<Record<string, Record<string, unknown>>> {
+    if (this.inFlight) return this.inFlight;
     const now = (this.opts.now ?? Date.now)();
-    if (now - this.fetchedAt < (this.opts.ttlMs ?? 5 * 60_000)) return Promise.resolve(Object.fromEntries(this.last));
-    this.inFlight ??= this.fetchAll().finally(() => {
-      this.fetchedAt = (this.opts.now ?? Date.now)();
-      this.inFlight = null;
-    });
+    if (!force && now < this.nextFetchAt) return Promise.resolve(Object.fromEntries(this.last));
+    this.inFlight = this.fetchAll(force).finally(() => { this.inFlight = null; });
     return this.inFlight;
   }
 
-  private async fetchAll(): Promise<Record<string, Record<string, unknown>>> {
+  private async fetchAll(force: boolean): Promise<Record<string, Record<string, unknown>>> {
+    const now = this.opts.now ?? Date.now;
+    const ttl = this.opts.ttlMs ?? 5 * 60_000;
     let credentials: Credential[];
     try {
       credentials = await this.source.credentials();
+      this.sourceRetrying = false;
     } catch (e) {
       this.opts.warn?.(`claude usage: no credentials: ${(e as Error).message}`);
+      this.sourceRetrying = force || !this.sourceRetrying;
+      this.nextFetchAt = now() + (this.sourceRetrying ? 15_000 : ttl);
+      for (const [owner, snapshot] of this.last) this.last.set(owner, { ...snapshot, stale: true });
       return Object.fromEntries(this.last);
     }
     await Promise.all(credentials.map(async (credential) => {
       const owner = credential.ownerId ?? credential.id;
+      const previousSchedule = this.schedule.get(owner);
+      if (!force && previousSchedule && now() < previousSchedule.at) return;
       const snapshot = await this.fetchOne(credential);
-      if (snapshot) this.last.set(owner, snapshot);
+      // Only the failed owner retries: a healthy account retains its full five-minute TTL.
+      const retrying = !snapshot && (force || !previousSchedule?.retrying);
+      this.schedule.set(owner, { at: now() + (retrying ? 15_000 : ttl), retrying });
+      if (snapshot) this.last.set(owner, { ...snapshot, at: now() });
+      else {
+        const previous = this.last.get(owner);
+        if (previous) this.last.set(owner, { ...previous, stale: true });
+      }
     }));
     // An account that was removed must not keep its old numbers on the screen.
     const owners = new Set(credentials.map((c) => c.ownerId ?? c.id));
-    for (const owner of [...this.last.keys()]) if (!owners.has(owner)) this.last.delete(owner);
+    for (const owner of this.last.keys()) if (!owners.has(owner)) this.last.delete(owner);
+    for (const owner of this.schedule.keys()) if (!owners.has(owner)) this.schedule.delete(owner);
+    this.nextFetchAt = this.schedule.size ? Math.min(...Array.from(this.schedule.values(), (s) => s.at)) : now() + ttl;
     return Object.fromEntries(this.last);
   }
 

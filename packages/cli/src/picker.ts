@@ -229,6 +229,41 @@ export function untrustCa(caPem: string, opts: { sweep?: boolean } = {}): boolea
   }
 }
 
+/** The steps of `picker off`, passed in so a test can run them without the keychain or Claude Desktop. */
+export type PickerOffSteps = {
+  removeAppProxy: () => boolean;
+  /** Sets picker.enabled = false in config.json; false when there is no config to change. */
+  disablePicker: () => boolean;
+  untrustCa: () => boolean;
+  /** Where the CA is trusted, for the output: "the login keychain", … */
+  caStore: string;
+};
+
+/**
+ * Turns picker mode off, each step tried even when one before it failed: `uninstall` runs this
+ * before it removes anything, and a trusted CA or an egressProxyUrl naming a router that is gone
+ * would outlive ClaudeRipple. Returns false when a step failed; the failure is in the output.
+ */
+export function turnPickerOff(steps: PickerOffSteps, log: (line: string) => void): boolean {
+  let ok = true;
+  const attempt = (what: string, step: () => void): void => {
+    try {
+      step();
+    } catch (e) {
+      ok = false;
+      log(`✗ could not ${what}: ${(e as Error).message}`);
+    }
+  };
+  attempt("remove the Claude Desktop config library entry", () =>
+    log(steps.removeAppProxy() ? "✓ Claude Desktop config library entry removed (previous entry restored if there was one)" : "✓ no ClaudeRipple config library entry"));
+  attempt("set picker.enabled = false", () => {
+    if (steps.disablePicker()) log("✓ picker.enabled = false");
+  });
+  attempt(`remove the CA from ${steps.caStore}`, () =>
+    log(steps.untrustCa() ? `✓ CA removed from ${steps.caStore}` : `✓ CA was not in ${steps.caStore}`));
+  return ok;
+}
+
 type Meta = { appliedId?: string; clauderipple?: { ourId?: string; previousAppliedId?: string | null } } & Record<string, unknown>;
 
 function readMeta(): Meta {

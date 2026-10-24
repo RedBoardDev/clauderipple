@@ -19,6 +19,7 @@ import { promisify } from "node:util";
 import { posixModes, posixPaths } from "../../../test/capabilities.ts";
 import { syncAgentFiles } from "../../router/src/agents.ts";
 import { DEFAULTS } from "../../router/src/config.ts";
+import { generateCerts } from "../src/certs.ts";
 
 const root = fs.mkdtempSync(path.join(os.tmpdir(), "cr-recovery-"));
 const label = `com.clauderipple.check-${crypto.randomBytes(4).toString("hex")}`;
@@ -678,4 +679,34 @@ test("CLI: doctor, direct on/off and app print one JSON object each and exit 0",
   }
   const used = fs.existsSync(calls) ? fs.readFileSync(calls, "utf8").trim().split("\n") : [];
   assert.ok(used.length > 0 && used.every((l) => l.startsWith("print ") && l.endsWith(`/${label}`)), used.join("\n"));
+});
+
+test("CLI: uninstall turns picker mode off before it stops the router", { skip: os.type() !== "Darwin" }, async () => {
+  const ctx = directSetup();
+  generateCerts(ctx.home, "example.invalid");
+  const fingerprint = new crypto.X509Certificate(fs.readFileSync(ctx.ca)).fingerprint.replace(/:/g, "");
+  const bin = path.join(root, "uninstall-bin");
+  const calls = path.join(root, "uninstall-calls.log");
+  fs.mkdirSync(bin, { recursive: true });
+  // Stand-ins for the login keychain and launchd, logging to one file so their order shows.
+  fs.writeFileSync(path.join(bin, "security"), `#!/bin/sh\necho "security $*" >> "${calls}"\nexit 0\n`, { mode: 0o755 });
+  fs.writeFileSync(path.join(bin, "launchctl"), `#!/bin/sh\necho "launchctl $*" >> "${calls}"\nexit 113\n`, { mode: 0o755 });
+  const env: NodeJS.ProcessEnv = { ...process.env, CLAUDERIPPLE_HOME: ctx.home, CLAUDERIPPLE_LAUNCHCTL: path.join(bin, "launchctl"), CODEX_HOME: path.join(ctx.home, "codex"), PATH: `${bin}${path.delimiter}${process.env.PATH ?? ""}` };
+  delete env.NODE_OPTIONS;
+  // The real `security` would remove the user's own CA: refuse to go on unless the stand-in wins.
+  const resolved = await promisify(execFile)("/bin/sh", ["-c", "command -v security"], { env });
+  assert.equal(resolved.stdout.trim(), path.join(bin, "security"));
+
+  const cli = path.resolve(import.meta.dirname, "../src/index.ts");
+  await promisify(execFile)(process.execPath, [cli, "uninstall"], { env, timeout: 60_000 });
+
+  const used = fs.readFileSync(calls, "utf8").trim().split("\n");
+  const firstLaunchctl = used.findIndex((l) => l.startsWith("launchctl "));
+  assert.ok(firstLaunchctl > 0, used.join("\n"));
+  assert.ok(used.slice(0, firstLaunchctl).some((l) => l.startsWith(`security delete-certificate -Z ${fingerprint}`)), used.join("\n"));
+  assert.ok(used.every((l) => !l.startsWith("security delete-certificate -c ")), "a second home must never sweep CAs by name");
+  assert.equal(meta().appliedId, "prev", "the entry picker mode replaced is applied again");
+  const config = path.join(ctx.home, "config.json");
+  assert.equal((JSON.parse(fs.readFileSync(config, "utf8")) as { picker: { enabled: boolean } }).picker.enabled, false);
+  assert.equal(fs.statSync(config).mode & 0o777, 0o600);
 });

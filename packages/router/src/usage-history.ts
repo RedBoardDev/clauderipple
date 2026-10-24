@@ -235,7 +235,9 @@ export class UsageHistory {
     if (lines.length === 0) return;
     try {
       fs.mkdirSync(path.dirname(this.file), { recursive: true });
-      fs.appendFileSync(this.file, lines.map(toLine).join(""), "utf8");
+      fs.appendFileSync(this.file, lines.map(toLine).join(""), { encoding: "utf8", mode: 0o600 });
+      // The mode above applies only when the append creates the file; one written before is narrowed here.
+      fs.chmodSync(this.file, 0o600);
     } catch {
       // Usage history is best-effort: it must never alter the proxy response path.
     }

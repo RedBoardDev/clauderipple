@@ -1,9 +1,10 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { dropPowerShellShim, installKind, isNewer, runUpdate } from "../src/update.ts";
+import { dropPowerShellShim, installKind, isNewer, runUpdate, updateSource } from "../src/update.ts";
 import { writePaths } from "../src/registration.ts";
 import { runtime } from "../src/runtime.ts";
 import { posixPaths } from "../../../test/capabilities.ts";
@@ -60,9 +61,10 @@ test("Windows script updates remove inherited PSModulePath after merging their e
     let called = false;
     const result = runUpdate({ kind: "script", prefix: "C:\\Ripple" }, { node: process.execPath, env: {}, cli: "unused.js" }, "clauderipple@test", {
       platform: "win32",
-      run: (program, _args, options) => {
+      run: (program, args, options) => {
         called = true;
         assert.equal(program, "powershell.exe");
+        assert.match(args.at(-1) ?? "", /^\$ErrorActionPreference = 'Stop';/);
         assert.equal(Object.keys(options.env).some(key => key.toLowerCase() === "psmodulepath"), false);
         assert.equal(options.env.CLAUDERIPPLE_PREFIX, "C:\\Ripple");
         assert.equal(options.env.CLAUDERIPPLE_PACKAGE, "clauderipple@test");
@@ -102,6 +104,54 @@ test("an install is recognised by where its files are", () => {
   const win = { packaged: false, cli: "C:\\Users\\me\\.clauderipple\\node_modules\\clauderipple\\dist\\cli\\src\\index.js", repo: "C:\\Users\\me\\.clauderipple\\node_modules\\clauderipple" };
   assert.deepEqual(installKind(win, { platform: "win32", env: {}, home: "C:\\Users\\ME" }), { kind: "script", prefix: "C:\\Users\\me\\.clauderipple" });
   assert.equal(installKind({ ...win, repo: "C:\\Users\\me\\AppData\\Roaming\\npm\\node_modules\\clauderipple" }, { platform: "win32", env: {}, home: "C:\\Users\\me" }).kind, "npm");
+});
+
+// The fork must not be replaced by the published package: upstream only when asked for.
+test("updates come from the fork unless upstream is asked for", () => {
+  assert.equal(updateSource({}), "fork");
+  assert.equal(updateSource({ CLAUDERIPPLE_UPDATE_SOURCE: "fork" }), "fork");
+  assert.equal(updateSource({ CLAUDERIPPLE_UPDATE_SOURCE: "npm" }), "fork");
+  assert.equal(updateSource({ CLAUDERIPPLE_UPDATE_SOURCE: "upstream" }), "upstream");
+});
+
+test("update on a fork installs nothing and says how; the check never offers one", () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "cr-update-"));
+  const env: NodeJS.ProcessEnv = { ...process.env, CLAUDERIPPLE_HOME: home, CLAUDE_SETTINGS_PATH: path.join(home, "settings.json") };
+  delete env.CLAUDERIPPLE_UPDATE_SOURCE;
+  delete env.CLAUDERIPPLE_PACKAGE;
+  delete env.NODE_OPTIONS;
+  const cli = path.resolve(import.meta.dirname, "../src/index.ts");
+  // A regression must fail locally, never contact the real registry.
+  const noRegistry = `data:text/javascript,${encodeURIComponent('globalThis.fetch = () => { throw new Error("unexpected registry request"); };')}`;
+  const run = (...flags: string[]) => spawnSync(process.execPath, ["--import", noRegistry, cli, "update", ...flags], { env, encoding: "utf8", timeout: 30_000 });
+  try {
+    const update = run();
+    assert.equal(update.status, 1, update.stderr);
+    assert.match(update.stdout, /npm install --prefix ~\/\.clauderipple\/lib .*\.tgz\n\s*clauderipple restart/);
+    // The tray and the dashboard offer an update only when this says newer.
+    const check = run("--check", "--json");
+    assert.equal(check.status, 0, check.stderr);
+    const result: unknown = JSON.parse(check.stdout);
+    assert.ok(typeof result === "object" && result !== null && "current" in result);
+    assert.equal(typeof result.current, "string");
+    assert.deepEqual(result, { current: result.current, latest: null, newer: false, kind: "fork" });
+    const textCheck = run("--check");
+    assert.equal(textCheck.status, 0, textCheck.stderr);
+    assert.match(textCheck.stdout, /Update it from the fork's checkout/);
+
+    env.CLAUDERIPPLE_PACKAGE = "clauderipple@test";
+    const forced = run("--force");
+    assert.equal(forced.status, 1, forced.stderr);
+    assert.match(forced.stdout, /does not install the published \(upstream\) version over it/);
+
+    // Explicit opt-in reaches the upstream check, still without a network request or install.
+    env.CLAUDERIPPLE_UPDATE_SOURCE = "upstream";
+    const upstream = run("--check", "--json");
+    assert.equal(upstream.status, 0, upstream.stderr);
+    assert.deepEqual(JSON.parse(upstream.stdout), { current: result.current, latest: null, newer: true, kind: "checkout" });
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
 });
 
 // PowerShell runs npm's clauderipple.ps1 before the .cmd, and its default policy refuses it (#62).

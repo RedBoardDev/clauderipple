@@ -182,6 +182,14 @@ test("persistPowerChange writes only what changed and nothing for a pin", () => 
   assert.deepEqual(JSON.parse(fs.readFileSync(file, "utf8")), { awake: { batteryFloorPercent: 30, mode: "working" }, tether: { hotspotSsid: "PBJ" } });
 });
 
+test("persistPowerChange leaves config.json readable by its owner only", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cr-power-"));
+  const file = path.join(dir, "config.json");
+  fs.writeFileSync(file, "{}", { mode: 0o644 });
+  assert.equal(persistPowerChange(file, { awake: { mode: "working" } }), true);
+  assert.equal(fs.statSync(file).mode & 0o777, 0o600);
+});
+
 test("config: off by default, validated when present", () => {
   assert.deepEqual(awakeSettings(DEFAULTS), { mode: "off", batteryFloorPercent: 20 });
   assert.deepEqual(tetherSettings(DEFAULTS), { enabled: false, hotspotSsid: "", probeEverySec: 10 });

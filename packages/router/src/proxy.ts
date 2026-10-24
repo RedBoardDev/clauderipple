@@ -1555,7 +1555,14 @@ export class Proxy {
           if (status >= 400) {
             this.pool.penalise(penalised.provider, penalised.id, status, retryAfterMs(upRes.headers), errBody);
             if (status === 401 && cfg.providers[penalised.provider]?.type === "anthropic") this.claudeAccounts.reject(penalised.id);
-          } else this.pool.succeed(penalised.provider, penalised.id);
+          } else if (status >= 200 && status < 300) this.pool.succeed(penalised.provider, penalised.id);
+        } else if (!route && isApiHost && pathname === "/v1/messages" && status >= 200 && status < 300) {
+          // Native passthrough uses the caller's current Claude login, not a selected pool account.
+          // Model answers only: telemetry and token counts on the same host would mark it active
+          // while the conversation runs on an added account.
+          for (const [name, provider] of Object.entries(cfg.providers)) {
+            if (provider.type === "anthropic" && provider.auth === "claude-code") this.pool.succeed(name, "current");
+          }
         }
 
         // Nothing has been written to the client yet, so a refused credential can still be replaced
@@ -1930,7 +1937,7 @@ export class Proxy {
     const cfg = this.deps.config();
     const out: Record<string, ReturnType<CredentialPool["report"]>> = {};
     for (const [name, provider] of Object.entries(cfg.providers)) {
-      const creds = provider.type === "anthropic" && provider.accountPool
+      const creds = provider.type === "anthropic" && provider.auth === "claude-code"
         ? this.claudeAccounts.peekCredentials()
         : this.credentialsOf(name, provider, true);
       if (!(provider.type === "anthropic" && provider.accountPool) && !("credentials" in provider && provider.credentials?.length)) continue;

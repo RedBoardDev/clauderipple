@@ -8,12 +8,13 @@ import path from "node:path";
 import { DEFAULTS, type Config, type ProviderModel } from "../src/config.ts";
 import { Logger } from "../src/log.ts";
 import { backfillContextWindows, effortLevelsForModel, googleHealth, measureUnsettledModels, parseUpdateCheck, startAdmin, type AdminDeps } from "../src/admin.ts";
-import type { ImageRequest } from "../src/providers/chatgpt/index.ts";
+import type { ChatGptAccountStatus, ImageRequest } from "../src/providers/chatgpt/index.ts";
+import type { LimitsProvider } from "../src/admin.ts";
 import type { GoogleAccountStatus } from "../src/providers/google/index.ts";
 import { RequestLog } from "../src/requestlog.ts";
 import { PRESETS } from "../src/presets.ts";
 import { saveClaudeAuthFile, saveClaudeOAuthFile } from "../src/providers/anthropic-token-file.ts";
-import { listClaudeAccounts, markClaudeAccountNeedsReauth, readClaudeAccountsFile, saveClaudeOAuthAccount, subjectHash } from "../src/providers/anthropic-accounts.ts";
+import { listClaudeAccounts, markClaudeAccountNeedsReauth, readClaudeAccountsFile, saveClaudeOAuthAccount, setPreferredClaudeAccount, subjectHash } from "../src/providers/anthropic-accounts.ts";
 import { ObservedClaudeCodeAuth } from "../src/providers/anthropic-observed.ts";
 import type { ModOptions } from "../src/admin.ts";
 import type { ModSettingsSnapshot } from "../src/mod-settings.ts";
@@ -1073,6 +1074,15 @@ test("config revisions prevent concurrent lost updates and detect external edits
   });
 });
 
+test("PUT /api/config leaves config.json readable by its owner only, even one that was not", async () => {
+  await withAdmin(makeCfg(), async ({ port, configFile }) => {
+    fs.chmodSync(configFile, 0o644);
+    const res = await fetch(`${base()}:${port}/api/config`, { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify(makeCfg()) });
+    assert.equal(res.status, 200);
+    assert.equal(fs.statSync(configFile).mode & 0o777, 0o600);
+  });
+});
+
 test("PUT /api/config carries a webSearch backend through to the file and GET returns it", async () => {
   await withAdmin(makeCfg(), async ({ port, configFile, setCfg }) => {
     const next = makeCfg({
@@ -1820,10 +1830,46 @@ test("the Origin guard covers the other state-changing endpoints too", async () 
       const res = await fetch(`${base()}:${port}${p}`, { method: "POST", headers: { origin: "http://evil.example" } });
       assert.equal(res.status, 403, `${p} must refuse a cross-site POST`);
     }
-    // Reading is not gated: a cross-site page cannot see the response anyway.
+    // A read is not gated on Origin (a cross-site page cannot see the response); the Host and
+    // sec-fetch-site guard below is what turns a browser read away.
     const get = await fetch(`${base()}:${port}/api/status`, { headers: { origin: "http://evil.example" } });
     assert.equal(get.status, 200);
   });
+});
+
+/** A request with exactly these headers: fetch sets Host itself and cannot be told otherwise. */
+function rawRequest(port: number, method: string, pathname: string, headers: Record<string, string>): Promise<number | undefined> {
+  return new Promise((resolve, reject) => {
+    const req = http.request({ host: "127.0.0.1", port, method, path: pathname, headers }, (res) => {
+      res.resume();
+      res.on("end", () => resolve(res.statusCode));
+    });
+    req.on("error", reject);
+    req.end();
+  });
+}
+
+test("every admin route refuses a rebound Host and a cross-site browser request, reads included", async () => {
+  let called = 0;
+  await withAdmin(
+    makeCfg(),
+    async ({ port }) => {
+      for (const host of ["evil.example", `evil.example:${port}`, "127.0.0.1:1", `127.0.0.2:${port}`]) {
+        assert.equal(await rawRequest(port, "GET", "/api/config", { host }), 403, `Host ${host} must be refused`);
+      }
+      assert.equal(await rawRequest(port, "GET", "/api/config", { host: `127.0.0.1:${port}`, "sec-fetch-site": "cross-site" }), 403);
+      assert.equal(await rawRequest(port, "POST", "/api/shutdown", { host: `evil.example:${port}` }), 403);
+      assert.equal(called, 0);
+      for (const host of [`127.0.0.1:${port}`, `localhost:${port}`, `[::1]:${port}`]) {
+        assert.equal(await rawRequest(port, "GET", "/api/config", { host }), 200, `Host ${host} must be allowed`);
+      }
+      assert.equal(await rawRequest(port, "GET", "/api/config", { host: `127.0.0.1:${port}`, "sec-fetch-site": "same-origin" }), 200);
+      // The tray's ripple://app/ proxy (protocol.ts): Host 127.0.0.1:<port>, no Origin, a write.
+      assert.equal(await rawRequest(port, "POST", "/api/shutdown", { host: `127.0.0.1:${port}`, accept: "*/*" }), 202);
+      assert.equal(called, 1);
+    },
+    { shutdown: () => void called++ },
+  );
 });
 
 test("GET /api/claude-models de-duplicates surfaces and drops our own injected ids", async () => {
@@ -2852,6 +2898,90 @@ test("POST /api/providers/probe[grok] without a session says to sign in and call
   assert.equal(called, false);
 });
 
+test("limits lists every Claude and ChatGPT account with identity, activity, preference and named windows", async () => {
+  const now = Date.now();
+  const week = 7 * 24 * 60 * 60_000;
+  const quota = { at: now, rate_limits: {
+    primary: { used_percent: 125, window_minutes: 10080, reset_at: (now + week / 2) / 1000 },
+    secondary: { used_percent: 15, window_minutes: 300, reset_at: (now + 3600_000) / 1000 },
+  } };
+  const flags: boolean[] = [];
+  let currentAvailable = true;
+  let refreshes = 0;
+  let fetched = false;
+  const accounts: ChatGptAccountStatus[] = [
+    { id: "gpt-work", label: "Work", email: "work@example.test", source: "own", expiresAt: now + 3600_000, needsReauth: false, paused: false, preferred: false, state: "cooling", cooldownSeconds: 60, active: true, inUse: false, quota },
+    { id: "gpt-personal", label: "Personal", source: "own", expiresAt: now + 3600_000, needsReauth: false, paused: false, preferred: true, state: "ready", active: false, inUse: true, quota: null },
+  ];
+  await withAdmin(makeCfg({ providers: { claude: { type: "anthropic", auth: "claude-code" }, gpt: { type: "chatgpt" } } }), async ({ port, home }) => {
+    const stored = saveClaudeOAuthAccount(home, { accessToken: "test-access", refreshToken: "test-refresh", expiresAt: now - 1, accountId: "other-test-account", email: "other@example.test" });
+    setPreferredClaudeAccount(home, stored.id);
+    const body = await (await fetch(`${base()}:${port}/api/limits`)).json() as { providers: LimitsProvider[] };
+    const [claude, gpt] = body.providers;
+    assert.equal(refreshes, 1, "Limits refreshes ChatGPT itself without a Status visit");
+    assert.deepEqual(claude?.accounts.map((a) => a.id), ["current", stored.id]);
+    const [current, other] = claude!.accounts;
+    assert.equal(current?.label, "Current Claude login");
+    assert.equal(current?.active, true);
+    assert.equal(current?.preferred, false);
+    assert.equal(current?.health?.state, "ready");
+    assert.equal(current?.usageWindows?.fiveHour?.usedPercent, 15);
+    assert.equal(current?.usageWindows?.weekly?.usedPercent, 125);
+    assert.equal(current?.usageWindows?.weekly?.resetAt, Math.round((now + week / 2) / 1000) * 1000);
+    assert.ok(Math.abs(current!.weeklyPace!.expectedPercent - 50) < 0.01);
+    assert.ok(Math.abs(current!.weeklyPace!.paceDelta - 75) < 0.01);
+    assert.equal(current?.stale, false);
+    assert.equal(current?.fetchedAt, now);
+    assert.equal(other?.label, "other@example.test");
+    assert.equal(other?.preferred, true);
+    assert.equal(other?.active, false);
+    assert.equal(other?.health?.state, "needs-login");
+    assert.equal(other?.unknown, true);
+    assert.equal(other?.stale, true);
+    assert.equal(other?.fetchedAt, null);
+    assert.deepEqual(other?.windows, []);
+    assert.deepEqual(other?.usageWindows, {});
+    assert.deepEqual(gpt?.accounts.map((a) => [a.id, a.label, a.preferred, a.active]), [
+      ["gpt-work", "work@example.test", false, false], ["gpt-personal", "Personal", true, true],
+    ]);
+    assert.equal(gpt?.accounts[0]?.health?.state, "paused-until");
+    assert.ok(gpt!.accounts[0]!.health!.pausedUntil! >= now + 60_000);
+    assert.equal(gpt?.accounts[1]?.unknown, true);
+    assert.deepEqual(flags, [false]);
+    const forced = await (await fetch(`${base()}:${port}/api/limits?refresh=1`)).json() as { providers: LimitsProvider[] };
+    assert.deepEqual(flags, [false, true]);
+    assert.equal(refreshes, 2);
+    assert.equal(forced.providers[0]?.accounts[1]?.active, false, "an expired account is not selected by the upstream pool");
+    assert.equal(forced.providers[0]?.accounts[0]?.active, true);
+    currentAvailable = false;
+    const signedOut = await (await fetch(`${base()}:${port}/api/limits`)).json() as { providers: LimitsProvider[] };
+    assert.equal(signedOut.providers[0]?.accounts[0]?.active, false, "an unavailable account is no longer in use");
+    assert.equal(signedOut.providers[0]?.accounts[0]?.health?.state, "needs-login", "cached usage cannot make an unavailable login ready");
+  }, {
+    claudeUsage: async (force) => { flags.push(force === true); return { current: quota }; },
+    credentials: () => ({ claude: currentAvailable ? [{ id: "current", state: "ready", failures: 0, inUse: true }] : [] }),
+    chatgpt: () => ({ quota: { gpt: fetched ? quota : null }, auth: {}, accounts: () => ({ gpt: accounts }), refresh: async () => { refreshes++; fetched = true; return quota; } }),
+  });
+});
+
+test("GET /api/limits gives the mod's legacy windows to the upstream pool's selected Claude account only", async () => {
+  const now = Date.now();
+  const quota = (five: number) => ({ at: now, rate_limits: { primary: { used_percent: five, window_minutes: 300, reset_at: (now + 3600_000) / 1000 } } });
+  let active = "current";
+  await withAdmin(makeCfg({ providers: { claude: { type: "anthropic", auth: "claude-code" } } }), async ({ port, home }) => {
+    const stored = saveClaudeOAuthAccount(home, { accessToken: "legacy-access", refreshToken: "legacy-refresh", expiresAt: now + 3600_000, accountId: "legacy-account", email: "legacy@example.test" });
+    const read = async () => ((await (await fetch(`${base()}:${port}/api/limits`)).json()) as { providers: LimitsProvider[] }).providers[0]!.accounts;
+    const first = await read();
+    assert.deepEqual(first.map((a) => a.windows.length > 0), [true, false]);
+    assert.deepEqual(first.map((a) => a.usageWindows?.fiveHour?.usedPercent), [3, 22], "the Status page still sees every account");
+    active = stored.id;
+    assert.deepEqual((await read()).map((a) => a.windows.length > 0), [false, true]);
+  }, {
+    claudeUsage: async () => ({ current: quota(3), [listClaudeAccounts(process.env.CLAUDERIPPLE_HOME!)[0]!.id]: quota(22) }),
+    credentials: () => ({ claude: [{ id: "current", state: "ready", failures: 0, inUse: active === "current" }, ...listClaudeAccounts(process.env.CLAUDERIPPLE_HOME!).map((account) => ({ id: account.id, state: "ready", failures: 0, inUse: account.id === active }))] }),
+  });
+});
+
 test("GET /api/limits assembles every readable provider and honours limits:false", async () => {
   const now = Date.now();
   const future = Math.floor((now + 3_600_000) / 1000);
@@ -2871,8 +3001,9 @@ test("GET /api/limits assembles every readable provider and honours limits:false
     assert.deepEqual(body.providers.map((p) => p.title), ["Claude", "GPT", "Gemini", "Go"]);
     assert.equal(body.providers[0]!.type, "anthropic");
     assert.deepEqual(body.providers[0]!.accounts[0]!.windows.map((w) => `${w.kind}${w.label ? ":" + w.label : ""}`), ["five_hour", "seven_day", "scoped:Fable"]);
-    // The paused ChatGPT account takes no number; the ready one is account 0.
-    assert.deepEqual(body.providers[1]!.accounts.map((a) => a.account), [0]);
+    // The ready account retains its index; the paused account is now visible too, with no windows.
+    assert.deepEqual(body.providers[1]!.accounts.map((a) => a.account), [0, 1]);
+    assert.deepEqual(body.providers[1]!.accounts[1]!.windows, []);
     assert.equal(body.providers[2]!.type, "google");
     assert.equal(body.providers[3]!.type, "opencode-go");
   }, {
@@ -2885,7 +3016,8 @@ test("GET /api/limits assembles every readable provider and honours limits:false
       accounts: () => ({
         chatgpt: [
           { id: "a", label: "A", paused: false, state: "ready", quota: { at: now, rate_limits: { primary: { used_percent: 23, window_minutes: 10080, reset_at: future }, secondary: null } }, active: true },
-          { id: "b", label: "B", paused: true, state: "paused", quota: null, active: false },
+          // A paused account keeps its last figures in the quota map; they must not reach `windows`.
+          { id: "b", label: "B", paused: true, state: "paused", quota: { at: now, rate_limits: { primary: { used_percent: 97, window_minutes: 10080, reset_at: future }, secondary: null } }, active: false },
         ] as never,
         quiet: [{ id: "c", label: "C", paused: false, state: "ready", quota: { at: now, rate_limits: { primary: { used_percent: 5, window_minutes: 10080 } } }, active: false }] as never,
       }),

@@ -22,7 +22,7 @@ import { installTrayAgent, removeTrayAgent, trayLoginItemDecision, trayPlistPath
 import { nativeSupervisor, registration, writePaths } from "./registration.ts";
 import { installLauncher, uninstallLauncher } from "./launcher.ts";
 import type { RecoveryDeps } from "./doctor.ts";
-import { applyAppProxy, caTrusted, currentAppProxy, nssDb, removeAppProxy, trustCa, untrustCa } from "./picker.ts";
+import { applyAppProxy, caTrusted, currentAppProxy, nssDb, removeAppProxy, trustCa, turnPickerOff, untrustCa } from "./picker.ts";
 import { defaultHome, removeClientIntegrations, setPickerEnabled } from "./integrations.ts";
 import { withCommandHelp } from "./help-gate.ts";
 import { runtime } from "./runtime.ts";
@@ -32,7 +32,7 @@ import { GROK_DEFAULT_URL } from "../../router/src/providers/grok/catalog.ts";
 import { claudeLogin, claudeLogout, desktopClaudeCodeDirs } from "./claude-auth.ts";
 import { openBrowser } from "./browser.ts";
 import { electronPath, installTrayRuntime, startTray } from "./tray.ts";
-import { dropPowerShellShim, installKind, isNewer, latestVersion, PACKAGE, runUpdate } from "./update.ts";
+import { dropPowerShellShim, FORK_UPDATE_STEPS, installKind, isNewer, latestVersion, PACKAGE, runUpdate, updateSource } from "./update.ts";
 import { ClaudeOAuthSession } from "../../router/src/providers/claude-oauth.ts";
 import { requestHostUpdate } from "../../remote/src/host-update.ts";
 import { purgeHome } from "./purge.ts";
@@ -61,6 +61,8 @@ async function pickerOn(): Promise<void> {
   const r = applyAppProxy(proxyUrl);
   console.log(`✓ Claude Desktop config library entry applied (${r.id}${r.replaced ? `, previous entry ${r.replaced} remembered` : ""}): egressProxyUrl=${proxyUrl}`);
   setPickerEnabled(true);
+  // Owner-only, as every config.json write: it carries provider keys.
+  fs.chmodSync(configPath(), 0o600);
   console.log("✓ picker.enabled = true (the router picks it up live; no restart)");
   console.log("\nStep 3/3 is yours: quit and reopen Claude Desktop. The app reads its proxy setting at start.");
   console.log("Then open the Code tab picker: entries from cli.extraModels should be there. `clauderipple status` shows the last injection.");
@@ -78,22 +80,25 @@ function describeRestart(r: ReturnType<typeof restartAgent>): string {
   return "✗ router not restarted — run `clauderipple repair` (or `clauderipple install`)";
 }
 
-function pickerOff(): void {
+/** Returns false when a step failed (reported in the output). */
+function pickerOff(): boolean {
   const home = homeDir();
   // Under another CLAUDERIPPLE_HOME only this install's entry and CA go (integrations.ts).
   const isDefault = path.resolve(home) === path.resolve(defaultHome());
-  const removed = removeAppProxy(isDefault ? undefined : proxyUrlFor(new ConfigStore(configPath()).get().listen.port));
-  console.log(removed ? "✓ Claude Desktop config library entry removed (previous entry restored if there was one)" : "✓ no ClaudeRipple config library entry");
-  try {
-    setPickerEnabled(false);
-    console.log("✓ picker.enabled = false");
-  } catch {
-    /* no config */
-  }
   if (isWindows) console.log("Removing the CA: Windows will ask you to confirm once more.");
-  const store = isWindows ? "your user certificate store" : isLinux ? `your NSS database (${nssDb()})` : "the login keychain";
-  console.log(untrustCa(certPaths(home).caPem, { sweep: isDefault }) ? `✓ CA removed from ${store}` : `✓ CA was not in ${store}`);
+  const ok = turnPickerOff({
+    removeAppProxy: () => removeAppProxy(isDefault ? undefined : proxyUrlFor(new ConfigStore(configPath()).get().listen.port)),
+    disablePicker: () => {
+      if (!fs.existsSync(configPath())) return false;
+      setPickerEnabled(false);
+      fs.chmodSync(configPath(), 0o600);
+      return true;
+    },
+    untrustCa: () => untrustCa(certPaths(home).caPem, { sweep: isDefault }),
+    caStore: isWindows ? "your user certificate store" : isLinux ? `your NSS database (${nssDb()})` : "the login keychain",
+  }, (line) => console.log(line));
   console.log("\nQuit and reopen Claude Desktop to apply.");
+  return ok;
 }
 
 import { VERSION } from "../../router/src/version.ts";
@@ -210,7 +215,7 @@ async function install(): Promise<void> {
   } else console.log("✓ certificates already present");
 
   if (!fs.existsSync(configPath())) {
-    fs.writeFileSync(configPath(), starterConfig(port));
+    fs.writeFileSync(configPath(), starterConfig(port), { mode: 0o600 });
     console.log(`✓ starter config written: ${configPath()}`);
   } else console.log(`✓ config kept: ${configPath()}`);
 
@@ -305,6 +310,9 @@ async function install(): Promise<void> {
 async function uninstall(): Promise<void> {
   const home = homeDir();
   const cfg = new ConfigStore(configPath()).get();
+  // Picker mode first, while the CA and the config are still there to undo: a trusted CA and a
+  // Claude Desktop egressProxyUrl pointing at a router that is gone would outlive the uninstall.
+  if (!pickerOff()) console.log("  picker mode was not fully turned off (see ✗ above); the uninstall goes on");
   // Stop the router before unregistering it. On macOS unloading the agent takes the process with
   // it; on Windows removing the task leaves it running, and a running router holds router.log open,
   // so --purge then fails with EPERM and leaves the home directory behind (measured 2026-09-16 in a
@@ -445,6 +453,15 @@ function logs(): void {
  * installed (update.ts) and fetches the tray's Electron again if the old copy had it.
  */
 async function update(): Promise<void> {
+  if (updateSource() === "fork") {
+    // Never "newer": the tray and the dashboard offer an update only when the check says so.
+    if (flag("check") && flag("json")) console.log(JSON.stringify({ current: VERSION, latest: null, newer: false, kind: "fork" }));
+    else {
+      console.log(FORK_UPDATE_STEPS);
+      if (!flag("check")) process.exitCode = 1;
+    }
+    return;
+  }
   const kind = installKind(installedRuntime);
   // CLAUDERIPPLE_PACKAGE names what to install instead of the registry's latest (a tarball, say).
   const override = process.env.CLAUDERIPPLE_PACKAGE;
@@ -710,7 +727,7 @@ async function dispatchCommand(): Promise<void> {
     case "picker": {
       const sub = args[1];
       if (sub === "on") await pickerOn();
-      else if (sub === "off") pickerOff();
+      else if (sub === "off") { if (!pickerOff()) process.exitCode = 1; }
       else console.log("usage: clauderipple picker on|off");
       break;
     }

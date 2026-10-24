@@ -276,7 +276,7 @@ proxy
       claudeClearCooldown: (id) => proxy.claudeClearCooldown(id),
       picker: () => ({ enabled: !!store.get().picker?.enabled, hosts: terminateHosts(store.get()).slice(1), last: proxy.lastPickerInjection }),
       observedClaudeCodeAuth,
-      claudeUsage: () => proxy.claudeUsage.snapshot(),
+      claudeUsage: (force) => proxy.claudeUsage.snapshot(force),
       claudeModels: () => proxy.claudeModels.list(),
       claudeIdentity: () => proxy.claudeIdentity.identify(),
       opencodeUsage: (name, credentialId) => proxy.opencodeLimits(name, credentialId),

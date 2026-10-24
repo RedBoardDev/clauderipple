@@ -33,7 +33,7 @@ function freePort(): Promise<number> {
 type Seen = { authorization?: string; currentOnly?: string; beta?: string; body: Record<string, unknown> };
 type Reply = { status: number; headers?: Record<string, string>; body?: string };
 
-async function nativeRig(reply: (seen: Seen, attempt: number) => Reply) {
+async function nativeRig(reply: (seen: Seen, attempt: number) => Reply, passthrough = false) {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "cr-native-account-proxy-"));
   const ca = createCa({ cn: "clauderipple native account test" });
   const leaf = createLeaf({ host: "localhost", caCertPem: ca.certPem, caKeyPem: ca.keyPem });
@@ -91,11 +91,11 @@ async function nativeRig(reply: (seen: Seen, attempt: number) => Reply) {
       claude: {
         type: "anthropic",
         auth: "claude-code",
-        accountPool: true,
+        accountPool: !passthrough,
         models: [{ id: "claude-opus-5" }],
       },
     },
-    routes: { "claude-opus-4-8": { provider: "claude", model: "claude-opus-5" } },
+    routes: passthrough ? {} : { "claude-opus-4-8": { provider: "claude", model: "claude-opus-5" } },
     direct: [],
   };
   const requests = new RequestLog(path.join(home, "requests.jsonl"));
@@ -143,6 +143,7 @@ async function nativeRig(reply: (seen: Seen, attempt: number) => Reply) {
 
   return {
     home,
+    proxy,
     stored,
     seen,
     requests,
@@ -161,6 +162,7 @@ test("a native Claude turn survives 429, keeps the replacement account, and pres
     : { status: 200 });
   try {
     assert.equal(await rig.send(), 200, "the first client request survives the first account's limit");
+    assert.deepEqual(rig.proxy.credentialHealth().claude?.filter((c) => c.inUse).map((c) => c.id), [rig.stored.id]);
     assert.equal(await rig.send(), 200, "the conversation remains on the account that answered");
     assert.deepEqual(rig.seen.map((item) => item.authorization), ["Bearer current-token", "Bearer stored-token", "Bearer stored-token"]);
     assert.equal(rig.seen[0]!.currentOnly, "current-fingerprint");
@@ -216,6 +218,16 @@ test("a native Claude request error does not consume another account", async () 
   try {
     assert.equal(await rig.send(), 400);
     assert.deepEqual(rig.seen.map((item) => item.authorization), ["Bearer current-token"]);
+  } finally {
+    await rig.stop();
+  }
+});
+
+test("native passthrough does not expose a pool when account rotation is disabled", async () => {
+  const rig = await nativeRig(() => ({ status: 200 }), true);
+  try {
+    assert.equal(await rig.send(), 200);
+    assert.equal(rig.proxy.credentialHealth().claude, undefined);
   } finally {
     await rig.stop();
   }

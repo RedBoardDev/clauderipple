@@ -106,7 +106,8 @@ export function persistPowerChange(configFile: string, change: PowerChange): boo
   }
   fs.mkdirSync(path.dirname(configFile), { recursive: true });
   const tmp = `${configFile}.tmp-${process.pid}-${Date.now()}`;
-  fs.writeFileSync(tmp, JSON.stringify(raw, null, 2) + "\n");
+  // Owner-only, as every config.json write: it carries provider keys.
+  fs.writeFileSync(tmp, JSON.stringify(raw, null, 2) + "\n", { mode: 0o600 });
   fs.renameSync(tmp, configFile);
   return true;
 }
