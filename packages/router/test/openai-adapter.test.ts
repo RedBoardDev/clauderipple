@@ -8,7 +8,7 @@ import { decodeEnvelope, encodeEnvelope } from "../src/reasoning.ts";
 import type { AnthropicRequest } from "../src/providers/chatgpt/translate.ts";
 
 const seen: { path: string; headers: http.IncomingHttpHeaders; body: Record<string, unknown> }[] = [];
-let mode: "chat" | "responses" | "error" | "cut-responses" | "cut-chat" | "done-chat" | "refuse-reasoning" | "refuse-chat" | "sealed" | "sealed-chat" = "chat";
+let mode: "chat" | "responses" | "error" | "oxion-error" | "cut-responses" | "cut-chat" | "done-chat" | "refuse-reasoning" | "refuse-chat" | "sealed" | "sealed-chat" = "chat";
 const sse = (records: Record<string, unknown>[]) => records.map((record) => `data: ${JSON.stringify(record)}\n\n`).join("");
 
 const upstream = http.createServer((req, res) => {
@@ -58,6 +58,11 @@ const upstream = http.createServer((req, res) => {
       return;
     }
     res.writeHead(200, { "content-type": "text/event-stream" });
+    // https://oxionai.com/docs/streaming documents a numeric 502 inside an HTTP 200 SSE stream.
+    if (mode === "oxion-error") {
+      res.end(`${sse([{ error: { message: "Upstream provider unavailable", type: "provider_error", code: 502 } }])}data: [DONE]\n\n`);
+      return;
+    }
     // Streams that stop without the vendor saying they are done, as muse's did (2026-09-19).
     if (mode === "cut-responses") {
       res.end(sse([{ type: "response.output_item.added", item: { type: "message", id: "msg_1" } }, { type: "response.output_text.delta", delta: "Hal" }]));
@@ -263,6 +268,24 @@ test("a Chat stream that ends on [DONE] without a finish_reason is complete, not
 test("a cut-off non-streaming turn is answered 529, not 200 with the fragment", async () => {
   mode = "cut-responses";
   adapter = new OpenAiCompatibleAdapter("fake", { type: "openai-compatible", url: `http://127.0.0.1:${upstreamPort}/v1`, wire: "responses" }, log);
+  const response = await call({ ...request, stream: false });
+  assert.equal(response.status, 529);
+  assert.equal(JSON.parse(response.text).error.type, "overloaded_error");
+});
+
+test("Oxion's in-band numeric 502 remains retryable even when followed by [DONE]", async () => {
+  mode = "oxion-error";
+  adapter = new OpenAiCompatibleAdapter("oxion", { type: "openai-compatible", url: `http://127.0.0.1:${upstreamPort}/v1` }, log);
+  const response = await call(request);
+  assert.equal(response.status, 200);
+  assert.match(response.text, /"type":"overloaded_error"/);
+  assert.match(response.text, /Upstream provider unavailable/);
+  assert.doesNotMatch(response.text, /message_stop|"stop_reason":"end_turn"/);
+});
+
+test("Oxion's in-band numeric 502 answers a non-streaming client with 529", async () => {
+  mode = "oxion-error";
+  adapter = new OpenAiCompatibleAdapter("oxion", { type: "openai-compatible", url: `http://127.0.0.1:${upstreamPort}/v1` }, log);
   const response = await call({ ...request, stream: false });
   assert.equal(response.status, 529);
   assert.equal(JSON.parse(response.text).error.type, "overloaded_error");

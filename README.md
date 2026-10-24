@@ -646,6 +646,7 @@ provider you configured is available the same way.
 | OpenRouter | Anthropic-compatible | API key | 400+, discovered | per-model effort support read from the API |
 | DeepSeek, Kimi, Z.ai GLM, MiniMax, Qwen (intl / cn) | Anthropic-compatible | API key | preset | verified against vendor docs |
 | xAI Grok, Mistral, Groq, Together, Fireworks | OpenAI-compatible | API key | discovered | translated (Chat Completions / Responses) |
+| Oxion AI | OpenAI-compatible | API key (`inference` + `models:read` scopes) | discovered | translated (Chat Completions); cache and reasoning effort not verified |
 | Ollama, LM Studio | OpenAI-compatible, local | none | discovered | |
 | Anthropic | native | Claude login(s) or API key | Claude models | optional sticky rotation for Claude Desktop/Code; Codex picks one login |
 | Anything else | custom | your choice | discovered | any Anthropic- or OpenAI-compatible endpoint |

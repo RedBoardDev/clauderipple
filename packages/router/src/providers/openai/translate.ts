@@ -864,7 +864,10 @@ export class OpenAiStreamMapper {
     // instead of the Responses `error` event shape. Do not finish it as a successful answer.
     if (ev.error && typeof ev.error === "object") {
       const error = ev.error as { message?: unknown; code?: unknown };
-      return [...this.start(), ...this.fail(typeof error.message === "string" ? error.message : "upstream error", typeof error.code === "string" ? error.code : undefined)];
+      // Oxion reports HTTP status codes as numbers inside an otherwise successful SSE response.
+      const code = typeof error.code === "string" ? error.code
+        : typeof error.code === "number" && Number.isInteger(error.code) && error.code >= 400 && error.code <= 599 ? String(error.code) : undefined;
+      return [...this.start(), ...this.fail(typeof error.message === "string" ? error.message : "upstream error", code)];
     }
     return wire === "chat" ? this.feedChat(ev) : this.feedResponses(ev);
   }
@@ -894,7 +897,8 @@ export class OpenAiStreamMapper {
     const message = this.redactError(rawMessage);
     // `overloaded_error` is the one mid-stream error Claude Code retries on its own (CLI 2.1.278
     // matches `"type":"overloaded_error"` in the message); `api_error` ends the turn for good.
-    const type = code === "rate_limit_exceeded" ? "rate_limit_error" : code === "server_is_overloaded" ? "overloaded_error" : "api_error";
+    const type = code === "rate_limit_exceeded" || code === "429" ? "rate_limit_error"
+      : code === "server_is_overloaded" || (code !== undefined && /^5\d{2}$/.test(code)) ? "overloaded_error" : "api_error";
     this.failure = { type, message, ...(code ? { code } : {}) };
     return [...this.start(), ...this.closeBlock(), { event: "error", data: { type: "error", error: { type, message } } }];
   }

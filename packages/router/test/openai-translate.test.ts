@@ -150,6 +150,29 @@ test("OpenAI-shaped SSE error becomes an Anthropic error event", () => {
   assert.equal(((events[1]?.data.error as { type: string }) ?? {}).type, "rate_limit_error");
 });
 
+test("numeric SSE error codes retain HTTP retry semantics without accepting malformed codes", () => {
+  const cases = [
+    { code: 502, type: "overloaded_error", stored: "502" },
+    { code: 503, type: "overloaded_error", stored: "503" },
+    { code: 429, type: "rate_limit_error", stored: "429" },
+    { code: 401, type: "api_error", stored: "401" },
+    { code: "502", type: "overloaded_error", stored: "502" },
+    { code: 502.5, type: "api_error", stored: undefined },
+    { code: Number.NaN, type: "api_error", stored: undefined },
+    { code: Number.POSITIVE_INFINITY, type: "api_error", stored: undefined },
+    { code: { status: 502 }, type: "api_error", stored: undefined },
+  ];
+  for (const wire of ["chat", "responses"] as const) {
+    for (const entry of cases) {
+      const mapper = new OpenAiStreamMapper("test");
+      const events = mapper.feed({ error: { message: "Upstream provider unavailable", type: "provider_error", code: entry.code } }, wire);
+      assert.equal((events.at(-1)?.data.error as { type: string }).type, entry.type, `${wire}: ${String(entry.code)}`);
+      assert.equal(mapper.failure?.code, entry.stored);
+      assert.deepEqual(mapper.finish(), [], "an error must not be followed by a successful turn end");
+    }
+  }
+});
+
 test("responses SSE mapper associates interleaved tool arguments by item_id", () => {
   const mapper = new OpenAiStreamMapper("test");
   const events = [

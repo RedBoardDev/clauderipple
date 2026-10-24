@@ -63,4 +63,21 @@ const FALLBACK_PRESETS = [
     verified: false,
     docsUrl: "https://docs.z.ai/",
   },
+  // Mirrors the Oxion AI entry in packages/router/src/presets.ts (kept in sync by a test).
+  {
+    id: "oxion",
+    kind: "openai-compatible",
+    name: "Oxion AI",
+    vendorUrl: "https://oxionai.com/",
+    anthropicBaseUrl: "https://oxionai.com/v1",
+    authHeader: "authorization-bearer",
+    modelsUrl: "https://oxionai.com/v1/models",
+    modelsAuthHeader: "authorization-bearer",
+    wire: "chat",
+    fallbackModels: [],
+    effortLevels: [],
+    thinking: "none",
+    verified: false,
+    docsUrl: "https://oxionai.com/docs/coding-agents",
+  },
 ];

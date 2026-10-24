@@ -1269,6 +1269,51 @@ test("POST /api/providers/probe discovers OpenAI-compatible models and probes Ch
   }
 });
 
+test("POST /api/providers/probe reads context_window only when context_length is unusable", async () => {
+  const upstream = http.createServer((req, res) => {
+    if (req.url === "/v1/models") {
+      res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ object: "list", data: [
+        { id: "window-only", name: "Window Only", context_window: 32768.9 },
+        { id: "both", context_length: 1000, context_window: 2000 },
+        { id: "bad-length", context_length: "big", context_window: 4096 },
+        { id: "zero-length", context_length: 0, context_window: 8192 },
+        { id: "malformed", context_length: -1, context_window: "8k" },
+        { id: "neither" },
+      ] }));
+      return;
+    }
+    if (req.url === "/v1/chat/completions") { res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ choices: [] })); return; }
+    res.writeHead(404).end();
+  });
+  await new Promise<void>((resolveP) => upstream.listen(0, "127.0.0.1", resolveP));
+  const address = upstream.address();
+  assert.ok(address && typeof address === "object");
+  const origin = `http://127.0.0.1:${address.port}/v1`;
+  try {
+    await withAdmin(makeCfg(), async ({ port }) => {
+      const res = await fetch(`${base()}:${port}/api/providers/probe`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ type: "openai-compatible", url: origin, headers: { authorization: "Bearer k" }, modelsUrl: `${origin}/models`, modelsAuthHeader: "authorization-bearer" }),
+      });
+      assert.deepEqual(await res.json(), {
+        ok: true,
+        auth: "ok",
+        models: [
+          { id: "window-only", name: "Window Only", contextWindow: 32768 },
+          { id: "both", contextWindow: 1000 },
+          { id: "bad-length", contextWindow: 4096 },
+          { id: "zero-length", contextWindow: 8192 },
+          { id: "malformed" },
+          { id: "neither" },
+        ],
+      });
+    });
+  } finally {
+    await new Promise<void>((resolveP, reject) => upstream.close((error) => error ? reject(error) : resolveP()));
+  }
+});
+
 // A provider entered by hand on the Responses wire may serve nothing else, so its test goes there.
 test("POST /api/providers/probe tests a hand-entered Responses provider on /responses", async () => {
   const seen: { path?: string | undefined; body?: Record<string, unknown> } = {};

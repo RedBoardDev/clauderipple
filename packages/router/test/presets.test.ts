@@ -1,5 +1,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { PRESETS } from "../src/presets.ts";
 
 test("provider presets have documented essentials and unique ids", () => {
@@ -145,4 +148,37 @@ test("every OpenCode Zen model carries the wire its published endpoint says, Cha
   // Gemini is served at /zen/v1/models/<id> and jev at /systemone — shapes this router does not
   // speak, so offering them would only produce a model that cannot answer.
   assert.equal(zen.fallbackModels.some((model) => model.id.startsWith("gemini") || model.id.startsWith("jev")), false);
+});
+
+test("Oxion AI is a first-class OpenAI-compatible preset on Chat Completions with discovery only", () => {
+  const oxion = PRESETS.find((preset) => preset.id === "oxion");
+  assert.ok(oxion, "oxion preset exists");
+  assert.equal(oxion.name, "Oxion AI");
+  assert.equal(oxion.kind, "openai-compatible");
+  assert.equal(oxion.vendorUrl, "https://oxionai.com/");
+  assert.equal(oxion.anthropicBaseUrl, "https://oxionai.com/v1");
+  assert.equal(oxion.modelsUrl, "https://oxionai.com/v1/models");
+  assert.equal(oxion.authHeader, "authorization-bearer");
+  assert.equal(oxion.modelsAuthHeader, "authorization-bearer");
+  assert.equal(oxion.wire, "chat", "no Responses or Messages contract is documented");
+  assert.deepEqual(oxion.fallbackModels, [], "the docs' example ids are not stable; discovery only");
+  assert.deepEqual(oxion.effortLevels, []);
+  assert.equal(oxion.thinking, "none");
+  assert.equal(oxion.verified, false);
+  assert.equal(oxion.serverTools, undefined);
+  assert.equal(oxion.anthropicSearch, undefined);
+  assert.equal(oxion.docsUrl, "https://oxionai.com/docs/coding-agents");
+  assert.match(oxion.notes ?? "", /models:read/);
+});
+
+// The chooser works from the checked-in fallback until /api/presets answers, so the Oxion entry has
+// to match the router's catalog field for field (notes are router-only help text).
+test("the UI fallback catalog mirrors the Oxion AI preset", () => {
+  const file = path.join(path.dirname(fileURLToPath(import.meta.url)), "../../ui/presets-fallback.js");
+  const fallback = new Function(`${fs.readFileSync(file, "utf8")}; return FALLBACK_PRESETS;`)() as Record<string, unknown>[];
+  const mirrored = fallback.find((preset) => preset.id === "oxion");
+  assert.ok(mirrored, "fallback has Oxion AI");
+  const { notes: _notes, ...expected } = PRESETS.find((preset) => preset.id === "oxion")!;
+  assert.deepEqual(mirrored, expected);
+  assert.equal(fallback.filter((preset) => preset.id === "oxion").length, 1);
 });

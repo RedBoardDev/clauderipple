@@ -404,6 +404,29 @@ export const PRESETS: ProviderPreset[] = [
     notes: "Separate from OpenCode Go and separately billed: Zen draws on a credit balance while Go is the subscription, and the two catalogues differ (76 models against 40, neither a subset of the other). Measured 2026-09-22: the key is shared \u2014 a Go key reached Zen's billing rather than being refused \u2014 and no session header is required, unlike Go. Each model's endpoint is published per model and the three wires are split across families: DeepSeek, MiniMax, GLM and Kimi on Chat Completions, the GPT and Grok rows plus Muse Spark on Responses, and the Claude and Qwen rows on Anthropic Messages. Gemini (/zen/v1/models/<id>) and jev (/systemone) are served in shapes ClaudeRipple does not speak and are not offered here. Effort ladders are unverified: the account had no Zen balance, so the per-model measurement settles them on the first save.",
     docsUrl: "https://opencode.ai/docs/zen/",
   },
+  // Docs: https://oxionai.com/docs/coding-agents
+  //
+  // Provider type "OpenAI Compatible", base https://oxionai.com/v1, Bearer key, model id from
+  // GET /v1/models. Only the Chat Completions wire is enabled: the docs name no Messages or
+  // Responses contract, so neither is assumed. The docs' example ids are not stable fallbacks,
+  // hence an empty list and discovery only.
+  {
+    id: "oxion",
+    kind: "openai-compatible",
+    name: "Oxion AI",
+    vendorUrl: "https://oxionai.com/",
+    anthropicBaseUrl: "https://oxionai.com/v1",
+    authHeader: "authorization-bearer",
+    modelsUrl: "https://oxionai.com/v1/models",
+    modelsAuthHeader: "authorization-bearer",
+    wire: "chat",
+    fallbackModels: [],
+    effortLevels: [],
+    thinking: "none",
+    verified: false,
+    notes: "Chat Completions with tools and streaming is documented; use a key with the inference and models:read scopes and pick a tools- and streaming-capable model. Prompt cache and reasoning effort are not documented or measured.",
+    docsUrl: "https://oxionai.com/docs/coding-agents",
+  },
   // Docs: https://docs.mistral.ai/api/endpoint/chat and https://docs.mistral.ai/api/endpoint/models
   {
     id: "mistral",
