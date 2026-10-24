@@ -12,7 +12,7 @@ copy of the official release history. See `CLAUDE.md` for the branch and deploym
 | Official content | 0.12.14 plus the subsequent official uninstall fix (`a7eb091`) |
 | Integration branch | `integration/personal-main-2026-10-24` |
 | Integration inputs | Oxion commit `f75b1a4`, official merge `a612a0e`, personal fork merge `4203a83`, native app branch `feature/macos-app` (`df0e76a`) |
-| Deployment | The new consolidated build has **not been installed**. The live router remains the earlier personal 0.12.7 build, which already contains some limits/UI/security additions listed below. |
+| Last verified router deployment | 2026-10-24: personal build 0.12.14 from `91de284e17c3a47cab24dec1381b24a580d1e99e`, installed and drain-restarted. The real admin instance on port 8791 reports 0.12.14 and offers Oxion AI. Accounts/configuration were not reset. The separately built Swift application was not replaced during this router deployment. |
 | Validation | Node: 1,873 passed, 12 skipped, 0 failed. Swift: 103 passed, 0 failed. Typecheck, npm build, native Release build, JavaScript syntax and diff checks passed. |
 | Upstream PRs | None opened and none implied. Keeping a feature personal is a normal outcome (`CLAUDE.md`). |
 
