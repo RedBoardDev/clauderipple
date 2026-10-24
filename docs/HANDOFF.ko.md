@@ -849,7 +849,8 @@ supervisor가 둘로 늘지 않는다). 설치본은 0.1.2였고 저장소는 0.
 - `schtasks.agentPid()`의 매칭을 `router\src\index.` 로 넓혔다. 안 그러면 npm 설치본에서 `restart`가 또
   거짓 보고한다.
 - 트레이는 `clauderipple tray`. Electron은 **의존성이 아니다**(270MB). `tray --install`이 그때 받아 온다.
-  기본 설치 828KB, 0.2초. Electron 받은 뒤 기동까지 실측 확인.
+  기본 설치 828KB, 0.2초. Electron 받은 뒤 기동까지 실측 확인. (이후 macOS는 `apps/macos`의 네이티브 메뉴 막대 앱이
+  대신 열리고 Electron을 받지 않는다. Windows·Linux는 위 그대로.)
 
 **설치 스크립트.** `scripts/install.sh`(macOS·Linux), `scripts/install.ps1`(Windows). GitHub raw로 제공하므로
 호스팅이 필요 없다. PATH에 Node 24+가 있으면 그대로 쓰고, 없으면 nodejs.org 공식 빌드를
@@ -926,6 +927,7 @@ GitHub의 0.1.1 zip을 직접 받아 확인: 헤더 수정·Haiku 수정 **전�
 `/api/status.runtime.router`가 새 번들, `/readyz` 200, `/api/claude-oauth` 응답. 주군 라이브 라우터가 이제 0.1.2다.
 (주의: 주군 맥의 `paths.json`은 이제 소스 체크아웃이 아니라 `/Applications` 앱을 가리킨다. 체크아웃을 고친 뒤
 실측하려면 다시 `npm run dist` → 번들 교체.)
+(당시 기록: 이 Electron 앱 경로는 macOS에서 `apps/macos`의 네이티브 앱으로 대체됐다. Windows는 Electron을 유지한다.)
 
 **검증 안 된 것 (다음에 할 일):**
 - `reconcileRouter()`의 **Windows VM 실기 검증**은 아직이다. 시나리오 둘:
@@ -1114,7 +1116,8 @@ GitHub **draft** 릴리스(비공개): https://github.com/PBJ-2/clauderipple/rel
   모든 기동이 `startup Nms: node …, config …, listen …`을 찍는다.
 - **`start`가 멱등적이 됐다.** 예전엔 `kickstart -k`라서 뜨는 중인 라우터를 죽이고 다시 기다리게 했다
   (로그인 후 4분 동안 runs=3의 정체).
-- **트레이 앱**: 로그인 자동시작, 라우터 다운 시 원인을 설명하는 화면, 20초 후 알림.
+- **트레이 앱**: 로그인 자동시작, 라우터 다운 시 원인을 설명하는 화면, 20초 후 알림. (macOS는 이제 `apps/macos`의 네이티브 앱이
+  이 보장을 맡고, Windows는 Electron 트레이가 그대로 맡는다.)
 - **openssl 제거** → `packages/router/src/x509.ts` (순수 `node:crypto`, 의존성 0). 기존 CA로
   발급·검증·TLS 핸드셰이크까지 실측 통과. **이 판단이 Windows에서 곧바로 값을 했다.**
 - **admin API 교차 사이트 POST 차단.** 127.0.0.1 바인딩은 브라우저를 막지 못한다 — 아무 웹페이지나
@@ -1237,7 +1240,7 @@ JSON 파일을 그것으로 쓰지 말 것(`@electron/rebuild`가 파싱 못 해
 - **프로바이더 URL의 경로 접두어**를 잃던 버그 수정(OpenRouter /api, DeepSeek /anthropic). 연결 확인은 통과하는데 실사용만 깨졌던 이유.
 - **effort 메타데이터** `GET /api/effort-levels`; GUI는 모델별 유효 단계만 보여줌. Claude(패스스루)는 low/medium/high/max, GPT Luna만 ultra.
 - **새로 추가한 피커 모델은 새 세션부터** 인식(CLI가 세션 시작 시 additional_model_options로 목록 고정). GUI 문구에 반영.
-- **앱**: 자체 완결형(앱 안의 Node로 라우터 실행, 소스 동봉). `npm run dist`는 `release-dev/`, 서명·공증 릴리스는
+- **앱**(당시 Electron 기준. macOS는 이후 `apps/macos`의 네이티브 앱으로 대체됐고, Electron은 Windows에만 남는다): 자체 완결형(앱 안의 Node로 라우터 실행, 소스 동봉). `npm run dist`는 `release-dev/`, 서명·공증 릴리스는
   `APPLE_KEYCHAIN_PROFILE=clauderipple-notary npm run release`(키체인 프로필은 주군 키체인에 저장됨) → `release/*.dmg|zip`.
   주군 맥의 실전 라우터는 **저장소 소스**로 다시 돌려 놓았다(`node packages/cli/src/index.ts install`); 앱의 "설정 다시 실행"을
   누르면 앱 번들 사본으로 바뀌므로 개발 중엔 누르지 말 것.
@@ -1274,7 +1277,8 @@ JSON 파일을 그것으로 쓰지 말 것(`@electron/rebuild`가 파싱 못 해
   (또는 GUI 상태 화면의 "모델 피커" 카드 버튼, 또는 터미널 `clauderipple picker on`) → macOS 암호 창(키체인 신뢰)
   → **Claude Desktop 완전 종료 후 재실행** → Code 탭 피커에 GPT-5.6 Terra/Sol/Luna, GPT-6 Astra가 보이는지 확인.
   라우터 재시작은 필요 없다(config 핫리로드). 되돌리기는 같은 메뉴의 "끄기". 앱은 `/Applications/ClaudeRipple.app`
-  (빌드 원본 `packages/app/release/mac-arm64/`).
+  (빌드 원본 `packages/app/release/mac-arm64/`; 이후 macOS는 `apps/macos/build.sh install`로 설치하는 네이티브 앱으로
+  대체됐다.)
 - proxenos 데몬(8787)·프로토타입(8790) 정리는 주군 확인 후.
 
 ## 다음 세션이 할 일 (우선순위순, 09-13 밤 기준)

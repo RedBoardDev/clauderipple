@@ -1,3 +1,5 @@
+> **Personal fork:** this repository is `RedBoardDev/clauderipple`. Its `main` keeps the personal additions alongside official updates; `upstream/main` remains the official reference. See [fork workflow](CLAUDE.md) and [personal changes](docs/FORK_CHANGES.md). Evaluations and personal development do not imply an upstream pull request.
+
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="brand/mark-dark.svg">
@@ -248,7 +250,7 @@ and claude.ai connectors keep working while another model does the thinking.
 | Prompt cache on translated providers | **94–99 %** measured | not measured | not measured | varies | n/a |
 | Subagents named by real model in the task panel | ✅ | ❌ | ❌ | ❌ | ❌ |
 | Settings GUI, no terminal needed | ✅ | ✅ | ❌ | ❌ | ❌ |
-| Signed, notarized app with its own runtime | ✅ | ✅ | ❌ | ❌ | – |
+| Native macOS menu-bar app; Electron tray on Windows | ✅ | - | ❌ | ❌ | - |
 
 ¹ opencodex's README showed Claude Desktop in a demo but published no setup steps for it,
 in the repository or on its documentation site (checked 2026-09-16). At the time the only
@@ -326,8 +328,8 @@ you map go to your provider, everything else goes to Anthropic byte for byte.
   worker's first request fell from 33k to 9k tokens.
 - **Made for people who don't want a terminal.** Provider presets with one-click
   connection tests and model discovery, drop-down model mapping, auto-save, a UI in
-  English, Korean, Chinese, Japanese, Spanish and Portuguese. A menu-bar app that carries its own runtime and sets itself up on
-  first launch. Signed and notarized.
+  English, Korean, Chinese, Japanese, Spanish and Portuguese. A native macOS menu-bar app
+  in `apps/macos`, and an Electron tray on Windows with its own runtime and first-launch setup.
 
 <p align="center">
   <img src="docs/media/mapping.png" width="880" alt="Model mapping: which model answers for each Claude name, with per-model reasoning effort">
@@ -417,25 +419,30 @@ clauderipple ui
 
 **Providers** → add ChatGPT or paste an API key → **Model mapping**.
 
-**The menu-bar / tray app** shows the router's state, opens the dashboard in a click, and
-keeps a repair screen that works while the router is down:
+**The menu-bar / tray app** is optional. On macOS, the native menu-bar app in
+[`apps/macos`](apps/macos) replaces the Electron tray. From a source checkout, install it with
+`apps/macos/build.sh install` (`/Applications/ClaudeRipple.app`, bundle id `com.clauderipple.mac`).
+Then open it with:
 
 ```sh
 clauderipple tray
 ```
 
-On macOS and Windows the install script adds it by default. It runs on Electron, about 270MB,
-fetched once; set `CLAUDERIPPLE_NO_TRAY=1` before the install command to skip it. On Linux, or
-after an npm-only install, `clauderipple tray --install` adds it. Everything else works without it.
+On macOS, `tray`, `tray --install`, `tray --ensure` and `app --install` open the native app;
+if it is absent, the CLI prints the install command. The app owns its login item and offers
+recovery through the CLI even when the router is down.
+Windows keeps the Electron tray, its login item and outage notifications. On Windows and Linux,
+`clauderipple tray --install` fetches Electron (~270MB) once; everything else works without it.
 
-**Updating.** The tray offers a new version when there is one (**Check for Updates…**), or:
+**Updating.** The Windows tray offers **Check for Updates…**, or use the CLI on any platform:
 
 ```sh
 clauderipple update
 ```
 
 It updates the way you installed — the install script again, or npm — and restarts the router
-on the new version. The tray's Electron is kept across updates.
+on the new version. The Windows/Linux tray's Electron is kept across updates; the native macOS app
+is built and installed separately from `apps/macos`.
 
 Optional, for real names in the Desktop picker: **Clients → Claude Desktop → Model
 picker → on**, then quit and reopen Claude Desktop. To trust the local certificate

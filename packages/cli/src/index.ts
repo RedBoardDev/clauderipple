@@ -485,7 +485,7 @@ async function update(): Promise<void> {
     console.log(`✓ ClaudeRipple ${VERSION} is the latest version`);
     return;
   }
-  const hadTray = electronPath() !== null;
+  const hadTray = process.platform !== "darwin" && electronPath() !== null;
   const spec = override ?? `${PACKAGE}@${latest}`;
   console.log(`Updating ClaudeRipple ${VERSION} → ${latest ?? spec} (${kind.kind === "script" ? "install script" : "npm"}, ${kind.prefix})…`);
   const result = runUpdate(kind, installedRuntime, spec);
@@ -610,7 +610,7 @@ function help(): void {
                     on: use Claude's default connection (Claude Desktop and Claude Code skip ClaudeRipple;
                     the router stays installed); off: go through ClaudeRipple again. Restart Claude after either.
   app --install|--uninstall [--json]
-                    a double-clickable launcher for the menu-bar app (~/Applications, Start Menu, app menu)
+                    macOS: open the native menu-bar app; elsewhere: manage Start Menu / app menu launchers
   start | stop | restart
   logs [-n N] [-f]
   remote [install|uninstall|status|pair]  run or manage the phone host (macOS, Windows, Linux systemd)
@@ -621,7 +621,7 @@ function help(): void {
   remote hosts      list remote (SSH) hosts and their tunnels (also shown by "remote status")
   config            print the config file path
   ui                open the dashboard in your browser
-  tray [--install]  start the menu-bar / tray app (--install fetches Electron, ~270MB, once)
+  tray [--install]  macOS: open the native menu-bar app; elsewhere: start the tray (--install fetches Electron)
   update [--check]  install the latest version the way this one was installed (--check only reports)
   login             add a ChatGPT account (opens your browser; run again to add another — they take turns when one runs out)
   logout            forget every ChatGPT account added with "login" (the Codex CLI's own login is left alone)
@@ -882,8 +882,9 @@ async function dispatchCommand(): Promise<void> {
         console.log(JSON.stringify({ on: fs.existsSync(trayPlistPath()), removeElectronItem: login === "init" && decision.removeElectronItem }));
         break;
       }
-      // --ensure is what the app launcher runs: fetch Electron once if it is missing, then start.
-      const ensured = args.includes("--ensure") && !installedRuntime.packaged ? installTrayRuntime() : null;
+      // On macOS both helpers open the native app once; they must never fetch Electron.
+      // Elsewhere --ensure fetches Electron once if it is missing, then starts the tray.
+      const ensured = process.platform !== "darwin" && args.includes("--ensure") && !installedRuntime.packaged ? installTrayRuntime() : null;
       const result = args.includes("--install") ? installTrayRuntime() : ensured && !ensured.ok ? ensured : await startTray({ atLogin: flag("at-login") });
       console.log(result.message);
       if (!result.ok) process.exit(1);

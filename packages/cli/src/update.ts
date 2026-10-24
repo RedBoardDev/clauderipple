@@ -37,7 +37,9 @@ export function updateSource(env: NodeJS.ProcessEnv = process.env): UpdateSource
 export const FORK_UPDATE_STEPS = [
   "This ClaudeRipple is a fork; `clauderipple update` does not install the published (upstream) version over it.",
   "Update it from the fork's checkout:",
-  "  git pull && npm pack",
+  "  git switch main",
+  "  git pull --ff-only origin main",
+  "  npm pack",
   "  npm install --prefix ~/.clauderipple/lib ./clauderipple-<version>.tgz",
   "  clauderipple restart",
   "To follow the published releases instead, run with CLAUDERIPPLE_UPDATE_SOURCE=upstream.",

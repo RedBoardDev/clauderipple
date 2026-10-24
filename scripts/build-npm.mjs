@@ -46,10 +46,13 @@ function build() {
     filter: (source) => !source.includes(`${path.sep}.claude-plugin${path.sep}types`) && !source.includes(`${path.sep}mod${path.sep}preview`),
   });
   fs.cpSync(path.join(root, "packages", "app", "dist"), path.join(dist, "app", "dist"), { recursive: true });
-  fs.cpSync(path.join(root, "packages", "app", "assets"), path.join(dist, "app", "assets"), { recursive: true });
-  // The app icon travels with the tray's assets: `clauderipple app --install` puts it on the launcher
-  // it makes (icns on macOS, png on Linux, ico on Windows) and the tray uses it for its window.
-  for (const name of ["icon.icns", "icon.png", "icon.ico"]) {
+  fs.cpSync(path.join(root, "packages", "app", "assets"), path.join(dist, "app", "assets"), {
+    recursive: true,
+    filter: (source) => !/\.icns$|Template(?:@2x)?\.png$/.test(source),
+  });
+  // Windows and Linux still need the tray and its shared assets. macOS opens the native app;
+  // its separately built bundle does not need an .icns in the npm package.
+  for (const name of ["icon.png", "icon.ico"]) {
     if (!fs.existsSync(path.join(dist, "app", "assets", name))) throw new Error(`packages/app/assets/${name} is missing; run: npm --workspace @clauderipple/app run icons`);
   }
   // The tray is compiled to CommonJS, but the package root says "type": "module", and the nearest

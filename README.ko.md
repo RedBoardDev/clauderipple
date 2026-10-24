@@ -216,7 +216,7 @@ ClaudeRipple은 데스크톱 앱·터미널·Codex를 메뉴 막대 앱 하나�
 | 번역 프로바이더의 프롬프트 캐시 | **94~99 %** 실측 | 미측정 | 미측정 | 제각각 | 해당 없음 |
 | 서브에이전트를 실제 모델 이름으로 표시 | ✅ | ❌ | ❌ | ❌ | ❌ |
 | 터미널 없이 쓰는 설정 GUI | ✅ | ✅ | ❌ | ❌ | ❌ |
-| 런타임 내장, 서명·공증된 앱 | ✅ | ✅ | ❌ | ❌ | – |
+| macOS 네이티브 메뉴 막대 앱, Windows는 Electron 트레이 | ✅ | - | ❌ | ❌ | - |
 
 ¹ opencodex는 README에 Claude Desktop 데모를 걸어 두었지만, 저장소에도 문서 사이트에도 설치 절차가 없었습니다
 (2026-09-16 확인). 당시 데스크톱 앱으로 들어가는 공개된 경로는 공식 게이트웨이 설정, 즉 마지막 칸뿐이었습니다.
@@ -270,7 +270,7 @@ ClaudeRipple은 Claude Code 프로세스만 신뢰하는 작은 HTTPS 프록시�
 - **원하면 가벼운 워커.** 스위치 하나로, 생성된 서브에이전트에 세션의 MCP·플러그인 도구 전부 대신 워커가 쓰는 도구만
   줍니다. 워커 첫 요청이 3.3만에서 0.9만 토큰으로 줄었습니다.
 - **터미널이 싫은 사람을 위해.** 원클릭 연결 확인과 모델 자동 검색이 붙은 프로바이더 프리셋, 드롭다운 모델 매핑, 자동 저장,
-  한국어·영어·중국어·일본어·스페인어·포르투갈어 UI. 런타임을 품고 첫 실행에 스스로 설치하는 메뉴 막대 앱. 서명·공증 완료.
+  한국어·영어·중국어·일본어·스페인어·포르투갈어 UI. macOS에서는 `apps/macos`의 네이티브 메뉴 막대 앱, Windows에서는 자체 런타임과 첫 실행 설정을 갖춘 Electron 트레이.
 
 <p align="center">
   <img src="docs/media/mapping.png" width="880" alt="모델 매핑: Claude 이름마다 실제로 답할 모델과 추론 강도">
@@ -355,24 +355,28 @@ clauderipple ui
 
 **프로바이더** → ChatGPT 추가 또는 API 키 붙여 넣기 → **모델 매핑**.
 
-**메뉴 막대·트레이 앱**은 라우터 상태를 보여주고, 한 번에 대시보드를 열고, 라우터가 죽어도 열리는 복구 화면을 갖고 있습니다.
+**메뉴 막대·트레이 앱은 선택 사항입니다.** macOS에서는 [`apps/macos`](apps/macos)의 네이티브 메뉴 막대 앱이
+Electron 트레이를 대신합니다. 소스 체크아웃에서 `apps/macos/build.sh install`로 설치합니다
+(`/Applications/ClaudeRipple.app`, 번들 ID `com.clauderipple.mac`). 그런 다음 이렇게 엽니다.
 
 ```sh
 clauderipple tray
 ```
 
-macOS와 Windows에서는 설치 스크립트가 기본으로 함께 설치합니다. Electron으로 돌아 약 270MB이고 한 번만 받습니다.
-빼고 싶으면 설치 명령 앞에 `CLAUDERIPPLE_NO_TRAY=1`을 붙이세요. Linux나 npm으로만 설치했다면
-`clauderipple tray --install`로 추가합니다. 나머지 기능은 앱 없이도 다 돕니다.
+macOS에서 `tray`, `tray --install`, `tray --ensure`, `app --install`은 네이티브 앱을 엽니다.
+앱이 없으면 CLI가 설치 명령을 알려 줍니다. 앱이 로그인 항목을 직접 관리하고, 라우터가 꺼져 있어도 CLI를 통한 복구를
+제공합니다.
+Windows는 Electron 트레이와 그 로그인 항목, 장애 알림을 그대로 씁니다. Windows와 Linux에서는
+`clauderipple tray --install`이 Electron(약 270MB)을 한 번만 받아 옵니다. 나머지 기능은 Electron 없이도 다 돕니다.
 
-**업데이트.** 새 버전이 나오면 트레이가 알려 줍니다(**업데이트 확인…**). 터미널에서는:
+**업데이트.** Windows 트레이는 **업데이트 확인…**을 제공합니다. 어느 플랫폼에서든 CLI로 할 수도 있습니다.
 
 ```sh
 clauderipple update
 ```
 
-설치한 방식 그대로(설치 스크립트 또는 npm) 업데이트하고, 라우터를 새 버전으로 다시 시작합니다. 트레이용
-Electron은 업데이트해도 그대로 남습니다.
+설치한 방식 그대로(설치 스크립트 또는 npm) 업데이트하고, 라우터를 새 버전으로 다시 시작합니다. Windows·Linux 트레이용
+Electron은 업데이트해도 그대로 남고, macOS 네이티브 앱은 `apps/macos`에서 따로 빌드해 설치합니다.
 
 선택 사항, Desktop 피커에 실제 이름을 띄우려면: **클라이언트 → Claude Desktop → 모델 피커 → 켜기**. 그다음 Claude
 Desktop을 완전히 종료했다가 다시 엽니다. 로컬 인증서를 사용자 범위로만 신뢰시키는데, 이때 macOS는 로그인 암호를

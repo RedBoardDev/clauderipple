@@ -1,5 +1,23 @@
 # Changelog
 
+## Personal fork — unreleased
+
+### Added
+
+- **A native macOS menu-bar app (`apps/macos`, SwiftUI).** The panel shows every Claude and ChatGPT
+  account's 5-hour and weekly limits with reset times and Active / Preferred / Paused
+  badges, suggests which account to drain first, and toggles keep-awake. The icon's ring is the
+  weekly room left on the tightest serving account. A settings window covers accounts (sign-in,
+  rotation, use first, pause, rename, remove), model mapping, workers and effort, clients,
+  activity, laptop, recovery and updates. Provider editing, Google accounts and phone pairing stay
+  on the web dashboard. Build with `apps/macos/build.sh install` (Xcode 26+, XcodeGen).
+
+### Changed
+
+- **macOS uses the native menu-bar app (`apps/macos`) instead of the Electron tray.** The CLI
+  opens `com.clauderipple.mac`; if it is not installed, it points to `apps/macos/build.sh install`.
+  Windows keeps the Electron tray, including its login item and router-down recovery.
+
 ## 0.12.14 — 2026-10-24
 
 ### Added

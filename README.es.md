@@ -253,7 +253,7 @@ claude.ai siguen funcionando mientras otro modelo hace el trabajo de pensar.
 | Caché de prompts en proveedores con traducción de protocolo | **94–99 %** medido | sin medir | sin medir | variable | no aplica |
 | Subagentes identificados por su modelo real en el panel de tareas | ✅ | ❌ | ❌ | ❌ | ❌ |
 | Interfaz gráfica de configuración, sin necesidad de terminal | ✅ | ✅ | ❌ | ❌ | ❌ |
-| App firmada y notarizada con su propio runtime | ✅ | ✅ | ❌ | ❌ | – |
+| App nativa en la barra de menús de macOS; bandeja Electron en Windows | ✅ | - | ❌ | ❌ | - |
 
 ¹ El README de opencodex mostraba Claude Desktop en una demo, pero no publicaba pasos de
 configuración para ello, ni en el repositorio ni en su sitio de documentación (revisado el
@@ -339,9 +339,9 @@ los modelos que asignas van a tu proveedor, y todo lo demás va a Anthropic byte
   de la sesión: la primera solicitud de un worker bajó de 33k a 9k tokens.
 - **Hecho para quien no quiere usar la terminal.** Ajustes predefinidos de proveedores con
   prueba de conexión y descubrimiento de modelos en un clic, asignación de modelos con
-  menús desplegables, guardado automático e interfaz en coreano e inglés. Una app de la
-  barra de menús que trae su propio runtime y se configura sola en el primer arranque.
-  Firmada y notarizada.
+  menús desplegables, guardado automático e interfaz en coreano e inglés. Una app nativa
+  en la barra de menús de macOS, en `apps/macos`, y una bandeja Electron en Windows con su
+  propio runtime y configuración en el primer arranque.
 
 <p align="center">
   <img src="docs/media/mapping.png" width="880" alt="Asignación de modelos: qué modelo responde por cada nombre de Claude, con esfuerzo de razonamiento por modelo">
@@ -437,27 +437,31 @@ clauderipple ui
 
 **Proveedores** → añade ChatGPT o pega una clave de API → **Asignación de modelos**.
 
-**La app de la barra de menús / bandeja** muestra el estado del router, abre el panel con un
-clic y ofrece una pantalla de reparación que funciona aunque el router esté caído:
+**La app de la barra de menús / bandeja** es opcional. En macOS, la app nativa de la barra de
+menús en [`apps/macos`](apps/macos) sustituye a la bandeja Electron. Desde una copia del código
+fuente se instala con `apps/macos/build.sh install` (`/Applications/ClaudeRipple.app`, bundle id
+`com.clauderipple.mac`). Después, ábrela con:
 
 ```sh
 clauderipple tray
 ```
 
-En macOS y Windows el script de instalación la añade por defecto. Funciona con Electron, unos
-270 MB que se descargan una sola vez; define `CLAUDERIPPLE_NO_TRAY=1` antes del comando de
-instalación para omitirla. En Linux, o tras instalar solo con npm, `clauderipple tray --install`
-la añade. Todo lo demás funciona sin ella.
+En macOS, `tray`, `tray --install`, `tray --ensure` y `app --install` abren la app nativa; si no
+está, la CLI imprime el comando de instalación. La app gestiona su propio elemento de inicio y
+ofrece recuperación a través de la CLI incluso con el router caído.
+Windows mantiene la bandeja Electron, su elemento de inicio y las notificaciones de caída. En
+Windows y Linux, `clauderipple tray --install` descarga Electron (~270 MB) una sola vez; todo lo
+demás funciona sin él.
 
-**Actualización.** La bandeja ofrece la nueva versión cuando la hay (**Buscar actualizaciones…**), o bien:
+**Actualización.** La bandeja de Windows ofrece **Buscar actualizaciones…**, o usa la CLI en cualquier plataforma:
 
 ```sh
 clauderipple update
 ```
 
 Actualiza de la misma forma en que instalaste (otra vez con el script de instalación, o con
-npm) y reinicia el router con la nueva versión. El Electron de la bandeja se conserva entre
-actualizaciones.
+npm) y reinicia el router con la nueva versión. El Electron de la bandeja de Windows/Linux se conserva entre
+actualizaciones; la app nativa de macOS se compila e instala por separado desde `apps/macos`.
 
 Opcional, para ver los nombres reales en el selector de Desktop:
 **Clientes → Claude Desktop → Selector de modelos → Activar el selector**, y después cierra

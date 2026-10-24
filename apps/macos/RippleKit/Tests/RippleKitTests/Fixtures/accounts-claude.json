@@ -1,0 +1,11 @@
+{"current":{"id":"current","label":"Current Claude login","source":"keychain","external":true,
+  "quota":{"type":"claude","rate_limits":{"primary":{"used_percent":30,"window_minutes":300,"reset_at":1800003600},
+                                          "secondary":{"used_percent":60,"window_minutes":10080,"reset_at":1800345600}},"at":1799999900000}},
+ "accounts":[
+  {"id":"0b5c6a1e-0000-4000-8000-000000000001","label":"Spare","email":"spare@example.com","expiresAt":1800100000000,
+   "needsReauth":false,"preferred":true,
+   "quota":{"rate_limits":{"primary":{"used_percent":5,"window_minutes":300,"reset_at":1800010000},
+                           "secondary":{"used_percent":10,"window_minutes":10080,"reset_at":1800500000}},"at":1799000000000}},
+  {"id":"0b5c6a1e-0000-4000-8000-000000000002","label":"old@example.com","email":"old@example.com","expiresAt":1799000000000,
+   "needsReauth":false,"preferred":false}
+ ]}

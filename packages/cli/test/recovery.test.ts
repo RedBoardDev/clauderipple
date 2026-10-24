@@ -16,7 +16,7 @@ import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
-import { posixModes, posixPaths } from "../../../test/capabilities.ts";
+import { posixPaths } from "../../../test/capabilities.ts";
 import { syncAgentFiles } from "../../router/src/agents.ts";
 import { DEFAULTS } from "../../router/src/config.ts";
 import { generateCerts } from "../src/certs.ts";
@@ -579,33 +579,35 @@ test("Windows PowerShell launcher files carry a UTF-8 BOM and preserve Korean pa
 
 // ---- app launcher ------------------------------------------------------------------------
 
-test("macOS launcher: a minimal bundle in the overridden Applications dir that runs `tray --ensure`", () => {
+test("macOS launcher opens the native app without writing a bundle, even from an old packaged runtime", () => {
   const { home } = scratch();
   const rt = { ...fakeRuntime(path.join(root, "rt-app")), packaged: false };
-  const r = installLauncher({ rt, home, version: "1.2.3", platform: "darwin" });
-  assert.equal(r.ok, true);
+  let opens = 0;
+  const options = { rt, home, version: "1.2.3", platform: "darwin" as const, openApp: () => { opens++; return { ok: true, message: "native opened" }; } };
+  assert.deepEqual(installLauncher(options), { ok: true, paths: [], detail: "native opened" });
+  assert.deepEqual(installLauncher({ ...options, rt: { ...rt, packaged: true } }), { ok: true, paths: [], detail: "native opened" });
+  assert.equal(opens, 2);
   const app = path.join(process.env.CLAUDERIPPLE_LAUNCHER_DIR!, "ClaudeRipple.app");
-  assert.deepEqual(r.paths, [app]);
-  const plist = fs.readFileSync(path.join(app, "Contents", "Info.plist"), "utf8");
-  assert.match(plist, new RegExp(`<key>CFBundleIdentifier</key><string>${LAUNCHER_BUNDLE_ID.replace(/\./g, "\\.")}</string>`));
-  assert.doesNotMatch(plist, /com\.clauderipple\.router/);
-  const exe = path.join(app, "Contents", "MacOS", "ClaudeRipple");
-  if (posixModes) assert.equal(fs.statSync(exe).mode & 0o111, 0o111);
-  const script = fs.readFileSync(exe, "utf8");
-  assert.match(script, /^#!\/bin\/sh/);
-  assert.ok(script.includes(`export CLAUDERIPPLE_HOME='${home}'`));
-  assert.ok(script.includes(`'${rt.node}' '${rt.cli}' tray --ensure`));
-
-  // Someone else's bundle under the same name is never written into or removed.
-  fs.writeFileSync(path.join(app, "Contents", "Info.plist"), "<key>CFBundleIdentifier</key><string>com.clauderipple.app</string>");
-  assert.equal(installLauncher({ rt, home, version: "1.2.3", platform: "darwin" }).ok, false);
-  assert.equal(uninstallLauncher({ rt, home, version: "1.2.3", platform: "darwin" }).ok, false);
-  assert.ok(fs.existsSync(app));
-  fs.rmSync(app, { recursive: true });
-
-  installLauncher({ rt, home, version: "1.2.3", platform: "darwin" });
-  assert.deepEqual(uninstallLauncher({ rt, home, version: "1.2.3", platform: "darwin" }).paths, [app]);
   assert.equal(fs.existsSync(app), false);
+  assert.deepEqual(installLauncher({ ...options, openApp: () => ({ ok: false, message: "Install the menu-bar app: apps/macos/build.sh install" }) }), {
+    ok: false, paths: [], detail: "Install the menu-bar app: apps/macos/build.sh install",
+  });
+
+  // Neither the native bundle nor another app is overwritten, removed or quit.
+  fs.mkdirSync(path.join(app, "Contents"), { recursive: true });
+  const plist = path.join(app, "Contents", "Info.plist");
+  for (const id of ["com.clauderipple.mac", "com.clauderipple.app"]) {
+    const content = `<key>CFBundleIdentifier</key><string>${id}</string>`;
+    fs.writeFileSync(plist, content);
+    assert.equal(installLauncher(options).ok, true);
+    assert.equal(uninstallLauncher(options).ok, false);
+    assert.equal(fs.readFileSync(plist, "utf8"), content);
+  }
+  // Removal remains available for the old generated shell launcher only.
+  fs.writeFileSync(plist, `<key>CFBundleIdentifier</key><string>${LAUNCHER_BUNDLE_ID}</string>`);
+  assert.deepEqual(uninstallLauncher(options).paths, [app]);
+  assert.equal(fs.existsSync(app), false);
+  assert.deepEqual(uninstallLauncher(options).paths, []);
 });
 
 test("Linux launcher: a desktop entry; Windows: shortcuts through a hidden PowerShell launcher", () => {
@@ -635,7 +637,7 @@ test("Linux launcher: a desktop entry; Windows: shortcuts through a hidden Power
   assert.ok(!trayScript.includes(`'${path.join(home, "logs", "launcher.log")}'`));
   assert.match(trayScript, /try \{ & .* tray --ensure \*>> .*tray-launcher\.log' \} catch \{ & .* tray --ensure \}/);
 
-  assert.deepEqual(installLauncher({ rt: { ...rt, packaged: true }, home, version: "1", platform: "darwin" }).paths, []);
+  assert.deepEqual(installLauncher({ rt: { ...rt, packaged: true }, home, version: "1", platform: "win32", powershell }).paths, []);
 });
 
 // ---- the CLI itself, end to end (macOS only: a fake launchctl stands in for launchd) -------
@@ -671,7 +673,8 @@ test("CLI: doctor, direct on/off and app print one JSON object each and exit 0",
     const off = await run("direct", "off");
     assert.deepEqual([off.ok, off.mode], [true, "ripple"]);
     assert.deepEqual(JSON.parse(fs.readFileSync(ctx.settings, "utf8")), ctx.settingsObj);
-    const app = await run("app", "--install");
+    // --install intentionally opens a real app on macOS now; exercise the non-launching removal.
+    const app = await run("app", "--uninstall");
     assert.equal(app.ok, true);
     assert.ok((app.paths as string[]).every((p) => p.startsWith(root)));
   } finally {

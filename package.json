@@ -11,8 +11,6 @@
   },
   "scripts": {
     "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p packages/remote/tsconfig.web.json --noEmit && tsc -p packages/remote/relay/tsconfig.json --noEmit",
-    "dist": "npm --workspace @clauderipple/app run dist",
-    "release": "npm --workspace @clauderipple/app run release",
     "router": "node packages/router/src/index.ts",
     "remote": "node --disable-warning=ExperimentalWarning packages/remote/src/main.ts",
     "relay:build": "node --disable-warning=ExperimentalWarning packages/remote/relay/build-web.ts",

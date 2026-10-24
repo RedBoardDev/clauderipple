@@ -1,5 +1,14 @@
 # ClaudeRipple 릴리스
 
+## Platform app targets
+
+The router and CLI still ship through npm on all platforms. On macOS the native menu-bar app
+in `apps/macos` replaces the Electron tray: `apps/macos/build.sh install` installs
+`/Applications/ClaudeRipple.app` (`com.clauderipple.mac`), and the CLI opens that bundle.
+There are no macOS Electron build/release targets. Windows keeps `packages/app`, its Electron
+runtime, and its router-down recovery and login item. The npm build still includes the tray
+and shared assets for Windows and Linux, but omits macOS-only tray icons and `.icns` assets.
+
 배포 경로는 **npm** 하나입니다. 플랫폼별 빌드도, 코드 서명도, 공증도, Windows VM도 필요 없습니다.
 게시는 어느 컴퓨터에서든 `npm publish` 한 번입니다.
 
@@ -8,9 +17,8 @@
 - 플랫폼별 산출물이 없습니다. 게시하는 것은 JavaScript 한 벌이고, macOS와 Windows가 같은 파일을 받습니다.
 - 서명·공증이 사라집니다. Apple Developer 인증서도, Windows 코드 서명 인증서(연 219~685달러, 하드웨어 토큰)도
   필요 없습니다. SmartScreen 경고도 없습니다.
-- 트레이에 필요한 Electron은 npm이 플랫폼에 맞는 바이너리를 받아 옵니다. 우리가 굽지 않습니다. 다만 270MB라
-  의존성에 넣지 않았습니다. npm 패키지는 828KB이고(실측), Electron은 `clauderipple tray --install`이 따로 받습니다.
-  macOS·Windows 설치 스크립트는 이 단계를 기본으로 돌리고, `CLAUDERIPPLE_NO_TRAY=1`이면 건너뜁니다.
+- On Windows and Linux, `clauderipple tray --install` fetches Electron on demand (~270MB).
+  On macOS it opens the separately installed native menu-bar app instead; it never fetches Electron.
 
 사용자에게 Node 24가 필요하지만, 설치 스크립트가 없으면 대신 깔아 줍니다.
 
@@ -121,11 +129,13 @@ dist/app/dist/main.js       트레이 (옆에 dist/app/assets)
 
 ## 독립 실행 앱 (선택)
 
-Node를 깔 수 없는 사람을 위해 electron-builder 경로를 남겨 두었습니다. 릴리스마다 요구되지는 않습니다.
+The optional electron-builder path remains for Windows only; it is not required for each npm release.
 
 ```sh
-npm run dist      # 서명 없는 .app 디렉터리 (로컬 확인용)
-npm run release   # 서명·공증된 macOS DMG/ZIP — Apple Developer 계정 필요
+npm --workspace @clauderipple/app run dist:win     # unpacked Windows app
+npm --workspace @clauderipple/app run release:win  # Windows NSIS / ZIP
+# macOS uses the native app instead (from a source checkout):
+apps/macos/build.sh install
 ```
 
 Windows 쪽에는 알려진 문제가 있습니다. **arm64 NSIS 설치 관리자가 실행 파일만 빼고 설치하면서 성공했다고

@@ -1,0 +1,41 @@
+{
+  "revision": 4,
+  "stored": true,
+  "settings": {
+    "effortAuto": true,
+    "judge": "haiku",
+    "judgeModel": "sample-judge",
+    "jevSource": "typesafe",
+    "bias": 0,
+    "floor": "low",
+    "ceiling": "max",
+    "agentAuto": "auto",
+    "rules": {"general": {"mode": "ladder", "rungs": {
+      "light": [{"target": {"agent": "sample-worker"}, "effort": "low"}],
+      "standard": [{"target": {"agent": "sample-worker"}, "effort": "medium"}],
+      "hard": [{"target": {"agent": "general-purpose", "model": "sonnet"}, "effort": "high"}],
+      "plan": [{"target": {"agent": "general-purpose", "model": "opus"}, "effort": "max"}]
+    }}},
+    "allow": [],
+    "allowKnown": [],
+    "modes": [],
+    "providers": {},
+    "fallback": {"agent": "general-purpose", "model": "sonnet"},
+    "keepWarm": false,
+    "keepWarmHours": 2,
+    "keepWarmMinTokens": 30000,
+    "compactWith": "haiku",
+    "handoffSkill": "",
+    "handoffAfter": "continue",
+    "handoffButton": "advised",
+    "swampAt": 50,
+    "swampAlert": false,
+    "layout": "dashboard",
+    "appearance": "auto",
+    "language": "auto",
+    "hide": ["reason"],
+    "extras": [],
+    "setupDone": true,
+    "futureFeature": {"enabled": true, "precise": 1e3, "values": ["keep", null]}
+  }
+}
