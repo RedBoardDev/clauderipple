@@ -12,6 +12,7 @@ import { DEFAULTS, type Config } from "../src/config.ts";
 import { UpstreamHealth } from "../src/health.ts";
 import { Logger } from "../src/log.ts";
 import { Proxy } from "../src/proxy.ts";
+import { setCurrentClaudeLoginPaused } from "../src/providers/anthropic-accounts.ts";
 import { ObservedClaudeCodeAuth } from "../src/providers/anthropic-observed.ts";
 import { RequestLog } from "../src/requestlog.ts";
 import { createCa, createLeaf } from "../src/x509.ts";
@@ -352,6 +353,17 @@ test("with no usable pool account, a Claude pool turn goes out on the app's own 
     assert.equal(record.status, 200);
     assert.equal(record.refusal, undefined);
     assert.equal(r.seenAuth.at(-1), "Bearer app-own-token");
+  } finally { await r.stop(); }
+});
+
+test("a paused current login is not the fallback: an empty Claude pool refuses the turn", async () => {
+  const r = await rig();
+  try {
+    setCurrentClaudeLoginPaused(r.home, true);
+    const { record } = await r.send("claude-pool", {}, "/v1/messages", undefined, { authorization: "Bearer app-own-token" });
+    assert.equal(record.status, 401);
+    assert.equal(record.refusal, "no-account");
+    assert.ok(!r.seenAuth.includes("Bearer app-own-token"));
   } finally { await r.stop(); }
 });
 

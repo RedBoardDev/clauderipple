@@ -164,12 +164,17 @@ export class ClaudeAccountAuthPool {
     return this.peekCredentials();
   }
 
+  /** The user keeps the current Claude Code/Desktop login out of use; the client's own Bearer is that login. */
+  currentPaused(): boolean {
+    return isCurrentClaudeLoginPaused(this.home);
+  }
+
   /** Current projection without network I/O, used by status and pre-routing health checks. */
   peekCredentials(): Credential[] {
     const out: Credential[] = [];
     const accounts = readClaudeOAuthAccounts(this.home);
     // A paused login is never projected: no request, usage probe or model listing carries its token.
-    const current = isCurrentClaudeLoginPaused(this.home) ? new Error("current Claude login paused") : this.current.get();
+    const current = this.currentPaused() ? new Error("current Claude login paused") : this.current.get();
     // A request from Claude Code itself names the newest version this machine runs; manufactured
     // headers may use it while the observation is recent (issue #103).
     const observedCliVersion = this.current.observedCliVersion();
