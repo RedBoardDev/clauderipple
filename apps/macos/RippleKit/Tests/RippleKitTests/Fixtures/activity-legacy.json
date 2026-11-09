@@ -1,0 +1,7 @@
+{
+  "total": { "count": 8, "ok": 6, "failed": 2, "input": 100, "cached": 800, "output": 40, "cacheHitPercent": 88.9, "avgMs": 120 },
+  "providers": {
+    "sample-a": { "count": 5, "ok": 4, "failed": 1, "input": 60, "cached": 540, "output": 25, "cacheHitPercent": 90, "avgMs": 100 },
+    "sample-b": { "count": 3, "ok": 2, "failed": 1, "input": 40, "cached": 260, "output": 15, "cacheHitPercent": 86.7, "avgMs": 153 }
+  }
+}

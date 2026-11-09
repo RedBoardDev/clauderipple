@@ -1,0 +1,14 @@
+{
+  "total": { "count": 12, "ok": 10, "failed": 1, "input": 200, "cached": 700, "cacheWrite": 100, "output": 50, "cacheHitPercent": 70, "avgMs": 150 },
+  "providers": {
+    "sample-a": { "count": 7, "ok": 6, "failed": 0, "input": 100, "cached": 400, "cacheWrite": 100, "output": 30, "cacheHitPercent": 66.7, "avgMs": 100 },
+    "sample-b": { "count": 5, "ok": 4, "failed": 1, "input": 100, "cached": 300, "cacheWrite": 0, "output": 20, "cacheHitPercent": 75, "avgMs": 220 }
+  },
+  "models": [
+    { "provider": "sample-a", "model": "example-large", "count": 7, "ok": 6, "failed": 0, "input": 100, "cached": 400, "cacheWrite": 100, "output": 30, "cacheHitPercent": 66.7, "avgMs": 100 },
+    { "provider": "sample-b", "model": "example-small", "count": 5, "ok": 4, "failed": 1, "input": 100, "cached": 300, "cacheWrite": 0, "output": 20, "cacheHitPercent": 75, "avgMs": 220 }
+  ],
+  "earliest": "2026-09-01T00:00:00.000Z",
+  "from": 1792454400000,
+  "to": 1792540800000
+}

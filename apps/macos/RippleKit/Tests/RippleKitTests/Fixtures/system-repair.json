@@ -1,0 +1,1 @@
+{"ok":true,"steps":[{"name":"supervisor","ok":true,"detail":"Example service already registered"},{"name":"start","ok":true,"detail":"Example router answering"}],"doctor":{"mode":"ripple","router":{"responding":true},"problems":[]}}

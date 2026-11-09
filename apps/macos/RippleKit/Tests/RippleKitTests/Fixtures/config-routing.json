@@ -1,0 +1,22 @@
+{
+  "listen": {"host": "127.0.0.1", "port": 18790},
+  "upstream": "api.example.test",
+  "providers": {
+    "beta": {"type": "openai-compatible", "url": "https://beta.example.test/v1", "headers": {"authorization": "Bearer sk-test"}, "models": [{"id": "shared-model", "name": "Shared", "effortLevels": []}, {"id": "beta-model", "name": "Beta", "contextWindow": 128000}]},
+    "alpha": {"type": "chatgpt", "models": [{"id": "alpha-model", "name": "Alpha", "effortLevels": ["low", "high"], "contextWindow": 400000}, {"id": "shared-model", "name": "Shared Alpha"}]},
+    "ingress": {"type": "anthropic", "auth": "api-key", "apiKey": "sk-test", "models": [{"id": "claude-test"}]},
+    "pool": {"type": "anthropic", "auth": "claude-code", "accountPool": true, "models": [{"id": "claude-pool"}]}
+  },
+  "routes": {
+    "claude-source-a": {"provider": "alpha", "model": "alpha-model", "effort": "high", "contextWindow": 400000, "fallbacks": [{"provider": "beta", "model": "beta-model", "unknown": {"n": 1e3}}], "futureRoute": {"ordered": [1, 2], "precision": 0.5000}},
+    "claude-source-b": {"model": "beta-model", "provider": "beta", "future": 2e3}
+  },
+  "direct": [{"prefix": "legacy-", "provider": "alpha", "future": 1e2}, {"prefix": "shared-model", "provider": "alpha", "future": true}, {"prefix": "beta-model", "provider": "beta"}, {"prefix": "orphan-model", "provider": "beta"}],
+  "cli": {"extraModels": [{"model": "alpha-model", "name": "Custom Alpha", "contextWindow": 350000, "description": "Keep me", "future": 1e3}, {"model": "orphan-model", "name": "Gone"}, {"model": "alpha-model", "name": "Duplicate"}], "models": {"main": "alpha-model", "smallFast": "beta-model", "subagent": "old-worker", "futureSlot": "keep"}, "agentFiles": true, "futureCLI": 1.5000},
+  "webSearch": {"provider": "alpha", "model": "alpha-model", "maxResults": 7, "futureSearch": {"n": 1e4}},
+  "aliases": {"a": "alpha-model"},
+  "effortClamp": {"ultra": "max"},
+  "health": {"maxConsecutiveUpstreamFailures": 20},
+  "log": {"maxBytes": 5242880, "keep": 3},
+  "unknownRoot": {"number": 5e2}
+}

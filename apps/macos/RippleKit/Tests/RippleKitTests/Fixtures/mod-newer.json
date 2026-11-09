@@ -1,0 +1,20 @@
+{
+  "revision": 9,
+  "stored": true,
+  "settings": {
+    "effortAuto": true,
+    "bias": 1,
+    "floor": "medium",
+    "ceiling": "high",
+    "skin": "flat",
+    "delegation": "normal",
+    "rules": {"general": {"mode": "ladder", "rungs": {
+      "light": [{"target": {"agent": "sample-worker", "futureTarget": true}, "effort": "low", "futureStep": 1}],
+      "standard": [{"target": {"agent": "sample-worker"}, "effort": "medium"}],
+      "hard": [{"target": {"agent": "general-purpose", "model": "sonnet"}, "effort": "high"}],
+      "plan": [{"target": {"agent": "general-purpose", "model": "opus"}, "effort": "max"}]
+    }}},
+    "modes": [{"id": "mode-example", "name": "Sample mode", "rungs": {}, "delegation": "eager", "until": {"reset": "sample-provider"}, "futureMode": "kept"}],
+    "unknown": {"nested": [1, 2, 3]}
+  }
+}

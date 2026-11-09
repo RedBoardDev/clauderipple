@@ -1,0 +1,38 @@
+name: ClaudeRipple
+options:
+  bundleIdPrefix: com.clauderipple
+  # Must match RippleKit's Package.swift platform floor.
+  deploymentTarget:
+    macOS: "26.0"
+  createIntermediateGroups: true
+
+packages:
+  RippleKit:
+    path: RippleKit
+
+targets:
+  RippleMac:
+    type: application
+    platform: macOS
+    sources:
+      - RippleMac
+    dependencies:
+      - package: RippleKit
+    info:
+      path: RippleMac/Info.generated.plist
+      properties:
+        LSUIElement: true
+        CFBundleDisplayName: ClaudeRipple
+        NSHumanReadableCopyright: "Not affiliated with Anthropic or OpenAI."
+        LSApplicationCategoryType: public.app-category.developer-tools
+    settings:
+      base:
+        PRODUCT_NAME: ClaudeRipple
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        PRODUCT_BUNDLE_IDENTIFIER: com.clauderipple.mac
+        MARKETING_VERSION: "0.1.0"
+        CURRENT_PROJECT_VERSION: "1"
+        GENERATE_INFOPLIST_FILE: NO
+        SWIFT_VERSION: "6.0" # Swift 6 language mode, matching RippleKit
+        ARCHS: arm64
+        ENABLE_HARDENED_RUNTIME: NO

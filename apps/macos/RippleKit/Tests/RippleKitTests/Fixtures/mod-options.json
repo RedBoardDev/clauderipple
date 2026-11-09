@@ -1,0 +1,11 @@
+{
+  "agents": [{"name": "sample-worker", "model": "sample-model", "provider": "sample-provider", "efforts": ["low", "high"], "billing": "payg"}],
+  "models": [
+    {"model": "sample-model", "provider": "sample-provider", "name": "Sample model", "judgeOnly": false},
+    {"model": "sample-judge", "provider": "sample-provider", "name": "Sample judge", "judgeOnly": true}
+  ],
+  "providers": [{"name": "sample-provider", "type": "openai-compatible", "usable": false, "billing": "payg", "reason": "Sample quota exhausted"}],
+  "claudeEfforts": ["low", "medium", "high", "xhigh", "max"],
+  "zen": {"configured": false, "model": null},
+  "scores": {"models": [], "attribution": "Made-up fixture", "generatedAt": null}
+}
