@@ -30,6 +30,17 @@ struct PanelView: View {
 
     @ViewBuilder
     private func content(now: Date) -> some View {
+        if let error = store.lastError, error.isIncompatible {
+            InlineError(error.userMessage)
+                .padding(.horizontal, Metrics.inset)
+                .padding(.bottom, Metrics.sectionGap)
+        }
+        if let version = store.untestedRouterVersion {
+            Text("untested router \(version)")
+                .font(.caption).foregroundStyle(.secondary)
+                .padding(.horizontal, Metrics.inset)
+                .padding(.bottom, Metrics.sectionGap)
+        }
         if store.connection == .offline {
             RouterDownCard(app: app)
                 .padding(.horizontal, Metrics.inset)
@@ -51,11 +62,14 @@ struct PanelView: View {
             }
         }
         if store.connection != .offline {
-            TodayStrip()
-                .padding(.horizontal, Metrics.inset)
-                .padding(.top, Metrics.sectionGap)
+            if store.today != nil {
+                TodayStrip()
+                    .padding(.horizontal, Metrics.inset)
+                    .padding(.top, Metrics.sectionGap)
+            }
             if store.powerAvailable == true, let power = store.power {
                 AwakeControl(power: power)
+                    .disabled(!store.incompatibilities.isEmpty)
                     .padding(.horizontal, Metrics.inset)
                     .padding(.top, 10)
             }

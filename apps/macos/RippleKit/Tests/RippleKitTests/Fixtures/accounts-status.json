@@ -1,10 +1,10 @@
-{"version":"0.9.5","providers":{"claude":{"type":"anthropic","reachable":true,"usable":true}},
+{"version":"0.9.5","readiness":{"ready":true,"problems":[]},"runtime":{"node":"contract-node","router":null,"startedAt":"2027-01-15T08:00:00Z"},"stats":{"inFlight":0,"messagesInFlight":0,"started":0,"completed":0,"failed":0},"consecutiveUpstreamFailures":0,"routes":0,"adminPort":18792,"cliVersion":"test","uiRevision":"test","statusMod":false,"picker":{"enabled":false,"last":null},"pickerModels":[],"settings":{"pointsAtRouter":true},"providers":{"claude":{"type":"anthropic","url":"https://api.example.test","authSource":"observed","signedIn":"oauth","accountCount":2,"reachable":true,"usable":true}},
  "chatgpt":{"accounts":{"chatgpt-subscription":[
    {"id":"own-1","label":"","email":"me@example.com","planType":"prolite","expiresAt":1800100000000,"needsReauth":false,"paused":false,
     "source":"own","state":"ready","active":true,
     "quota":{"rate_limits":{"primary":{"used_percent":88,"window_minutes":10080,"reset_at":1800432000},"secondary":null},"at":1799999900000}},
    {"id":"codex","label":"Codex","expiresAt":1800100000000,"needsReauth":false,"paused":false,"source":"codex",
     "state":"cooling","cooldownSeconds":600,"quota":null,"active":false},
-   {"id":"own-2","label":"Later","expiresAt":1800100000000,"needsReauth":false,"paused":false,"source":"own","state":"warming-up","active":false}
+   {"id":"own-2","label":"Later","expiresAt":1800100000000,"needsReauth":false,"paused":false,"source":"own","state":"warming-up","quota":null,"active":false}
  ]}},
- "credentials":{"claude":[{"id":"0b5c6a1e-0000-4000-8000-000000000001","state":"cooling","cooldownSeconds":120}]}}
+ "credentials":{"claude":[{"id":"0b5c6a1e-0000-4000-8000-000000000001","state":"cooling","failures":1,"cooldownSeconds":120}]}}

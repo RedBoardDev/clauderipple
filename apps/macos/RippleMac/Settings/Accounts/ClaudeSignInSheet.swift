@@ -19,6 +19,7 @@ struct ClaudeSignInSheet: View {
 
     @State private var step: Step = .consent
     @State private var accepted = false
+    @State private var incompatible = false
     @State private var code = ""
     @State private var submitting = false
     @State private var attempt = 0
@@ -96,6 +97,7 @@ struct ClaudeSignInSheet: View {
             buttons {
                 Button("Try again by pasting a code") { start(manual: true) }
                     .keyboardShortcut(.defaultAction)
+                    .disabled(incompatible)
             }
         }
     }
@@ -137,9 +139,18 @@ struct ClaudeSignInSheet: View {
         while !Task.isCancelled {
             do { try await Task.sleep(for: Self.pollInterval) } catch { return }
             // A transient failure keeps the last state: the router may be busy refreshing quotas.
-            guard let state = try? await client.claudeOAuthState(), !state.running else { continue }
-            await finish(state)
-            return
+            do {
+                let state = try await client.claudeOAuthState()
+                guard !state.running else { continue }
+                await finish(state)
+                return
+            } catch {
+                if error.asAdminError.isIncompatible {
+                    incompatible = true
+                    step = .failed(error.asAdminError.userMessage)
+                    return
+                }
+            }
         }
     }
 

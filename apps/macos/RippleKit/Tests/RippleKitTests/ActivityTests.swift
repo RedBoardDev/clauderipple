@@ -46,11 +46,10 @@ final class ActivityTests: XCTestCase {
         XCTAssertEqual(rows[1].usage?.cacheWrite, 10)
         XCTAssertEqual(rows[1].resent, true)
         XCTAssertEqual(rows[1].session, "example-session")
-        XCTAssertNil(rows[2].date)
-        XCTAssertNil(rows[2].ok)
+        XCTAssertNil(rows[2].date, "An unparsable date is not a missing wire field")
+        XCTAssertEqual(rows[2].ok, false)
         XCTAssertNil(rows[2].usage?.input)
-        let empty = try JSONDecoder().decode(RequestRecord.self, from: Data("{}".utf8))
-        XCTAssertFalse(empty.id.isEmpty)
+        XCTAssertThrowsError(try JSONDecoder().decode(RequestRecord.self, from: Data("{}".utf8)))
     }
 
     func testPeriodQueriesUseLocalCalendarDays() {

@@ -11,10 +11,10 @@
                      "weekly":{"usedPercent":5,"windowMinutes":10080,"resetAt":1800518400000}},
      "stale":true,"fetchedAt":1799990000000}
   ]},
-  {"provider":"chatgpt-subscription","type":"chatgpt","accounts":[
+  {"provider":"chatgpt-subscription","type":"chatgpt","title":"ChatGPT","accounts":[
     {"account":0,"windows":[{"kind":"weekly","used_percent":52,"window_minutes":10080,"reset_at":1800432000}],"at":1799999910000,
      "id":"pro-1","label":"Pro","active":true,
      "usageWindows":{"weekly":{"usedPercent":52,"windowMinutes":10080,"resetAt":1800432000000}}}
   ]},
-  {"provider":"gemini","type":"google","accounts":[{"account":0,"windows":[],"at":0,"id":"g-1"}]}
+  {"provider":"gemini","type":"google","title":"Gemini","accounts":[{"account":0,"windows":[],"at":0,"id":"g-1"}]}
 ]}

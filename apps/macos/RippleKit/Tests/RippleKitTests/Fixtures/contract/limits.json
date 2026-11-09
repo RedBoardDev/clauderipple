@@ -1,0 +1,76 @@
+{
+  "providers": [
+    {
+      "accounts": [
+        {
+          "account": 0,
+          "at": 1800000000000,
+          "inUse": true,
+          "windows": [
+            {
+              "kind": "five_hour",
+              "reset_at": 1800003600,
+              "used_percent": 24,
+              "window_minutes": 300
+            },
+            {
+              "kind": "seven_day",
+              "reset_at": 1800086400,
+              "used_percent": 42,
+              "window_minutes": 10080
+            }
+          ]
+        },
+        {
+          "account": 1,
+          "at": 1800000000000,
+          "label": "claude@example.test",
+          "windows": [
+            {
+              "kind": "five_hour",
+              "reset_at": 1800003600,
+              "used_percent": 24,
+              "window_minutes": 300
+            },
+            {
+              "kind": "seven_day",
+              "reset_at": 1800086400,
+              "used_percent": 42,
+              "window_minutes": 10080
+            }
+          ]
+        }
+      ],
+      "provider": "claude",
+      "title": "Claude",
+      "type": "anthropic"
+    },
+    {
+      "accounts": [
+        {
+          "account": 0,
+          "at": 1800000000000,
+          "inUse": true,
+          "label": "gpt@example.test",
+          "windows": [
+            {
+              "kind": "five_hour",
+              "reset_at": 1800003600,
+              "used_percent": 24,
+              "window_minutes": 300
+            },
+            {
+              "kind": "seven_day",
+              "reset_at": 1800086400,
+              "used_percent": 42,
+              "window_minutes": 10080
+            }
+          ]
+        }
+      ],
+      "provider": "chatgpt",
+      "title": "GPT",
+      "type": "chatgpt"
+    }
+  ]
+}

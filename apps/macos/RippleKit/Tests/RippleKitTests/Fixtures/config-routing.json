@@ -18,5 +18,6 @@
   "effortClamp": {"ultra": "max"},
   "health": {"maxConsecutiveUpstreamFailures": 20},
   "log": {"maxBytes": 5242880, "keep": 3},
+  "configRevision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
   "unknownRoot": {"number": 5e2}
 }

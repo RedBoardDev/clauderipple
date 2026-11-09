@@ -10,7 +10,7 @@ let package = Package(
         .library(name: "RippleKit", targets: ["RippleKit"]),
     ],
     targets: [
-        .target(name: "RippleKit"),
+        .target(name: "RippleKit", resources: [.process("Resources")]),
         .testTarget(
             name: "RippleKitTests",
             dependencies: ["RippleKit"],

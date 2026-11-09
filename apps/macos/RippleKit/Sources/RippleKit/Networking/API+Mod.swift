@@ -27,7 +27,7 @@ public extension AdminClient {
         for attempt in 1...ModSettingsEditor.maximumSaveAttempts {
             try Task.checkCancellation()
             let answer = try await exchange("PUT", "/api/mod-settings", json: draft.putBody())
-            if answer.status == 426 { throw ModSaveError.unsupportedSchema }
+            if answer.status == 426 { throw AdminError.incompatible(route: "/api/mod-settings", codingPath: "schemaVersion") }
             if answer.status == 409, let document = answer.document, document["settings"] != nil {
                 let current = try ModSettingsSnapshot(document: document)
                 if attempt == ModSettingsEditor.maximumSaveAttempts { throw ModSaveError.conflict(current) }
@@ -37,7 +37,7 @@ public extension AdminClient {
             guard (200..<300).contains(answer.status) else {
                 throw AdminError.http(status: answer.status, message: answer.document?["error"]?.stringValue)
             }
-            guard let document = answer.document else { throw AdminError.decoding("missing saved settings snapshot") }
+            guard let document = answer.document else { throw AdminError.incompatible(route: "/api/mod-settings", codingPath: "$document") }
             return try ModSettingsSnapshot(document: document)
         }
         throw AdminError.decoding("missing mod save result")

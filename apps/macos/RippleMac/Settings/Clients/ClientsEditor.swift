@@ -32,11 +32,15 @@ final class ClientsEditor {
     }
 
     func loadCodex(using client: AdminClient) async {
-        do { codex = .loaded(try await client.codexIntegration()) } catch { codex = .failed(error.asAdminError) }
+        do { codex = .loaded(try await client.codexIntegration()) }
+        catch {
+            codex = .failed(error.asAdminError)
+            if error.asAdminError.isIncompatible { load = .failed(error.asAdminError) }
+        }
     }
 
     func edit(_ name: String, store: RouterStore, change: @escaping @Sendable (inout JSONValue) throws -> Void) {
-        guard busy == nil else { return }
+        guard busy == nil, load.value != nil else { return }
         busy = name
         error = nil
         saved = false
@@ -47,14 +51,25 @@ final class ClientsEditor {
                 try change(&document)
                 configuration = RoutingConfiguration(document: document)
                 saved = true
-            } catch { self.error = error.asAdminError.userMessage }
+            } catch {
+                self.error = error.asAdminError.userMessage
+                if error.asAdminError.isIncompatible { load = .failed(error.asAdminError) }
+            }
             await store.refresh()
-            capabilities = try? await store.client.clientCapabilities()
+            await refreshCapabilities(using: store.client)
+        }
+    }
+
+    private func refreshCapabilities(using client: AdminClient) async {
+        do { capabilities = try await client.clientCapabilities() }
+        catch {
+            self.error = error.asAdminError.userMessage
+            if error.asAdminError.isIncompatible { load = .failed(error.asAdminError) }
         }
     }
 
     func command(_ name: String, store: RouterStore, action: @escaping @Sendable (AdminClient) async throws -> ClientCommandResult) {
-        guard busy == nil else { return }
+        guard busy == nil, load.value != nil else { return }
         busy = name
         error = nil
         warning = nil
@@ -67,7 +82,7 @@ final class ClientsEditor {
             } catch { self.error = error.asAdminError.userMessage }
             // Even a failed CLI command may have completed part of its work. Show actual state.
             await store.refresh()
-            capabilities = try? await store.client.clientCapabilities()
+            await refreshCapabilities(using: store.client)
             await loadCodex(using: store.client)
         }
     }

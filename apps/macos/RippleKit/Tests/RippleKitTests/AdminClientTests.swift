@@ -68,7 +68,7 @@ final class AdminClientTests: XCTestCase {
     // (no `from` echoed) and ask for "since midnight" from the ring instead.
     func testTodaySummaryFallsBackToSinceOnOlderRouters() async throws {
         let client = MockRouter.client { request in
-            .json(#"{"total":{"count":\#(request.query?.contains("since") == true ? 42 : 7),"ok":1,"failed":0,"input":0,"cached":0,"output":0,"cacheHitPercent":90,"avgMs":10},"providers":{}}"#)
+            .json(#"{"total":{"count":\#(request.query?.contains("since") == true ? 42 : 7),"ok":1,"failed":0,"input":0,"cached":0,"cacheWrite":0,"output":0,"cacheHitPercent":90,"avgMs":10},"providers":{},"models":[]}"#)
         }
         let summary = try await client.summarySinceMidnight()
         XCTAssertEqual(summary.total.count, 42)

@@ -67,12 +67,16 @@ struct AccountsPane: View {
         do {
             let loaded = try await AccountsBook.load(from: store.client)
             book = .loaded(loaded)
+            actions.writesEnabled = true
             if !loaded.providers.claude.isEmpty {
                 store.claudeRotation = !loaded.providers.claudeRotating.isDisjoint(with: loaded.providers.claude)
             }
         } catch {
             // Keep showing the last good list through a transient failure.
-            if book.value == nil { book = .failed(error.asAdminError) }
+            if book.value == nil || error.asAdminError.isIncompatible {
+                actions.writesEnabled = false
+                book = .failed(error.asAdminError)
+            }
         }
     }
 

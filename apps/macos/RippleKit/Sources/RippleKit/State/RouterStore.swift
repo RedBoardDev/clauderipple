@@ -33,6 +33,12 @@ public final class RouterStore {
     public private(set) var powerAvailable: Bool?
     public private(set) var lastUpdated: Date?
     public private(set) var lastError: AdminError?
+    /// A successful status poll must not hide an incompatible limits, usage or power response.
+    public private(set) var incompatibilities: [String: AdminError] = [:]
+    public var untestedRouterVersion: String? {
+        guard let version = status?.version, version != AdminContractMetadata.tested.routerVersion else { return nil }
+        return version
+    }
     public private(set) var isRefreshing = false
     /// When the router stopped answering, for the "router down" notification grace period.
     public private(set) var downSince: Date?
@@ -137,8 +143,15 @@ public final class RouterStore {
             }
             connection = .online
             downSince = nil
-            lastError = nil
+            clearIncompatibility("/api/status")
         } catch let error as AdminError {
+            if error.isIncompatible {
+                status = nil
+                accounts = []
+                claudeAccounts = nil
+                today = nil
+                power = nil
+            }
             markDown(error)
             return
         } catch {
@@ -147,16 +160,28 @@ public final class RouterStore {
         }
 
         let loadAccountsNow = force || !panelVisible || tick % Self.accountsEveryTicks == 1 || accounts.isEmpty
-        async let todayTask: RequestSummary? = try? client.summarySinceMidnight()
+        async let todayTask = client.summarySinceMidnight()
         if loadAccountsNow { await loadAccounts(force: force) }
         await loadPower()
-        today = await todayTask
+        do {
+            today = try await todayTask
+            clearIncompatibility("/api/requests/summary")
+        } catch {
+            today = nil
+            markDown(error.asAdminError)
+        }
         lastUpdated = Date()
         recompute()
     }
 
+    private func clearIncompatibility(_ route: String) {
+        incompatibilities[route] = nil
+        lastError = incompatibilities.sorted { $0.key < $1.key }.first?.value
+    }
+
     private func markDown(_ error: AdminError) {
-        lastError = error
+        if case let .incompatible(route, _) = error { incompatibilities[route] = error }
+        lastError = incompatibilities.sorted { $0.key < $1.key }.first?.value ?? error
         if case .offline = error {
             connection = .offline
             if downSince == nil { downSince = Date() }
@@ -166,23 +191,40 @@ public final class RouterStore {
 
     private func loadAccounts(force: Bool) async {
         let now = Date()
-        let mayHaveLimits = limitsSource != .accountEndpoints
+        let mayHaveLimits = force || incompatibilities["/api/limits"] != nil || limitsSource != .accountEndpoints
             || perAccountCheckedAt.map { now.timeIntervalSince($0) > Self.limitsRecheck } ?? true
         if mayHaveLimits {
             perAccountCheckedAt = now
-            if let response = try? await client.limits(refresh: force),
-               let rows = UsageBuilder.fromLimits(response, now: now) {
-                accounts = rows
-                limitsSource = .perAccount
-                // The Accounts pane still needs the Claude account list (emails, expiry).
-                claudeAccounts = try? await client.claudeAccounts()
+            do {
+                let response = try await client.limits(refresh: force)
+                clearIncompatibility("/api/limits")
+                if let rows = UsageBuilder.fromLimits(response, now: now) {
+                    accounts = rows
+                    limitsSource = .perAccount
+                    claudeAccounts = try await client.claudeAccounts()
+                    clearIncompatibility("/api/claude-accounts")
+                    return
+                }
+            } catch AdminError.routeMissing {
+                // Only an absent route or the explicitly anonymous limits variant uses the fallback.
+            } catch {
+                accounts = []
+                claudeAccounts = nil
+                markDown(error.asAdminError)
                 return
             }
         }
-        let claude = try? await client.claudeAccounts()
-        claudeAccounts = claude
-        accounts = UsageBuilder.fromAccounts(claude: claude, status: status, now: now)
-        limitsSource = .accountEndpoints
+        do {
+            let claude = try await client.claudeAccounts()
+            clearIncompatibility("/api/claude-accounts")
+            claudeAccounts = claude
+            accounts = UsageBuilder.fromAccounts(claude: claude, status: status, now: now)
+            limitsSource = .accountEndpoints
+        } catch {
+            accounts = []
+            claudeAccounts = nil
+            markDown(error.asAdminError)
+        }
     }
 
     private func loadPower() async {
@@ -190,16 +232,20 @@ public final class RouterStore {
         do {
             power = try await client.power()
             powerAvailable = true
+            clearIncompatibility("/api/power")
         } catch AdminError.routeMissing, AdminError.http(status: 501, _) {
             power = nil
             powerAvailable = false
         } catch {
-            // Transient: keep the last reading.
+            if error.asAdminError.isIncompatible { power = nil }
+            markDown(error.asAdminError)
         }
     }
 
     /// Keep-awake from the panel. Applies the router's answer, so the control shows what took effect.
     public func setAwake(_ mode: AwakeStatus.Mode) async throws {
+        if let error = incompatibilities["/api/status"] ?? incompatibilities["/api/power"] { throw error }
+        guard power != nil else { throw AdminError.offline }
         power = try await client.setAwakeMode(mode)
     }
 

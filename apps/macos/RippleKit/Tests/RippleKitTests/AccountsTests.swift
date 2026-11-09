@@ -6,7 +6,23 @@ private let now = Date(timeIntervalSince1970: 1_800_000_000)
 
 final class ClaudeAccountRowsTests: XCTestCase {
     private func response(_ text: String) throws -> ClaudeAccountsResponse {
-        try JSONDecoder().decode(ClaudeAccountsResponse.self, from: Data(text.utf8))
+        // UI row scenarios start from explicit wire defaults; contract tests never use this helper.
+        var document = try JSONValue(string: text)
+        if var current = document["current"], !current.isNull {
+            if current["paused"] == nil { current["paused"] = .bool(false) }
+            if current["source"] == nil { current["source"] = .string("observed") }
+            document["current"] = current
+        }
+        if let accounts = document["accounts"]?.arrayValue {
+            document["accounts"] = .array(accounts.map { original in
+                var account = original
+                for (key, value) in [("expiresAt", JSONValue.number("1900000000000")), ("needsReauth", .bool(false)), ("preferred", .bool(false)), ("paused", .bool(false))] {
+                    if account[key] == nil { account[key] = value }
+                }
+                return account
+            })
+        }
+        return try document.decode(ClaudeAccountsResponse.self)
     }
 
     // WHY: rows follow the order the router tries accounts in, so "First" and "Use first" mean
@@ -36,6 +52,15 @@ final class ClaudeAccountRowsTests: XCTestCase {
         XCTAssertEqual(rows.map(\.isFirst), [true, false])
         XCTAssertTrue(rows[0].needsSignIn)
         XCTAssertFalse(rows[1].needsSignIn, "no expiry known is not an expiry")
+    }
+
+    // WHY: a paused account, the current login included, must read as paused so "Resume" is offered.
+    func testPausedAccountsAreMarked() throws {
+        let data = try response(#"{"current":{"id":"current","label":"Current Claude login","paused":true},"accounts":[{"id":"a","label":"A","paused":true},{"id":"b","label":"B"}]}"#)
+        XCTAssertEqual(data.rows(now: now).map(\.paused), [true, true, false])
+        XCTAssertThrowsError(try JSONDecoder().decode(ClaudeAccountsResponse.self,
+            from: Data(#"{"current":{"id":"current","label":"Current Claude login"},"accounts":[]}"#.utf8)),
+            "A missing pause control is a contract failure, never implicitly resumed")
     }
 
     func testOneAccountOffersNoChoice() throws {

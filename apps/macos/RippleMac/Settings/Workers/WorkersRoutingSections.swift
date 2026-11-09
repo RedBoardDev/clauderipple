@@ -36,9 +36,31 @@ struct WorkersRoutingSections: View {
         if model.settings["modes"] != nil {
             modeSection
         }
+        reviewSection
         if model.mode == nil { allowSection }
         if model.mode?["rungs"] != nil || (model.mode == nil && model.settings.value(at: ["rules", "general", "rungs"]) != nil) {
             rungSection
+        }
+    }
+
+    /// Schema 2 review overrides are visible and preserved even though this pane edits general rungs.
+    private var reviewSection: some View {
+        Section("Red team & review") {
+            let review = model.mode?.value(at: ["domainRules", "review"])
+                ?? (model.mode == nil ? model.settings.value(at: ["domainRules", "review"]) : nil)
+            if let review {
+                ForEach(["light", "hard"], id: \.self) { rung in
+                    let steps = review["rungs"]?[rung]?.arrayValue ?? []
+                    LabeledContent(rung == "light" ? "Light / Standard" : "Hard / Plan") {
+                        Text(steps.map { step in
+                            "\(ModWorkerChoice.key(for: step["target"])) · \(step["effort"]?.stringValue ?? "")"
+                        }.joined(separator: " → "))
+                    }
+                }
+                FormNote("This worker set's review ladder is preserved when saving. Edit its ordered models in the web dashboard.")
+            } else {
+                FormNote("No review override. Red-team and review tasks follow this worker set's general ladder.")
+            }
         }
     }
 

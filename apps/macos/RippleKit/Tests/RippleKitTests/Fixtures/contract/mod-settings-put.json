@@ -1,0 +1,121 @@
+{
+  "revision": 1,
+  "schemaVersion": 2,
+  "settings": {
+    "agentAuto": "auto",
+    "allow": [],
+    "allowKnown": [],
+    "appearance": "auto",
+    "bias": 1,
+    "ceiling": "max",
+    "compactModel": "claude-haiku-5-5",
+    "compactModels": [],
+    "delegation": "normal",
+    "domainRules": {
+      "review": {
+        "mode": "ladder",
+        "rungs": {
+          "hard": [
+            {
+              "effort": "high",
+              "target": {
+                "agent": "general-purpose",
+                "model": "opus"
+              }
+            }
+          ],
+          "light": [
+            {
+              "effort": "medium",
+              "target": {
+                "agent": "general-purpose",
+                "model": "sonnet"
+              }
+            }
+          ],
+          "plan": [
+            {
+              "effort": "high",
+              "target": {
+                "agent": "general-purpose",
+                "model": "opus"
+              }
+            }
+          ],
+          "standard": [
+            {
+              "effort": "medium",
+              "target": {
+                "agent": "general-purpose",
+                "model": "sonnet"
+              }
+            }
+          ]
+        }
+      }
+    },
+    "effortAuto": true,
+    "extras": [],
+    "fallback": {
+      "agent": "general-purpose",
+      "model": "sonnet"
+    },
+    "floor": "low",
+    "hide": [
+      "reason"
+    ],
+    "jevSource": "typesafe",
+    "judge": "haiku",
+    "judgeModel": "deepseek-v4.1-flash",
+    "keepWarm": false,
+    "keepWarmHours": 2,
+    "keepWarmMinTokens": 30000,
+    "language": "auto",
+    "layout": "dashboard",
+    "modes": [],
+    "providers": {},
+    "rules": {
+      "general": {
+        "mode": "ladder",
+        "rungs": {
+          "hard": [
+            {
+              "effort": "high",
+              "target": {
+                "agent": "gpt-6-astra"
+              }
+            }
+          ],
+          "light": [
+            {
+              "effort": "max",
+              "target": {
+                "agent": "deepseek-v4-1-flash"
+              }
+            }
+          ],
+          "plan": [
+            {
+              "effort": "high",
+              "target": {
+                "agent": "general-purpose",
+                "model": "opus"
+              }
+            }
+          ],
+          "standard": [
+            {
+              "effort": "medium",
+              "target": {
+                "agent": "gpt-6-1-sol"
+              }
+            }
+          ]
+        }
+      }
+    },
+    "setupDone": false,
+    "skin": "deep",
+    "swampAlert": false
+  }
+}

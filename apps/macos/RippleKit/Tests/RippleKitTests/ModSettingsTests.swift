@@ -3,7 +3,9 @@ import XCTest
 
 final class ModSettingsTests: XCTestCase {
     private func snapshot(_ name: String = "mod-older") throws -> ModSettingsSnapshot {
-        try ModSettingsSnapshot(document: JSONValue(data: fixture(name)))
+        // Hand-written snapshots exercise editor/UI edge cases, not today's HTTP envelope.
+        let document = try JSONValue(data: fixture(name))
+        return ModSettingsSnapshot(settings: try XCTUnwrap(document["settings"]), revision: try XCTUnwrap(document["revision"]?.intValue))
     }
 
     func testOldAndNewSnapshotsDoNotInventFields() throws {
@@ -32,7 +34,7 @@ final class ModSettingsTests: XCTestCase {
         let editor = ModSettingsEditor(snapshot: try snapshot())
         let body = try editor.putBody()
         XCTAssertEqual(body.keys, ["schemaVersion", "settings", "revision"])
-        XCTAssertEqual(body["schemaVersion"], .int(1))
+        XCTAssertEqual(body["schemaVersion"], .int(2))
         XCTAssertEqual(body["revision"], .int(4))
         XCTAssertEqual(body["settings"], editor.settings)
     }
@@ -150,15 +152,16 @@ final class ModSettingsTests: XCTestCase {
     }
 
     func testAPIUsesConflictBodyAndRevisionForRetry() async throws {
-        let initial = try snapshot()
+        let recorded = try ModSettingsSnapshot(document: JSONValue(data: fixture("contract/mod-settings")))
+        let initial = ModSettingsSnapshot(settings: recorded.settings, revision: 4)
         var editor = ModSettingsEditor(snapshot: initial)
         editor.set(.int(2), at: ["bias"])
         var remote = initial.settings
         remote["keepWarm"] = .bool(true)
-        let conflict = JSONValue.object([("settings", remote), ("revision", .int(8))]).serialized()
+        let conflict = JSONValue.object([("settings", remote), ("revision", .int(8)), ("stored", .bool(true)), ("compactAt", .null)]).serialized()
         let client = MockRouter.client { request in
             if request.json?["revision"] == .int(4) { return .json(conflict, status: 409) }
-            return .json(JSONValue.object([("settings", request.json?["settings"] ?? .null), ("revision", .int(9))]).serialized())
+            return .json(JSONValue.object([("settings", request.json?["settings"] ?? .null), ("revision", .int(9)), ("stored", .bool(true)), ("compactAt", .null)]).serialized())
         }
         let saved = try await client.saveModSettings(editor)
         XCTAssertEqual(saved.settings["bias"], .int(2))
@@ -169,8 +172,8 @@ final class ModSettingsTests: XCTestCase {
     }
 
     func testThreeConflictAttemptsStopWithoutAnotherWrite() async throws {
-        let original = try snapshot()
-        let conflict = JSONValue.object([("settings", original.settings), ("revision", .int(5))]).serialized()
+        let original = try ModSettingsSnapshot(document: JSONValue(data: fixture("contract/mod-settings")))
+        let conflict = JSONValue.object([("settings", original.settings), ("revision", .int(5)), ("stored", .bool(true)), ("compactAt", .null)]).serialized()
         let client = MockRouter.client { _ in .json(conflict, status: 409) }
         do {
             _ = try await client.saveModSettings(ModSettingsEditor(snapshot: original))
@@ -184,17 +187,31 @@ final class ModSettingsTests: XCTestCase {
         do {
             _ = try await client.saveModSettings(ModSettingsEditor(snapshot: snapshot()))
             XCTFail("expected unsupported schema")
-        } catch ModSaveError.unsupportedSchema { } catch { XCTFail("unexpected \(error)") }
+        } catch {
+            XCTAssertEqual(error as? AdminError, .incompatible(route: "/api/mod-settings", codingPath: "schemaVersion"))
+        }
         XCTAssertEqual(MockRouter.requests().count, 1)
     }
 
+    func testReviewAndUnknownFieldsSurviveDecodeEditEncode() throws {
+        var document = try JSONValue(data: fixture("contract/mod-settings"))
+        document.set(.object([("literal", .number("1e3")), ("enabled", .bool(true))]), at: ["settings", "futureFeature"])
+        let snapshot = try ModSettingsSnapshot(document: document)
+        var editor = ModSettingsEditor(snapshot: snapshot)
+        editor.set(.int(2), at: ["bias"])
+        let encoded = try JSONValue(data: editor.putBody().data())
+        XCTAssertEqual(encoded["settings"]?["domainRules"]?.serialized(), snapshot.settings["domainRules"]?.serialized())
+        XCTAssertEqual(encoded["settings"]?["futureFeature"]?.serialized(), snapshot.settings["futureFeature"]?.serialized())
+        XCTAssertEqual(encoded["schemaVersion"], .int(2))
+    }
+
     func testReadsUseMockRouterOnly() async throws {
-        let settings = try fixtureText("mod-older")
+        let settings = try fixtureText("contract/mod-settings")
         let options = try fixtureText("mod-options")
         let client = MockRouter.client { .json($0.path == "/api/mod-options" ? options : settings) }
         let snapshot = try await client.modSettings()
         let catalog = try await client.modOptions()
-        XCTAssertEqual(snapshot.revision, 4)
+        XCTAssertEqual(snapshot.revision, 1)
         XCTAssertEqual(catalog.agents.count, 1)
     }
 }

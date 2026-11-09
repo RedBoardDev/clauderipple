@@ -9,14 +9,19 @@ public enum AdminError: Error, Equatable, Sendable {
     case routeMissing(path: String)
     /// A non-2xx answer, with the router's own `{error}` text when it sent one.
     case http(status: Int, message: String?)
-    /// JSON that does not match the expected shape.
+    /// A breaking admin contract change; never substitute defaults or write from this reading.
+    case incompatible(route: String, codingPath: String)
+    /// Local parsing/validation failures outside an admin response.
     case decoding(String)
+
+    public var isIncompatible: Bool { if case .incompatible = self { true } else { false } }
 
     public var userMessage: String {
         switch self {
         case .offline: "The router isn't answering."
         case let .routeMissing(path): "This router version doesn't offer \(path). Update ClaudeRipple."
         case let .http(status, message): message ?? "The router answered HTTP \(status)."
+        case let .incompatible(route, codingPath): "Router API changed: \(route) \(codingPath). Update the app."
         case let .decoding(detail): "Unexpected answer from the router (\(detail))."
         }
     }
@@ -62,7 +67,7 @@ public struct AdminClient: Sendable {
     /// GET a JSON route as an order-preserving document (config, settings).
     public func getDocument(_ path: String, query: [URLQueryItem] = []) async throws -> JSONValue {
         let data = try await perform("GET", path, query: query, body: nil, timeout: Self.readTimeout)
-        do { return try JSONValue(data: data) } catch { throw AdminError.decoding("\(error)") }
+        do { return try JSONValue(data: data) } catch { throw AdminError.incompatible(route: path, codingPath: "$document") }
     }
 
     /// GET a plain-text route (the router log).
@@ -85,7 +90,7 @@ public struct AdminClient: Sendable {
     /// A state-changing call whose answer is kept as a document.
     public func sendDocument(_ method: String, _ path: String, json body: JSONValue? = nil, timeout: TimeInterval = writeTimeout) async throws -> JSONValue {
         let data = try await perform(method, path, query: [], body: body?.data(), timeout: timeout)
-        do { return try JSONValue(data: data) } catch { throw AdminError.decoding("\(error)") }
+        do { return try JSONValue(data: data) } catch { throw AdminError.incompatible(route: path, codingPath: "$document") }
     }
 
     /// A call whose non-2xx answers carry a document the caller needs, e.g. the mod-settings 409
@@ -155,15 +160,26 @@ public struct AdminClient: Sendable {
         do {
             return try JSONDecoder().decode(T.self, from: data)
         } catch let error as DecodingError {
-            throw AdminError.decoding(Self.describe(error))
+            throw AdminError.incompatible(route: path, codingPath: Self.codingPath(error))
         } catch {
-            throw AdminError.decoding("\(error)")
+            throw AdminError.incompatible(route: path, codingPath: "$document")
         }
     }
 
     static func errorMessage(in data: Data) -> String? {
         guard let doc = try? JSONValue(data: data) else { return nil }
         return doc["error"]?.stringValue ?? doc["output"]?.stringValue
+    }
+
+    static func codingPath(_ error: DecodingError) -> String {
+        let keys: [any CodingKey]
+        switch error {
+        case let .keyNotFound(key, context): keys = context.codingPath + [key]
+        case let .typeMismatch(_, context), let .valueNotFound(_, context), let .dataCorrupted(context): keys = context.codingPath
+        @unknown default: keys = []
+        }
+        let path = keys.map { $0.intValue.map(String.init) ?? $0.stringValue }.joined(separator: ".")
+        return path.isEmpty ? "$document" : path
     }
 
     static func describe(_ error: DecodingError) -> String {

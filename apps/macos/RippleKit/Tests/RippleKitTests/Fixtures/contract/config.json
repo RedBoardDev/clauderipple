@@ -1,0 +1,67 @@
+{
+  "admin": {
+    "port": 0
+  },
+  "aliases": {},
+  "autoUpdate": false,
+  "cli": {
+    "agentFiles": true,
+    "extraModels": [
+      {
+        "contextWindow": 475000,
+        "model": "gpt-6-1-sol",
+        "name": "Contract GPT"
+      }
+    ]
+  },
+  "configRevision": "4055d8ae63ede48eff433e239f67ad7861220dc8bd1740420581843a89a7e04c",
+  "direct": [],
+  "effortClamp": {
+    "ultra": "max"
+  },
+  "health": {
+    "maxConsecutiveUpstreamFailures": 20
+  },
+  "listen": {
+    "host": "127.0.0.1",
+    "port": 8790
+  },
+  "log": {
+    "keep": 3,
+    "maxBytes": 5242880
+  },
+  "providers": {
+    "chatgpt": {
+      "auth": "own",
+      "models": [
+        {
+          "contextWindow": 475000,
+          "id": "gpt-6-1-sol",
+          "name": "Contract GPT"
+        }
+      ],
+      "type": "chatgpt",
+      "url": "https://contract.invalid"
+    },
+    "claude": {
+      "accountPool": true,
+      "auth": "claude-code",
+      "models": [
+        {
+          "id": "claude-sonnet-5-5",
+          "name": "Sonnet 5.5"
+        }
+      ],
+      "type": "anthropic"
+    }
+  },
+  "routes": {
+    "claude-haiku-5-5": {
+      "contextWindow": 475000,
+      "effort": "medium",
+      "model": "gpt-6-1-sol",
+      "provider": "chatgpt"
+    }
+  },
+  "upstream": "api.anthropic.com"
+}

@@ -1,0 +1,89 @@
+{
+  "agents": [
+    {
+      "billing": "subscription",
+      "efforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "model": "claude-sonnet-5-5",
+      "name": "claude-sonnet-5-5",
+      "provider": "claude"
+    },
+    {
+      "billing": "subscription",
+      "efforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "model": "gpt-6-1-sol",
+      "name": "gpt-6-1-sol",
+      "provider": "chatgpt"
+    }
+  ],
+  "claudeEfforts": [
+    "low",
+    "medium",
+    "high",
+    "xhigh",
+    "max"
+  ],
+  "models": [
+    {
+      "judgeOnly": false,
+      "model": "claude-sonnet-5-5",
+      "name": "Sonnet 5.5",
+      "provider": "claude"
+    },
+    {
+      "judgeOnly": false,
+      "model": "gpt-6-1-sol",
+      "name": "Contract GPT",
+      "provider": "chatgpt"
+    }
+  ],
+  "providers": [
+    {
+      "billing": "subscription",
+      "name": "claude",
+      "type": "anthropic",
+      "usable": true
+    },
+    {
+      "billing": "subscription",
+      "name": "chatgpt",
+      "type": "chatgpt",
+      "usable": false
+    }
+  ],
+  "scores": {
+    "attribution": "Data: Artificial Analysis (artificialanalysis.ai)",
+    "generatedAt": null,
+    "models": [
+      {
+        "aaBase": "claude-sonnet-5-5",
+        "matched": false,
+        "model": "claude-sonnet-5-5",
+        "provider": "claude",
+        "variants": []
+      },
+      {
+        "aaBase": "gpt-6-1-sol",
+        "matched": false,
+        "model": "gpt-6-1-sol",
+        "provider": "chatgpt",
+        "variants": []
+      }
+    ]
+  },
+  "zen": {
+    "configured": false,
+    "model": null
+  }
+}

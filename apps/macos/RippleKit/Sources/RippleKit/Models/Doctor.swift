@@ -63,6 +63,23 @@ public struct UpdateCheck: Decodable, Sendable, Equatable {
     public let running: Bool?
     public let started: Bool?
 
+    enum CodingKeys: String, CodingKey { case current, latest, newer, kind, running, started }
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        current = try c.decode(String.self, forKey: .current)
+        latest = try c.decode(String?.self, forKey: .latest)
+        newer = try c.decode(Bool.self, forKey: .newer)
+        kind = try c.decode(String.self, forKey: .kind)
+        if c.contains(.started) {
+            started = try c.decode(Bool.self, forKey: .started)
+            // Only GET carries running; a successful POST returns started instead.
+            running = try c.decodeIfPresent(Bool.self, forKey: .running)
+        } else {
+            running = try c.decode(Bool.self, forKey: .running)
+            started = nil
+        }
+    }
+
     public var supportsUpdate: Bool { kind == "script" || kind == "npm" }
     public var canUpdate: Bool { newer && supportsUpdate && running != true && started != true }
     public var installationNote: String? {

@@ -17,6 +17,7 @@ final class AccountActions {
     }
 
     var error: String?
+    var writesEnabled = false
     private(set) var busy: Set<String> = []
     var renaming: Target?
     var renameDraft = ""
@@ -43,7 +44,7 @@ final class AccountActions {
     /// Runs one change for one row, then reloads; a failure lands in `error` in the router's words.
     func perform(_ kind: Kind, _ id: String, reload: @escaping () async -> Void, _ work: @escaping () async throws -> Void) async {
         let key = Self.key(kind, id)
-        guard !busy.contains(key) else { return }
+        guard writesEnabled, !busy.contains(key) else { return }
         busy.insert(key)
         error = nil
         defer { busy.remove(key) }
@@ -57,7 +58,7 @@ final class AccountActions {
 
     /// Starts the router's ChatGPT browser login and waits for it, as the dashboard does.
     func signInChatGpt(client: AdminClient, adding: Bool, reload: @escaping () async -> Void) async {
-        guard chatgptLoginMessage == nil else { return }
+        guard writesEnabled, chatgptLoginMessage == nil else { return }
         error = nil
         chatgptLoginMessage = adding
             ? "Sign in with the account to add in your browser. If it shows an account you already added, pick another."
@@ -97,14 +98,14 @@ private struct AccountPrompts: ViewModifier {
         content
             .alert("Rename account", isPresented: presence($actions.renaming), presenting: actions.renaming) { target in
                 TextField("Name", text: $actions.renameDraft)
-                Button("Rename") { apply(rename: target) }
+                Button("Rename") { apply(rename: target) }.disabled(!actions.writesEnabled)
                 Button("Cancel", role: .cancel) {}
             } message: { target in
                 Text("The name ClaudeRipple shows for \(target.label).")
             }
             .confirmationDialog(removeTitle, isPresented: presence($actions.removing), titleVisibility: .visible,
                                 presenting: actions.removing) { target in
-                Button("Remove", role: .destructive) { apply(remove: target) }
+                Button("Remove", role: .destructive) { apply(remove: target) }.disabled(!actions.writesEnabled)
             } message: { target in
                 Text(target.kind == .claude
                      ? "Its sign-in is deleted from this Mac. Claude Code and Claude Desktop keep their own login."
@@ -112,12 +113,13 @@ private struct AccountPrompts: ViewModifier {
             }
             .confirmationDialog("Remove every Claude account added to ClaudeRipple?", isPresented: $actions.removingAllClaude,
                                 titleVisibility: .visible) {
-                Button("Remove all", role: .destructive) { removeAll() }
+                Button("Remove all", role: .destructive) { removeAll() }.disabled(!actions.writesEnabled)
             } message: {
                 Text("The current Claude Code and Claude Desktop login is not changed.")
             }
             .sheet(isPresented: $actions.signingInClaude) {
                 ClaudeSignInSheet(client: client) { await reload() }
+                    .disabled(!actions.writesEnabled)
             }
     }
 

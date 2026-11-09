@@ -16,15 +16,15 @@ public struct SummaryBucket: Decodable, Sendable, Equatable {
 
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
-        count = try c.decodeIfPresent(Int.self, forKey: .count) ?? 0
-        ok = try c.decodeIfPresent(Int.self, forKey: .ok) ?? 0
-        failed = try c.decodeIfPresent(Int.self, forKey: .failed) ?? 0
-        input = try c.decodeIfPresent(Double.self, forKey: .input) ?? 0
-        cached = try c.decodeIfPresent(Double.self, forKey: .cached) ?? 0
-        cacheWrite = try c.decodeIfPresent(Double.self, forKey: .cacheWrite) ?? 0
-        output = try c.decodeIfPresent(Double.self, forKey: .output) ?? 0
-        cacheHitPercent = try c.decodeIfPresent(Double.self, forKey: .cacheHitPercent) ?? 0
-        avgMs = try c.decodeIfPresent(Double.self, forKey: .avgMs) ?? 0
+        count = try c.decode(Int.self, forKey: .count)
+        ok = try c.decode(Int.self, forKey: .ok)
+        failed = try c.decode(Int.self, forKey: .failed)
+        input = try c.decode(Double.self, forKey: .input)
+        cached = try c.decode(Double.self, forKey: .cached)
+        cacheWrite = try c.decode(Double.self, forKey: .cacheWrite)
+        output = try c.decode(Double.self, forKey: .output)
+        cacheHitPercent = try c.decode(Double.self, forKey: .cacheHitPercent)
+        avgMs = try c.decode(Double.self, forKey: .avgMs)
     }
 }
 
@@ -61,8 +61,9 @@ public struct RequestSummary: Decodable, Sendable, Equatable {
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         total = try c.decode(SummaryBucket.self, forKey: .total)
-        providers = try c.decodeIfPresent([String: SummaryBucket].self, forKey: .providers) ?? [:]
-        models = (try? c.decodeIfPresent([ModelBucket].self, forKey: .models)) ?? []
+        providers = try c.decode([String: SummaryBucket].self, forKey: .providers)
+        models = try c.decode([ModelBucket].self, forKey: .models)
+        // Only durable range responses include earliest/from/to; the ring omits all three.
         earliest = try c.decodeIfPresent(String.self, forKey: .earliest)
         from = try c.decodeIfPresent(Double.self, forKey: .from)
         to = try c.decodeIfPresent(Double.self, forKey: .to)

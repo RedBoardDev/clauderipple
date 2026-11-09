@@ -30,7 +30,7 @@ struct DrainHint: View {
                     .buttonStyle(.borderedProminent)
                     .buttonBorderShape(.capsule)
                     .controlSize(.small)
-                    .disabled(applying)
+                    .disabled(applying || !store.incompatibilities.isEmpty)
                     .help("Make \(target.label) the account new Claude conversations start on")
             }
         }
