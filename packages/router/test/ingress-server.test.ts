@@ -12,7 +12,9 @@ import { ClaudeCodeAuthStore, ClaudeCodeCredentialStore } from "../src/providers
 import { RequestLog } from "../src/requestlog.ts";
 import type { Config } from "../src/config.ts";
 
+const noClaudeCodeCredentialReaders = { keychain: () => null, credentialsFile: () => null };
 const seen: { headers: http.IncomingHttpHeaders; body: Record<string, unknown> }[] = [];
+let upstreamStopReason = "end_turn";
 const upstream = http.createServer((req, res) => {
   const chunks: Buffer[] = [];
   req.on("data", (chunk: Buffer) => chunks.push(chunk));
@@ -26,12 +28,12 @@ const upstream = http.createServer((req, res) => {
         'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\n',
         'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"ok"}}\n\n',
         'event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n',
-        'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":12,"cache_read_input_tokens":8,"output_tokens":2}}\n\n',
+        `event: message_delta\ndata: ${JSON.stringify({ type: "message_delta", delta: { stop_reason: upstreamStopReason }, usage: { input_tokens: 12, cache_read_input_tokens: 8, output_tokens: 2 } })}\n\n`,
         'event: message_stop\ndata: {"type":"message_stop"}\n\n',
       ].join(""));
       return;
     }
-    res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ id: "msg_1", type: "message", role: "assistant", content: [{ type: "text", text: "ok" }], stop_reason: "end_turn", usage: { input_tokens: 12, cache_read_input_tokens: 8, output_tokens: 2 } }));
+    res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ id: "msg_1", type: "message", role: "assistant", content: [{ type: "text", text: "ok" }], stop_reason: upstreamStopReason, usage: { input_tokens: 12, cache_read_input_tokens: 8, output_tokens: 2 } }));
   });
 });
 
@@ -51,7 +53,7 @@ const config: Config = {
 };
 const log = new Logger(null, 1e9, 0, false);
 const requests = new RequestLog(path.join(root, "requests.jsonl"));
-const ingress = new OpenAiIngress({ config: () => config, log, requests });
+const ingress = new OpenAiIngress({ config: () => config, log, requests, claudeCodeCredentialReaders: noClaudeCodeCredentialReaders });
 const ingressPort = await ingress.listen();
 
 async function call(pathname: string, body?: unknown, port = ingressPort): Promise<{ status: number; text: string }> {
@@ -61,6 +63,7 @@ async function call(pathname: string, body?: unknown, port = ingressPort): Promi
       let text = "";
       res.on("data", (chunk: Buffer) => { text += chunk.toString("utf8"); });
       res.on("end", () => resolve({ status: res.statusCode ?? 0, text }));
+      res.on("error", reject);
     });
     req.on("error", reject);
     if (data) req.end(data); else req.end();
@@ -85,6 +88,104 @@ test("Responses non-stream and stream traverse fake Anthropic-compatible provide
   assert.match(stream.text, /"cached_tokens":8/);
   assert.equal(seen.at(-1)?.headers.authorization, undefined, "local client bearer token is never forwarded");
   assert.equal(seen.at(-1)?.headers["x-api-key"], "upstream-key");
+});
+
+// Issue #104: this is the body Codex sends for /compact against a Claude model (transcript, then the
+// remote-compaction control item). Anthropic refuses it when it arrives with an assistant last turn.
+test("Codex /compact body reaches the provider ending with a user message", async () => {
+  const response = await call("/v1/responses", {
+    model: "claude-sonnet-5",
+    instructions: "system",
+    input: [
+      { type: "message", role: "user", content: [{ type: "input_text", text: "add a test" }] },
+      { type: "message", role: "assistant", content: [{ type: "output_text", text: "I added it." }] },
+      { type: "compaction_trigger" },
+    ],
+    max_output_tokens: 16,
+  });
+  assert.equal(response.status, 200);
+  const messages = seen.at(-1)?.body.messages as { role: string }[];
+  assert.equal(messages.at(-2)?.role, "assistant", "the transcript is unchanged");
+  assert.equal(messages.at(-1)?.role, "user");
+});
+
+for (const stream of [true, false]) {
+  test(`Codex compaction round trip restores summary (${stream ? "stream" : "JSON"})`, async () => {
+    const response = await call("/v1/responses", {
+      ...input, stream,
+      input: [
+        { type: "message", role: "user", content: "add a test" },
+        { type: "message", role: "assistant", content: "I added it." },
+        { type: "compaction_trigger" },
+      ],
+    });
+    assert.equal(response.status, 200);
+    let output: Record<string, unknown>[];
+    if (stream) {
+      const events = response.text.split("\n").filter((line) => line.startsWith("data: "))
+        .map((line) => JSON.parse(line.slice(6)) as Record<string, unknown>);
+      const done = events.filter((event) => event.type === "response.output_item.done");
+      assert.equal(done.length, 1);
+      const item = done[0]!.item as Record<string, unknown>;
+      assert.equal(item.type, "compaction");
+      assert.deepEqual(events.map((event) => event.type), [
+        "response.created", "response.output_item.added", "response.output_item.done", "response.completed",
+      ]);
+      assert.deepEqual(events[1]!.item, item);
+      output = (events.at(-1)!.response as { output: Record<string, unknown>[] }).output;
+      assert.deepEqual(output, [item]);
+    } else {
+      output = (JSON.parse(response.text) as { output: Record<string, unknown>[] }).output;
+    }
+    assert.equal(output.length, 1);
+    assert.equal(output[0]!.type, "compaction");
+    assert.equal(typeof output[0]!.encrypted_content, "string");
+    const next = await call("/v1/responses", {
+      ...input, input: [...output, { type: "message", role: "user", content: "continue" }],
+    });
+    assert.equal(next.status, 200);
+    assert.deepEqual(seen.at(-1)!.body.messages, [
+      { role: "user", content: [{ type: "text", text: "Summary of the earlier conversation: ok" }] },
+      { role: "user", content: [{ type: "text", text: "continue", cache_control: { type: "ephemeral" } }] },
+    ]);
+    assert.equal(JSON.parse(next.text).output[0].type, "message", "ordinary turns stay ordinary");
+  });
+}
+
+test("foreign compaction is logged once without leaking its opaque content", async () => {
+  const warnings: string[] = [];
+  const warn = log.warn;
+  log.warn = (message: string) => { warnings.push(message); };
+  try {
+    const response = await call("/v1/responses", { ...input, input: [
+      { type: "compaction", encrypted_content: "foreign-opaque-content" },
+      { type: "message", role: "user", content: "continue" },
+    ] });
+    assert.equal(response.status, 200);
+    assert.equal(warnings.length, 1);
+    assert.match(warnings[0]!, /ignored foreign compaction/);
+    assert.ok(!warnings[0]!.includes("foreign-opaque-content"));
+    assert.deepEqual(seen.at(-1)!.body.messages, [
+      { role: "user", content: [{ type: "text", text: "continue", cache_control: { type: "ephemeral" } }] },
+    ]);
+  } finally {
+    log.warn = warn;
+  }
+});
+
+test("truncated compaction fails over HTTP without a successful compaction response", async () => {
+  upstreamStopReason = "max_tokens";
+  try {
+    const body = { ...input, input: [{ type: "compaction_trigger" }] };
+    const response = await call("/v1/responses", body);
+    assert.equal(response.status, 502);
+    assert.equal(JSON.parse(response.text).output, undefined);
+    assert.match(response.text, /Compaction did not finish/);
+    await assert.rejects(call("/v1/responses", { ...body, stream: true }), /aborted|socket hang up/);
+    assert.equal(requests.list(1)[0]?.status, 502);
+  } finally {
+    upstreamStopReason = "end_turn";
+  }
 });
 
 test("Chat Completions non-stream and stream traverse same provider", async () => {
@@ -143,4 +244,5 @@ test("native ingress uses one added Claude account without enabling failover", a
 test("cleanup", async () => {
   await ingress.drain(1);
   await new Promise<void>((resolve) => upstream.close(() => resolve()));
+  fs.rmSync(root, { recursive: true, force: true });
 });

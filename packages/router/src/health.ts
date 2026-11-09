@@ -32,12 +32,24 @@ export function providerExhaustion(status: number, body = "", retryMs?: number, 
   // A relay's 402 for its upstream being down is not about money (pool.ts, RELAY_UPSTREAM_FAILED).
   if (RELAY_UPSTREAM_FAILED.test(body)) return undefined;
   const balance = /\b(?:insufficient[_ -]+(?:balance|credits?|funds)|(?:balance|credits?)[_ -]+(?:insufficient|exhausted|depleted))\b/i.test(body);
-  const billing = /\bbilling[_ -]+(?:hard[_ -]+)?(?:limit|exhausted|quota)|\b(?:exhausted|exceeded|insufficient)[_ -]+billing\b/i.test(body);
-  const quota = /\b(?:insufficient_quota|usage_limit_reached|quota[_ -]+exhausted|exhausted[_ -]+quota)\b/i.test(body);
+  const billing = /\bbilling[_ -]+(?:hard[_ -]+)?(?:limit|exhausted|quota)|\b(?:exhausted|exceeded|insufficient)[_ -]+billing\b|\byour project has exceeded its monthly spending cap\b/i.test(body);
+  // OpenCode Go answers a spent subscription window with `{"type":"error","error":{"type":
+  // "GoUsageLimitError","message":"Go usage limit exceeded"},"metadata":{"limitName":"weekly"}}`
+  // (#95, measured 2026-10-25). Its wording says "usage limit", not "rate limit", so the plan's own
+  // phrase is the subscription's quota; a limit counted per minute or hour is still a speed limit.
+  const quota = /\b(?:insufficient_quota|usage_limit_reached|quota[_ -]+exhausted|exhausted[_ -]+quota|go[_ -]*usage[_ -]*limit[_ -]*(?:error|exceeded)|usage[_ -]+limit[_ -]+exceeded(?!\s+(?:per|a|each|every)\s+(?:second|minute|hour)))\b/i.test(body);
   if (status !== 402 && !balance && !billing && !quota) return undefined;
   const reason = balance ? "insufficient_balance" : billing || status === 402 ? "billing_exhausted" : "quota_exhausted";
   const wait = retryMs !== undefined && Number.isFinite(retryMs) && retryMs > 0 ? retryMs : 30 * 60_000;
   return { reason, at: now, until: now + wait };
+}
+
+/** A definite exhaustion is not a rate limit: asking again inside the same minute fails the same
+ * way. Claude Code reads `x-should-retry` before its own 429 rule, so `false` fails the turn at
+ * once; `retry-after` says when the provider is back, rounded up so a wait is never zero (#89).
+ */
+export function exhaustionHeaders(exhaustion: ProviderExhaustion, now = Date.now()): Record<string, string> {
+  return { "x-should-retry": "false", "retry-after": String(Math.max(1, Math.ceil((exhaustion.until - now) / 1000))) };
 }
 
 /** Per router instance, advisory only: manual traffic can prove a topped-up provider healthy. */
@@ -49,9 +61,57 @@ export class ProviderHealth {
     else if (status >= 200 && status < 300) this.exhausted.delete(provider);
   }
 
+  clear(provider: string): void {
+    this.exhausted.delete(provider);
+  }
+
   snapshot(now = Date.now()): Record<string, ProviderExhaustion> {
     for (const [name, value] of this.exhausted) if (value.until <= now) this.exhausted.delete(name);
     return Object.fromEntries(this.exhausted);
+  }
+}
+
+export type ModelUnavailable = { reason: "model_deprecated"; at: number };
+
+/**
+ * Explicit model retirement, not a missing endpoint or a temporary failure. `model_not_found` is
+ * not one: it also answers a key without access or a relay mid-deploy, and this record has no TTL.
+ */
+export function modelDeprecation(status: number, body: string, now = Date.now()): ModelUnavailable | undefined {
+  if (status !== 404 && status !== 410) return undefined;
+  return /\b(?:ModelDeprecated|model_deprecated)\b|\bmodel\b[^\n]*\bhas been deprecated\b/i.test(body)
+    ? { reason: "model_deprecated", at: now } : undefined;
+}
+
+/** Provider + exact upstream model id. No timer or successful sibling clears a retirement;
+ * a success on that exact target or a change to its provider's configuration permits another probe.
+ */
+export class ModelHealth {
+  private readonly unavailable: Record<string, Record<string, ModelUnavailable>> = Object.create(null);
+
+  observe(provider: string, model: string, state: ModelUnavailable | undefined): void {
+    if (!state) return;
+    const models = this.unavailable[provider] ??= Object.create(null);
+    models[model] = state;
+  }
+
+  success(provider: string, model: string): void {
+    const models = this.unavailable[provider];
+    if (!models) return;
+    delete models[model];
+    if (!Object.keys(models).length) delete this.unavailable[provider];
+  }
+
+  clear(provider: string): void {
+    delete this.unavailable[provider];
+  }
+
+  get(provider: string, model: string): ModelUnavailable | undefined {
+    return this.unavailable[provider]?.[model];
+  }
+
+  snapshot(): Record<string, Record<string, ModelUnavailable>> {
+    return structuredClone(this.unavailable);
   }
 }
 

@@ -1,6 +1,7 @@
 // How much of each Antigravity (Cloud Code Assist) account's quota is left, for the dashboard and
-// the status bar's limits row. One request per account, like ClaudeUsage (anthropic-usage.ts): the
-// accounts store already refreshes the OAuth token, so this only reads.
+// the status bar's limits row. One lookup per account and host: the accounts store already
+// refreshes the OAuth token, so this only reads. The CLI User-Agent includes Argon's weekly group;
+// an unreadable CLI answer falls back to the IDE answer for the existing Gemini/3P windows.
 //
 // Measured 2026-10-15 against a live Antigravity subscription:
 //   POST {host}/v1internal:retrieveUserQuotaSummary
@@ -21,7 +22,7 @@
 // older `retrieveUserQuota` returns meaningless values and is deliberately not used.
 
 import type { GoogleCredential } from "./accounts.ts";
-import { GOOGLE_OAUTH, antigravityUserAgent, type FetchLike } from "./antigravity.ts";
+import { GOOGLE_OAUTH, antigravityCliUserAgent, antigravityUserAgent, type FetchLike } from "./antigravity.ts";
 
 /** The five-hour and weekly window lengths in minutes, for the limits row's `window_minutes`. */
 const FIVE_HOURS = 5 * 60;
@@ -34,6 +35,8 @@ export type QuotaBucket = {
   /** "5h" or "weekly", as the endpoint names it. */
   window: string;
   resetTime?: string;
+  /** A disabled bucket is not positive evidence of remaining quota. */
+  disabled?: boolean;
   /** 0..1 of the quota left; 1 = untouched. */
   remainingFraction: number;
 };
@@ -58,7 +61,7 @@ export function parseQuotaSummary(body: unknown): QuotaGroup[] | null {
     if (Array.isArray(group.buckets)) {
       for (const b of group.buckets) {
         if (!b || typeof b !== "object" || Array.isArray(b)) continue;
-        const bucket = b as { bucketId?: unknown; displayName?: unknown; window?: unknown; resetTime?: unknown; remainingFraction?: unknown };
+        const bucket = b as { bucketId?: unknown; displayName?: unknown; window?: unknown; resetTime?: unknown; remainingFraction?: unknown; disabled?: unknown };
         if (typeof bucket.remainingFraction !== "number" || !Number.isFinite(bucket.remainingFraction)) continue;
         if (typeof bucket.window !== "string" || !bucket.window) continue;
         buckets.push({
@@ -66,6 +69,7 @@ export function parseQuotaSummary(body: unknown): QuotaGroup[] | null {
           displayName: typeof bucket.displayName === "string" ? bucket.displayName : "",
           window: bucket.window,
           ...(typeof bucket.resetTime === "string" ? { resetTime: bucket.resetTime } : {}),
+          ...(typeof bucket.disabled === "boolean" ? { disabled: bucket.disabled } : {}),
           remainingFraction: bucket.remainingFraction,
         });
       }
@@ -100,19 +104,23 @@ function ordered(windows: GoogleWindow[]): GoogleWindow[] {
 
 /**
  * The endpoint's groups as windows the limits row reads. "Gemini Models" carries the plan's own
- * five-hour and weekly windows; every other group (the measured "Claude and GPT models") is a
- * third-party window, shown as a `scoped` "3P" with its length in `window_minutes`.
+ * five-hour and weekly windows; "Gemini 4 Argon" has its own scoped weekly window. Other groups
+ * (the measured "Claude and GPT models") are shown as `scoped` "3P" with their window length.
  */
 export function googleWindowsFromGroups(groups: readonly QuotaGroup[]): GoogleWindow[] {
   const out: GoogleWindow[] = [];
   for (const group of groups) {
+    const argon = group.displayName.trim().toLowerCase() === ARGON_GROUP.name;
     const gemini = /gemini/i.test(group.displayName);
     for (const bucket of group.buckets) {
       const minutes = windowMinutes(bucket.window);
       const used = Math.round((1 - bucket.remainingFraction) * 1000) / 10;
       const at = bucket.resetTime ? Math.round(Date.parse(bucket.resetTime) / 1000) : NaN;
       const reset = Number.isFinite(at) ? { reset_at: at } : {};
-      if (gemini) {
+      if (argon) {
+        const weekly = bucket.window === "weekly" && bucket.bucketId === ARGON_GROUP.ids.weekly;
+        out.push({ kind: "scoped", label: weekly ? "Argon weekly" : "Argon", used_percent: used, ...(minutes !== undefined ? { window_minutes: minutes } : {}), ...reset });
+      } else if (gemini) {
         const kind: GoogleWindow["kind"] = bucket.window === "5h" ? "five_hour" : bucket.window === "weekly" ? "seven_day" : "window";
         out.push({ kind, used_percent: used, ...(minutes !== undefined ? { window_minutes: minutes } : {}), ...reset });
       } else {
@@ -164,34 +172,53 @@ function strictQuotaGroups(body: unknown): QuotaGroup[] | null {
       if (!isObject(b) || typeof b.bucketId !== "string" || typeof b.window !== "string" || !b.window) return null;
       if (typeof b.remainingFraction !== "number" || !Number.isFinite(b.remainingFraction)) return null;
       if (b.resetTime !== undefined && typeof b.resetTime !== "string") return null;
-      buckets.push({ bucketId: b.bucketId, displayName: typeof b.displayName === "string" ? b.displayName : "", window: b.window, ...(typeof b.resetTime === "string" ? { resetTime: b.resetTime } : {}), remainingFraction: b.remainingFraction });
+      if (b.disabled !== undefined && typeof b.disabled !== "boolean") return null;
+      buckets.push({ bucketId: b.bucketId, displayName: typeof b.displayName === "string" ? b.displayName : "", window: b.window, ...(typeof b.resetTime === "string" ? { resetTime: b.resetTime } : {}), ...(typeof b.disabled === "boolean" ? { disabled: b.disabled } : {}), remainingFraction: b.remainingFraction });
     }
     out.push({ displayName: g.displayName, buckets });
   }
   return out;
 }
 
-/** The measured group names and their bucket ids; the endpoint reports no per-model quota. */
+/** The measured group names and their required bucket ids; Argon on Pro has only a weekly bucket. */
 const GEMINI_GROUP = { name: "gemini models", ids: { "5h": "gemini-5h", weekly: "gemini-weekly" } };
 const THIRD_PARTY_GROUP = { name: "claude and gpt models", ids: { "5h": "3p-5h", weekly: "3p-weekly" } };
+const ARGON_GROUP = { name: "gemini 4 argon", ids: { weekly: "gemini-argon-wtu-weekly" } };
 
-/** gemini-* draws on "Gemini Models"; claude-* and gpt-oss* on "Claude and GPT models"; else unknown. */
-function groupFor(groups: readonly QuotaGroup[], model: string): { group: QuotaGroup; ids: Record<"5h" | "weekly", string> } | undefined {
-  const id = model.toLowerCase();
-  const known = /^gemini-/.test(id) ? GEMINI_GROUP : /^claude-/.test(id) || /^gpt-oss(-|$)/.test(id) ? THIRD_PARTY_GROUP : undefined;
+/**
+ * The quota group a model draws on, as a pool scope (pool.ts): `argon` for gemini-4-argon*,
+ * `gemini` for other gemini-*, `3p` for claude-* and gpt-oss*, undefined otherwise.
+ * A spent group rests only its own models.
+ */
+export function antigravityQuotaScope(model: string): "argon" | "gemini" | "3p" | undefined {
+  const id = model.toLowerCase().replace(/@[^@]*$/, "");
+  // The CLI quota summary reports a separate "Gemini 4 Argon" weekly bucket on Pro (measured
+  // 2026-10-28). Keep Argon's cooldown isolated; missing summary evidence never proves shared
+  // Gemini quota or an Ultra plan. Catalogue quotaInfo is not quota evidence.
+  if (/^gemini-4-argon(?:-|$)/.test(id)) return "argon";
+  if (/^gemini-/.test(id)) return "gemini";
+  if (/^claude-/.test(id) || /^gpt-oss(-|$)/.test(id)) return "3p";
+  return undefined;
+}
+
+/** Match exactly one known group, without substituting general Gemini quota for absent Argon quota. */
+function groupFor(groups: readonly QuotaGroup[], model: string): { group: QuotaGroup; ids: Record<string, string> } | undefined {
+  const scope = antigravityQuotaScope(model);
+  const known = scope === "argon" ? ARGON_GROUP : scope === "gemini" ? GEMINI_GROUP : scope === "3p" ? THIRD_PARTY_GROUP : undefined;
   if (!known) return undefined;
   const found = groups.filter((g) => g.displayName.trim().toLowerCase() === known.name);
   return found.length === 1 ? { group: found[0]!, ids: known.ids } : undefined;
 }
 
-/** True when the group is exactly its 5h and weekly buckets, each with 0 < fraction <= 1 and a reset after `now`. */
-function groupHasQuota(group: QuotaGroup, ids: Record<"5h" | "weekly", string>, now: number): boolean {
-  if (group.buckets.length !== 2) return false;
-  return (["5h", "weekly"] as const).every((window) => {
-    const matches = group.buckets.filter((b) => b.window === window && b.bucketId === ids[window]);
+/** Exactly the required enabled buckets, each with finite 0 < fraction <= 1 and a future reset. */
+function groupHasQuota(group: QuotaGroup, ids: Record<string, string>, now: number): boolean {
+  const required = Object.entries(ids);
+  if (group.buckets.length !== required.length) return false;
+  return required.every(([window, id]) => {
+    const matches = group.buckets.filter((b) => b.window === window && b.bucketId === id);
     const bucket = matches[0];
-    if (matches.length !== 1 || !bucket) return false;
-    if (bucket.remainingFraction <= 0 || bucket.remainingFraction > 1) return false;
+    if (matches.length !== 1 || !bucket || bucket.disabled) return false;
+    if (!Number.isFinite(bucket.remainingFraction) || bucket.remainingFraction <= 0 || bucket.remainingFraction > 1) return false;
     const reset = bucket.resetTime ? Date.parse(bucket.resetTime) : Number.NaN;
     return Number.isFinite(reset) && reset > now;
   });
@@ -254,8 +281,9 @@ export class GoogleUsage {
    * Whether the cached quota still shows room for `model` on this account and project, **on the host
    * the model's requests are sent to**. Reads the cache only (never fetches), and is true only when
    * the last refresh of that account and host succeeded within the TTL, the model's group is
-   * recognized, and both its 5h and weekly buckets have a remaining fraction in (0, 1] and a reset
-   * time in the future. Everything else is false: this is positive evidence, not a guess, so "false"
+   * recognized, and every required bucket (weekly alone for Argon, 5h and weekly otherwise) is
+   * enabled with a remaining fraction in (0, 1] and a future reset. Everything else is false:
+   * this is positive evidence, not a guess, so "false"
    * means "unknown or spent", not "refused".
    */
   hasRemainingQuota(credential: Pick<GoogleCredential, "ownerId" | "projectId">, model: string, host?: string): boolean {
@@ -304,11 +332,22 @@ export class GoogleUsage {
   }
 
   private async fetchOne(credential: GoogleCredential, host: string): Promise<{ groups: QuotaGroup[]; strict: QuotaGroup[] | null } | null> {
+    const cli = await this.fetchAs(credential, host, antigravityCliUserAgent());
+    if (cli) return cli;
+    const ide = await this.fetchAs(credential, host, antigravityUserAgent());
+    if (!ide) return null;
+    // The IDE response does not establish Argon's quota. Keep the other groups for existing
+    // accounts, but never carry an older CLI answer or infer shared quota from the missing group.
+    const withoutArgon = (g: QuotaGroup) => g.displayName.trim().toLowerCase() !== ARGON_GROUP.name;
+    return { groups: ide.groups.filter(withoutArgon), strict: ide.strict?.filter(withoutArgon) ?? null };
+  }
+
+  private async fetchAs(credential: GoogleCredential, host: string, userAgent: string): Promise<{ groups: QuotaGroup[]; strict: QuotaGroup[] | null } | null> {
     const owner = credential.ownerId.slice(0, 8);
     try {
       const res = await (this.opts.fetch ?? fetch)(`${host}/${GOOGLE_OAUTH.apiVersion}:retrieveUserQuotaSummary`, {
         method: "POST",
-        headers: { authorization: `Bearer ${credential.accessToken}`, "content-type": "application/json", accept: "*/*", "user-agent": antigravityUserAgent() },
+        headers: { authorization: `Bearer ${credential.accessToken}`, "content-type": "application/json", accept: "*/*", "user-agent": userAgent },
         body: JSON.stringify({ project: credential.projectId }),
         signal: AbortSignal.timeout(this.opts.timeoutMs ?? 5000),
       });

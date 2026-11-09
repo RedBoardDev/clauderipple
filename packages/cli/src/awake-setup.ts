@@ -324,6 +324,18 @@ export function releaseFailedHint(platform: NodeJS.Platform = process.platform):
 }
 
 /**
+ * Uninstall clears the sleep bit but cannot silently take back the sudoers grant: removing a file
+ * under /etc/sudoers.d needs an administrator, and an unattended prompt during uninstall is not one
+ * (D2, 2026-10-25). `awake setup --remove` is the explicit, password-prompting path; this only says
+ * the grant is still there and names the command. Pure, so it can be checked without touching sudo.
+ */
+export function remainingAwakeGrantHint(opts: { platform?: NodeJS.Platform; exists?: (file: string) => boolean } = {}): string | null {
+  if ((opts.platform ?? process.platform) !== "darwin") return null;
+  if (!(opts.exists ?? fs.existsSync)(SUDOERS_FILE)) return null;
+  return `덮개를 닫아도 시스템이 잠자기에 들어가지 않게 하는 관리자 권한 규칙이 남아 있습니다. 더 이상 필요하지 않다면 \`sudo rm ${SUDOERS_FILE}\`을 직접 실행해 주세요. (또는 \`clauderipple awake setup --remove\`)`;
+}
+
+/**
  * If the router set the sleep bit (journal), clear it now with `sudo -n`; on Windows, put back the
  * lid-close action it saved (the execution state died with the router's child). For `stop`,
  * `uninstall` and `awake off` with no router answering: a router that is gone cannot reconcile it.

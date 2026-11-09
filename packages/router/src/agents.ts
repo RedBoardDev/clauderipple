@@ -7,14 +7,18 @@
 // to a model id no provider declared and `PASS` sent thirty 404s to Anthropic (2026-09-20).
 //
 // This module derives both from config: the aliases a marker can name, and the agent files
-// themselves. Files it writes are recorded in a manifest and are the only ones it may touch — a
-// hand-written `muse.md` or `gpt.md` is never overwritten or removed.
+// themselves. Files it writes are recorded in a manifest; marked current targets can recover lost
+// ownership. A hand-written `muse.md` or `gpt.md` is never overwritten or removed.
 
+import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { adminPort, homeDir, type Config, type Provider } from "./config.ts";
-import { declaredBy } from "./routing.ts";
+import { withFileLock } from "./locked-file.ts";
+import { accountPinFor, declaredBy, pinnedModel, qualifiedModel } from "./routing.ts";
+import { storedAccountsFor, storedAccountsSignature, type PinnedAccount } from "./pinned-accounts.ts";
+import { bareOwners, isTargetProvider, namedOnly } from "./targets.ts";
 import { isJudgeOnlyModel } from "./model-policy.ts";
 import { GROK_EFFORT_LEVELS } from "./providers/grok/catalog.ts";
 import { shortName } from "../../cli/src/hooks/agent-title.ts";
@@ -29,11 +33,13 @@ export function defaultAgentDir(): string {
 
 /**
  * `cfg` with the agent files' derived aliases merged in. An explicit `cfg.aliases` entry wins, so a
- * hand-written alias is never overridden by a generated one.
+ * hand-written alias is never overridden by a generated one. The names the 0.12.18 build gave the
+ * same workers join as aliases too, so a marker written against one still resolves (#111); a current
+ * name wins over an old one, since the derived and explicit entries sit above them.
  */
 export function withAgentAliases(cfg: Config, dir: string, log?: AgentLog): Config {
   const derived = agentAliases(dir, log);
-  return { ...cfg, aliases: { ...derived, ...cfg.aliases } };
+  return { ...cfg, aliases: { ...legacyAgentAliases(cfg, dir, log), ...derived, ...cfg.aliases } };
 }
 
 /** The body every generated worker carries, verbatim. */
@@ -75,7 +81,7 @@ export function imageLine(port: number): string {
 const TOOLS = ["Read", "Write", "Edit", "Glob", "Grep", "Bash", "WebFetch", "WebSearch", "Skill"];
 
 /** One parsed agent file. `model` is null when the file has no `model:` line. */
-type AgentEntry = { name: string; model: string | null; mtimeMs: number };
+type AgentEntry = { name: string; model: string | null; generated: boolean; mtimeMs: number };
 
 /**
  * Parsed `*.md` frontmatter per directory, keyed by file mtime so a request never re-reads the whole
@@ -136,7 +142,7 @@ function scanDir(dir: string, log?: AgentLog): Map<string, AgentEntry> {
       log?.warn(`agent ${file}: frontmatter has no name; skipped`);
       continue;
     }
-    next.set(file, { name, model: fm.model ?? null, mtimeMs: st.mtimeMs });
+    next.set(file, { name, model: fm.model ?? null, generated: isGenerated(text), mtimeMs: st.mtimeMs });
   }
   if (changed || prev.size !== next.size) cache.set(dir, next);
   return next;
@@ -155,9 +161,230 @@ export function agentAliases(dir: string, log?: AgentLog): Record<string, string
   return out;
 }
 
-/** The agent name (and file basename) a model id maps to: everything outside `[a-z0-9-]` becomes `-`. */
+/**
+ * The agent name (and file basename) a model id maps to: lower-cased first, everything outside
+ * `[a-z0-9-]` becomes `-`, runs of `-` collapse to one and the ends are trimmed. Lower-casing comes
+ * first because a hosted id keeps its vendor's capitals — `deepseek-ai/DeepSeek-V4.1-Flash-1017`
+ * must read as its own model. The 0.12.18 build sanitised without it, so each capital and its
+ * neighbours became one dash (`deepseek-ai--eep-eek--4-1--lash-1017`, #111), and a name that ends
+ * up empty falls back to `model` rather than writing a `.md` with no name.
+ */
 export function agentNameFor(modelId: string): string {
+  return modelId.toLowerCase().replace(/[^a-z0-9-]/g, "-").replace(/-{2,}/g, "-").replace(/^-+|-+$/g, "") || "model";
+}
+
+/** The name the 0.12.18 build gave a model id: sanitised without lower-casing, nothing else. */
+function legacyAgentNameFor(modelId: string): string {
   return modelId.replace(/[^a-z0-9-]/g, "-");
+}
+
+/** A generated worker's current name and the name the 0.12.18 build gave the same target. */
+function workerNames(modelId: string, providerName: string, suffixed: boolean): { name: string; legacy: string } {
+  const suffix = (of: (id: string) => string): string => (suffixed ? `-${of(providerName)}` : "");
+  return { name: agentNameFor(modelId) + suffix(agentNameFor), legacy: legacyAgentNameFor(modelId) + suffix(legacyAgentNameFor) };
+}
+
+/** One generated worker: the config it comes from, and the two names it can be known by. */
+type AgentTarget = { modelId: string; title: string; provider: string; suffix: string; legacy: string; account?: string };
+
+/** Where a provider's pinned workers come from: the stored accounts of that one provider. */
+export type AccountsFor = (provider: Provider) => readonly PinnedAccount[];
+
+/**
+ * The short name an account is *shown* by: its description, its title prefix and its dashboard
+ * entry. An email label keeps its local part, so the worker reads `… · mambo20211 · ` rather than
+ * carrying a whole address. Never part of the file name or the model id — those are the stable
+ * account id prefix, so a relabel cannot move a saved ladder rung to another account.
+ */
+function accountDisplayName(account: PinnedAccount): string {
+  const label = (account.label ?? "").trim();
+  if (label.includes("@")) return label.slice(0, label.indexOf("@")) || label;
+  if (label) return label;
+  const email = (account.email ?? "").trim();
+  return email.includes("@") ? email.slice(0, email.indexOf("@")) : email;
+}
+
+/**
+ * One worker per outbound provider/model declaration; the first owner keeps the bare name (#94), and
+ * a duplicate declaration's later provider gets `<model>-<provider>`. Two ids that sanitise alike,
+ * and a name a hand file already uses, are what the caller resolves.
+ *
+ * A provider that holds stored accounts (Claude OAuth, ChatGPT, Google Antigravity) adds one
+ * pinned worker per account and declared model (`<worker name>-<account id prefix>`), whose model
+ * id names the account. `handTaken` names files a person owns; a pinned worker that would land on
+ * one is skipped with a warning, as a duplicate model name is.
+ */
+function agentTargets(cfg: Config, log?: AgentLog, accountsFor: AccountsFor = () => [], handTaken: ReadonlySet<string> = new Set()): Map<string, AgentTarget> {
+  const targets = new Map<string, AgentTarget>();
+  // Every declared model's own name: a fallback `<model>-<provider>` below must not take one, or a
+  // model that happens to be called that (`Model-x-b` on `b`) would lose its worker to `Model-x`.
+  const declaredNames = new Set<string>();
+  for (const provider of Object.values(cfg.providers)) {
+    if (!isTargetProvider(provider)) continue;
+    for (const model of provider.models ?? []) declaredNames.add(agentNameFor(model.id));
+  }
+  for (const [providerName, provider] of Object.entries(cfg.providers)) {
+    if (!isTargetProvider(provider)) continue;
+    for (const model of provider.models ?? []) {
+      if (isJudgeOnlyModel(model.id)) continue;
+      const owners = declaredBy(model.id, cfg);
+      // The bare name goes to the owner a bare id routes to: a plan before a metered key, and never
+      // a Claude API key, whose workers are always `<model>-<provider>` (targets.ts `bareOwners`).
+      const first = bareOwners(model.id, cfg).find(name => isTargetProvider(cfg.providers[name]));
+      const duplicate = owners.length > 1 || namedOnly(provider);
+      let qualified = duplicate;
+      const suffixedAlready = duplicate && first !== providerName;
+      const names = workerNames(model.id, providerName, suffixedAlready);
+      const legacy = names.legacy;
+      let name = names.name;
+      let clash = targets.get(name);
+      // Two providers' ids that differ only in case or punctuation (OpenCode Go's
+      // `minimax-m3.1-flash`, MiniMax's own `MiniMax-M3.1-Flash`) are not one declaration, but they
+      // sanitise to one name. The later provider takes `<model>-<provider>` and a qualified model
+      // id, as a duplicate does, rather than losing its worker; ids alike within one provider
+      // still clash. Its legacy name stays the unsuffixed one: the 0.12.18 build kept case, so
+      // there the two never met and this worker had the bare name.
+      if (clash && clash.provider !== providerName && !suffixedAlready) {
+        const suffixed = workerNames(model.id, providerName, true).name;
+        if (!targets.has(suffixed) && !declaredNames.has(suffixed)) {
+          name = suffixed;
+          qualified = true;
+          clash = undefined;
+        }
+      }
+      if (clash) {
+        log?.warn(`agent files: "${model.id}" and "${clash.modelId}" both map to "${name}"; skipping "${model.id}"`);
+        continue;
+      }
+      targets.set(name, { modelId: qualified ? `${providerName}:${model.id}` : model.id, title: shortName(model.name ?? model.id), provider: providerName, suffix: effortSuffix(provider, model.id), legacy });
+    }
+  }
+  for (const [name, target] of pinnedTargets(cfg, targets, accountsFor, handTaken, log)) targets.set(name, target);
+  return targets;
+}
+
+/**
+ * One worker per declared model × stored account of an account-holding provider. Generated only
+ * when the caller resolves accounts (syncAgentFiles does; alias derivation does not need them). The
+ * name is the model's own worker name plus the account's stable id prefix, the same pin the model
+ * id carries: a label never enters it, so relabelling an account — or removing one of two accounts
+ * that share a label — cannot make an existing name resolve to a different account and move a saved
+ * ladder rung, workflow or marker. The label still shows in the description, the title and the
+ * dashboard. A name a hand file or another worker already holds is skipped with a warning, as any
+ * other generated clash is.
+ */
+function pinnedTargets(
+  cfg: Config,
+  base: ReadonlyMap<string, AgentTarget>,
+  accountsFor: AccountsFor,
+  handTaken: ReadonlySet<string>,
+  log?: AgentLog,
+): Map<string, AgentTarget> {
+  const out = new Map<string, AgentTarget>();
+  const taken = new Set<string>([...base.keys(), ...handTaken]);
+  // One store read per provider, not one per declared model.
+  const resolved = new Map<Provider, readonly PinnedAccount[]>();
+  const accountsOf = (provider: Provider): readonly PinnedAccount[] => {
+    let accounts = resolved.get(provider);
+    if (accounts === undefined) {
+      accounts = accountsFor(provider);
+      resolved.set(provider, accounts);
+    }
+    return accounts;
+  };
+  for (const [name, target] of base) {
+    const provider = cfg.providers[target.provider];
+    const accounts = provider ? accountsOf(provider) : [];
+    if (accounts.length === 0) continue;
+    const model = qualifiedModel(target.modelId, cfg)?.model ?? target.modelId.split("@")[0]!;
+    for (const account of accounts) {
+      const pin = accountPinFor(account.id);
+      const display = accountDisplayName(account) || pin;
+      const pinnedName = `${name}-${pin}`;
+      if (taken.has(pinnedName)) {
+        log?.warn(`agent files: "${pinnedName}" is taken; no pinned worker for ${display}`);
+        continue;
+      }
+      taken.add(pinnedName);
+      out.set(pinnedName, {
+        modelId: `${target.provider}#${pin}:${model}`,
+        title: `${target.title} · ${display}`,
+        provider: target.provider,
+        suffix: target.suffix,
+        legacy: pinnedName,
+        account: display,
+      });
+    }
+  }
+  return out;
+}
+
+/** The names in `dir` whose file is a person's own, not one this router wrote: no generated mark. */
+function handAgentNames(dir: string, log?: AgentLog): Set<string> {
+  const names = new Set<string>();
+  for (const entry of scanDir(dir, log).values()) if (!entry.generated) names.add(entry.name);
+  return names;
+}
+
+/**
+ * Whether the 0.12.18 name `legacy` already belongs to a worker the rename is not about: a hand
+ * file's name, or any file at that name that is not our generated file for exactly `modelId`. Only
+ * that file is the duplicate the rename replaces; the same evidence dropRenamedAgent removes it by.
+ */
+function otherWorkerAt(dir: string, legacy: string, modelId: string, hand: Set<string>): boolean {
+  if (hand.has(legacy)) return true;
+  const file = path.join(dir, `${legacy}.md`);
+  let text: string;
+  try {
+    if (!fs.lstatSync(file).isFile()) return false;
+    text = fs.readFileSync(file, "utf8");
+  } catch {
+    return false;
+  }
+  return !(isGenerated(text) && parseFrontmatter(text)?.model?.replace(/@[a-z]+$/i, "") === modelId);
+}
+
+/**
+ * Every target the name change renamed (#111), provided its 0.12.18 name is still free: no current
+ * worker name, no model any provider declares, no explicit alias, and no hand file (or another
+ * worker's file) holding the name. An alias or a rename for such a name would take it over — two
+ * ids that collapse to one name (`a//b` and `a--b` both shorten to `a-b`) leave the skipped one
+ * declared, and `a--b -> a//b` would send the real `a--b`'s markers to a different model — and a
+ * saved ladder rung naming a person's own worker would be rewritten to the generated one.
+ */
+function* renamedTargets(cfg: Config, dir: string, log?: AgentLog): Generator<{ name: string; legacy: string; modelId: string }> {
+  const targets = agentTargets(cfg);
+  const current = new Set(targets.keys());
+  let hand: Set<string> | undefined;
+  for (const [name, t] of targets) {
+    if (t.legacy === name || current.has(t.legacy)) continue;
+    if (Object.hasOwn(cfg.aliases, t.legacy) || declaredBy(t.legacy, cfg).length > 0) continue;
+    hand ??= handAgentNames(dir, log);
+    if (otherWorkerAt(dir, t.legacy, t.modelId, hand)) continue;
+    yield { name, legacy: t.legacy, modelId: t.modelId };
+  }
+}
+
+/**
+ * `{ [0.12.18 name]: model id }` for the workers the name change renamed (#111): a marker or a saved
+ * script that still says the old name resolves to the model instead of going out as a model id no
+ * provider declares. Derived from config, not the files, so it holds once the old file is gone —
+ * except for a name a hand file holds, which stays that file's own.
+ */
+export function legacyAgentAliases(cfg: Config, dir = defaultAgentDir(), log?: AgentLog): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const { legacy, modelId } of renamedTargets(cfg, dir, log)) if (!(legacy in out)) out[legacy] = modelId;
+  return out;
+}
+
+/**
+ * `{ [0.12.18 name]: current name }` for the same workers, so a ladder rung or an allow-list entry
+ * saved before the change keeps pointing at its worker (admin.ts migrates them on read).
+ */
+export function agentRenames(cfg: Config, dir = defaultAgentDir(), log?: AgentLog): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const { name, legacy } of renamedTargets(cfg, dir, log)) if (!(legacy in out)) out[legacy] = name;
+  return out;
 }
 
 function capsEffortLevels(provider: Provider): string[] | undefined {
@@ -192,32 +419,95 @@ function titlePrefix(title: string, suffix: string): string {
     : `Start the Agent description with "${title} · " so the app's task list shows the model.`;
 }
 
-function fileContent(name: string, modelId: string, title: string, provider: string, suffix: string, limitTools: boolean, imagePort: number | null): string {
+/**
+ * What marks a file as this router's: a YAML comment in its frontmatter. The note is for a person
+ * opening the file; in the description the main chat read it in every request's agent list, eight
+ * workers' worth (2026-10-24).
+ */
+const GENERATED_MARK = "# Generated by ClaudeRipple from config.json — edits are overwritten; to customise, copy to another name.";
+/** Where files written before 2026-10-24 carry the mark: in their description. */
+const GENERATED_DESCRIPTION = "Generated by ClaudeRipple from config.json — edits are overwritten";
+
+/** A frontmatter that carries the mark, as a comment line or in the description. Never the body's. */
+function isGenerated(text: string): boolean {
+  const fm = parseFrontmatter(text);
+  if (!fm) return false;
+  if (fm.description?.includes(GENERATED_DESCRIPTION)) return true;
+  const lines = text.split(/\r?\n/);
+  for (let i = 1; i < lines.length && lines[i]!.trim() !== "---"; i++) if (lines[i]!.trim() === GENERATED_MARK) return true;
+  return false;
+}
+
+function fileContent(name: string, modelId: string, title: string, provider: string, suffix: string, limitTools: boolean, imagePort: number | null, pinned?: { account: string; pin: string; model: string }): string {
   const description =
-    `${modelId} via ${provider}. Generated by ClaudeRipple from config.json — edits are overwritten; ` +
-    `to customise, copy to another name. Set effort with [[ripple: ${name}@<level>]] on the first line. ` +
-    titlePrefix(title, suffix);
+    pinned
+      // "via <provider>." stays the first sentence: the mod reads the provider from it (workers.ts
+      // agentProvider), and without it a pinned worker was never a candidate, so naming one ran the
+      // ladder's pick instead (0.12.31).
+      ? `${pinned.model} via ${provider}. Runs on ${pinned.account} (account ${pinned.pin}). Set effort with [[ripple: ${name}@<level>]] on the first line. ` +
+        titlePrefix(title, suffix)
+      : `${modelId} via ${provider}. Set effort with [[ripple: ${name}@<level>]] on the first line. ` +
+        titlePrefix(title, suffix);
   const tools = limitTools ? `tools: ${TOOLS.join(", ")}\n` : "";
   const body = imagePort === null ? BODY : `${BODY}\n${imageLine(imagePort)}`;
-  return `---\nname: ${name}\ndescription: ${description}\nmodel: ${modelId}${suffix}\n${tools}---\n${body}\n`;
+  return `---\n${GENERATED_MARK}\nname: ${name}\ndescription: ${description}\nmodel: ${modelId}${suffix}\n${tools}---\n${body}\n`;
 }
 
 type Manifest = { agents: string[] };
 
-function readManifest(file: string): Manifest {
+function readManifest(file: string, strict = false): Manifest {
   try {
-    const parsed = JSON.parse(fs.readFileSync(file, "utf8")) as { agents?: unknown };
-    if (Array.isArray(parsed.agents)) return { agents: parsed.agents.filter((a): a is string => typeof a === "string") };
-  } catch {
-    /* missing or broken: treat as empty, and it is rewritten below */
+    const parsed = JSON.parse(fs.readFileSync(file, "utf8")) as { agents?: unknown } | null;
+    if (Array.isArray(parsed?.agents) && parsed.agents.every((name): name is string => typeof name === "string" && /^[a-z0-9-]+$/.test(name))) return { agents: parsed.agents };
+    throw new Error("생성 워커 목록이 올바르지 않아 워커 파일을 제거하지 않았습니다.");
+  } catch (error) {
+    // A missing manifest is an empty claim; unreadable or invalid claims block every deletion.
+    if (strict && (error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
   }
   return { agents: [] };
 }
 
-export type GeneratedAgent = { name: string; model: string; provider: string };
+/**
+ * The shared worker folder's lock. The manifest is per home, but the files are one folder for every
+ * installation on the account, so two routers or an install and a router would otherwise write the
+ * same name over each other (2026-10-25 lock audit). The lock lives outside the folder so Claude
+ * Code's watcher never sees it.
+ */
+function agentDirLock(dir: string): string {
+  const key = crypto.createHash("sha256").update(path.resolve(dir)).digest("hex").slice(0, 16);
+  return path.join(os.tmpdir(), `clauderipple-agents-${key}`);
+}
+
+/**
+ * Uninstall: the manifest is the ownership boundary, never all of ~/.claude/agents. Names another
+ * install's manifest also records (`sharedWith`: the default home's and every home the ownership
+ * store knows) stay: two homes write the same agent folder.
+ */
+export function removeGeneratedAgentFiles(dir: string, manifestPath: string, sharedWith?: string | string[]): void {
+  withFileLock(agentDirLock(dir), () => {
+    if (!fs.existsSync(manifestPath)) return;
+    const parsed = readManifest(manifestPath, true);
+    if (fs.existsSync(dir) && fs.lstatSync(dir).isSymbolicLink()) throw new Error("워커 폴더가 심볼릭 링크이므로 제거하지 않았습니다.");
+    const sharedPaths = (Array.isArray(sharedWith) ? sharedWith : sharedWith ? [sharedWith] : []).filter((file) => path.resolve(file) !== path.resolve(manifestPath));
+    const shared = new Set(sharedPaths.flatMap((file) => readManifest(file, true).agents));
+    for (const name of parsed.agents) {
+      if (shared.has(name)) continue;
+      const file = path.join(dir, `${name}.md`);
+      if (!fs.existsSync(file) || !fs.lstatSync(file).isFile()) continue;
+      const text = fs.readFileSync(file, "utf8");
+      // A recorded worker replaced by a person's own definition is no longer ours.
+      if (parseFrontmatter(text)?.name === name && isGenerated(text)) fs.rmSync(file);
+    }
+    fs.rmSync(manifestPath);
+    cache.delete(dir);
+  });
+}
+
+/** `account` is the stored Claude account a pinned worker runs on, shown beside its model. */
+export type GeneratedAgent = { name: string; model: string; provider: string; account?: string };
 
 /** Owned files that still exist and name a configured worker, not hand-written agents. */
-export function generatedAgents(cfg: Config, dir = defaultAgentDir(), manifestPath = path.join(homeDir(), "generated-agents.json"), log?: AgentLog): GeneratedAgent[] {
+export function generatedAgents(cfg: Config, dir = defaultAgentDir(), manifestPath = path.join(homeDir(), "generated-agents.json"), log?: AgentLog, accountsFor: AccountsFor = () => []): GeneratedAgent[] {
   const owned = new Set(readManifest(manifestPath).agents);
   const result: GeneratedAgent[] = [];
   for (const entry of scanDir(dir, log).values()) {
@@ -226,111 +516,291 @@ export function generatedAgents(cfg: Config, dir = defaultAgentDir(), manifestPa
     const owners = declaredBy(model, cfg);
     const provider = owners.length === 1 ? owners[0] : undefined;
     const target = provider ? cfg.providers[provider] : undefined;
-    if (!provider || !target || (target.type === "anthropic" && !target.accountPool)) continue;
-    result.push({ name: entry.name, model, provider });
+    if (!provider || !isTargetProvider(target)) continue;
+    const pinned = pinnedModel(model);
+    const accounts = pinned && target ? accountsFor(target) : [];
+    const account = pinned ? accounts.find((candidate) => candidate.id.slice(0, pinned.accountPin.length) === pinned.accountPin) : undefined;
+    const display = account ? accountDisplayName(account) : undefined;
+    result.push({
+      name: entry.name,
+      model: qualifiedModel(model, cfg)?.model ?? model,
+      provider,
+      ...(display ? { account: display } : {}),
+    });
   }
   return result.sort((a, b) => a.name.localeCompare(b.name));
 }
 
-function writeManifest(file: string, manifest: Manifest, log?: AgentLog): void {
+function writeManifest(file: string, manifest: Manifest, log?: AgentLog): boolean {
   try {
     fs.writeFileSync(file, JSON.stringify(manifest, null, 2) + "\n");
+    return true;
   } catch (e) {
     log?.warn(`generated-agents manifest: cannot write ${file}: ${(e as Error).message}`);
+    return false;
   }
 }
 
 export type SyncOptions = {
   /** Where the ownership manifest lives. Defaults to `<homeDir()>/generated-agents.json`. */
   manifestPath?: string;
+  /**
+   * Resolves a provider's stored accounts, one pinned worker each. Absent means none: a caller
+   * that does not mean to write pinned files never picks up the machine's own account stores.
+   */
+  pinnedAccounts?: AccountsFor;
+  /** Called when the pass skipped or failed to write or remove a file, so the caller retries. */
+  onIncomplete?: () => void;
 };
 
 /**
- * Bring `dir`'s generated agent files in step with `cfg`: one file per model exactly one non-anthropic
- * provider declares, and remove the ones this router wrote whose model is no longer ticked. Only
- * files named in the manifest are ever written or removed — a hand-written agent is left alone, and
- * a name it already uses is skipped rather than overwritten.
+ * Bring `dir`'s generated agent files in step with `cfg`: one file per outbound provider/model
+ * declaration, and remove the ones this router wrote whose model is no longer ticked. Only
+ * files named in the manifest or marked current targets are written; only manifest files are removed.
+ * A hand-written agent is left alone, and a name it already uses is skipped rather than overwritten.
  *
- * Never throws: a write failure is a warning, not a dead router.
+ * Never throws: a write failure is a warning, not a dead router. Returns the generated files there
+ * are now when it wrote or removed any, for `retouchLater`; [] when nothing changed.
  */
-export function syncAgentFiles(cfg: Config, dir: string, log?: AgentLog, opts: SyncOptions = {}): void {
-  if (cfg.cli.agentFiles === false) return;
+export function syncAgentFiles(cfg: Config, dir: string, log?: AgentLog, opts: SyncOptions = {}): string[] {
+  if (cfg.cli.agentFiles === false) return [];
+  try {
+    return withFileLock(agentDirLock(dir), () => syncAgentFilesLocked(cfg, dir, log, opts));
+  } catch (e) {
+    // Another installation's sync holds the folder (or it cannot be locked): skip this pass.
+    // Nothing is left half-written; the next start or file change syncs again.
+    log?.warn(`agent files: cannot lock ${dir} (${(e as Error).message}); this pass was skipped`);
+    opts.onIncomplete?.();
+    return [];
+  }
+}
 
+/**
+ * Remove `dir/<legacy>.md` when it is a generated worker for the same model, now written as `name`:
+ * a file the 0.12.18 build named after a model id it had not lower-cased (#111). The name alone is
+ * never the evidence — the generated mark and the `model:` line must both agree.
+ */
+function dropRenamedAgent(dir: string, legacy: string, name: string, modelId: string, log?: AgentLog): boolean {
+  const file = path.join(dir, `${legacy}.md`);
+  let text: string;
+  try {
+    if (!fs.lstatSync(file).isFile()) return false;
+    text = fs.readFileSync(file, "utf8");
+  } catch {
+    return false;
+  }
+  if (!isGenerated(text) || parseFrontmatter(text)?.model?.replace(/@[a-z]+$/i, "") !== modelId) return false;
+  try {
+    fs.rmSync(file);
+  } catch (e) {
+    log?.warn(`agent files: cannot remove ${file}: ${(e as Error).message}`);
+    return false;
+  }
+  log?.info?.(`agent files: removed ${legacy}.md (the same worker, now ${name}.md)`);
+  return true;
+}
+
+function syncAgentFilesLocked(cfg: Config, dir: string, log: AgentLog | undefined, opts: SyncOptions): string[] {
   const manifestFile = opts.manifestPath ?? path.join(homeDir(), "generated-agents.json");
   const manifest = readManifest(manifestFile);
   const owned = new Set(manifest.agents);
   const scanned = scanDir(dir, log);
 
-  // Names already taken by files this router did not write: hand files win, always.
+  // Names already taken by files this router did not write: hand files win, always. A generated
+  // file outside the manifest is adopted by the ordinary loop below, so only a person's own file
+  // pushes a pinned worker to its owner-id suffix.
   const handNames = new Set<string>();
-  for (const entry of scanned.values()) if (!owned.has(entry.name)) handNames.add(entry.name);
-
-  // Targets: each model declared by exactly one provider, that provider not ingress-only.
-  const targets = new Map<string, { modelId: string; title: string; provider: string; suffix: string }>();
-  for (const [providerName, provider] of Object.entries(cfg.providers)) {
-    if (provider.type === "anthropic" && !provider.accountPool) continue;
-    for (const model of provider.models ?? []) {
-      if (isJudgeOnlyModel(model.id)) continue;
-      const owners = declaredBy(model.id, cfg);
-      if (owners.length !== 1) {
-        if (owners.length > 1) log?.warn(`agent files: "${model.id}" is declared by ${owners.join(", ")}; not generating an agent for it`);
-        continue;
-      }
-      const name = agentNameFor(model.id);
-      const clash = targets.get(name);
-      if (clash) {
-        log?.warn(`agent files: "${model.id}" and "${clash.modelId}" both map to "${name}"; skipping "${model.id}"`);
-        continue;
-      }
-      targets.set(name, { modelId: model.id, title: shortName(model.name ?? model.id), provider: providerName, suffix: effortSuffix(provider, model.id) });
-    }
+  const handOnly = new Set<string>();
+  for (const entry of scanned.values()) {
+    if (owned.has(entry.name)) continue;
+    handNames.add(entry.name);
+    if (!entry.generated) handOnly.add(entry.name);
   }
+
+  // Targets: one worker per declaring outbound provider; the first owner keeps the old name (#94).
+  // An account-holding provider adds one pinned worker per stored account.
+  const targets = agentTargets(cfg, log, opts.pinnedAccounts ?? (() => []), handOnly);
 
   const imagePort = Object.values(cfg.providers).some((p) => p.type === "chatgpt") ? adminPort(cfg) : null;
   const nextOwned: string[] = [];
+  let changed = false;
   for (const [name, t] of targets) {
-    if (handNames.has(name)) {
+    const file = path.join(dir, `${name}.md`);
+    let current: string | null = null;
+    try {
+      current = fs.readFileSync(file, "utf8");
+    } catch {
+      current = null;
+    }
+    // Recover a lost manifest only for current targets: renamed copies belong to the user.
+    const generated = isGenerated(current ?? "");
+    if (handNames.has(name) && !generated) {
       log?.info?.(`agent files: "${name}" exists and is not ours; leaving it alone`);
       continue;
     }
-    const file = path.join(dir, `${name}.md`);
-    const content = fileContent(name, t.modelId, t.title, t.provider, t.suffix, cfg.cli.limitWorkerTools === true, imagePort);
-    const existing = scanned.get(`${name}.md`);
-    if (existing) {
-      let current: string | null = null;
-      try {
-        current = fs.readFileSync(file, "utf8");
-      } catch {
-        current = null;
-      }
-      if (current === content) {
-        nextOwned.push(name); // already correct: do not rewrite
-        continue;
-      }
+    const pinned = t.account ? pinnedModel(t.modelId) : null;
+    const content = fileContent(
+      name, t.modelId, t.title, t.provider, t.suffix, cfg.cli.limitWorkerTools === true, imagePort,
+      pinned && t.account ? { account: t.account, pin: pinned.accountPin, model: pinned.model } : undefined,
+    );
+    if (current === content) {
+      nextOwned.push(name); // already correct: do not rewrite
+      continue;
     }
     try {
       fs.mkdirSync(dir, { recursive: true });
       fs.writeFileSync(file, content);
       nextOwned.push(name);
+      changed = true;
       log?.info?.(`agent files: wrote ${name}.md (${t.modelId} via ${t.provider})`);
     } catch (e) {
       log?.warn(`agent files: cannot write ${file}: ${(e as Error).message}`);
+      // The file this router wrote before stays, and stays owned: the retry rewrites it.
+      if (current !== null && generated) nextOwned.push(name);
+      opts.onIncomplete?.();
     }
   }
 
+  // The name the 0.12.18 build wrote for a worker whose name has since changed (#111): once the
+  // renamed file is in place, the old one is the same worker twice. An owned one is removed by the
+  // loop below like any stale file; one outside the manifest (a lost ownership record) is removed
+  // here, where its mark and its `model:` line are the evidence that it is ours.
+  for (const name of nextOwned) {
+    const t = targets.get(name);
+    if (!t || t.legacy === name || owned.has(t.legacy) || nextOwned.includes(t.legacy)) continue;
+    if (dropRenamedAgent(dir, t.legacy, name, t.modelId, log)) changed = true;
+  }
+
   // A model that is no longer ticked: remove the file this router wrote for it, and only that.
+  // One that could not be removed stays in the manifest, so the retry still owns it.
+  const stuck: string[] = [];
   for (const name of owned) {
     if (nextOwned.includes(name)) continue;
     try {
       fs.rmSync(path.join(dir, `${name}.md`), { force: true });
+      changed = true;
       log?.info?.(`agent files: removed ${name}.md (model no longer configured)`);
     } catch (e) {
       log?.warn(`agent files: cannot remove ${name}.md: ${(e as Error).message}`);
+      stuck.push(name);
+      opts.onIncomplete?.();
     }
   }
 
   const sorted = [...nextOwned].sort();
-  if (JSON.stringify(sorted) !== JSON.stringify([...manifest.agents].sort())) {
-    writeManifest(manifestFile, { agents: sorted }, log);
+  const recorded = [...nextOwned, ...stuck].sort();
+  if (JSON.stringify(recorded) !== JSON.stringify([...manifest.agents].sort())) {
+    if (!writeManifest(manifestFile, { agents: recorded }, log)) opts.onIncomplete?.();
+  }
+  return changed ? sorted.map((name) => path.join(dir, `${name}.md`)) : [];
+}
+
+/**
+ * How long after a sync its files are touched again: past Claude Code's 30 s idle poll and the
+ * 1 s it waits for a write to settle.
+ *
+ * Claude Code 2.1.308 polls `~/.claude/agents` every 2 s while a session is in use and every 30 s
+ * once it has sat a minute. Going back to 2 s rebuilds the watcher, which takes the directory as it
+ * finds it, and the catch-up it then runs compares only skills and commands. A worker written in
+ * the 30 s before the user returns to an idle session is never read there, and `/clear` keeps the
+ * session's list: the MAMBO session refused `zai-org-glm-5-3-flash` 26 s after it was written and
+ * still 33 minutes later, after a `/clear` (2026-10-23). A change to any agent file rereads them
+ * all, so one more touch past that window reaches a session that missed the first.
+ */
+export const RETOUCH_AFTER_MS = 45_000;
+
+/** Touch `files` again after `delay`, never holding the process open. A file gone since is skipped. */
+export function retouchLater(files: string[], delay = RETOUCH_AFTER_MS): void {
+  if (files.length === 0) return;
+  const timer = setTimeout(() => {
+    const now = new Date();
+    for (const file of files) {
+      try {
+        fs.utimesSync(file, now, now);
+      } catch {
+        // removed or replaced by a later sync, which schedules its own touch
+      }
+    }
+  }, delay);
+  timer.unref?.();
+}
+
+export type PinnedAgentSyncOptions = {
+  /** The live config; read at each regeneration and each change check. */
+  config: () => Config;
+  /** The installation home whose account stores the pinned workers follow. */
+  home: string;
+  /** Where the generated worker files live (~/.claude/agents). */
+  dir: string;
+  log?: AgentLog;
+  /** Where the ownership manifest lives. Defaults to `<homeDir()>/generated-agents.json`. */
+  manifestPath?: string;
+  /**
+   * Called after every regeneration pass, whether or not it rewrote anything: remote hosts resync
+   * their copy of the worker files. The config callback and the dashboard's account endpoints both
+   * end here, so neither can leave a tunneled host on stale workers.
+   */
+  notify?: () => void;
+};
+
+/**
+ * Keeps the generated worker files in step with the config *and* with the stored accounts, on every
+ * path that can move either. Besides the router's own config saves and dashboard account endpoints,
+ * the terminal CLI writes the same stores (`login`, `claude-login`, `google-login`, `logout`), and
+ * a running router is never told. So the accounts the files were last generated from are reduced to
+ * a signature (`storedAccountsSignature`) and compared on a timer: a login, logout, removal or
+ * relabel regenerates; a token refresh, which changes nothing a generated file shows, does not.
+ * Regeneration itself rewrites only files whose content differs, so a pass with nothing to do
+ * touches no file at all.
+ */
+export class PinnedAgentSync {
+  /** The account signature the files were last generated from; null until a pass succeeds, and again after one fails. */
+  private signature: string | null = null;
+  private readonly opts: PinnedAgentSyncOptions;
+
+  constructor(opts: PinnedAgentSyncOptions) {
+    this.opts = opts;
+  }
+
+  /**
+   * Re-derive every generated worker file, pinned ones included, and remember the account
+   * signature they came from. Never throws: a failure keeps the previous signature, so the next
+   * change check (or the next config load) retries.
+   */
+  regenerate(cfg: Config = this.opts.config()): void {
+    let files: string[];
+    let incomplete = false;
+    // Read before the pass, so an account that changes during it still differs on the next check.
+    let signature: string | null = null;
+    try {
+      signature = storedAccountsSignature(cfg.providers, this.opts.home);
+    } catch (e) {
+      this.opts.log?.warn(`agent files: cannot read the stored accounts: ${(e as Error).message}`);
+    }
+    try {
+      files = syncAgentFiles(cfg, this.opts.dir, this.opts.log, {
+        ...(this.opts.manifestPath ? { manifestPath: this.opts.manifestPath } : {}),
+        pinnedAccounts: (provider) => storedAccountsFor(provider, this.opts.home),
+        onIncomplete: () => { incomplete = true; },
+      });
+    } catch (e) {
+      this.opts.log?.warn(`agent files: ${(e as Error).message}`);
+      return;
+    }
+    // A skipped or partly failed pass forgets the signature, so the next check tries again even
+    // when only the config moved and the accounts read the same.
+    if (incomplete) this.signature = null;
+    else if (signature !== null) this.signature = signature;
+    retouchLater(files);
+    this.opts.notify?.();
+  }
+
+  /** Whether a stored account changed since the files were last generated from them. */
+  changed(): boolean {
+    try {
+      return storedAccountsSignature(this.opts.config().providers, this.opts.home) !== this.signature;
+    } catch {
+      return false;
+    }
   }
 }

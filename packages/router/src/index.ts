@@ -10,12 +10,14 @@ import path from "node:path";
 import { codexEnabled, followCodexCache, writeCodexCatalog } from "../../cli/src/codex.ts";
 import { ingressModels } from "./ingress/models.ts";
 import { ConfigStore, awakeSettings, configPath, homeDir, terminateHosts, tetherSettings } from "./config.ts";
+import { targetWarnings } from "./targets.ts";
+import { ensureInstallationId } from "./installation-id.ts";
 import { AwakeController, execRunner, type Activity } from "./awake.ts";
 import { TetherController } from "./tether.ts";
 import { AutoUpdater } from "./autoupdate.ts";
 import { runCli, startCliDetached } from "./cli-control.ts";
 import { powerPlatform } from "./power.ts";
-import { defaultAgentDir, syncAgentFiles } from "./agents.ts";
+import { defaultAgentDir, PinnedAgentSync } from "./agents.ts";
 import { CertStore } from "./certs.ts";
 import { Logger } from "./log.ts";
 import { UpstreamHealth, EXIT_UPSTREAM_UNREACHABLE, checkConnectivity } from "./health.ts";
@@ -30,6 +32,8 @@ import { VERSION } from "./version.ts";
 import { allowLongSilences } from "./providers/retry.ts";
 import { assetsFingerprint, readLocalAssets, spawnSsh, syncRemoteAssets } from "./remote-host.ts";
 import { RemoteTunnels, proxyConnectHost } from "./remote-tunnel.ts";
+import { syncContextWindows } from "./context-windows.ts";
+import { applyProcessPriority } from "./process-priority.ts";
 
 // Startup timing. Claude Desktop routes *all* its traffic through us in picker mode, so every
 // second before the socket is open is a second the app cannot reach anything (ERR_PROXY_-
@@ -45,8 +49,28 @@ const logFile = process.env.CLAUDERIPPLE_NO_LOGFILE ? null : path.join(home, "lo
 let log: Logger | null = null;
 // Created after listen(); the config callback below runs before that and finds it null.
 let tunnels: RemoteTunnels | null = null;
+/** The last config read's validation errors: the status and readiness report them (G-D14). */
+let configErrors: string[] = [];
+let reconcileProxyConfig: ((config: ReturnType<ConfigStore["get"]>) => void) | undefined;
+/**
+ * Every path that writes or removes a generated worker file goes through this: the config callback
+ * below, the dashboard's account endpoints (`AdminDeps.agentsChanged`), and the periodic check that
+ * catches a terminal `login`/`logout` the router was never told about. It notifies the tunnels
+ * itself, so a remote host never keeps workers after any of them.
+ */
+const agentSync = new PinnedAgentSync({
+  config: () => store.get(),
+  home,
+  dir: defaultAgentDir(),
+  log: { warn: (msg) => (log ?? console).warn(msg), info: (msg) => (log ?? console).info(msg) },
+  notify: () => tunnels?.assetsChanged(),
+});
 const store = new ConfigStore(undefined, (c, errors) => {
+  configErrors = [...errors];
+  applyProcessPriority(c.processPriority, { log: line => (log ?? console).info(line) });
+  reconcileProxyConfig?.(c);
   for (const e of errors) (log ?? console).warn(`config: ${e}`);
+  for (const w of targetWarnings(c)) (log ?? console).warn(`config: ${w}`);
   log?.info(`config loaded: ${Object.keys(c.routes).length} routes, ${Object.keys(c.providers).length} providers, direct=${c.direct.map((d) => d.prefix).join(",") || "-"}`);
   // Keep the Codex app's model list in step with the models we serve (only while `codex on` is in effect).
   try {
@@ -55,18 +79,19 @@ const store = new ConfigStore(undefined, (c, errors) => {
     log?.warn(`codex catalog: ${(e as Error).message}`);
   }
   // One place for the truth: the agent files a worker's model comes from are derived from this
-  // config, so a model ticked here cannot disagree with the alias a marker resolves to.
-  try {
-    syncAgentFiles(c, defaultAgentDir(), log ?? console);
-  } catch (e) {
-    (log ?? console).warn(`agent files: ${(e as Error).message}`);
-  }
-  // Remote hosts get the regenerated agent files too, and a hand edit of `remote.hosts` takes effect.
+  // config, so a model ticked here cannot disagree with the alias a marker resolves to. A session
+  // idle when they change can miss the change; the second touch is for it (`RETOUCH_AFTER_MS`).
+  // The stored accounts are part of the derivation (each gets a pinned worker per model), and the
+  // regeneration notifies the tunnels, so a remote host gets the rewritten files too.
+  agentSync.regenerate(c);
+  try { syncContextWindows(c); }
+  catch (e) { (log ?? console).warn(`compact windows: ${(e as Error).message}`); }
+  // A hand edit of `remote.hosts` takes effect; the agent files were already offered to the tunnels.
   tunnels?.reconcile(c.remote?.hosts ?? []);
-  tunnels?.assetsChanged();
 });
 const cfg0 = store.get();
 log = new Logger(logFile, cfg0.log.maxBytes, cfg0.log.keep, !!process.env.CLAUDERIPPLE_ECHO || !logFile);
+applyProcessPriority(cfg0.processPriority, { log: line => log!.info(line) });
 const T_CONFIG = Date.now();
 
 const certs = new CertStore(home);
@@ -116,6 +141,7 @@ const observedClaudeCodeAuth = new ObservedClaudeCodeAuth(path.join(home, "claud
 // Before any provider fetches: a reasoning model may stay silent past fetch's 300s default.
 allowLongSilences();
 const proxy = new Proxy({ config: () => store.get(), log, certs, health, home, requests, observedClaudeCodeAuth, hold });
+reconcileProxyConfig = config => proxy.reconcileConfig(config);
 const ingress = new OpenAiIngress({ config: () => store.get(), log, requests, home, observedClaudeCodeAuth, chatgpt: (name) => proxy.chatgptForCodex(name), hold });
 
 // Lid-closed awake and hotspot failover (macOS and Windows; no-ops elsewhere, off until configured).
@@ -158,6 +184,14 @@ process.on("uncaughtException", (e) => log!.error(`uncaught ${(e as Error).stack
 process.on("unhandledRejection", (e) => log!.error(`unhandled ${(e as Error)?.stack ?? e}`));
 const DRAIN_MS = 90_000; // new model calls are refused during drain, so this is the longest single call we wait for; `clauderipple restart` waits 120s
 let draining = false;
+
+/**
+ * Re-derive the worker files after a stored account was added, removed, relabelled or reauthorized
+ * from the dashboard: pinned workers are named and pinned from that store, so they follow it
+ * without a router restart or a config save. Never throws (the next check retries), and the tunnels
+ * are notified by the sync itself.
+ */
+const regenerateAgents = (): void => agentSync.regenerate();
 
 /**
  * Stop accepting, let in-flight model calls finish, exit. Idempotent.
@@ -238,16 +272,55 @@ proxy
     // Quota only arrives on GPT response headers, so a quiet day left the status 11 hours stale
     // (2026-09-20). Ask once now, after listen(), and never wait for the answer.
     proxy.chatgptRefreshAll();
+    // The model catalogue is where a GPT model's real window comes from (6.1 Sol runs 500000 × 95%
+    // = 475000), and until now only an open dashboard asked for it. Read it now and every two hours;
+    // the adapter's own hour-long cache makes the interval the refresh, not a poll (§4, 2026-10-23).
+    const catalogEvery = 2 * 60 * 60_000;
+    proxy.chatgptRefreshCatalog();
+    setInterval(() => proxy.chatgptRefreshCatalog(), catalogEvery).unref();
+    // Also notices hand edits to global/model settings and catalogue/agent changes, without a restart.
+    const syncCompact = () => {
+      if (draining) return;
+      try { syncContextWindows(store.get()); }
+      catch (e) { log!.warn(`compact windows: ${(e as Error).message}`); }
+    };
+    syncCompact();
+    // The terminal CLI signs accounts in and out without telling a running router; the signature
+    // costs three small file reads and moves only when a worker file would change, so this is the
+    // cheapest place to notice. Same cadence as the compact-window sync above.
+    const watchAccounts = () => {
+      if (draining || !agentSync.changed()) return;
+      log!.info("agent files: the stored accounts changed; regenerating the pinned workers");
+      agentSync.regenerate();
+    };
+    setInterval(() => { syncCompact(); watchAccounts(); }, 15_000).unref();
+    // Captured once, at start: this process's installation id and pid are what it reports and what
+    // a control request is checked against, whatever the files say later (B01/D6).
+    const instance = {
+      installId: (() => {
+        try {
+          return ensureInstallationId(homeDir());
+        } catch {
+          return null;
+        }
+      })(),
+      pid: process.pid,
+    };
     const adminDeps: AdminDeps = {
       autoUpdater,
+      instance,
+      agentsChanged: regenerateAgents,
       config: () => store.get(),
+      configErrors: () => configErrors,
       configFile: configPath(),
       log: log!,
       stats: () => proxy.stats,
       health: () => health.consecutiveFailures,
       providerHealth: () => proxy.providerHealth.snapshot(),
+      modelHealth: () => proxy.modelHealth.snapshot(),
       version: VERSION,
       requests,
+      compactPick: (session, model) => model === null ? proxy.compactPicks.clear(session) : proxy.compactPicks.set(session, model),
       chatgpt: () => ({
         quota: proxy.chatgptRateLimits,
         auth: proxy.chatgptAuthStatus(),
@@ -260,16 +333,20 @@ proxy
         accounts: () => proxy.googleAccounts(),
         models: (name: string) => proxy.googleFetchModels(name),
         usage: (name: string) => proxy.googleUsage(name),
+        quotaScope: (name: string, model: string) => proxy.googleQuotaScope(name, model),
         clearCooldown: (id: string) => proxy.googleClearCooldown(id),
         recheckVerification: (id: string) => proxy.googleRecheckVerification(id),
       }),
       credentials: () => proxy.credentialHealth(),
+      clearCredentialCooldown: (provider, id) => proxy.clearCredentialCooldown(provider, id),
+      claudeClearCooldown: (id) => proxy.claudeClearCooldown(id),
       picker: () => ({ enabled: !!store.get().picker?.enabled, hosts: terminateHosts(store.get()).slice(1), last: proxy.lastPickerInjection }),
       observedClaudeCodeAuth,
-      claudeUsage: (force) => proxy.claudeUsage.snapshot(force),
-      claudeActive: () => proxy.claudeActiveAccounts(),
+      claudeUsage: () => proxy.claudeUsage.snapshot(),
       claudeModels: () => proxy.claudeModels.list(),
-      opencodeUsage: (name: string) => proxy.opencodeLimits(name),
+      claudeIdentity: () => proxy.claudeIdentity.identify(),
+      opencodeUsage: (name, credentialId) => proxy.opencodeLimits(name, credentialId),
+      minimaxUsage: (name, credentialId) => proxy.minimaxLimits(name, credentialId),
       grokUsage: (name: string) => proxy.grokLimits(name),
       image: (req, signal, meta) => proxy.generateImage(req, signal, meta),
       modelCatalog: () => loadModelCatalog(),

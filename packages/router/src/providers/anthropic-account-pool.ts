@@ -3,6 +3,9 @@
 // ordinary proxy credentials, so the shared CredentialPool supplies affinity, cooldown and retry.
 
 import crypto from "node:crypto";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import type { Logger } from "../log.ts";
 import type { Credential } from "../pool.ts";
 import { redactErrorText } from "../redact.ts";
@@ -11,6 +14,7 @@ import {
   markClaudeAccountNeedsReauth,
   readClaudeOAuthAccounts,
   replaceClaudeOAuthAccount,
+  subjectHash,
   type ClaudeOAuthAccount,
 } from "./anthropic-accounts.ts";
 import {
@@ -32,6 +36,11 @@ export type ClaudeAccountPoolOptions = Omit<ClaudeCodeAuthOptions, "log" | "fetc
   fetch?: FetchLike;
   /** Test seam for the external Claude Code/Desktop login source. */
   current?: ClaudeCodeAuthStore;
+  /**
+   * Test seam for the local Claude login's durable account id (an account UUID or organization id,
+   * never a token). Defaults to reading Claude Code's own config; see `readClaudeLoginKey`.
+   */
+  loginKey?: () => string | undefined;
 };
 
 function credentialId(ownerId: string, ...generation: string[]): string {
@@ -50,18 +59,51 @@ function refreshKey(home: string, account: ClaudeOAuthAccount): string {
   return `${home}\0${account.id}\0${generation}`;
 }
 
+/** The same file cached between requests; Claude Code rewrites it on a login, not on a token refresh. */
+let loginKeyCache: { file: string; mtimeMs: number; size: number; key: string | undefined } | null = null;
+
+/**
+ * The app's own login as a durable account key for the credential pool. Every generation of that
+ * login is named `current`, so keying a rest by it moved one person's spent 5h/7d window onto
+ * whoever signed in next (2026-11-07). Claude Code's config names the account it is signed in as
+ * (`oauthAccount.accountUuid`, measured 2026-11-07); the value changes on an account switch and not
+ * on a token refresh, and reading it costs no network request. Only the UUID/organization id is
+ * read, then hashed and never stored, logged or returned — this is not a token digest. A missing
+ * file or block returns undefined, and the caller falls back to the runtime generation.
+ */
+function readClaudeLoginKey(): string | undefined {
+  const file = path.join(os.homedir(), ".claude.json");
+  try {
+    const stat = fs.statSync(file);
+    if (loginKeyCache && loginKeyCache.file === file && loginKeyCache.mtimeMs === stat.mtimeMs && loginKeyCache.size === stat.size) return loginKeyCache.key;
+    const account = (JSON.parse(fs.readFileSync(file, "utf8")) as { oauthAccount?: { accountUuid?: unknown; organizationUuid?: unknown } } | null)?.oauthAccount;
+    const id = typeof account?.accountUuid === "string" && account.accountUuid
+      ? account.accountUuid
+      : typeof account?.organizationUuid === "string" && account.organizationUuid ? account.organizationUuid : undefined;
+    const hash = subjectHash(id);
+    const key = hash ? `login:${hash}` : undefined;
+    loginKeyCache = { file, mtimeMs: stat.mtimeMs, size: stat.size, key };
+    return key;
+  } catch {
+    loginKeyCache = null;
+    return undefined;
+  }
+}
+
 export class ClaudeAccountAuthPool {
   private readonly home: string;
   private readonly now: () => number;
   private readonly log: Pick<Logger, "info" | "warn">;
   private readonly fetchImpl: FetchLike | undefined;
   private readonly current: ClaudeCodeAuthStore;
+  private readonly loginKey: () => string | undefined;
 
   constructor(options: ClaudeAccountPoolOptions) {
     this.home = options.home;
     this.now = options.now ?? Date.now;
     this.log = options.log;
     this.fetchImpl = options.fetch;
+    this.loginKey = options.loginKey ?? readClaudeLoginKey;
     this.current = options.current ?? new ClaudeCodeAuthStore(undefined, {
       home: options.home,
       ...(options.observed ? { observed: options.observed } : {}),
@@ -125,30 +167,47 @@ export class ClaudeAccountAuthPool {
   /** Current projection without network I/O, used by status and pre-routing health checks. */
   peekCredentials(): Credential[] {
     const out: Credential[] = [];
+    const accounts = readClaudeOAuthAccounts(this.home);
     // A paused login is never projected: no request, usage probe or model listing carries its token.
     const current = isCurrentClaudeLoginPaused(this.home) ? new Error("current Claude login paused") : this.current.get();
+    // A request from Claude Code itself names the newest version this machine runs; manufactured
+    // headers may use it while the observation is recent (issue #103).
+    const observedCliVersion = this.current.observedCliVersion();
     let currentToken: string | undefined;
     if (!(current instanceof Error)) {
+      // The observed snapshot and the Claude Code keychain/file are the same machine login, which
+      // Claude Code's config names; env and ClaudeRipple's own token file may be another account, so
+      // those fall back to the runtime generation (a refresh may revive a rest, but never moves it).
+      const durable = current.source === "observed" || current.source === "stored"
+        ? this.loginKey() ?? undefined
+        : undefined;
       if (current.source === "observed") {
         currentToken = current.observed.authorization.replace(/^Bearer\s+/i, "");
+        const id = credentialId("current", currentToken);
         out.push({
-          id: credentialId("current", currentToken),
+          id,
           ownerId: "current",
+          healthKey: durable ?? id,
           label: "Current Claude session",
           headers: observedAnthropicHeaders(current.observed),
         });
       } else {
         currentToken = current.credentials.accessToken;
+        const id = credentialId("current", currentToken);
         out.push({
-          id: credentialId("current", currentToken),
+          id,
           ownerId: "current",
+          healthKey: durable ?? id,
           label: "Current Claude login",
-          headers: nativeAnthropicHeaders({ type: "anthropic", auth: "claude-code" }, current.credentials),
+          headers: nativeAnthropicHeaders({ type: "anthropic", auth: "claude-code" }, current.credentials, { observed: observedCliVersion }),
         });
       }
     }
-    for (const account of readClaudeOAuthAccounts(this.home)) {
-      if (account.needsReauth || this.now() >= account.expiresAt) continue;
+    const currentAccount = accounts.find((account) => account.token === currentToken);
+    if (currentAccount?.paused) out.length = 0;
+    else if (currentAccount && out[0]) out[0].preferred = currentAccount.preferred === true;
+    for (const account of accounts) {
+      if (account.paused || account.needsReauth || this.now() >= account.expiresAt) continue;
       // The legacy single-account file is also what ClaudeCodeAuthStore read as current. Until the
       // first migration write, omit that duplicate instead of trying the same token twice.
       if (currentToken && account.token === currentToken) continue;
@@ -156,9 +215,11 @@ export class ClaudeAccountAuthPool {
         id: credentialId(account.id, account.token, account.refreshToken),
         ownerId: account.id,
         label: account.label,
+        preferred: account.preferred === true,
         headers: nativeAnthropicHeaders(
           { type: "anthropic", auth: "claude-code" },
           { accessToken: account.token, expiresAt: account.expiresAt },
+          { observed: observedCliVersion },
         ),
       };
       // The pool tries credentials in this order, so the account the user chose goes ahead of the
@@ -167,6 +228,32 @@ export class ClaudeAccountAuthPool {
       else out.push(credential);
     }
     return out;
+  }
+
+  /** Runtime owner aliases for cooldown clearing; a legacy/current duplicate shares one token. */
+  cooldownOwners(ownerId: string): string[] {
+    const account = readClaudeOAuthAccounts(this.home).find((account) => account.id === ownerId);
+    const current = this.current.get();
+    if (!account || current instanceof Error) return [ownerId];
+    const token = current.source === "observed" ? current.observed.authorization.replace(/^Bearer\s+/i, "") : current.credentials.accessToken;
+    return account.token === token ? [ownerId, "current"] : [ownerId];
+  }
+
+  /**
+   * The pool answered on one of its credentials. For the current login held as an observation that
+   * answer is the only validity evidence there is: a 401 means it was signed out or revoked and is
+   * dropped, any other answer means the token was accepted, so the 12 h idle guard starts over.
+   * Without this, use through the pool did not count and an actively used login vanished from the
+   * accounts list and the rotation after 12 h of un-routed silence (issue #123, 2026-11-05).
+   * Keychain/env/token-file sources are left alone: their own expiry is authoritative.
+   */
+  noteAnswer(id: string, status: number): void {
+    const current = this.current.get();
+    if (current instanceof Error || current.source !== "observed") return;
+    const authorization = current.observed.authorization;
+    if (credentialId("current", authorization.replace(/^Bearer\s+/i, "")) !== id) return;
+    if (status === 401) this.current.forgetObserved(authorization);
+    else this.current.noteObservedUse(authorization);
   }
 
   /** Persist a rejected stored account as requiring re-login. The current CLI account stays external. */

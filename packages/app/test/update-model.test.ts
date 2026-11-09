@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { readUpdateSeen, rememberUpdate, updateNotice, type RouterUpdate, type UpdateSeen } from "../src/update-model.ts";
+import { readUpdateSeen, readReplacementTries, rememberUpdate, releaseNotesUrl, replacementExhausted, nextReplacementTries, resolveTrayVersion, updateNotice, REPLACEMENT_LIMIT, type RouterUpdate, type UpdateSeen } from "../src/update-model.ts";
 
 const empty = (): UpdateSeen => ({ updated: [], available: [] });
 const completed: RouterUpdate = { enabled: true, kind: "script", lastUpdatedFrom: "1.0.0", lastUpdatedTo: "1.1.0", lastUpdatedAt: 1000 };
@@ -39,6 +39,60 @@ test("available and completed notifications have independent version deduplicati
   assert.deepEqual(rememberUpdate(both, notice), both);
   assert.equal(updateNotice("1.1.0", "1.0.0", { enabled: false, available: "1.1.0" }, empty()), null);
 });
+test("failed tray replacement retries the same version independently of an already delivered notice", async () => {
+  const module = await import("../src/update-model.ts");
+  assert.equal(typeof module.TrayReplacement, "function", "replacement is separate from notification deduplication");
+  let now = 0, calls = 0;
+  const replacement = new module.TrayReplacement(() => now);
+  const seen = rememberUpdate(empty(), updateNotice("1.1.0", "1.0.0", completed, empty())!);
+  assert.equal(updateNotice("1.1.0", "1.0.0", completed, seen), null);
+  const run = async () => { if (++calls === 1) throw new Error("launcher failed"); };
+  await assert.rejects(replacement.reconcile("1.1.0", "1.0.0", completed, run), /launcher failed/);
+  await replacement.reconcile("1.1.0", "1.0.0", completed, run);
+  assert.equal(calls, 1, "polls do not cause a tight retry loop");
+  now += 60_000;
+  await replacement.reconcile("1.1.0", "1.0.0", completed, run);
+  assert.equal(calls, 2);
+  now += 60_000;
+  await replacement.reconcile("1.1.0", "1.0.0", completed, run);
+  assert.equal(calls, 2, "only a successful launch is complete");
+});
+
 test("malformed notification history is rejected at the file boundary", () => {
   for (const value of [null, {}, { updated: [1], available: [] }, { updated: [], available: "1.0.0" }]) assert.throws(() => readUpdateSeen(value));
+});
+
+test("the tray's version is the package's, not Electron's, outside a packaged build", () => {
+  // `electron main.js` — how the CLI starts an npm install — made app.getVersion() answer 38.8.6.
+  assert.equal(resolveTrayVersion(false, "38.8.6", "0.12.14"), "0.12.14");
+  assert.equal(resolveTrayVersion(false, "38.8.6", " 0.12.14\n"), "0.12.14");
+  assert.equal(resolveTrayVersion(true, "0.12.14", "0.12.13"), "0.12.14", "the bundle is the truth in a packaged app");
+  for (const missing of [null, "", "   "]) assert.equal(resolveTrayVersion(false, "38.8.6", missing), "38.8.6", `no package version (${JSON.stringify(missing)}) falls back`);
+});
+
+test("replacement attempts are counted per version pair and stop the loop", () => {
+  assert.equal(replacementExhausted(null, "1.1.0", "1.0.0"), false, "nothing tried yet");
+  let tries = nextReplacementTries(null, "1.1.0", "1.0.0");
+  assert.deepEqual(tries, { routerVersion: "1.1.0", trayVersion: "1.0.0", attempts: 1 });
+  for (let i = 1; i < REPLACEMENT_LIMIT; i++) tries = nextReplacementTries(readReplacementTries(JSON.parse(JSON.stringify(tries))), "1.1.0", "1.0.0");
+  assert.equal(tries.attempts, REPLACEMENT_LIMIT);
+  assert.equal(replacementExhausted(tries, "1.1.0", "1.0.0"), true);
+  assert.equal(replacementExhausted(tries, "1.2.0", "1.0.0"), false, "a new router version is a new attempt");
+  assert.equal(replacementExhausted(tries, "1.1.0", "1.1.0"), false, "a tray that caught up is not stuck");
+  assert.deepEqual(nextReplacementTries(tries, "1.1.0", "1.1.0"), { routerVersion: "1.1.0", trayVersion: "1.1.0", attempts: 1 }, "a different pair starts its own count");
+});
+
+test("a damaged replacement state is ignored rather than stopping updates", () => {
+  for (const value of [null, {}, { routerVersion: "1.1.0" }, { routerVersion: "1.1.0", trayVersion: "1.0.0", attempts: "3" }, { routerVersion: "1.1.0", trayVersion: "1.0.0", attempts: Infinity }]) {
+    assert.equal(readReplacementTries(value), null);
+  }
+  assert.deepEqual(readReplacementTries(JSON.parse('{"routerVersion":"1.1.0","trayVersion":"1.0.0","attempts":-2}')), { routerVersion: "1.1.0", trayVersion: "1.0.0", attempts: 0 });
+});
+
+test("an update notice links to that version's release notes", () => {
+  assert.equal(releaseNotesUrl("0.12.30"), "https://github.com/PBJ-2/clauderipple/releases/tag/v0.12.30");
+  assert.equal(releaseNotesUrl("1.0.0-beta.2"), "https://github.com/PBJ-2/clauderipple/releases/tag/v1.0.0-beta.2");
+  for (const odd of ["", "v0.12.30", "0.12", "0.12.30/../../x", "0.12.30?x=1"]) {
+    assert.equal(releaseNotesUrl(odd), "https://github.com/PBJ-2/clauderipple/releases/latest", odd);
+  }
 });

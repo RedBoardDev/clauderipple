@@ -53,8 +53,8 @@ export type Envelope =
   | { w: "responses"; p: string; m: string; r: Record<string, unknown> }
   | { w: "chat"; p: string; m: string; f: string };
 
-/** A reasoning item as we are willing to send back: type, id, summary, encrypted_content. */
-export type ReplayedReasoning = { type: "reasoning"; id?: string; summary?: unknown; encrypted_content: string };
+/** Full reasoning text is replayable too; a display-only summary is not a substitute for it. */
+export type ReplayedReasoning = { type: "reasoning"; id?: string; summary?: unknown; encrypted_content?: string; content?: { type: "reasoning_text"; text: string }[] };
 
 /** Thrown when a signature looks like ours and does not decode. */
 export class UndecodableEnvelope extends Error {}
@@ -104,18 +104,23 @@ export function decodeEnvelope(signature: unknown): Envelope | null {
 }
 
 /**
- * Whether a stored item is worth replaying at all. A reasoning item with no `encrypted_content`
- * carries nothing the backend can resume — the summary is text it thinks in, not state — so it is
- * not carried and never replayed. Measured 2026-10-14 (Codex records, 161 items across one day):
- * every item the CLI replayed had the sealed blob, and most had an empty summary.
+ * Replay sealed state or full reasoning text, never a summary alone. Codex's sealed items need
+ * `encrypted_content`; compatible Responses vendors can instead supply `reasoning_text` content.
  */
 export function replayableReasoning(stored: Record<string, unknown>): ReplayedReasoning | null {
   if (stored.type !== "reasoning") return null;
   const encrypted = stored.encrypted_content;
-  if (typeof encrypted !== "string" || encrypted.length === 0) return null;
-  // Only the fields the wire defines are forwarded: a vendor's item may carry bookkeeping
-  // (`internal_chat_message_metadata_passthrough`) that is meaningless and unverified to send back.
-  const out: ReplayedReasoning = { type: "reasoning", encrypted_content: encrypted };
+  const content = Array.isArray(stored.content) && stored.content.every((part: unknown) => {
+    if (!part || typeof part !== "object") return false;
+    const value = part as { type?: unknown; text?: unknown };
+    return value.type === "reasoning_text" && typeof value.text === "string";
+  }) ? stored.content as { type: "reasoning_text"; text: string }[] : undefined;
+  const sealed = typeof encrypted === "string" && encrypted.length > 0;
+  if (!sealed && !content?.some((part) => part.text.length > 0)) return null;
+  // Only wire fields go back, not vendor bookkeeping or client-injected metadata.
+  const out: ReplayedReasoning = { type: "reasoning" };
+  if (sealed) out.encrypted_content = encrypted;
+  if (content) out.content = content.map(({ type, text }) => ({ type, text }));
   if (typeof stored.id === "string" && stored.id.length > 0) out.id = stored.id;
   if (Array.isArray(stored.summary)) out.summary = stored.summary;
   return out;
@@ -162,5 +167,10 @@ const REASONING_REFUSAL = /reasoning|encrypted|\binput\[\d+\]|\bitem\b|signature
  * blob minted on one account or one model is the thing most likely to be refused on another.
  */
 export function refusesReplayedReasoning(status: number, message: string): boolean {
-  return status >= 400 && status < 500 && (status === 422 || REASONING_REFUSAL.test(message));
+  return !requiresThinkingReplay(status, message) && status >= 400 && status < 500 && (status === 422 || REASONING_REFUSAL.test(message));
+}
+
+/** Missing mandatory history cannot be repaired by removing more reasoning or resending the body. */
+export function requiresThinkingReplay(status: number, message: string): boolean {
+  return status === 400 && /The `?content\[\]\.thinking`? in the thinking mode must be passed back to the API\./.test(message);
 }

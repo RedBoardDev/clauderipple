@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { ClaudeUsage, claudeUsageFromBody } from "../src/providers/anthropic-usage.ts";
+import { ClaudeUsage, claudeLimitResetMs, claudeUsageFromBody, claudeUsageFromHeaders } from "../src/providers/anthropic-usage.ts";
 
 // Shape measured 2026-09-28 from GET /api/oauth/usage.
 const BODY = {
@@ -80,69 +80,258 @@ test("each account is asked once per interval with its own headers, and a failur
   assert.deepEqual(Object.keys(kept).sort(), ["acct", "current"], "a failed lookup keeps the last good numbers");
 });
 
-test("refresh bypasses TTL, shares in-flight work, and retries only the failed owner once after 15s", async () => {
-  let now = 1_000_000;
-  const calls: Record<string, number> = {};
-  let fail = false;
-  let release: (() => void) | undefined;
-  let gate: Promise<void> = Promise.resolve();
-  const usage = new ClaudeUsage({ credentials: async () => ["current", "other"].map((id) => ({ id, headers: { owner: id } })) }, {
-    upstream: () => "api.anthropic.com", now: () => now,
-    fetch: async (_url, init) => {
-      const owner = (init.headers as Record<string, string>).owner!;
-      calls[owner] = (calls[owner] ?? 0) + 1;
-      await gate;
-      return fail && owner === "other" ? new Response("no", { status: 503 }) : Response.json(BODY);
-    },
-  });
-  const first = await usage.snapshot();
-  assert.equal(first.other?.at, now);
-  await usage.snapshot();
-  assert.deepEqual(calls, { current: 1, other: 1 });
-  fail = true;
-  gate = new Promise<void>((resolve) => { release = resolve; });
-  const forced = usage.snapshot(true);
-  assert.equal(usage.snapshot(true), forced, "forced requests join one lookup");
-  assert.equal(usage.snapshot(), forced, "ordinary polls join it too");
-  release!();
-  const failed = await forced;
-  assert.equal(failed.other?.stale, true);
-  assert.equal(failed.other?.at, first.other?.at, "a failure never changes the successful-fetch timestamp");
-  now += 14_999;
-  await usage.snapshot();
-  assert.deepEqual(calls, { current: 2, other: 2 });
-  now += 1;
-  await usage.snapshot();
-  assert.deepEqual(calls, { current: 2, other: 3 }, "only the failed owner is retried");
-  now += 15_000;
-  await usage.snapshot();
-  assert.equal(calls.other, 3, "a second failure returns to the full TTL rather than looping");
-  fail = false;
-  now += 300_000;
-  const recovered = await usage.snapshot();
-  assert.equal(recovered.other?.stale, undefined);
-  assert.equal(recovered.other?.at, now);
+// Measured against the installed CLI 2.1.317 bundle (2026-11-05): the unified utilization
+// headers are fractions 0..1 and the resets are epoch seconds.
+test("unified limit headers give the same windows in the snapshot shape", () => {
+  const now = Date.parse("2026-11-02T11:18:00Z");
+  const reset5h = Math.floor(now / 1000) + 1_200;
+  const reset7d = Math.floor(now / 1000) + 86_400;
+  const q = claudeUsageFromHeaders({
+    "anthropic-ratelimit-unified-status": "rejected",
+    "anthropic-ratelimit-unified-5h-utilization": "1",
+    "anthropic-ratelimit-unified-5h-reset": String(reset5h),
+    "anthropic-ratelimit-unified-7d-utilization": "0.584",
+    "anthropic-ratelimit-unified-7d-reset": String(reset7d),
+  }, now) as { rate_limits: { primary: Record<string, number>; secondary: Record<string, number> }; at: number };
+  assert.equal(q.at, now);
+  assert.deepEqual(q.rate_limits.primary, { used_percent: 100, window_minutes: 300, reset_at: reset5h });
+  assert.deepEqual(q.rate_limits.secondary, { used_percent: 58.4, window_minutes: 10080, reset_at: reset7d });
+  assert.equal(claudeUsageFromHeaders({}, now), null, "no unified limiter headers, no reading");
+  assert.equal(claudeUsageFromHeaders({ "anthropic-ratelimit-unified-status": "allowed" }, now), null, "a window is what a reading needs");
+  const ended = claudeUsageFromHeaders({
+    "anthropic-ratelimit-unified-status": "allowed",
+    "anthropic-ratelimit-unified-5h-utilization": "1",
+    "anthropic-ratelimit-unified-5h-reset": String(Math.floor(now / 1000) - 10),
+  }, now) as { rate_limits: { primary: Record<string, number> } };
+  assert.equal(ended.rate_limits.primary.reset_at, undefined, "a reset already behind us is not shown as the next one");
 });
 
-test("a credential-source failure also keeps stale data and gets one short retry", async () => {
-  let now = 0;
+// A 429 without retry-after cooled a spent Claude subscription for a minute, so a 5h/7d window was
+// re-tried every minute until it reset (2026-11-07). The unified headers state the real reset.
+test("a rejected unified window states how long the account must rest", () => {
+  const now = Date.parse("2026-11-07T10:00:00Z");
+  const reset5h = Math.floor(now / 1000) + 1_200;
+  const reset7d = Math.floor(now / 1000) + 86_400;
+  const headers = {
+    "anthropic-ratelimit-unified-status": "rejected",
+    "anthropic-ratelimit-unified-5h-utilization": "1",
+    "anthropic-ratelimit-unified-5h-reset": String(reset5h),
+    "anthropic-ratelimit-unified-7d-utilization": "0.584",
+    "anthropic-ratelimit-unified-7d-reset": String(reset7d),
+  };
+  assert.equal(claudeLimitResetMs(headers, now), 1_200_000, "the spent 5h window's reset");
+  // Only a window that is actually spent names a wait; allowed, below 100%, or a reset already gone
+  // by is an ordinary 429 and keeps the pool's default.
+  assert.equal(claudeLimitResetMs({ ...headers, "anthropic-ratelimit-unified-status": "allowed" }, now), undefined);
+  assert.equal(claudeLimitResetMs({ ...headers, "anthropic-ratelimit-unified-5h-utilization": "0.99" }, now), undefined);
+  assert.equal(claudeLimitResetMs({ ...headers, "anthropic-ratelimit-unified-5h-reset": String(Math.floor(now / 1000) - 1) }, now), undefined);
+  assert.equal(claudeLimitResetMs({ "anthropic-ratelimit-unified-5h-reset": String(reset5h) }, now), undefined, "no limiter status, no claim");
+  // Both windows spent: the soonest reset is the first moment asking again can work.
+  assert.equal(claudeLimitResetMs({ ...headers, "anthropic-ratelimit-unified-7d-utilization": "1" }, now), 1_200_000);
+});
+
+// Issue #123 part 2: a refused usage lookup kept the last numbers and showed them as current.
+test("a 429 keeps the last numbers, marks them stale and honors retry-after (#123)", async () => {
+  let now = 1_000_000;
+  const calls: string[] = [];
+  const lines: string[] = [];
+  let reply = (): Response => Response.json(BODY);
+  const usage = new ClaudeUsage(
+    { credentials: async () => [{ id: "current:aa", ownerId: "current", headers: { authorization: "Bearer one" } }] },
+    {
+      upstream: () => "api.anthropic.com",
+      now: () => now,
+      ttlMs: 60_000,
+      warn: (line) => lines.push(line),
+      fetch: async () => { calls.push("call"); return reply(); },
+    },
+  );
+  const first = await usage.snapshot();
+  assert.equal((first.current as Record<string, unknown>).stale, undefined, "a successful reading is not stale");
+
+  now += 61_000;
+  reply = () => new Response("no", { status: 429, headers: { "retry-after": "300" } });
+  const stale = (await usage.snapshot()).current as Record<string, unknown>;
+  assert.equal((stale.rate_limits as { primary: { used_percent: number } }).primary.used_percent, 14, "the last good numbers stay");
+  assert.equal(stale.at, 1_000_000, "at is the last success, not the failed try");
+  assert.equal(stale.stale, true);
+  assert.equal(stale.failed_status, 429);
+  assert.equal(stale.failed_at, 1_061_000);
+  assert.ok(lines.some((line) => /HTTP 429 \(retry after 300s\)/.test(line)), "the vendor's wait is logged");
+
+  // Inside retry-after nothing is asked again, although the normal interval has passed.
+  now += 60_000;
+  await usage.snapshot();
+  assert.equal(calls.length, 2);
+  now += 300_000;
+  reply = () => Response.json(BODY);
+  await usage.snapshot();
+  assert.equal(calls.length, 3, "the wait ends and the account is asked again");
+  const recovered = (await usage.snapshot()).current as Record<string, unknown>;
+  assert.equal(recovered.stale, undefined);
+});
+
+test("a message answer fills in a stale reading from its unified headers (#123)", async () => {
+  let now = 1_000_000;
   let fail = false;
-  let calls = 0;
-  const usage = new ClaudeUsage({ credentials: async () => {
-    calls++;
-    if (fail) throw new Error("unavailable");
-    return [{ id: "current", headers: {} }];
-  } }, { upstream: () => "api.anthropic.com", now: () => now, fetch: async () => Response.json(BODY) });
+  const usage = new ClaudeUsage(
+    { credentials: async () => [{ id: "current:aa", ownerId: "current", headers: {} }] },
+    {
+      upstream: () => "api.anthropic.com",
+      now: () => now,
+      ttlMs: 60_000,
+      fetch: async () => fail ? new Response("no", { status: 429 }) : Response.json(BODY),
+    },
+  );
+  const headers = {
+    "anthropic-ratelimit-unified-status": "rejected",
+    "anthropic-ratelimit-unified-5h-utilization": "1",
+    "anthropic-ratelimit-unified-5h-reset": String(Math.floor(now / 1000) + 600),
+  };
   await usage.snapshot();
+  usage.observeAnswer("current", headers);
+  const fresh = (await usage.snapshot()).current as Record<string, unknown>;
+  assert.equal((fresh.rate_limits as { primary: { used_percent: number } }).primary.used_percent, 14, "the richer body reading wins while it is fresh");
+
+  now += 61_000;
   fail = true;
-  now = 300_000;
-  assert.equal((await usage.snapshot()).current?.stale, true);
-  now += 15_000;
   await usage.snapshot();
-  assert.equal(calls, 3);
-  now += 15_000;
+  usage.observeAnswer("current", headers);
+  const refreshed = (await usage.snapshot()).current as Record<string, unknown>;
+  assert.equal((refreshed.rate_limits as { primary: { used_percent: number } }).primary.used_percent, 100, "the answer's headers fill in while the usage endpoint refuses");
+  assert.equal(refreshed.stale, undefined);
+});
+
+test("during a backoff, every answer's headers update the reading and a body read still wins (#123)", async () => {
+  let now = 1_000_000;
+  let reply = (): Response => Response.json(BODY);
+  const usage = new ClaudeUsage(
+    { credentials: async () => [{ id: "current:aa", ownerId: "current", headers: {} }] },
+    { upstream: () => "api.anthropic.com", now: () => now, ttlMs: 60_000, fetch: async () => reply() },
+  );
+  const headers = (fraction: number) => ({
+    "anthropic-ratelimit-unified-status": "allowed",
+    "anthropic-ratelimit-unified-5h-utilization": String(fraction),
+    "anthropic-ratelimit-unified-5h-reset": String(Math.floor(now / 1000) + 600),
+  });
+  const primary = async () => ((await usage.snapshot()).current as { rate_limits: { primary: { used_percent: number } }; stale?: true })
+    .rate_limits.primary.used_percent;
   await usage.snapshot();
-  assert.equal(calls, 3);
+  now += 61_000;
+  reply = () => new Response("no", { status: 429, headers: { "retry-after": "3600" } });
+  await usage.snapshot();
+  usage.observeAnswer("current", headers(0.1));
+  assert.equal(await primary(), 10, "the answer's headers fill in while the endpoint refuses");
+  now += 60_000;
+  usage.observeAnswer("current", headers(1));
+  assert.equal(await primary(), 100, "a newer header reading replaces the older one for the whole wait");
+  // The wait ends, a body reading arrives, and headers stop overriding it until it goes stale again.
+  now += 3_600_000;
+  reply = () => Response.json(BODY);
+  assert.equal(await primary(), 14);
+  usage.observeAnswer("current", headers(1));
+  assert.equal(await primary(), 14, "a fresh body reading is not replaced by an answer's headers");
+});
+
+test("a body reading older than its interval no longer blocks an answer's headers (#123)", async () => {
+  let now = 1_000_000;
+  let reply = (): Response => Response.json(BODY);
+  const usage = new ClaudeUsage(
+    { credentials: async () => [{ id: "current:aa", ownerId: "current", headers: {} }] },
+    { upstream: () => "api.anthropic.com", now: () => now, ttlMs: 60_000, fetch: async () => reply() },
+  );
+  const headers = {
+    "anthropic-ratelimit-unified-status": "allowed",
+    "anthropic-ratelimit-unified-5h-utilization": "0.42",
+    "anthropic-ratelimit-unified-5h-reset": String(Math.floor(now / 1000) + 600),
+  };
+  const primary = async () => ((await usage.snapshot()).current as { rate_limits: { primary: { used_percent: number } } })
+    .rate_limits.primary.used_percent;
+  await usage.snapshot();
+  usage.observeAnswer("current", headers);
+  assert.equal(await primary(), 14, "within the interval the richer body reading wins");
+  // The interval passes while nobody polls, so the body reading is now as old as a failed try.
+  now += 60_000;
+  reply = () => new Response("no", { status: 429, headers: { "retry-after": "3600" } });
+  usage.observeAnswer("current", headers);
+  assert.equal(await primary(), 42, "past the interval the answer's headers are the newer reading");
+});
+
+test("a 429 that lands after an answer's newer reading does not mark that reading stale (#123)", async () => {
+  let now = 1_000_000;
+  let release!: (response: Response) => void;
+  let began!: () => void;
+  const started = new Promise<void>(resolve => { began = resolve; });
+  const usage = new ClaudeUsage(
+    { credentials: async () => [{ id: "current:aa", ownerId: "current", headers: {} }] },
+    { upstream: () => "api.anthropic.com", now: () => now, ttlMs: 60_000,
+      fetch: () => { began(); return new Promise<Response>(resolve => { release = resolve; }); } },
+  );
+  const pending = usage.snapshot(); // the refresh starts now
+  await started;
+  // A Messages answer stores fresh header readings while the lookup is still in flight.
+  now += 30_000;
+  usage.observeAnswer("current", {
+    "anthropic-ratelimit-unified-status": "allowed",
+    "anthropic-ratelimit-unified-5h-utilization": "0.9",
+    "anthropic-ratelimit-unified-5h-reset": String(Math.floor(now / 1000) + 600),
+  });
+  release(new Response("no", { status: 429, headers: { "retry-after": "60" } }));
+  const snapshot = (await pending).current as Record<string, unknown>;
+  assert.equal(snapshot.at, 1_030_000, "the answer's reading stays the current one");
+  assert.equal(snapshot.stale, undefined, "a refusal older than the reading does not mark it stale");
+  assert.equal(snapshot.failed_at, undefined);
+});
+
+test("an answer's reading stored in the same millisecond as the refusal is not marked stale (#123)", async () => {
+  let now = 1_000_000;
+  let release!: (response: Response) => void;
+  let began!: () => void;
+  const started = new Promise<void>(resolve => { began = resolve; });
+  const usage = new ClaudeUsage(
+    { credentials: async () => [{ id: "current:aa", ownerId: "current", headers: {} }] },
+    { upstream: () => "api.anthropic.com", now: () => now, ttlMs: 60_000,
+      fetch: () => { began(); return new Promise<Response>(resolve => { release = resolve; }); } },
+  );
+  const pending = usage.snapshot(); // the refresh starts now
+  await started;
+  // The clock does not advance, so the reading and the failure carry the same `at`.
+  usage.observeAnswer("current", {
+    "anthropic-ratelimit-unified-status": "allowed",
+    "anthropic-ratelimit-unified-5h-utilization": "0.9",
+    "anthropic-ratelimit-unified-5h-reset": String(Math.floor(now / 1000) + 600),
+  });
+  release(new Response("no", { status: 429, headers: { "retry-after": "60" } }));
+  const snapshot = (await pending).current as Record<string, unknown>;
+  assert.equal(snapshot.at, 1_000_000, "the answer's reading is the current one");
+  assert.equal(snapshot.stale, undefined, "the refusal started before the reading, so it does not mark it stale");
+  assert.equal(snapshot.failed_at, undefined);
+});
+
+test("a header reading that lands while credentials are collected is not marked stale (#123)", async () => {
+  let now = 1_000_000;
+  let release!: (list: { id: string; ownerId: string; headers: Record<string, string> }[]) => void;
+  let began!: () => void;
+  const started = new Promise<void>(resolve => { began = resolve; });
+  const usage = new ClaudeUsage(
+    { credentials: () => { began(); return new Promise(resolve => { release = resolve; }); } },
+    { upstream: () => "api.anthropic.com", now: () => now, ttlMs: 60_000,
+      fetch: async () => new Response("no", { status: 429, headers: { "retry-after": "60" } }) },
+  );
+  const pending = usage.snapshot(); // the refresh starts, and waits on the credential list
+  await started;
+  // A Messages answer stores a fresh header reading before the credential list arrives.
+  now += 30_000;
+  usage.observeAnswer("current", {
+    "anthropic-ratelimit-unified-status": "allowed",
+    "anthropic-ratelimit-unified-5h-utilization": "0.9",
+    "anthropic-ratelimit-unified-5h-reset": String(Math.floor(now / 1000) + 600),
+  });
+  release([{ id: "current:aa", ownerId: "current", headers: {} }]);
+  const snapshot = (await pending).current as Record<string, unknown>;
+  assert.equal(snapshot.at, 1_030_000, "the answer's reading stays the current one");
+  assert.equal(snapshot.stale, undefined, "the refusal started before the reading, so it does not mark it stale");
+  assert.equal(snapshot.failed_at, undefined);
 });
 
 test("a removed account drops out of the snapshot", async () => {

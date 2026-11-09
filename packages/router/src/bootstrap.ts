@@ -9,9 +9,21 @@ import path from "node:path";
 import type { Config } from "./config.ts";
 import { agentAliases } from "./agents.ts";
 import { isJudgeOnlyModel } from "./model-policy.ts";
-import { chatPickerModels, providerModelWindow } from "./picker.ts";
+import { qualifiedModel } from "./routing.ts";
+import { chatPickerModels, pickerWindowOverride, providerModelWindow, resolvedModelWindow } from "./picker.ts";
+import { chatgptModelWindow } from "./providers/chatgpt/windows.ts";
 
 export const BOOTSTRAP_PATH = "/api/claude_cli/bootstrap";
+
+/**
+ * The largest per-model window Claude Code takes from `auto_compact_windows`. A value outside its
+ * settings range (100K–1M in 2.1.308) is dropped whole and the model falls back to the session's
+ * own setting, so Gemini's 1,048,576 never applied (read from the CLI, 2026-10-24). It is also the
+ * cap `install` writes as `CLAUDE_CODE_MAX_CONTEXT_TOKENS`: Claude Code compacts a model it does
+ * not know at the smaller of that cap and the model's own window, and 272000 there cut 6.1 Sol's
+ * 475000 and DeepSeek's million alike. With the cap at the ceiling, each model's window decides.
+ */
+export const CLI_WINDOW_MAX = 1_000_000;
 
 /**
  * Model ids named in the user's agent definitions (~/.claude/agents/*.md frontmatter `model:`),
@@ -31,7 +43,8 @@ export function agentModelIds(dirs: string[] = [path.join(os.homedir(), ".claude
     for (const f of files) {
       try {
         const head = fs.readFileSync(path.join(dir, f), "utf8").slice(0, 8192);
-        const m = /^model:\s*['"]?([A-Za-z0-9._\/:\-]+(?:@[a-z]+)?)/m.exec(head);
+        // `#` carries a pinned account in a qualified id (`anthropic#3f2a9c1b:claude-opus-5-5`).
+        const m = /^model:\s*['"]?([A-Za-z0-9._\/:\-#]+(?:@[a-z]+)?)/m.exec(head);
         if (m && !isJudgeOnlyModel(m[1]!)) out.add(m[1]!);
       } catch {
         /* unreadable: skip */
@@ -45,10 +58,14 @@ function routable(id: string, cfg: Config): boolean {
   const base = id.split("@")[0]!;
   if (cfg.cli.extraModels.some((m) => m.model === base)) return true;
   if (cfg.routes[base] || cfg.aliases[base]) return true;
-  return cfg.direct.some((d) => base.startsWith(d.prefix));
+  if (cfg.direct.some((d) => base.startsWith(d.prefix))) return true;
+  // A qualified id names a configured provider that declares the model; a pinned one (`#account`)
+  // is the same declaration plus an account, and must reach the CLI's list or the worker silently
+  // runs on the parent session's model.
+  return qualifiedModel(base, cfg) !== null;
 }
 
-export function injectBootstrap(body: Buffer, cfg: Config, agentDirs?: string[]): Buffer {
+export function bootstrapModels(cfg: Config, agentDirs?: string[]): ReturnType<typeof chatPickerModels> {
   const known = new Set(cfg.cli.extraModels.map((m) => m.model));
   // The agent files' derived aliases are the same set a marker resolves against, so an id an agent
   // file names (and its base) is routable here too — otherwise the CLI never lists it and the
@@ -61,14 +78,32 @@ export function injectBootstrap(body: Buffer, cfg: Config, agentDirs?: string[])
       const [base, effort] = id.split("@");
       const named = cfg.cli.extraModels.find((m) => m.model === base);
       // An "<model>@<effort>" entry is the same model with a different effort, so it has the same window.
-      const window = named?.contextWindow ?? providerModelWindow({ ...cfg, aliases }, base ?? id);
+      // A window the operator set on the picker entry wins; otherwise the live catalogue wins over
+      // both the copied entry value and the provider's stored value (§4, 2026-10-30).
+      const window = pickerWindowOverride({ ...cfg, aliases }, base ?? id) ?? chatgptModelWindow({ ...cfg, aliases }, base ?? id) ?? named?.contextWindow ?? providerModelWindow({ ...cfg, aliases }, base ?? id);
       return { model: id, name: `${named?.name ?? base}${effort ? ` · ${effort}` : ""}`, ...(window ? { contextWindow: window } : {}) };
     });
-  const extra = chatPickerModels({ ...cfg, aliases, cli: { ...cfg.cli, extraModels: [...cfg.cli.extraModels, ...fromAgents] } });
-  const win = cfg.cli.autoCompactWindow;
-  // Routed models do not share a context window; the global value is only the fallback for entries
-  // that do not name their own, so a per-entry window alone is reason enough to write the map.
-  const anyWindow = win !== undefined || extra.some((m) => m.contextWindow) || Object.values(cfg.routes).some((r) => r.contextWindow);
+  return chatPickerModels({ ...cfg, aliases, cli: { ...cfg.cli, extraModels: [...cfg.cli.extraModels, ...fromAgents] } });
+}
+
+/** Raw capacities for exactly the keys bootstrap advertises, shared with settings reconciliation. */
+export function bootstrapWindows(cfg: Config, extra = bootstrapModels(cfg)): Record<string, number> {
+  const windows: Record<string, number> = {};
+  for (const m of extra) {
+    const window = resolvedModelWindow(cfg, m.model).contextWindow ?? m.contextWindow ?? cfg.cli.autoCompactWindow;
+    if (window) windows[m.model] = window;
+  }
+  for (const alias of Object.keys(cfg.routes)) {
+    const window = resolvedModelWindow(cfg, alias).contextWindow ?? cfg.cli.autoCompactWindow;
+    if (window) windows[alias] = window;
+  }
+  return windows;
+}
+
+export function injectBootstrap(body: Buffer, cfg: Config, agentDirs?: string[]): Buffer {
+  const extra = bootstrapModels(cfg, agentDirs);
+  const windows = bootstrapWindows(cfg, extra);
+  const anyWindow = Object.keys(windows).length > 0;
   if (extra.length === 0 && !anyWindow) return body;
   let j: Record<string, unknown>;
   try {
@@ -78,18 +113,12 @@ export function injectBootstrap(body: Buffer, cfg: Config, agentDirs?: string[])
   }
   if (extra.length > 0) {
     const existing = Array.isArray(j.additional_model_options) ? (j.additional_model_options as unknown[]) : [];
-    j.additional_model_options = [...existing, ...extra];
+    // The CLI requires a description even when the config or an agent-derived entry omits it.
+    j.additional_model_options = [...existing, ...extra.map((m) => ({ ...m, description: m.description ?? m.name ?? m.model }))];
   }
   if (anyWindow) {
     const acw = { ...((j.auto_compact_windows as Record<string, number> | undefined) ?? {}) };
-    for (const m of extra) {
-      const w = m.contextWindow ?? win;
-      if (w) acw[m.model] = w;
-    }
-    for (const [alias, route] of Object.entries(cfg.routes)) {
-      const w = route.contextWindow ?? win;
-      if (w) acw[alias] = w;
-    }
+    for (const [id, window] of Object.entries(windows)) acw[id] = Math.min(window, CLI_WINDOW_MAX);
     j.auto_compact_windows = acw;
   }
   return Buffer.from(JSON.stringify(j));

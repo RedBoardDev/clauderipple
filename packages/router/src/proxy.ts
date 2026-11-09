@@ -22,37 +22,43 @@ import zlib from "node:zlib";
 import type { Duplex } from "node:stream";
 import type { Config, ProviderModel } from "./config.ts";
 import type { Logger } from "./log.ts";
-import { ProviderHealth, providerExhaustion, UpstreamHealth } from "./health.ts";
+import { exhaustionHeaders, ModelHealth, modelDeprecation, ProviderHealth, providerExhaustion, UpstreamHealth } from "./health.ts";
 import type { HoldGate } from "./hold.ts";
 import { BOOTSTRAP_PATH, injectBootstrap } from "./bootstrap.ts";
-import { THREAD_UNSUPPORTED, effortOf, isAutoModeClassifier, resolve, rewriteBody, stripThreadFields, threadDecision, unroutableReason, type Resolved } from "./routing.ts";
+import { readWorkerLadder, type WorkerLadderRoute } from "../../mod/hooks/ladder.ts";
+import { routingSettings } from "../../mod/hooks/modes.ts";
+import { candidateKey, isAllowed } from "../../mod/hooks/settings.ts";
+import { readCompactModel, readModRoutingSettings } from "./mod-settings.ts";
+import { CompactPicks, THREAD_UNSUPPORTED, continuesTranslatedTurn, decide, effortOf, isSmallFastSideRequest, requestKind, resolve, rewriteBody, stripThreadFields, threadDecision, type RequestKind, type Resolved } from "./routing.ts";
 import { defaultAgentDir, imageLine, withAgentAliases } from "./agents.ts";
 import { forwardCompatibleHeader, resolveCompatibleCaps, sanitizeForCompatible } from "./compat.ts";
-import { applyIdentityToAnthropicBody } from "./identity.ts";
+import { applyIdentityToAnthropicBody, promptAdditions } from "./identity.ts";
 import { anthropicServerToolBackend, webPluginBackend, webSearchBlocks, webSearchErrorBlocks, webSearchMessage, webSearchQuery, webSearchSse, type WebSearchQuery } from "./websearch.ts";
-import { classify, CredentialPool, retryAfterMs, type Credential } from "./pool.ts";
-import { PRESETS } from "./presets.ts";
+import { classify, CredentialPool, pinnedCredential, retryAfterMs, ThreadAffinity, type Credential } from "./pool.ts";
+import { PRESETS, presetUserAgent, withDefaultUserAgent } from "./presets.ts";
 import { ChatGptAdapter, type ChatGptAccountStatus, type ImageRequest, type ImageResult } from "./providers/chatgpt/index.ts";
 import { OpenAiCompatibleAdapter } from "./providers/openai/index.ts";
-import { GoogleAdapter, type GoogleAccountStatus } from "./providers/google/index.ts";
+import { GoogleAdapter, googleKeyRejected, type GoogleAccountStatus } from "./providers/google/index.ts";
 import type { QuotaGroup } from "./providers/google/usage.ts";
 import { OpenCodeUsage, isOpenCodeGo, type OpenCodeWindow } from "./providers/opencode-usage.ts";
+import { MiniMaxUsage, isMiniMaxPlan, type MiniMaxWindow } from "./providers/minimax-usage.ts";
 import { GrokAdapter } from "./providers/grok/index.ts";
 import type { GrokWindow } from "./providers/grok/usage.ts";
 import { conversationKey, type AnthropicRequest } from "./providers/chatgpt/translate.ts";
 import { adminPort, providerFor, searchProviderFor, terminateHosts } from "./config.ts";
 import type { CertStore } from "./certs.ts";
 import { chatPickerModels, injectPickerModels, isBootstrapPath } from "./picker.ts";
-import { effortLevels, effortLevelsForModel } from "./admin.ts";
-import { isWebFetchRequest } from "./webfetch.ts";
-import { ResponseUsageTap, requestId, type RequestLog, type RequestRecord, type RequestUsage } from "./requestlog.ts";
+import { effortLevelsForModel } from "./admin.ts";
+import { CLAUDE_SMALL_MODEL, claudeLastResortProviders, effortLevels, isTargetProvider, runsServerTools } from "./targets.ts";
+import { requestConversationKey, ResponseUsageTap, requestId, type RequestLog, type RequestRecord, type RequestUsage } from "./requestlog.ts";
 import { credentialHeaderValues, redactErrorText, redactHeaders } from "./redact.ts";
 import type { ObservedClaudeCodeAuth } from "./providers/anthropic-observed.ts";
-import type { ClaudeCodeCredentialReaders } from "./providers/anthropic.ts";
+import { nativeAnthropicHeaders, type ClaudeCodeCredentialReaders } from "./providers/anthropic.ts";
 import { ClaudeAccountAuthPool } from "./providers/anthropic-account-pool.ts";
 import { ClaudeModelCatalog } from "./providers/anthropic-models.ts";
-import { ClaudeUsage } from "./providers/anthropic-usage.ts";
-import { dropForeignThinking } from "./thinking.ts";
+import { ClaudeUsage, claudeLimitResetMs } from "./providers/anthropic-usage.ts";
+import { ClaudeCurrentIdentity } from "./providers/anthropic-identity.ts";
+import { dropForeignThinking, ThinkingOrigins } from "./thinking.ts";
 
 const MAX_BODY = 64 * 1024 * 1024;
 const HOP_BY_HOP = new Set(["connection", "keep-alive", "proxy-connection", "transfer-encoding", "upgrade", "host", "content-length"]);
@@ -134,12 +140,39 @@ export function withCredential(
  * the client's, never used in their place. Only for native Claude accounts: a compatible vendor's
  * beta filtering happens elsewhere and must not be undone here.
  */
+/**
+ * A Messages request that brings its own Anthropic API key and is not Claude Code: a script or SDK
+ * run from a session's shell, which inherits the session's HTTPS_PROXY. It goes out on its own key.
+ * Routing it put it on the subscription accounts instead (2026-11-05: another project's haiku and
+ * sonnet tests were answered 429 by the subscription, both accounts cooled for a minute, and the
+ * mod fell back from named Claude workers). Claude Code keeps its own path even on an API key: it
+ * says so in `x-app: cli` and its `claude-cli/` user agent, and a request carrying a login is never a
+ * caller key.
+ */
+export function callerOwnsKey(headers: http.IncomingHttpHeaders): boolean {
+  const key = headers["x-api-key"];
+  if (typeof key !== "string" || !key.trim()) return false;
+  // A login beside the key keeps the old path: a client with a real Bearer and a placeholder key is
+  // common, and sending that pair out unchanged would fail on the placeholder.
+  if (typeof headers.authorization === "string" && headers.authorization.trim()) return false;
+  if (headers["x-app"] === "cli") return false;
+  const agent = headers["user-agent"];
+  return !(typeof agent === "string" && /^claude-cli\//i.test(agent));
+}
+
 export function withClientBetas(credential: Record<string, string>, clientBeta: string | string[] | undefined): Record<string, string> {
   if (clientBeta === undefined) return credential;
   const name = Object.keys(credential).find((key) => key.toLowerCase() === "anthropic-beta") ?? "anthropic-beta";
   const flags = (raw: string) => raw.split(",").map((flag) => flag.trim()).filter(Boolean);
   const merged = [...new Set([...flags(([] as string[]).concat(clientBeta).join(",")), ...flags(credential[name] ?? "")])];
   return { ...credential, [name]: merged.join(",") };
+}
+
+/** The client's betas less the OAuth one, which belongs to a sign-in and not to an API key; none left is none sent. */
+export function apiKeyBetas(clientBeta: string | string[] | undefined): string | undefined {
+  if (clientBeta === undefined) return undefined;
+  const kept = ([] as string[]).concat(clientBeta).join(",").split(",").map((flag) => flag.trim()).filter((flag) => flag && !/^oauth-/.test(flag));
+  return kept.length ? kept.join(",") : undefined;
 }
 
 /**
@@ -249,8 +282,12 @@ export class Proxy {
   readonly claudeUsage: ClaudeUsage;
   /** The Claude models the signed-in account can use, from Anthropic's own list. */
   readonly claudeModels: ClaudeModelCatalog;
+  /** Who the current Claude login is (never a token), so admin can spot a stored copy of it. */
+  readonly claudeIdentity: ClaudeCurrentIdentity;
   /** Each OpenCode Go provider's usage windows, for the status bar's limits row (never a key). */
   private readonly opencodeUsage: OpenCodeUsage;
+  /** Each MiniMax plan provider's usage windows, for the status bar's limits row (never a key). */
+  private readonly minimaxUsage: MiniMaxUsage;
   private readonly deps: ProxyDeps;
   /**
    * Cooldowns, quarantines and conversation stickiness for provider credentials. In memory: a
@@ -258,7 +295,19 @@ export class Proxy {
    * its quarantine again on the first request.
    */
   private readonly pool = new CredentialPool();
+  /** Last configured implicit headers, not model-folded headers: changing wire must not reset health. */
+  private readonly implicitCredentialHeaders = new Map<string, string>();
+  /** Recent non-Anthropic answers whose vendor ids cannot identify the route by their shape. */
+  private readonly routedMessageIds = new Set<string>();
+  /** Which conversation each native pool answer belonged to, for a later `continue` of that thread. */
+  private readonly threadAffinity = new ThreadAffinity();
+  private readonly thinkingOrigins = new ThinkingOrigins();
   readonly providerHealth = new ProviderHealth();
+  readonly modelHealth = new ModelHealth();
+  readonly compactPicks = new CompactPicks();
+  private readonly healthConfig = new Map<string, { config: string; credentials: string; keys: Record<string, string> }>();
+  /** Agent/session-scoped spawn snapshots survive compaction, never shared by model id. */
+  private readonly workerLadders = new Map<string, WorkerLadderRoute>();
 
   /** Latest rate-limit snapshot reported by any chatgpt provider (for the admin GUI). */
   get chatgptRateLimits(): Record<string, Record<string, unknown> | null> {
@@ -293,6 +342,19 @@ export class Proxy {
   chatgptRefreshAll(): void {
     for (const [name, p] of Object.entries(this.deps.config().providers)) {
       if (p.type === "chatgpt") void this.chatgptFetchRateLimits(name);
+    }
+  }
+
+  /**
+   * Read every configured chatgpt provider's model catalogue now, in the background. Nothing else
+   * asks for it unless the dashboard is open, yet it is where a model's real window comes from
+   * (6.1 Sol: 500000 × 95% = 475000, ARCHITECTURE §4). The adapter keeps its own hour-long cache,
+   * so a caller may ask as often as it likes; the startup call and the periodic one in index.ts
+   * share that cache. Never throws.
+   */
+  chatgptRefreshCatalog(): void {
+    for (const [name, p] of Object.entries(this.deps.config().providers)) {
+      if (p.type === "chatgpt") void this.chatgptFetchModels(name).catch(() => {});
     }
   }
 
@@ -454,13 +516,30 @@ export class Proxy {
   }
 
   /** An OpenCode Go provider's usage windows, for the status bar's limits row. Empty otherwise. */
-  opencodeLimits(name: string): Promise<OpenCodeWindow[]> {
+  opencodeLimits(name: string, credentialId?: string): Promise<OpenCodeWindow[]> {
     const cfg = this.deps.config().providers[name];
     if (!cfg || cfg.type !== "openai-compatible" || !isOpenCodeGo(cfg)) return Promise.resolve([]);
-    return this.opencodeUsage.windows(name, cfg.url, cfg.headers ?? {});
+    const credential = credentialId === undefined ? undefined : cfg.credentials?.find((c) => c.id === credentialId);
+    if (credentialId !== undefined && !credential) return Promise.resolve([]);
+    return this.opencodeUsage.windows(credential ? `${name}/${credential.id}` : name, cfg.url, credential?.headers ?? cfg.headers ?? {});
+  }
+
+  /** A MiniMax plan provider's usage windows, for the status bar's limits row. Empty otherwise. */
+  minimaxLimits(name: string, credentialId?: string): Promise<MiniMaxWindow[]> {
+    const cfg = this.deps.config().providers[name];
+    if (!cfg || cfg.type !== "anthropic-compatible" || !isMiniMaxPlan(cfg)) return Promise.resolve([]);
+    const credential = credentialId === undefined ? undefined : cfg.credentials?.find((c) => c.id === credentialId);
+    if (credentialId !== undefined && !credential) return Promise.resolve([]);
+    return this.minimaxUsage.windows(credential ? `${name}/${credential.id}` : name, cfg.url, credential?.headers ?? cfg.headers ?? {});
   }
 
   /** Dashboard action: put one resting Google account back into rotation now. */
+  /** The pool scope a turn for `model` rests in on one antigravity provider (its quota group on its host). */
+  googleQuotaScope(name: string, model: string): string | undefined {
+    const p = this.deps.config().providers[name];
+    return p?.type === "google" && p.auth === "antigravity" ? this.google(name, p).quotaScopeOf(model) : undefined;
+  }
+
   googleClearCooldown(ownerId: string): void {
     for (const [name, p] of Object.entries(this.deps.config().providers)) {
       if (p.type === "google" && p.auth === "antigravity") this.google(name, p).clearCooldown(ownerId);
@@ -477,8 +556,40 @@ export class Proxy {
     return "unknown";
   }
 
+  /** ConfigStore calls this on reload; requests also reconcile injected/mutable configs. */
+  reconcileConfig(cfg: Config): void {
+    const digest = (value: unknown): string => crypto.createHash("sha256").update(JSON.stringify(value)).digest("hex");
+    for (const [name, provider] of Object.entries(cfg.providers)) {
+      const authentication = Object.entries(provider).filter(([field]) =>
+        ["type", "auth", "headers", "credentials", "apiKey", "accountPool", "home"].includes(field));
+      const credentials = digest(authentication);
+      const config = digest([...authentication, ...Object.entries(provider).filter(([field]) =>
+        ["url", "models", "wire"].includes(field))]);
+      const declared = "credentials" in provider ? provider.credentials : undefined;
+      const keys = declared?.length ? Object.fromEntries(declared.map(key => [key.id, digest(key.headers)])) : { default: credentials };
+      const previous = this.healthConfig.get(name);
+      if (previous && previous.config !== config) this.modelHealth.clear(name);
+      if (previous && previous.credentials !== credentials) {
+        this.providerHealth.clear(name);
+        // Preserve unchanged spent keys when a new one is added; only replaced generations revive.
+        for (const [id, generation] of Object.entries(previous.keys)) {
+          if (keys[id] !== generation) this.pool.clear(name, id);
+        }
+      }
+      this.healthConfig.set(name, { config, credentials, keys });
+    }
+    for (const name of this.healthConfig.keys()) {
+      if (cfg.providers[name]) continue;
+      this.healthConfig.delete(name);
+      this.modelHealth.clear(name);
+      this.providerHealth.clear(name);
+      this.pool.clear(name);
+    }
+  }
+
   constructor(deps: ProxyDeps) {
     this.deps = deps;
+    this.reconcileConfig(deps.config());
     this.claudeAccounts = new ClaudeAccountAuthPool({
       home: deps.home,
       log: deps.log,
@@ -493,7 +604,12 @@ export class Proxy {
       upstream: () => this.deps.config().upstream,
       warn: (message) => deps.log.warn(message),
     });
+    this.claudeIdentity = new ClaudeCurrentIdentity(this.claudeAccounts, {
+      upstream: () => this.deps.config().upstream,
+      warn: (message) => deps.log.warn(message),
+    });
     this.opencodeUsage = new OpenCodeUsage({ warn: (message) => deps.log.warn(message) });
+    this.minimaxUsage = new MiniMaxUsage({ warn: (message) => deps.log.warn(message) });
     this.httpServer = http.createServer({ maxHeaderSize: 64 * 1024 }, (req, res) => {
       void this.handle(req, res);
     });
@@ -509,7 +625,7 @@ export class Proxy {
   }
 
   /** Surfaces + model ids seen in the last injected bootstrap (admin GUI / debugging). */
-  lastPickerInjection: { at: string; injected: number; surfaces: { id: string; models: string[]; entries: { id: string; name: string }[] }[] } | null = null;
+  lastPickerInjection: { at: string; injected: number; surfaces: { id: string; models: string[]; entries: { id: string; name: string }[]; injected: string[] }[] } | null = null;
 
   listen(): Promise<void> {
     const { host, port } = this.deps.config().listen;
@@ -718,6 +834,7 @@ export class Proxy {
     // The agent files' derived aliases join the config's own, so a marker naming a worker resolves
     // the same way here as it does everywhere else. Explicit aliases win; the scan is mtime-cached.
     const cfg = withAgentAliases(this.deps.config(), this.deps.agentDir ?? defaultAgentDir(), log);
+    this.reconcileConfig(cfg);
     const t0 = Date.now();
     const method = req.method ?? "?";
     const path = req.url ?? "/";
@@ -733,6 +850,8 @@ export class Proxy {
     }
     let tag = "PASS";
     let finished = false;
+    let clientClosed = false;
+    res.once("close", () => { clientClosed = !res.writableEnded; });
     let record: Omit<RequestRecord, "at" | "id" | "ms" | "status" | "ok" | "usage" | "stopReason" | "note"> = {
       kind: pathname === "/v1/messages/count_tokens" ? "count_tokens" : pathname === "/v1/messages" ? "messages" : "other",
       source: "-",
@@ -749,6 +868,10 @@ export class Proxy {
     const agentId = req.headers["x-claude-code-agent-id"];
     const subagent = typeof agentId === "string" && agentId.length > 0;
     if (subagent) record.subagent = true;
+    // The CLI's own name for the request (`main`, `subagent`, `compaction`, …), sent with its gateway
+    // hint headers (CLI 2.1.309); requestKind trusts it over the prompt text.
+    const classHeader = req.headers["x-claude-code-request-class"];
+    const requestClass = typeof classHeader === "string" && classHeader ? classHeader : undefined;
     let observedUsage: RequestUsage | undefined;
     let observedStopReason: string | undefined;
     // Set once a Google turn came back unwritten (a prompt refusal or no model capacity), which allows
@@ -760,6 +883,14 @@ export class Proxy {
     const finish = (status: string, bytes: number, note?: string, failed: boolean = note !== undefined, extra?: { usage?: RequestUsage; stopReason?: string; resent?: boolean; messageId?: string; requestedTier?: string; servedTier?: string; upstreamCalled?: false | undefined; refusal?: RequestRecord["refusal"] }): void => {
       if (finished) return;
       finished = true;
+      // A translated adapter may have sent 200 before the client left. That is not a
+      // completed turn; reuse the request log's existing string-status contract.
+      const cancelled = clientClosed || (res.destroyed && !res.writableEnded);
+      if (cancelled) {
+        status = "aborted";
+        failed = true;
+        note = "client closed";
+      }
       if (unwrittenFallbackNote) note = [unwrittenFallbackNote, note].filter(Boolean).join("; ");
       this.stats.inFlight--;
       if (isMessages) {
@@ -769,7 +900,7 @@ export class Proxy {
       if (failed) this.stats.failed++;
       else this.stats.completed++;
       const ms = Date.now() - t0;
-      log.info(`${tag} ${method} ${path} -> ${status} ${bytes}B ${(ms / 1000).toFixed(1)}s${note ? " " + note : ""}`);
+      log.info(`${record.purpose === "compaction" ? "COMPACTION " : ""}${tag} ${method} ${path} -> ${status} ${bytes}B ${(ms / 1000).toFixed(1)}s${record.credential ? ` credential=${record.credential}` : ""}${note ? " " + note : ""}`);
       if (isLoggedRequest) {
         const numericStatus = Number(status);
         const usage = extra?.usage ?? observedUsage;
@@ -780,10 +911,10 @@ export class Proxy {
           at: new Date(t0).toISOString(),
           ms,
           status: Number.isFinite(numericStatus) ? numericStatus : status,
-          ok: Number.isFinite(numericStatus) && numericStatus >= 200 && numericStatus < 400,
+          ok: !failed && Number.isFinite(numericStatus) && numericStatus >= 200 && numericStatus < 400,
         };
         if (usage) completed.usage = usage;
-        if (stopReason) completed.stopReason = stopReason;
+        if (stopReason && !cancelled) completed.stopReason = stopReason;
         if (note) completed.note = note;
         if (extra?.resent && !completed.ok) completed.resent = true;
         if (extra?.messageId !== undefined) completed.messageId = extra.messageId;
@@ -791,6 +922,20 @@ export class Proxy {
         if (extra?.servedTier !== undefined) completed.servedTier = extra.servedTier;
         if (extra?.upstreamCalled === false && !unwrittenSeen) completed.upstreamCalled = false;
         if (extra?.refusal !== undefined) completed.refusal = extra.refusal;
+        const provider = cfg.providers[completed.provider];
+        if (completed.ok && completed.kind === "messages" && completed.messageId && provider && provider.type !== "anthropic") {
+          this.routedMessageIds.delete(completed.messageId);
+          this.routedMessageIds.add(completed.messageId);
+          // In memory only, bounded independently of the persistent request log.
+          if (this.routedMessageIds.size > 10_000) {
+            const oldest = this.routedMessageIds.values().next().value;
+            if (oldest !== undefined) this.routedMessageIds.delete(oldest);
+          }
+        }
+        // A caller's own key answering says nothing about the pool's accounts or models.
+        if (completed.ok && completed.kind === "messages" && numericStatus >= 200 && numericStatus < 300 && extra?.upstreamCalled !== false && !ownKey) {
+          this.modelHealth.success(completed.provider, completed.target);
+        }
         this.deps.requests.add(completed);
       }
     };
@@ -819,6 +964,7 @@ export class Proxy {
     // anything else (claude.ai in picker mode) is passed through, with bootstrap injection.
     const reqHost = (req.headers.host ?? cfg.upstream).split(":")[0]!;
     const isApiHost = reqHost === cfg.upstream;
+    const ownKey = isApiHost && isMessages && callerOwnsKey(req.headers);
 
     // Route decision: only Messages requests carry a model.
     let json: Record<string, unknown> | null = null;
@@ -831,6 +977,14 @@ export class Proxy {
         json = null;
       }
     }
+    // A request on its own API key is not this router's to route: with no body to read it takes the
+    // un-routed path, on its own headers, byte for byte. The model is kept for the log line only.
+    if (ownKey) {
+      if (typeof model === "string") record.source = model;
+      record.stream = json?.stream === true;
+      json = null;
+    }
+    const kind: RequestKind = json && isApiHost && path.startsWith("/v1/messages") ? requestKind(json, pathname, method, requestClass) : "turn";
     // A WebSearch arrives as its own request aimed at ANTHROPIC_SMALL_FAST_MODEL, recognised by the
     // forced `web_search` server tool rather than by its model id. Recognise it whether or not a
     // backend is configured: `cfg.webSearch` decides who answers it, but knowing that this is a
@@ -839,106 +993,242 @@ export class Proxy {
     if (json) {
       record.source = record.target = typeof model === "string" ? model : "-";
       record.stream = json.stream === true;
-      if (isAutoModeClassifier(json)) record.purpose = "auto-mode-classifier";
+      if (pathname === "/v1/messages") {
+        const conversation = requestConversationKey(json, record.session, typeof agentId === "string" ? agentId : undefined);
+        if (conversation) record.conversation = conversation;
+      }
+      if (kind === "auto-mode-classifier") record.purpose = "auto-mode-classifier";
+      if (cfg.webSearch && kind === "web-fetch") record.purpose = "web-fetch";
     }
-    const search = json && isApiHost && pathname === "/v1/messages" ? webSearchQuery(json) : null;
+    // Pool affinity must distinguish workers whose injected first 4000 characters are identical.
+    // Capture before routing/sanitizing rewrites the prompt; retries use exactly this same identity.
+    // Metadata-less side requests retain their shared cache-class key, never a per-request id.
+    const cacheRequest = json && Array.isArray(json.messages) ? json as AnthropicRequest : null;
+    const sideRequest = cacheRequest && !subagent && !cacheRequest.metadata?.user_id && cacheRequest.messages.length <= 1;
+    // A `continue` carries only the new messages, so its own first user message is not the
+    // conversation's. Ask the answer it continues which conversation produced it, so the pool
+    // stays on the account that holds the server-side thread; an unknown id keeps the old key.
+    const continued = cacheRequest ? this.continuedConversation(json!) : undefined;
+    const affinity = cacheRequest ? (continued ?? (!sideRequest ? requestConversationKey(json!, record.session, subagent ? agentId : undefined) : undefined)) ?? conversationKey(cacheRequest) : undefined;
+    const recordCredential = (name: string, using: Credential, credentials: readonly Credential[], retry = false, pinned = false): void => {
+      // count_tokens is answered locally by the translated adapters: no key was actually sent.
+      const type = cfg.providers[name]?.type;
+      if (pathname === "/v1/messages/count_tokens" && (type === "openai-compatible" || type === "google")) return;
+      record.credential = this.credentialLabel(name, using, credentials);
+      const first = this.pool.pick(name, credentials);
+      const reason = pinned ? "account-pin" : retry ? "retry" : !first ? "all-unavailable" : first.id !== using.id ? "affinity" : "configured-order";
+      const states = this.pool.report(name, credentials).map((row, i) => `${this.credentialLabel(name, credentials[i]!, credentials)}:${row.paused ? "paused" : row.state}`).join(", ");
+      log.info(`KEY ${name} credential=${record.credential} conversation=${affinity ?? "-"} reason=${reason} candidates=[${states}]`);
+    };
+    const search = kind === "web-search" ? webSearchQuery(json!) : null;
     let searchAttempted = false;
     const markSearchAttempted = (): void => { searchAttempted = true; };
+    /** Why the configured search backend did not answer, for the note a Claude fallback leaves. */
+    let searchBackendWhy: string | undefined;
     if (search && cfg.webSearch) {
-      const served = await this.serveWebSearch(res, json!, search, cfg.webSearch, record, finish, markSearchAttempted);
-      if (served) return;
-      // Fall through on failure: the ordinary path still answers, and a search that quietly
-      // returns nothing is worse than one that costs what it always cost.
+      // A backend whose provider is already spent (a weekly quota, every key cooling) is not asked:
+      // the call would fail the same way, and the next option is what answers the search.
+      if (!this.targetUsable(cfg.webSearch, cfg)) {
+        searchBackendWhy = `${cfg.webSearch.provider} unusable`;
+        log.warn(`web search via ${cfg.webSearch.provider}: provider unusable; not asked`);
+      } else {
+        const served = await this.serveWebSearch(res, json!, search, cfg.webSearch, record, finish, markSearchAttempted);
+        if (served) return;
+        searchBackendWhy = `${cfg.webSearch.provider} failed`;
+        // Fall through on failure: the ordinary path still answers, and a search that quietly
+        // returns nothing is worse than one that costs what it always cost.
+      }
     }
 
-    const webFetch = !!(cfg.webSearch && json && pathname === "/v1/messages" && isWebFetchRequest(json));
+    const webFetch = !!cfg.webSearch && kind === "web-fetch";
     let fetchRoute: Resolved | null = null;
-    if (webFetch) record.purpose = "web-fetch";
     if (webFetch && cfg.webSearch) {
       const settings = cfg.webSearch;
       if (this.targetUsable(settings, cfg)) {
         const ladder = effortLevels(cfg).providers[settings.provider];
         const levels = ladder?.models?.[settings.model] ?? ladder?.default ?? [];
-        fetchRoute = { ...settings, effort: levels.includes("low") ? "low" : undefined, tag: `${String(model)}->${settings.model} (web fetch)` };
+        fetchRoute = {
+          ...settings,
+          effort: levels.includes("low") ? "low" : undefined,
+          tag: `${String(model)}->${settings.model} (web fetch)`,
+          kind: "web-fetch",
+          asked: String(model),
+        };
       } else {
-        unwrittenFallbackNote = `web fetch via ${settings.provider} unavailable; original destination fallback`;
-        log.warn(`web fetch via ${settings.provider}: provider unusable; leaving the request alone`);
+        // The configured reader is spent. Claude answers the page question when it can, rather than
+        // the request going back to the slot's own route, which is often that same spent provider.
+        const claude = this.claudeLastResort(cfg);
+        if (claude) {
+          fetchRoute = {
+            provider: claude.provider,
+            model: claude.model,
+            effort: undefined,
+            tag: `${String(model)}->${claude.model} (web fetch, Claude last resort)`,
+            kind: "web-fetch",
+            asked: String(model),
+          };
+          unwrittenFallbackNote = `fallback to Claude (${settings.provider} unusable)`;
+          log.warn(`web fetch via ${settings.provider}: provider unusable; falling back to Claude (${claude.provider}/${claude.model})`);
+        } else {
+          unwrittenFallbackNote = `web fetch via ${settings.provider} unavailable; original destination fallback`;
+          log.warn(`web fetch via ${settings.provider}: provider unusable; leaving the request alone`);
+        }
       }
     }
+    let compactModel: string | undefined;
+    if (kind === "compaction" && method === "POST") {
+      record.purpose = "compaction";
+      try {
+        compactModel = this.compactPicks.take(record.session, subagent, () => readCompactModel(this.deps.home));
+      } catch (error) {
+        log.warn(`compaction: saved settings unavailable; keeping session model (${(error as Error).message})`);
+      }
+    }
+    type Override = { route: Resolved | null; model: string; label: string; purpose: "web-fetch" | "compaction"; refusal?: string | null };
+    const compactDecision = compactModel ? decide(compactModel, {}, cfg, "compaction") : null;
+    const override: Override | null = compactModel && compactDecision
+      ? { ...compactDecision, model: compactModel, label: `compact→${compactModel}`, purpose: "compaction" }
+      : fetchRoute ? { route: fetchRoute, model: fetchRoute.model, label: `web fetch via ${fetchRoute.provider}`, purpose: "web-fetch" } : null;
     const originalBody = body;
-    const originalJson = fetchRoute ? structuredClone(json) : null;
+    const originalJson = override ? structuredClone(json) : null;
     const originalRecord = { ...record };
     const response = res;
     const complete = finish;
-    // Every provider still uses the ordinary path below. Only this opt-in side request may
-    // withhold an error response and retry the original destination, before the first byte.
-    const run = async (fetchTarget: Resolved | null): Promise<void> => {
+    // Both overrides use ordinary adapters and may retry only before a response is committed.
+    const run = async (override: Override | null): Promise<void> => {
+      const fetchTarget = override?.route ?? null;
       let attemptDone = false;
-      const res = fetchTarget ? deferErrorResponse(response, () => attemptDone) : response;
+      const res = override ? deferErrorResponse(response, () => attemptDone) : response;
       const finish: typeof complete = (status, bytes, note, failed, extra) => {
         if (attemptDone) return;
-        if (fetchTarget && !response.headersSent && !response.destroyed && !req.aborted && (Number(status) >= 400 || !Number.isFinite(Number(status)) || Number(status) <= 0)) {
+        if (override && !response.headersSent && !response.destroyed && !req.aborted && (Number(status) < 200 || Number(status) >= 300 || !Number.isFinite(Number(status)))) {
           attemptDone = true;
           // A later local refusal must not claim that no upstream was called on this request.
           searchAttempted ||= extra?.upstreamCalled !== false;
-          log.warn(`web fetch via ${fetchTarget.provider}: ${note ?? status}; falling back to original destination`);
+          const failure = `${override.label}: ${note ?? status}`;
+          log.warn(`${failure}; falling back to original destination`);
+          if (override.purpose === "compaction") {
+            this.deps.requests.add({ ...record, id: crypto.randomUUID(), at: new Date(t0).toISOString(), ms: Date.now() - t0,
+              status: Number.isFinite(Number(status)) ? Number(status) : status, ok: false, note: `${failure}; fallback` });
+          }
           body = originalBody;
           json = structuredClone(originalJson);
-          record = { ...originalRecord, purpose: "web-fetch" };
-          unwrittenFallbackNote = `web fetch via ${fetchTarget.provider} failed; original destination fallback`;
+          record = { ...originalRecord, purpose: override.purpose };
+          observedUsage = undefined;
+          observedStopReason = undefined;
+          unwrittenFallbackNote = `${failure}; original destination fallback`;
           void run(null).catch((error: Error) => {
-            complete("502", 0, `web fetch fallback error: ${error.message}`);
+            complete("502", 0, `${override.label} fallback error: ${error.message}`);
             if (!response.headersSent) response.writeHead(502).end();
             else response.destroy();
           });
           return;
         }
-        if (!fetchTarget) { complete(status, bytes, note, failed, extra); return; }
-        complete(status, bytes, [`web fetch via ${fetchTarget.provider}`, note].filter(Boolean).join("; "), failed ?? (!!note || Number(status) >= 400), extra);
+        if (!override) { complete(status, bytes, note, failed, extra); return; }
+        complete(status, bytes, [override.label, note].filter(Boolean).join("; "), failed ?? (!!note || Number(status) >= 400), extra);
       };
-      if (fetchTarget && json) {
-        record.purpose = "web-fetch";
+      try {
+      if (override?.purpose === "compaction" && json && !fetchTarget && !override.refusal) {
+        // A native Claude id has no outbound provider: retain the caller's authentication and prompt.
+        const [targetModel, effort] = override.model.split("@");
+        json.model = targetModel;
+        if (effort) json.output_config = { ...(json.output_config as Record<string, unknown> | undefined), effort };
+        body = Buffer.from(JSON.stringify(json));
+        record.target = targetModel!;
+      }
+      if (override && json) {
+        record.purpose = override.purpose;
+      }
+      if (override?.purpose === "web-fetch" && json) {
         const output = { ...(json.output_config as Record<string, unknown> | undefined) };
         delete output.effort;
         json.output_config = output;
       }
-      const resolved = fetchTarget ?? (json ? resolve(model, json, cfg) : null);
+      const decision = override
+        ? { route: fetchTarget, refusal: override.refusal ?? null }
+        : json ? decide(model, json, cfg, kind) : { route: null, refusal: null };
+      let resolved = decision.route;
+      if (!fetchTarget && subagent && resolved && json) {
+        resolved = this.workerFallbacks(resolved, json, cfg, typeof model === "string" ? model : "", record.session && `${record.session}:${agentId}`);
+      }
 
       // A non-Claude model this router cannot route is refused here, by name, instead of being
       // forwarded to Anthropic. `PASS` on such a request answers 404 from Anthropic and looks like
       // "the model vanished" (2026-09-20: an agent file named `deepseek` resolved, through a missing
       // alias, to a model no provider declared — thirty of them came back 404). A native `claude-*`
       // id is deliberately unrouted and must keep passing through (§5).
-      if (!resolved && isApiHost && isMessages && json && typeof model === "string" && !model.startsWith("claude-")) {
-        const reason = unroutableReason(model, json, cfg);
+      if (!resolved && isApiHost && isMessages && json) {
+        const reason = decision.refusal;
         if (reason) {
           const payload = JSON.stringify({ type: "error", error: { type: "invalid_request_error", message: `ClaudeRipple: ${reason}` } });
           res.writeHead(400, { "content-type": "application/json", "content-length": String(Buffer.byteLength(payload)) }).end(payload);
-          tag = `REFUSE ${model}`;
+          tag = `REFUSE ${String(model)}`;
           record = { ...record, provider: "refused" };
           finish("400", payload.length, `ClaudeRipple: ${reason}`, true, { ...(!searchAttempted ? { upstreamCalled: false as const } : {}), refusal: "unroutable" });
           return;
         }
       }
+      // A continue of a turn a translated provider answered carries no marker to route by and would
+      // pass through to Anthropic, which has no such thread (404). Refused the way a translated route
+      // refuses it, so the CLI resends the whole conversation, marker included, and stays stateless.
+      if (!resolved && isApiHost && isMessages && json && continuesTranslatedTurn(json, this.routedMessageIds)) {
+        const out = JSON.stringify(THREAD_UNSUPPORTED);
+        res.writeHead(400, { "content-type": "application/json", "content-length": String(Buffer.byteLength(out)) }).end(out);
+        finish("400", out.length, "continue of a translated turn refused → CLI resends stateless", false, { resent: true, ...(!searchAttempted ? { upstreamCalled: false as const } : {}), refusal: "thread-continue" });
+        return;
+      }
       // A slot with fallbacks picks its provider before anything is sent, so a primary that is rate
       // limited for the next hour is skipped rather than rediscovered once per request. A distinct
       // prompt refusal can also select one fallback below, but only before any response is written.
-      let route = resolved ? this.chooseTarget(resolved, cfg, log) : null;
+      // Claude is the last resort for Claude Code's own small side requests: a request for the
+      // `smallFast` slot's model (title, classifier, search, page read) that would go to a spent
+      // non-Claude provider is given the native Claude providers as a final fallback. Subagents,
+      // main-session turns and a route's own ladder are not touched.
+      // Only chooseTarget sees the extra fallbacks: a Google turn handed back unwritten still falls
+      // back along the route's own list (`unwrittenFallback`), never to Claude.
+      let placed = resolved;
+      let claudeLast = false;
+      if (resolved && !override && cfg.providers[resolved.provider]?.type !== "anthropic" &&
+          isSmallFastSideRequest(cfg, model, json, kind, requestClass, subagent)) {
+        const known = new Set((resolved.fallbacks ?? []).map(f => `${f.provider}/${f.model}`));
+        const added = claudeLastResortProviders(cfg).filter(provider => !known.has(`${provider}/${CLAUDE_SMALL_MODEL}`))
+          .map(provider => ({ provider, model: CLAUDE_SMALL_MODEL }));
+        if (added.length) {
+          placed = { ...resolved, fallbacks: [...(resolved.fallbacks ?? []), ...added] };
+          claudeLast = true;
+        }
+      }
+      let route = placed ? this.chooseTarget(placed, cfg, log) : null;
+      if (resolved?.ladderPick && route && (route.provider !== resolved.provider || route.model !== resolved.model)) {
+        unwrittenFallbackNote = `ladder pick=${resolved.ladderPick} fallback ${resolved.provider}/${resolved.model} → ${route.provider}/${route.model}: ${this.unavailableReason(resolved) ?? "provider_unusable"}`;
+      }
+      if (claudeLast && resolved && route && route.model === CLAUDE_SMALL_MODEL && route.provider !== resolved.provider &&
+          cfg.providers[route.provider]?.type === "anthropic") {
+        // The route carried the primary's effort, a word Claude's small model may not know.
+        route = { ...route, effort: undefined };
+        unwrittenFallbackNote = `fallback to Claude (${resolved.provider} unusable)`;
+        log.warn(`${kind}: ${resolved.provider}/${resolved.model} unusable; falling back to Claude (${route.provider}/${route.model})`);
+      }
       /** The request before any target rewrote it, kept only when a Google target may hand the turn back. */
       let pristine: typeof json | undefined;
       const source = typeof model === "string" ? model : "-";
       record = {
         ...record,
         source,
-        target: source,
-        stream: json?.stream === true,
+        target: override?.purpose === "compaction" && !fetchTarget ? String(json?.model ?? source) : source,
+        // A caller-key request has no body left to read; its flag was taken before it was dropped.
+        stream: ownKey ? record.stream : json?.stream === true,
       };
       const requestedEffort = effortOf(json ?? {});
       if (requestedEffort) record.effort = requestedEffort;
 
-      // Only a real, un-routed Claude Code Messages request may refresh this RAM-only source.
+      // Only a real Claude Code Messages request may refresh this RAM-only source. A routed one
+      // carries the same app login as an un-routed one, and the router answers it with a pool
+      // account instead of that login; ignoring it left the login forgotten after 12 h of nothing
+      // but routed traffic while it was being used through the pool (issue #123, 2026-11-05). The
+      // observation also follows a token refresh or an account switch on the app's next request.
       // Do not inspect it elsewhere: it must never enter logs, RequestLog, picker diagnostics, or admin data.
-      if (isApiHost && pathname === "/v1/messages" && !route) this.deps.observedClaudeCodeAuth?.observe(req.rawHeaders);
+      if (isApiHost && pathname === "/v1/messages") this.deps.observedClaudeCodeAuth?.observe(req.rawHeaders);
 
       // A `WebSearch` side request routed to a provider that cannot run the server tool must not be
       // sent. The tool is dropped on every translated path, which leaves "you are an assistant for
@@ -949,7 +1239,7 @@ export class Proxy {
       //
       // Say so in the shape the CLI prints. A search that fails visibly can be retried by a human;
       // one that returns prose shaped like an answer cannot.
-      if (search && route && json && !this.canRunServerTools(route.provider, cfg)) {
+      if (search && route && json && !runsServerTools(cfg, route.provider)) {
         // A ChatGPT provider has a search of its own — the backend `webSearch` names — so a search
         // routed there is served by it, not refused. Requiring `webSearch` as well refused every
         // search of a `smallFast` slot pointed at Luna while the Clients screen called that provider
@@ -958,7 +1248,25 @@ export class Proxy {
         // The same holds for a plan that searches on another of its endpoints (`anthropicSearch`).
         const own = (cfg.providers[route.provider]?.type === "chatgpt" || searchProviderFor(cfg.providers[route.provider], route.model) !== undefined) &&
           cfg.webSearch?.provider !== route.provider;
-        if (own && (await this.serveWebSearch(res, json, search, { provider: route.provider, model: route.model }, record, finish, markSearchAttempted))) return;
+        let ownWhy: string | undefined;
+        if (own) {
+          // A route whose provider is spent is not asked either; the call would fail the same way.
+          if (!this.targetUsable(route, cfg)) ownWhy = `${route.provider} unusable`;
+          else if (await this.serveWebSearch(res, json, search, { provider: route.provider, model: route.model }, record, finish, markSearchAttempted)) return;
+          else ownWhy = `${route.provider} failed`;
+        }
+        // Nothing of the configured providers could search. Claude runs Anthropic's own `web_search`
+        // server tool on its small model, so it is the last resort before refusing: the request keeps
+        // its tool and body, only the model changes. Refused as before only when no Claude is usable.
+        const claude = this.claudeLastResort(cfg);
+        if (claude) {
+          const why = [searchBackendWhy, ownWhy ?? (cfg.webSearch?.provider === route.provider ? undefined : `${route.provider} runs no server tools`)]
+            .filter(Boolean).join(", ");
+          unwrittenFallbackNote = `fallback to Claude (${why})`;
+          log.warn(`web search: ${why}; falling back to Claude (${claude.provider}/${claude.model})`);
+          route = { provider: claude.provider, model: claude.model, effort: undefined, tag: `${route.asked}->${claude.model} (web search, Claude last resort)`, kind: route.kind, asked: route.asked };
+          record = { ...record, purpose: "web-search" };
+        } else {
         const blocks = webSearchErrorBlocks(search, "unavailable");
         const model = typeof json.model === "string" ? json.model : "unknown";
         const wantStream = json.stream === true;
@@ -970,13 +1278,19 @@ export class Proxy {
         record = { ...record, target: route.model, provider: route.provider, purpose: "web-search" };
         finish("200", Buffer.byteLength(payload), `web search refused: ${route.provider} runs no server tools`, false, { ...(!searchAttempted ? { upstreamCalled: false as const } : {}), refusal: "web-search-unsupported" });
         return;
+        }
       }
 
       let compatCaps: ReturnType<typeof resolveCompatibleCaps> | undefined;
       let compatChanges: string[] = [];
       /** The credential this attempt is using, and so the one a failure is charged to. */
       let chosen: Credential | null = null;
+      let credentialCandidates: readonly Credential[] = [];
       let penalised: { provider: string; id: string } | null = null;
+      /** This attempt goes out on the app's own Claude login rather than a pool credential. */
+      let ownLogin = false;
+      /** This attempt goes out on a native Claude account-pool credential, so its answer names a thread. */
+      let poolAnswer = false;
       let target: { protocol: "http:" | "https:"; host: string; port: number; agent: http.Agent | https.Agent; extraHeaders: Record<string, string>; basePath?: string; dropClientAuth?: boolean; dropHeaders?: Set<string>; dropHeaderPrefixes?: string[] };
       // Re-enter only for the one unwritten Google turn (prompt refusal or no model capacity). Each target sees the original
       // request, not the primary's rewritten effort, stripped thread, or translated body.
@@ -995,6 +1309,17 @@ export class Proxy {
           // several protocols is one provider, and this is where the model's own shape is folded in so
           // the branches below pick the adapter it actually needs.
           const provider = providerFor(configured, route.model);
+          // Translators scope reasoning themselves. A native/compatible fallback cannot validate
+          // the original provider's opaque signatures, whether selected by a ladder or a route.
+          if (provider.type === "anthropic-compatible" || provider.type === "anthropic") {
+            const targetProvider = route.provider;
+            if (resolved && (targetProvider !== resolved.provider || route.model !== resolved.model)) {
+              dropForeignThinking(json, targetProvider !== resolved.provider
+                ? block => this.thinkingOrigins.owns(targetProvider, block) : undefined);
+            } else {
+              this.thinkingOrigins.dropKnownForeign(json, targetProvider);
+            }
+          }
           // Only the Google adapter can return a turn unwritten, so only it pays for the copy.
           if (!pristine && provider.type === "google") pristine = structuredClone(json);
           rewriteBody(json, route, cfg.effortClamp);
@@ -1013,7 +1338,7 @@ export class Proxy {
             try {
               // The adapter reports each account's outcome to the shared pool itself, so a slot pointing
               // here fails over once every account is out (chooseTarget asks the adapter).
-              const o = await this.chatgpt(route.provider, provider).handle(req, res, path, json as unknown as AnthropicRequest, route.model, effortOf(json), { subagent, imageHint: imageLine(adminPort(cfg)) });
+              const o = await this.chatgpt(route.provider, provider).handle(req, res, path, json as unknown as AnthropicRequest, route.model, effortOf(json), { subagent, imageHint: imageLine(adminPort(cfg)), kind: route.kind, ...(route.accountPin ? { accountPin: route.accountPin } : {}) });
               if (!path.startsWith("/v1/messages/count_tokens")) this.providerHealth.observe(route.provider, o.status, o.exhaustion);
               finish(String(o.status), o.bytes, o.note, o.status >= 400, { ...o, ...(searchAttempted ? { upstreamCalled: undefined } : {}) });
             } catch (e) {
@@ -1035,13 +1360,39 @@ export class Proxy {
             const routeEffort = effortOf(json);
             if (routeEffort) record.effort = routeEffort;
             tag = `OPENAI ${route.tag} wire=${provider.wire ?? "chat"} effort=${routeEffort ?? "-"}`;
+            const credentials = this.credentialsOf(route.provider, provider);
+            if (credentials.length === 0) {
+              const out = JSON.stringify({ type: "error", error: { type: "overloaded_error", message: "모든 API 키가 일시 중지되어 있습니다." } });
+              res.writeHead(503, { "content-type": "application/json" }).end(out);
+              finish("503", out.length, "all credentials paused", false, { upstreamCalled: false });
+              return;
+            }
+            let using = this.pool.pick(route.provider, credentials, affinity) ?? credentials[0]!;
+            recordCredential(route.provider, using, credentials);
+            const tried = new Set([using.id]);
+            const poolName = route.provider;
+            const next = credentials.length > 1 ? (status: number, retryAfter: number | undefined, body: string): Record<string, string> | null => {
+              if (!classify(status, undefined, body).retryable) return null;
+              const candidate = this.pool.pick(poolName, credentials.filter((c) => !tried.has(c.id)), affinity);
+              if (!candidate) return null;
+              this.pool.penalise(poolName, using.id, status, retryAfter, body);
+              log.info(`RETRY ${poolName}: ${this.credentialLabel(poolName, using, credentials)} answered ${status}, trying ${this.credentialLabel(poolName, candidate, credentials)}`);
+              using = candidate;
+              recordCredential(poolName, using, credentials, true);
+              tried.add(using.id);
+              return using.headers;
+            } : undefined;
             try {
-              const o = await this.openai(route.provider, provider).handle(req, res, path, json as unknown as AnthropicRequest, route.model, routeEffort);
-              this.recordOutcome(route.provider, o.status);
-              if (!path.startsWith("/v1/messages/count_tokens")) this.providerHealth.observe(route.provider, o.status, o.exhaustion);
+              const o = await this.openai(route.provider, provider).handle(req, res, path, json as unknown as AnthropicRequest, route.model, routeEffort, { headers: using.headers, ...(next ? { next } : {}) }, { kind: route.kind });
+              if (o.status >= 400) this.pool.penalise(poolName, using.id, o.upstreamStatus ?? o.status, o.retryAfterMs, o.errorBody);
+              else if (o.status > 0) this.pool.succeed(poolName, using.id);
+              if (!path.startsWith("/v1/messages/count_tokens")) {
+                this.providerHealth.observe(route.provider, o.status, o.exhaustion);
+                this.modelHealth.observe(route.provider, route.model, o.modelUnavailable);
+              }
               finish(String(o.status), o.bytes, o.note, o.status >= 400, { ...o, ...(searchAttempted ? { upstreamCalled: undefined } : {}) });
             } catch (e) {
-              this.recordOutcome(route.provider, 0);
+              if (!res.destroyed && !req.aborted) this.pool.penalise(poolName, using.id, 0);
               finish("-", 0, `openai error ${(e as NodeJS.ErrnoException).code ?? ""} ${(e as Error).message}`);
               if (!res.headersSent) res.writeHead(502, { "content-type": "application/json" }).end(JSON.stringify({ type: "error", error: { type: "api_error", message: (e as Error).message } }));
               else res.destroy();
@@ -1062,8 +1413,42 @@ export class Proxy {
             const routeEffort = effortOf(json);
             if (routeEffort) record.effort = routeEffort;
             tag = `GOOGLE ${route.tag} effort=${routeEffort ?? "-"}`;
+            // The api-key wire takes its key from the provider's pool like every other translated
+            // wire: folding a relay's Gemini model into a `google` provider used to leave only its
+            // first key, so a spent key answered 429 to every turn, with no failover and no
+            // `credential` in the log (#112). The antigravity accounts are the adapter's own pool
+            // and rotate inside it, exactly as before.
+            const credentials = provider.auth === "api-key" ? this.credentialsOf(route.provider, provider) : [];
+            if (provider.auth === "api-key" && credentials.length === 0) {
+              const out = JSON.stringify({ type: "error", error: { type: "overloaded_error", message: "모든 API 키가 일시 중지되어 있습니다." } });
+              res.writeHead(503, { "content-type": "application/json" }).end(out);
+              finish("503", out.length, "all credentials paused", false, { upstreamCalled: false });
+              return;
+            }
+            const poolName = route.provider;
+            let using = provider.auth === "api-key" ? this.pool.pick(poolName, credentials, affinity) ?? credentials[0]! : null;
+            if (using) recordCredential(poolName, using, credentials);
+            const tried = new Set(using ? [using.id] : []);
+            // Nothing has reached the client here yet, so a refusal another key could answer is asked
+            // again inside the turn instead of being handed to the user to retry by hand.
+            // Google can reject a key with HTTP 400. Only structured auth evidence makes that
+            // a credential refusal; an ordinary invalid request must never walk the pool.
+            const poolStatus = (status: number, body: string): number => status === 400 && googleKeyRejected(status, body) ? 401 : status;
+            const next = using && credentials.length > 1 ? (status: number, retryAfter: number | undefined, body: string): Record<string, string> | null => {
+              const judgedStatus = poolStatus(status, body);
+              if (!classify(judgedStatus, undefined, body).retryable) return null;
+              const current = using!;
+              const candidate = this.pool.pick(poolName, credentials.filter((c) => !tried.has(c.id)), affinity);
+              if (!candidate) return null;
+              this.pool.penalise(poolName, current.id, judgedStatus, retryAfter, body);
+              log.info(`RETRY ${poolName}: ${this.credentialLabel(poolName, current, credentials)} answered ${status}, trying ${this.credentialLabel(poolName, candidate, credentials)}`);
+              using = candidate;
+              recordCredential(poolName, candidate, credentials, true);
+              tried.add(candidate.id);
+              return candidate.headers;
+            } : undefined;
             try {
-              const o = await this.google(route.provider, provider).handle(req, res, path, json as unknown as AnthropicRequest, route.model, routeEffort);
+              const o = await this.google(route.provider, provider).handle(req, res, path, json as unknown as AnthropicRequest, route.model, routeEffort, using ? { headers: provider.credentials?.length ? using.headers : {}, ...(next ? { next } : {}) } : undefined, { kind: route.kind, ...(route.accountPin ? { accountPin: route.accountPin } : {}) });
               if (o.kind === "prompt-incompatible" || o.kind === "model-capacity") {
                 const why = o.kind === "prompt-incompatible" ? "prompt" : "capacity";
                 const alreadyRetried = unwrittenSeen;
@@ -1087,11 +1472,20 @@ export class Proxy {
                 finish(String(o.status), Buffer.byteLength(o.errorBody), o.note, true, o.kind === "prompt-incompatible" ? { refusal: "prompt-incompatible" } : undefined);
                 return;
               }
-              this.recordOutcome(route.provider, o.status);
-              if (!path.startsWith("/v1/messages/count_tokens")) this.providerHealth.observe(route.provider, o.status, o.exhaustion);
+              // The answer is charged to the key that actually produced it, which after a retry is a
+              // later one than the turn started on.
+              if (using) {
+                if (o.status >= 400) this.pool.penalise(poolName, using.id, poolStatus(o.upstreamStatus ?? o.status, o.errorBody ?? ""), o.retryAfterMs, o.errorBody);
+                else if (o.status > 0) this.pool.succeed(poolName, using.id);
+              } else this.recordOutcome(route.provider, o.status);
+              if (!path.startsWith("/v1/messages/count_tokens")) {
+                this.providerHealth.observe(route.provider, o.status, o.exhaustion);
+                this.modelHealth.observe(route.provider, route.model, o.modelUnavailable);
+              }
               finish(String(o.status), o.bytes, o.note, o.status >= 400, { ...o, ...(searchAttempted ? { upstreamCalled: undefined } : {}) });
             } catch (e) {
-              this.recordOutcome(route.provider, 0);
+              if (using) this.pool.penalise(poolName, using.id, 0);
+              else this.recordOutcome(route.provider, 0);
               finish("-", 0, `google error ${(e as NodeJS.ErrnoException).code ?? ""} ${(e as Error).message}`);
               if (!res.headersSent) res.writeHead(502, { "content-type": "application/json" }).end(JSON.stringify({ type: "error", error: { type: "api_error", message: (e as Error).message } }));
               else res.destroy();
@@ -1114,7 +1508,7 @@ export class Proxy {
             if (routeEffort) record.effort = routeEffort;
             tag = `GROK ${route.tag} effort=${routeEffort ?? "-"}`;
             try {
-              const o = await this.grok(route.provider, provider).handle(req, res, path, json as unknown as AnthropicRequest, route.model, routeEffort);
+              const o = await this.grok(route.provider, provider).handle(req, res, path, json as unknown as AnthropicRequest, route.model, routeEffort, { kind: route.kind });
               this.recordOutcome(route.provider, o.status);
               finish(String(o.status), o.bytes, o.note, o.status >= 400, { ...(o.usage ? { usage: o.usage } : {}), ...(o.stopReason ? { stopReason: o.stopReason } : {}) });
             } catch (e) {
@@ -1126,15 +1520,48 @@ export class Proxy {
             return;
           }
           if (provider.type === "anthropic") {
-            if (!provider.accountPool || provider.auth !== "claude-code") {
+            if (!isTargetProvider(provider)) {
               finish("400", 0, "native Anthropic provider is available through OpenAI ingress only", false);
               res.writeHead(400, { "content-type": "application/json" }).end(JSON.stringify({ error: { type: "invalid_request_error", message: "native Anthropic provider is available through OpenAI ingress only" } }));
               return;
             }
             // Native Messages need no translation. Only authentication changes, so server-side threads,
             // prompt caching, beta features and the client's exact tool contract remain first-party.
+            if (provider.auth === "api-key") {
+              // Only ever reached by name (targets.ts `bareOwners`): a worker, slot or rule chose the key.
+              let headers: Record<string, string>;
+              try { headers = nativeAnthropicHeaders(provider); }
+              catch (e) {
+                const out = JSON.stringify({ type: "error", error: { type: "authentication_error", message: `ClaudeRipple: ${(e as Error).message}` } });
+                res.writeHead(401, { "content-type": "application/json", "content-length": String(Buffer.byteLength(out)) }).end(out);
+                finish("401", out.length, "no Anthropic API key", true, { ...(!searchAttempted ? { upstreamCalled: false as const } : {}), refusal: "no-account" });
+                return;
+              }
+              dropForeignThinking(json);
+              body = Buffer.from(JSON.stringify(json));
+              target = {
+                protocol: "https:",
+                host: cfg.upstream,
+                port: this.deps.upstreamPort ?? 443,
+                agent: this.deps.upstreamAgent ?? this.agentFor(route.provider, "https:"),
+                // The app's sign-in asks for the OAuth beta, which an API key is not.
+                extraHeaders: withClientBetas(headers, apiKeyBetas(req.headers["anthropic-beta"])),
+                dropClientAuth: true,
+                dropHeaders: new Set(["anthropic-beta"]),
+              };
+              const routeEffort = effortOf(json);
+              if (routeEffort) record.effort = routeEffort;
+              tag = `CLAUDE ${route.tag} account=api-key`;
+              break;
+            }
             const credentials = await this.claudeAccounts.credentials();
-            if (credentials.length === 0) {
+            // With no account of the pool usable, the app's own sign-in still is: the turn goes out on
+            // it, as it did before the provider was added. A pool whose only stored account lost its
+            // grant refused every main-chat turn with this 401 until the provider was deleted, the
+            // current login having aged out of the observed source unseen (#88, 2026-10-24).
+            const clientAuth = req.headers.authorization;
+            const ownSignIn = credentials.length === 0 && typeof clientAuth === "string" && /^Bearer\s+\S+$/i.test(clientAuth);
+            if (credentials.length === 0 && !ownSignIn) {
               const out = JSON.stringify({ type: "error", error: { type: "authentication_error", message: "ClaudeRipple: no usable Claude account; sign in or reauthenticate an account" } });
               res.writeHead(401, { "content-type": "application/json", "content-length": String(Buffer.byteLength(out)) }).end(out);
               finish("401", out.length, "no usable Claude account", true, { ...(!searchAttempted ? { upstreamCalled: false as const } : {}), refusal: "no-account" });
@@ -1142,10 +1569,33 @@ export class Proxy {
             }
             dropForeignThinking(json);
             body = Buffer.from(JSON.stringify(json));
-            chosen = this.pool.pick(route.provider, credentials, conversationKey(json as AnthropicRequest));
+            if (ownSignIn) {
+              target = { protocol: "https:", host: cfg.upstream, port: this.deps.upstreamPort ?? 443, agent: this.deps.upstreamAgent ?? this.agentFor(route.provider, "https:"), extraHeaders: {} };
+              ownLogin = true;
+              const routeEffort = effortOf(json);
+              if (routeEffort) record.effort = routeEffort;
+              tag = `CLAUDE ${route.tag} account=app (no usable pool account)`;
+              if (route.accountPin) log.info(`account-pin fallback ${route.accountPin} → app`);
+              break;
+            }
+            // A pinned worker names the stored account it runs on. Use it while it can answer; a
+            // paused, cooling, quarantined or removed account falls back to the ordinary pool order,
+            // and the turn is never refused because of the pin (zero vanished requests). Choosing it
+            // directly leaves the conversation's sticky claim and the provider's preference untouched.
+            const pinned = pinnedCredential(route.provider, credentials, route.accountPin, this.pool);
+            const pinnedUsable = pinned !== undefined;
+            if (pinnedUsable) {
+              chosen = pinned;
+            } else {
+              chosen = this.pool.pick(route.provider, credentials, affinity);
+              if (route.accountPin) log.info(`account-pin fallback ${route.accountPin} → ${chosen?.ownerId?.slice(0, 8) ?? "configured-order"}`);
+            }
             const using = chosen ?? credentials[0]!;
             chosen = using;
+            credentialCandidates = credentials;
+            recordCredential(route.provider, using, credentials, false, pinnedUsable);
             penalised = { provider: route.provider, id: using.id };
+            poolAnswer = true;
             target = {
               protocol: "https:",
               host: cfg.upstream,
@@ -1186,8 +1636,7 @@ export class Proxy {
           applyIdentityToAnthropicBody(json, {
             model: route.model,
             effort: effortOf(json),
-            identity: provider.identity,
-            instructionsAppend: provider.instructionsAppend,
+            ...promptAdditions(route.kind, provider),
           });
           body = Buffer.from(JSON.stringify(json));
           const u = new URL(provider.url);
@@ -1197,26 +1646,35 @@ export class Proxy {
           // quarantined leaves `chosen` null, and the request goes out on the configured headers so the
           // provider — not us — gets to say no.
           const credentials = this.credentialsOf(route.provider, provider);
-          // The same key the prompt cache is keyed on. `metadata.user_id` alone is one value for every
-          // conversation a user has, so using it raw would drag all of them onto one credential at once
-          // — the opposite of what stickiness is for (see conversationKey and ARCHITECTURE §4).
-          chosen = this.pool.pick(route.provider, credentials, conversationKey(json as AnthropicRequest));
+          if (credentials.length === 0) {
+            const out = JSON.stringify({ type: "error", error: { type: "overloaded_error", message: "모든 API 키가 일시 중지되어 있습니다." } });
+            res.writeHead(503, { "content-type": "application/json" }).end(out);
+            finish("503", out.length, "all credentials paused", false, { upstreamCalled: false });
+            return;
+          }
+          // Use the original conversation/agent identity, not the truncated provider cache key.
+          chosen = this.pool.pick(route.provider, credentials, affinity);
           // Nothing usable means every credential is cooling, and the turn still has to go somewhere:
           // the first one, so the request carries real credentials rather than none, and so the answer
           // is charged to the credential that actually produced it.
           const using = chosen ?? credentials[0]!;
           chosen = using;
+          credentialCandidates = credentials;
+          recordCredential(route.provider, using, credentials);
           penalised = { provider: route.provider, id: using.id };
+          // The credential wins over the session header: they are different names in practice, but a
+          // vendor that reused one would mean the request going out unauthenticated.
+          const keyedHeaders = provider.sessionHeader
+            ? { [provider.sessionHeader]: conversationKey(json as AnthropicRequest), ...using.headers }
+            : using.headers;
           target = {
             protocol,
             host: u.hostname,
             port: Number(u.port) || (protocol === "https:" ? 443 : 80),
             agent: this.agentFor(route.provider, protocol),
-            // The credential wins over the session header: they are different names in practice, but a
-            // vendor that reused one would mean the request going out unauthenticated.
-            extraHeaders: provider.sessionHeader
-              ? { [provider.sessionHeader]: conversationKey(json as AnthropicRequest), ...using.headers }
-              : using.headers,
+            // The caller's own User-Agent is forwarded as it is. Only a caller that sends none gets the
+            // preset's default (issue #132); a User-Agent the provider's headers set wins over both.
+            extraHeaders: req.headers["user-agent"] === undefined ? withDefaultUserAgent(keyedHeaders, presetUserAgent(provider.preset)) : keyedHeaders,
             dropClientAuth: true,
             // Providers mount their Anthropic-compatible API under a path (DeepSeek /anthropic, OpenRouter /api,
             // Qwen /apps/anthropic): the CLI's /v1/messages is appended to it. Dropping it sent requests to the
@@ -1229,9 +1687,15 @@ export class Proxy {
           }
         } else if (isApiHost) {
           target = { protocol: "https:", host: cfg.upstream, port: this.deps.upstreamPort ?? 443, agent: this.deps.upstreamAgent ?? this.upstreamAgent, extraHeaders: {} };
-          tag = `PASS ${typeof model === "string" ? model : "-"}`;
+          tag = `PASS ${ownKey ? "caller-key " : ""}${typeof model === "string" ? model : "-"}`;
+          // An un-routed native Messages turn goes out on the app's own sign-in, and its answer is the
+          // only statement of that login's unified limits when the usage endpoint refuses (2026-11-05).
+          ownLogin = isMessages && typeof req.headers.authorization === "string";
           // Passthrough stays byte-exact unless another model's thinking would get the turn refused.
-          if (json && dropForeignThinking(json) > 0) body = Buffer.from(JSON.stringify(json));
+          if (json) {
+            const removed = this.thinkingOrigins.dropKnownForeign(json, "anthropic");
+            if (dropForeignThinking(json) + removed > 0) body = Buffer.from(JSON.stringify(json));
+          }
         } else {
           target = { protocol: "https:", host: reqHost, port: 443, agent: this.agentFor(`host:${reqHost}`, "https:"), extraHeaders: {} };
           tag = `WEB ${reqHost}`;
@@ -1247,13 +1711,15 @@ export class Proxy {
       const isBootstrap = isCliBootstrap || isPickerBootstrap;
       const headers: string[] = [];
       const raw = req.rawHeaders;
+      // A User-Agent the target sets under any spelling replaces the caller's; `in` below matches only the exact spelling.
+      const targetSetsUserAgent = Object.keys(target.extraHeaders).some((name) => name.toLowerCase() === "user-agent");
       for (let i = 0; i < raw.length; i += 2) {
         const k = raw[i]!;
         const lk = k.toLowerCase();
         if (HOP_BY_HOP.has(lk)) continue;
         // Bootstrap responses are edited: keep the client's accept-encoding as-is (some edges misbehave without it)
         // and decompress whatever comes back before editing.
-        if (lk in target.extraHeaders || target.dropHeaders?.has(lk) || target.dropHeaderPrefixes?.some((prefix) => lk.startsWith(prefix))) continue;
+        if (lk in target.extraHeaders || (lk === "user-agent" && targetSetsUserAgent) || target.dropHeaders?.has(lk) || target.dropHeaderPrefixes?.some((prefix) => lk.startsWith(prefix))) continue;
         if (target.dropClientAuth && CLIENT_AUTH.has(lk)) continue;
         // Anthropic beta flags opt into features most compatible providers have not implemented.
         if (compatCaps && !forwardCompatibleHeader(lk, compatCaps)) {
@@ -1298,6 +1764,10 @@ export class Proxy {
       let lastAttemptHeaders: string[] = headers;
       let staleRetries = 0;
       const send = (attemptHeaders: string[]): void => {
+        // Buffered refusal bytes and truncation belong only to the response of this attempt.
+        headFilled = false;
+        errRaw = Buffer.alloc(0);
+        errTruncated = false;
         lastAttemptHeaders = attemptHeaders;
         upReq = lib.request({
           protocol: target.protocol,
@@ -1331,7 +1801,10 @@ export class Proxy {
         const available = native ? this.claudeAccounts.peekCredentials() : this.credentialsOf(route.provider, provider);
         const rest = available.filter((c) => !tried.has(c.id));
         if (rest.length === 0) return null;
-        const next = this.pool.pick(route.provider, rest, conversationKey(json as AnthropicRequest));
+        // A retry keeps honouring the pin first; once that account was spent, it falls back to the
+        // same pool order the first attempt would have used.
+        const pinned = native ? pinnedCredential(route.provider, rest, route.accountPin, this.pool) : undefined;
+        const next = pinned ?? this.pool.pick(route.provider, rest, affinity);
         return next && native ? { ...next, headers: withClientBetas(next.headers, req.headers["anthropic-beta"]) } : next;
       };
 
@@ -1376,11 +1849,13 @@ export class Proxy {
           send(lastAttemptHeaders);
           return;
         }
+        // Our own abort is neither a stuck router nor a failed credential. The close
+        // handler records it; do not count the ECONNRESET that destroy() caused.
+        if (clientAborted) return;
         if (target.host === cfg.upstream) this.deps.health.failure(e);
         // Nothing reached the provider, so this says nothing about the credential — but it does say
         // the route is unusable for a moment, and a pool with somewhere else to go should use it.
-        // Our own abort is not the provider's fault and must not be charged to it.
-        if (penalised && !clientAborted) this.pool.penalise(penalised.provider, penalised.id, 0);
+        if (penalised) this.pool.penalise(penalised.provider, penalised.id, 0);
         finish("-", 0, `upstream error ${(e as NodeJS.ErrnoException).code ?? ""} ${(e as Error).message}`);
         if (!res.headersSent) {
           res.writeHead(502, { "content-type": "application/json", connection: "close" });
@@ -1393,11 +1868,14 @@ export class Proxy {
       const onUpstreamResponse = (upRes: http.IncomingMessage): void => {
         if (target.host === cfg.upstream) this.deps.health.success();
         const status = upRes.statusCode ?? 0;
-        // A 403 is the one status whose meaning is in its body. A relay reporting a broken upstream
-        // must not be charged to the credential — that is what made one working key answer every turn
-        // with an authentication error for a minute (2026-09-21). Every other status is judged from
-        // the status alone, and its body is left for the forward below, untouched.
-        if (status === 403) {
+        // Read body-dependent refusals before committing headers. A relay 403 can report its own
+        // broken upstream, while the narrowly classified workspace-region 400 (#101) rests this key
+        // and can be answered by another. Other 400s remain request errors and never walk the pool.
+        // 402 and 429 are read ahead as well: a definite billing/quota exhaustion must be answered
+        // with `x-should-retry: false` before the headers go out, and only its body says whether a
+        // 429 is exhausted or an ordinary rate limit (#89). A bootstrap response is never a model
+        // turn and is forwarded as it arrives.
+        if (override?.purpose === "compaction" && (status < 200 || status >= 300) || status === 403 || (!isBootstrap && (status === 400 || status === 402 || status === 429))) {
           bufferBody(upRes, ERROR_HEAD_MAX).then((whole) => onUpstreamJudged(upRes, status, whole)).catch((e: Error) => {
             log.warn(`upstream ${status}: could not read the body: ${e.message}`);
             finish(String(status), 0, `upstream ${status}: body read failed`);
@@ -1414,7 +1892,8 @@ export class Proxy {
        * A 403's meaning is in its body and cannot be judged before it arrives, so the bytes are read
        * and handed back as the head: `unshift` after a stream has ended throws, and reading a head and
        * forwarding the rest mid-flow is where a body can be lost to a pause nothing resumes. A 403 is
-       * a refusal, so its body is small.
+       * a refusal, so its body is small. A 402/429 is read the same way, because the headers that tell
+       * the client to stop retrying must be decided before they go out (#89).
        *
        * What is returned is the body **decoded for reading**, because the judgement is about what the
        * body says. The bytes themselves are kept in `errRaw` for the client: a compressed body is
@@ -1447,33 +1926,56 @@ export class Proxy {
       });
 
       const onUpstreamJudged = (upRes: http.IncomingMessage, status: number, errBody: string): void => {
+        // A Claude subscription limit states its window in the unified headers rather than in
+        // `retry-after`. Reading that as an ordinary 429 rested the account for a minute, so a spent
+        // 5h/7d window was retried every minute until it reset (2026-11-06/07). A short `retry-after`
+        // beside a rejected window is the limiter's next refresh, not the end of the window, so the
+        // account rests until the later of the two. The same value is what the caller gets if no
+        // account can take the turn.
+        const statedRetryMs = retryAfterMs(upRes.headers);
+        const claudeLimitMs = status === 429 && isApiHost && (!route || cfg.providers[route.provider]?.type === "anthropic")
+          ? claudeLimitResetMs(upRes.headers) : undefined;
+        const restMs = claudeLimitMs !== undefined ? Math.max(statedRetryMs ?? 0, claudeLimitMs) : statedRetryMs;
         // Charge the answer to the credential that produced it. A rate limit parks this one until its
         // stated reset so the next request takes another; an answer clears whatever it was carrying.
         // A 400 is our own request and is charged to nobody (see `classify`).
         if (penalised) {
           if (status >= 400) {
-            this.pool.penalise(penalised.provider, penalised.id, status, retryAfterMs(upRes.headers), errBody);
+            this.pool.penalise(penalised.provider, penalised.id, status, restMs, errBody);
             if (status === 401 && cfg.providers[penalised.provider]?.type === "anthropic") this.claudeAccounts.reject(penalised.id);
-          } else if (status >= 200 && status < 300) this.pool.succeed(penalised.provider, penalised.id, chosen?.ownerId);
-        } else if (!route && isApiHost && pathname === "/v1/messages" && status >= 200 && status < 300) {
-          // Native passthrough uses the caller's current Claude login, not a selected pool account.
-          // Model answers only: telemetry and token counts on the same host would mark it active
-          // while the conversation runs on an added account.
-          for (const [name, provider] of Object.entries(cfg.providers)) {
-            if (provider.type === "anthropic" && provider.auth === "claude-code") this.pool.succeed(name, "current");
+          } else this.pool.succeed(penalised.provider, penalised.id);
+          if (cfg.providers[penalised.provider]?.type === "anthropic") {
+            // An answer on the app's own login is what keeps it in the pool; a 401 drops it
+            // (issue #123, 2026-11-05). A message answer also states its window usage in the
+            // unified limit headers, the only reading available while the usage endpoint refuses.
+            this.claudeAccounts.noteAnswer(penalised.id, status);
+            this.claudeUsage.observeAnswer(penalised.id.split(":", 1)[0]!, upRes.headers);
           }
+        } else if (ownLogin) {
+          // No pool credential answered: the app's own login did. Its unified limit headers are the
+          // only fresh reading of that account while GET /api/oauth/usage refuses; without them the
+          // current login's card kept an old number through the whole backoff (2026-11-05).
+          this.claudeUsage.observeAnswer("current", upRes.headers);
         }
 
         // Nothing has been written to the client yet, so a refused credential can still be replaced
         // and the client answered on its first ask. Only here: once the answer starts flowing the
         // turn is committed, because replacing a half-sent stream splices two answers together.
+        if (override?.purpose === "compaction" && (status < 200 || status >= 300)) {
+          finish(String(status), 0, `upstream ${status}: ${redactErrorText(errBody, [...errorSecrets], 300)}`, true);
+          return;
+        }
         const retry = status >= 400 ? nextCredential(status, errBody) : null;
         if (retry) {
-          const previousId = retry.ownerId ? penalised!.id.split(":", 1)[0]! : penalised!.id;
-          log.info(`RETRY ${route!.provider}: ${previousId} answered ${status}, trying ${retry.ownerId ?? retry.id}`);
+          const credentials = credentialCandidates;
+          log.info(`RETRY ${route!.provider}: ${this.credentialLabel(route!.provider, chosen!, credentials)} answered ${status}, trying ${this.credentialLabel(route!.provider, retry, credentials)}`);
+          recordCredential(route!.provider, retry, credentials, true);
           tried.add(retry.id);
           usedCredentialHeaders = { ...usedCredentialHeaders, ...(chosen?.headers ?? {}), ...retry.headers };
           chosen = retry;
+          // The completion line names the account that finally answered, not the one the turn
+          // started on (2026-11-07: after an in-turn retry it kept saying the first account).
+          if (route && tag.startsWith("CLAUDE ")) tag = `CLAUDE ${route.tag} account=${retry.ownerId?.slice(0, 8) ?? "current"}`;
           penalised = { provider: route!.provider, id: retry.id };
           for (const secret of credentialHeaderValues(Object.entries(retry.headers))) errorSecrets.add(secret);
           upRes.resume();
@@ -1548,22 +2050,50 @@ export class Proxy {
           });
           return;
         }
+        // A definite exhaustion (a spending cap, a used-up quota) is not worth asking again in the
+        // same minute, and a worker that does retries the plain 429 for about two and a half minutes
+        // before failing (#89, 2026-10-24). Its body was read ahead for 402/429, so the answer is
+        // known before the headers go out; a bare rate limit is left exactly as it was. A Claude
+        // subscription window that the unified headers say is spent gets the same rule: the caller
+        // must not spend its own retry ladder until a reset hours away (2026-11-07).
+        if (headFilled) {
+          const exhaustion = providerExhaustion(status, errBody, statedRetryMs);
+          if (exhaustion || claudeLimitMs !== undefined) {
+            for (let i = outHeaders.length - 2; i >= 0; i -= 2) {
+              const name = outHeaders[i]!.toLowerCase();
+              if (name === "retry-after" || name === "x-should-retry") outHeaders.splice(i, 2);
+            }
+            if (exhaustion) {
+              for (const [name, value] of Object.entries(exhaustionHeaders(exhaustion))) outHeaders.push(name, value);
+            } else if (claudeLimitMs !== undefined && restMs !== undefined) {
+              // The stated reset itself. The pool clamps its own rest to 6 h and asks again then;
+              // the caller, told not to retry, is told the real reset (a weekly window can be days).
+              outHeaders.push("x-should-retry", "false", "retry-after", String(Math.max(1, Math.ceil(restMs / 1000))));
+            }
+          }
+          // The stream forward below cannot reach its own end handler when the body is already here.
+          if (route && path.startsWith("/v1/messages") && !path.startsWith("/v1/messages/count_tokens")) {
+            this.providerHealth.observe(route.provider, status, exhaustion);
+          }
+        }
         res.writeHead(status, outHeaders);
         // This observer is deliberately side-band: it sees the exact chunks after they are written
         // to the client, retains only a 64 KiB line/object fragment, and never changes backpressure.
         const tap = new ResponseUsageTap(
           typeof upRes.headers["content-type"] === "string" ? upRes.headers["content-type"] : undefined,
           typeof upRes.headers["content-encoding"] === "string" ? upRes.headers["content-encoding"] : undefined,
+          status >= 200 && status < 300 && pathname === "/v1/messages"
+            ? block => this.thinkingOrigins.remember(route?.provider ?? "anthropic", block) : undefined,
         );
         // An error body is the only thing that says why the provider refused; keep its head for the
         // log and the Logs page. A DeepSeek 401 went unexplained for a day because only the status
         // code was recorded (2026-09-15).
         const errorHead: Buffer[] = [];
         let errorHeadBytes = 0;
-        // The 403 body was read to judge it, so it is written here instead of read again from a
-        // stream that has already ended. The bytes go back exactly as they arrived, so a compressed
-        // body still matches the `content-encoding` and `content-length` the upstream stated; only a
-        // truncated one is sent decoded, and both headers were dropped above for it.
+        // A buffered body (a 403, or a 402/429 read for its verdict) is written here instead of read
+        // again from a stream that has already ended. The bytes go back exactly as they arrived, so a
+        // compressed body still matches the `content-encoding` and `content-length` the upstream
+        // stated; only a truncated one is sent decoded, and both headers were dropped above for it.
         if (headFilled) {
           const body = errTruncated ? Buffer.from(errBody, "utf8") : errRaw;
           bytes = body.length;
@@ -1589,10 +2119,17 @@ export class Proxy {
           observedStopReason = observed.stopReason;
           if (!native && observed.messageId !== undefined) record.messageId = observed.messageId;
           if (observed.servedTier !== undefined) record.servedTier = observed.servedTier;
+          // A native pool answer's id is what a later `continue` names. Remember the conversation
+          // that produced it (not in the request log, which keeps its existing shape) so that turn,
+          // carrying only its delta, finds the account whose server-side thread holds it.
+          if (poolAnswer && affinity !== undefined && observed.messageId !== undefined && status >= 200 && status < 300) {
+            this.threadAffinity.remember(observed.messageId, affinity);
+          }
           res.end();
           const errorBody = status >= 400 ? decodeBodyToText(Buffer.concat(errorHead), upRes.headers["content-encoding"]) : "";
           if (route && path.startsWith("/v1/messages") && !path.startsWith("/v1/messages/count_tokens")) {
             this.providerHealth.observe(route.provider, status, providerExhaustion(status, errorBody, retryAfterMs(upRes.headers)));
+            this.modelHealth.observe(route.provider, route.model, modelDeprecation(status, errorBody));
           }
           const note = status >= 400 ? `upstream ${status}: ${errorSnippet(Buffer.concat(errorHead), upRes.headers["content-encoding"], [...errorSecrets], upRes.headers["content-type"])}` : undefined;
           // Anthropic forgets a conversation's server-side thread after a few idle minutes, and the CLI
@@ -1612,8 +2149,13 @@ export class Proxy {
       };
 
       send(headers);
+      } catch (error) {
+        finish("502", 0, `request dispatch error: ${(error as Error).message}`);
+        if (!res.headersSent) res.writeHead(502, { "content-type": "application/json" }).end(JSON.stringify({ type: "error", error: { type: "api_error", message: "request dispatch failed" } }));
+        else res.destroy();
+      }
     };
-    await run(fetchRoute);
+    await run(override);
   }
 
   /**
@@ -1627,7 +2169,7 @@ export class Proxy {
     query: WebSearchQuery,
     settings: NonNullable<Config["webSearch"]>,
     record: { source?: string; target?: string; provider?: string; purpose?: RequestRecord["purpose"] },
-    finish: (status: string, bytes: number, note?: string, failed?: boolean) => void,
+    finish: (status: string, bytes: number, note?: string, failed?: boolean, extra?: { usage?: RequestUsage }) => void,
     markAttempted: () => void,
   ): Promise<boolean> {
     const configured = this.deps.config().providers[settings.provider];
@@ -1661,7 +2203,7 @@ export class Proxy {
       // Refuse before sending rather than after. A provider that cannot run the server tool is sent
       // "perform a web search" with no tool attached, and a model told to search with nothing to
       // search with narrates a tool call instead — an answer shaped like success, holding nothing.
-      if (!searchVia && !this.canRunServerTools(settings.provider, this.deps.config())) {
+      if (!searchVia && !runsServerTools(this.deps.config(), settings.provider)) {
         this.deps.log.warn(`web search: provider ${settings.provider} does not run server tools; leaving the request alone`);
         return false;
       }
@@ -1677,16 +2219,21 @@ export class Proxy {
 
     const model = typeof json.model === "string" ? json.model : "unknown";
     let blocks;
+    let usage: RequestUsage | undefined;
     try {
       markAttempted();
       const outcome = await backend.search(query);
       blocks = webSearchBlocks(query, outcome).blocks;
+      usage = outcome.usage;
     } catch (e) {
       this.deps.log.warn(`web search via ${settings.provider}: ${(e as Error).message}`);
       return false;
     }
 
-    record.target = `${settings.provider}/${settings.model}`;
+    // The row is the model that searched, not the provider that billed for it: `target` is the id
+    // the search ran on, and `purpose` keeps it out of that model's own turns on the model table
+    // (a provider-named target read as a model of its own, 2026-10-26).
+    record.target = settings.model;
     record.provider = settings.provider;
     record.purpose = "web-search";
     const wantStream = json.stream === true;
@@ -1695,24 +2242,70 @@ export class Proxy {
       ? { "content-type": "text/event-stream", "cache-control": "no-cache", connection: "keep-alive" }
       : { "content-type": "application/json" };
     res.writeHead(200, headers).end(payload);
-    finish("200", Buffer.byteLength(payload), `web search via ${settings.provider}`, false);
+    finish("200", Buffer.byteLength(payload), `web search via ${settings.provider}`, false, usage ? { usage } : undefined);
     return true;
   }
 
-  /**
-   * Whether this provider executes Anthropic's server-side tools (`web_search`) itself, rather than
-   * having them dropped on the way out. Only an anthropic-compatible provider whose preset or caps
-   * say so, measured per provider — `serverTools` in compat.ts. Two routes to the same vendor can
-   * differ: DeepSeek's own endpoint runs it, the same model through OpenCode Go does not.
-   */
-  private canRunServerTools(name: string, cfg: Config): boolean {
-    const provider = cfg.providers[name];
-    // A routed native account still calls Anthropic's Messages API unchanged, so Anthropic executes
-    // its own server tools. Only translated/compatible providers need an explicit measured capability.
-    if (provider?.type === "anthropic") return provider.accountPool === true && provider.auth === "claude-code";
-    if (!provider || provider.type !== "anthropic-compatible") return false;
-    const preset = provider.preset ? PRESETS.find((entry) => entry.id === provider.preset) : undefined;
-    return resolveCompatibleCaps(preset ? { ...(preset.serverTools ? { serverTools: true } : {}) } : undefined, provider.caps).serverTools;
+  /** Bind the task's spawn snapshot to its agent, not to x@effort (several tiers can use it). */
+  private workerFallbacks(resolved: Resolved, json: Record<string, unknown>, cfg: Config, model: string, key?: string): Resolved {
+    let snapshot = key ? this.workerLadders.get(key) : undefined;
+    if (!snapshot && Array.isArray(json.messages)) {
+      // register.tsx prepends this line to the spawn prompt, not to later history or blocks.
+      // Only leading engine reminders may precede it; removing reminders elsewhere can expose prose.
+      const content: unknown = json.messages.find(message => message?.role === "user")?.content;
+      const first: unknown = Array.isArray(content) ? content[0] : undefined;
+      const text = typeof content === "string" ? content : first && typeof first === "object" &&
+        "type" in first && first.type === "text" && "text" in first && typeof first.text === "string" ? first.text : "";
+      snapshot = readWorkerLadder(text.replace(/^(?:\s*<system-reminder>[\s\S]*?<\/system-reminder>)+\s*/, ""));
+    }
+    // Never override an explicit marker/rule that resolved somewhere other than the spawn's model.
+    if (!snapshot || snapshot.model !== model) return resolved;
+    const picked = resolve(snapshot.model, {}, cfg);
+    if (!picked || picked.provider !== resolved.provider || picked.model !== resolved.model || picked.effort !== resolved.effort) return resolved;
+    if (key && !this.workerLadders.has(key)) {
+      this.workerLadders.set(key, snapshot);
+      if (this.workerLadders.size > 10_000) this.workerLadders.delete(this.workerLadders.keys().next().value!);
+    }
+    const allowed = this.savedLadderTargets(cfg);
+    const fallbacks = snapshot.fallbacks.flatMap(id => {
+      const target = resolve(id, {}, cfg);
+      return target && allowed.some(step => step.provider === target.provider && step.model === target.model && step.effort === target.effort)
+        ? [{ provider: target.provider, model: target.model, ...(target.effort ? { effort: target.effort } : {}), ...(target.accountPin ? { accountPin: target.accountPin } : {}) }] : [];
+    });
+    return { ...resolved, fallbacks, ladderPick: snapshot.pick };
+  }
+
+  /** Task text is not authority: even a bound snapshot must remain on the current saved worker set. */
+  private savedLadderTargets(cfg: Config): Resolved[] {
+    try {
+      const saved = readModRoutingSettings(this.deps.home);
+      if (!saved.stored) return [];
+      const settings = routingSettings(saved.settings);
+      const rules = [settings.rules.general, ...Object.values(settings.domainRules ?? {})];
+      return rules.flatMap(rule => Object.values(rule.rungs).flatMap(steps => (steps ?? []).flatMap(step => {
+        const model = step.target.agent === "general-purpose" ? step.target.model : cfg.aliases[step.target.agent];
+        if (!model) return [];
+        const target = resolve(`${model.replace(/@[^@]*$/, "")}@${step.effort}`, {}, cfg);
+        return target && settings.providers[target.provider] !== false &&
+          isAllowed(candidateKey(step.target), target.provider, settings.allow, settings.allowKnown) ? [target] : [];
+      })));
+    } catch (error) {
+      this.deps.log.warn(`worker ladder: saved settings unavailable; not rerouting (${(error as Error).message})`);
+      return [];
+    }
+  }
+
+  private unavailableReason(target: Pick<Resolved, "provider" | "model">): string | undefined {
+    const retired = this.modelHealth.get(target.provider, target.model)?.reason;
+    if (retired) return retired;
+    const exhaustion = this.providerHealth.snapshot()[target.provider];
+    if (!exhaustion) return undefined;
+    const configured = this.deps.config().providers[target.provider];
+    const provider = configured && providerFor(configured, target.model);
+    // An explicit key pool knows more than a provider-wide advisory from one spent key.
+    if (provider && "credentials" in provider && provider.credentials?.length &&
+        this.pool.hasUsable(target.provider, this.credentialsOf(target.provider, provider))) return undefined;
+    return exhaustion.reason;
   }
 
   /**
@@ -1724,19 +2317,28 @@ export class Proxy {
    */
   private chooseTarget(resolved: Resolved, cfg: Config, log: Logger): Resolved {
     if (!resolved.fallbacks?.length) return resolved;
+    const reason = this.unavailableReason(resolved);
+    const provider = cfg.providers[resolved.provider];
+    // An ordinary API rate limit is not definite exhaustion. OAuth adapters additionally know
+    // when every account (or the model's quota group) is unavailable without a billing error.
+    const accounts = provider?.type === "chatgpt" || provider?.type === "anthropic" || provider?.type === "google" && provider.auth === "antigravity";
+    if (resolved.ladderPick && !reason && !accounts) return resolved;
     if (this.targetUsable(resolved, cfg)) return resolved;
     for (const f of resolved.fallbacks) {
       if (f.provider === resolved.provider && f.model === resolved.model) continue;
-      if (!this.targetUsable(f, cfg)) continue;
-      log.info(`FAILOVER ${resolved.provider}/${resolved.model} exhausted → ${f.provider}/${f.model}`);
+      if (!this.targetUsable({ ...f, effort: f.effort ?? resolved.effort }, cfg)) continue;
+      log.info(`${resolved.ladderPick ? `LADDER pick=${resolved.ladderPick}` : "FAILOVER"} ${resolved.provider}/${resolved.model} → ${f.provider}/${f.model} reason=${reason ?? "provider_unusable"}`);
       // The tag names the model that answers, not the one that could not: a log line saying `->m1`
       // for a turn that ran on m2 is the kind of thing that costs an hour to disbelieve.
-      const asked = resolved.tag.split("->")[0] ?? resolved.model;
       return {
         provider: f.provider,
         model: f.model,
         effort: f.effort ?? resolved.effort,
-        tag: `${asked}->${f.model} (failover from ${resolved.provider})`,
+        // A fallback to a pinned worker goes out on that worker's account, as a direct pick would.
+        ...(f.accountPin ? { accountPin: f.accountPin } : {}),
+        tag: `${resolved.asked}->${f.model} (failover from ${resolved.provider})`,
+        kind: resolved.kind,
+        asked: resolved.asked,
       };
     }
     return resolved;
@@ -1746,26 +2348,39 @@ export class Proxy {
   private unwrittenFallback(resolved: Resolved, attempted: Resolved, cfg: Config, why: "prompt" | "capacity"): Resolved | null {
     for (const f of resolved.fallbacks ?? []) {
       if (f.provider === attempted.provider && f.model === attempted.model) continue;
-      if (!this.targetUsable(f, cfg)) continue;
+      if (!this.targetUsable({ ...f, effort: f.effort ?? resolved.effort }, cfg)) continue;
       return {
         provider: f.provider, model: f.model, effort: f.effort ?? resolved.effort,
-        tag: `${resolved.tag.split("->")[0] ?? resolved.model}->${f.model} (${why} fallback from ${attempted.provider})`,
+        ...(f.accountPin ? { accountPin: f.accountPin } : {}),
+        tag: `${resolved.asked}->${f.model} (${why} fallback from ${attempted.provider})`,
+        kind: resolved.kind, asked: resolved.asked,
       };
     }
     return null;
   }
 
-  private targetUsable(target: Pick<Resolved, "provider" | "model">, cfg: Config): boolean {
+  /**
+   * A native Claude provider that can answer now, with Claude Code's small model: the last resort
+   * for the side requests Claude Code makes for itself. Null when no signed-in Claude pool is usable.
+   */
+  private claudeLastResort(cfg: Config): { provider: string; model: string } | null {
+    for (const provider of claudeLastResortProviders(cfg)) {
+      if (this.targetUsable({ provider, model: CLAUDE_SMALL_MODEL }, cfg)) return { provider, model: CLAUDE_SMALL_MODEL };
+    }
+    return null;
+  }
+
+  private targetUsable(target: Pick<Resolved, "provider" | "model"> & { effort?: string | undefined }, cfg: Config): boolean {
     const configured = cfg.providers[target.provider];
-    if (!configured) return false;
+    if (!configured || this.unavailableReason(target)) return false;
     const provider = providerFor(configured, target.model);
     if (provider.type === "anthropic") {
-      if (!provider.accountPool || provider.auth !== "claude-code") return false;
+      if (!isTargetProvider(provider)) return false;
       const accounts = this.claudeAccounts.peekCredentials();
       return accounts.length > 0 && this.pool.hasUsable(target.provider, accounts);
     }
     if (provider.type === "chatgpt") return this.chatgpt(target.provider, provider).hasUsable();
-    if (provider.type === "google" && provider.auth === "antigravity") return this.google(target.provider, provider).hasUsable();
+    if (provider.type === "google" && provider.auth === "antigravity") return this.google(target.provider, provider).hasUsable(target.model, target.effort);
     return this.pool.hasUsable(target.provider, this.credentialsOf(target.provider, provider));
   }
 
@@ -1786,18 +2401,56 @@ export class Proxy {
    * A provider's credentials as a pool. A provider that declares none has exactly the one it always
    * had, under a fixed id so its health survives config edits that do not touch it.
    */
-  private credentialsOf(name: string, provider: Config["providers"][string]): Credential[] {
+  private credentialsOf(name: string, provider: Config["providers"][string], includePaused = false): Credential[] {
     const declared = (provider as { credentials?: Credential[] }).credentials;
-    if (declared && declared.length > 0) return declared;
+    if (declared && declared.length > 0) return includePaused ? declared : declared.filter((credential) => !credential.paused);
     const headers = ("headers" in provider && provider.headers) || {};
+    const configured = this.deps.config().providers[name] ?? provider;
+    const configuredHeaders = ("headers" in configured && configured.headers) || {};
+    const fingerprint = crypto.createHash("sha256").update(JSON.stringify(
+      Object.entries(configuredHeaders).map(([key, value]): [string, string] => [key.toLowerCase(), value]).sort(([a], [b]) => a.localeCompare(b)),
+    )).digest("hex");
+    const previous = this.implicitCredentialHeaders.get(name);
+    if (previous !== undefined && previous !== fingerprint) this.pool.clear(name, "default");
+    this.implicitCredentialHeaders.set(name, fingerprint);
     return [{ id: "default", headers }];
   }
 
-  /** Last successful Claude owner per provider, independent of current credential availability. */
-  claudeActiveAccounts(): Record<string, string | null> {
-    return Object.fromEntries(Object.entries(this.deps.config().providers)
-      .filter(([, p]) => p.type === "anthropic" && p.auth === "claude-code")
-      .map(([name]) => [name, this.pool.activeOwner(name)]));
+  /** Only explicit labels or configured ordinals are public; runtime ids may be secrets. */
+  private credentialLabel(name: string, credential: Credential, available: readonly Credential[]): string {
+    const provider = this.deps.config().providers[name];
+    const configured = provider && "credentials" in provider ? provider.credentials : undefined;
+    const credentials = configured?.length ? configured : available;
+    const index = credentials.findIndex((candidate) => candidate.id === credential.id);
+    // A token refresh between the turn's first pick and its in-turn retry gives the same account a
+    // new runtime id, which the first pick's list does not contain. Match the durable owner so the
+    // log and requests.jsonl name the account that answered instead of `#0` (2026-11-07).
+    const owner = credential.ownerId;
+    const ordinal = index >= 0 ? index
+      : owner ? credentials.findIndex((candidate) => "ownerId" in candidate && candidate.ownerId === owner) : -1;
+    const secrets = credentialHeaderValues(credentials.flatMap((candidate) => Object.entries(candidate.headers)));
+    // OAuth labels are derived from account emails, not operator-supplied key labels.
+    const label = !credential.ownerId && credential.label ? redactErrorText(credential.label, secrets, 80) : "";
+    return label || (ordinal >= 0 ? `#${ordinal + 1}` : owner?.slice(0, 8) ?? "-");
+  }
+
+  /** The conversation that produced the answer a `continue` names, when this router remembers it. */
+  private continuedConversation(json: Record<string, unknown>): string | undefined {
+    const thread = json.thread as { type?: unknown; previous_message_id?: unknown } | undefined;
+    if (!thread || typeof thread !== "object" || thread.type !== "continue") return undefined;
+    return typeof thread.previous_message_id === "string" ? this.threadAffinity.lookup(thread.previous_message_id) : undefined;
+  }
+
+  clearCredentialCooldown(provider: string, id: string): void {
+    this.pool.clear(provider, id);
+  }
+
+  claudeClearCooldown(ownerId: string): void {
+    const owners = this.claudeAccounts.cooldownOwners(ownerId);
+    for (const [name, provider] of Object.entries(this.deps.config().providers)) {
+      if (provider.type !== "anthropic" || provider.auth !== "claude-code") continue;
+      for (const owner of owners) this.pool.clearOwner(name, owner);
+    }
   }
 
   /** Health of every credential the config declares, for the dashboard. */
@@ -1805,10 +2458,10 @@ export class Proxy {
     const cfg = this.deps.config();
     const out: Record<string, ReturnType<CredentialPool["report"]>> = {};
     for (const [name, provider] of Object.entries(cfg.providers)) {
-      const creds = provider.type === "anthropic" && provider.auth === "claude-code"
+      const creds = provider.type === "anthropic" && provider.accountPool
         ? this.claudeAccounts.peekCredentials()
-        : this.credentialsOf(name, provider);
-      if (creds.length === 0 || (creds.length === 1 && creds[0]!.id === "default")) continue; // nothing to report about a pool of one
+        : this.credentialsOf(name, provider, true);
+      if (!(provider.type === "anthropic" && provider.accountPool) && !("credentials" in provider && provider.credentials?.length)) continue;
       out[name] = this.pool.report(name, creds).map((report) => {
         const credential = creds.find((candidate) => candidate.id === report.id);
         return credential?.ownerId ? { ...report, id: credential.ownerId } : report;
@@ -1839,7 +2492,7 @@ function deferErrorResponse(response: http.ServerResponse, discarded: () => bool
     get(target, key) {
       if (key === "writeHead") return (...args: unknown[]) => {
         if (discarded()) return guarded;
-        error = typeof args[0] === "number" && args[0] >= 400 && !target.headersSent;
+        error = typeof args[0] === "number" && (args[0] < 200 || args[0] >= 300) && !target.headersSent;
         return error ? guarded : Reflect.apply(target.writeHead, target, args);
       };
       if (key === "write" || key === "end" || key === "flushHeaders" || key === "destroy") return (...args: unknown[]) => {

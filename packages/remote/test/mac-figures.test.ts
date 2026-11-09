@@ -9,6 +9,7 @@ import { PermissionQueue } from "../src/permissions.ts";
 import { BridgeClient } from "../src/bridge-client.ts";
 import type { DesktopProcess } from "../src/desktop.ts";
 import type { Figures, SessionEvent } from "../src/protocol.ts";
+import { RouterClient } from "../src/router.ts";
 
 const id = "dddddddd-dddd-dddd-dddd-dddddddddddd";
 const line = (value: unknown): string => JSON.stringify(value) + "\n";
@@ -32,7 +33,7 @@ const idleBridge = (): BridgeClient => new BridgeClient({
 });
 
 /** A Mac session the host only reads, with a router that records what it was asked for figures. */
-function fixture(t: TestContext, opts: { status?: DesktopProcess["status"]; bridgeId?: string; windows?: Record<string, number>; reply?: () => Figures } = {}) {
+function fixture(t: TestContext, opts: { status?: DesktopProcess["status"]; bridgeId?: string; windows?: Record<string, number>; reply?: () => Figures | Promise<Figures> } = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "mac-figures-"));
   const project = path.join(root, "projects", "project");
   fs.mkdirSync(project, { recursive: true });
@@ -131,8 +132,7 @@ test("a Mac session the host tails over Remote Control gets its figures in its o
   assert.ok(f.events.some(e => e.session === id && e.event.kind === "figures"), "a live log announces it");
 });
 
-test("a session with no window of its own reads the router's catalogue window; [1m] is a million", async () => {
-  const { RouterClient } = await import("../src/router.ts");
+test("catalogue values outrank SDK caches and a [1m] name alone proves no window", async () => {
   let windowReads = 0;
   const fetchStub = async (url: string) => {
     const path = new URL(url).pathname;
@@ -144,8 +144,78 @@ test("a session with no window of its own reads the router's catalogue window; [
   const known = await router.figures("s", "claude-opus-5-5", null);
   assert.equal(known.contextWindow, 400_000);
   assert.equal(known.contextPct, 25);
-  assert.equal((await router.figures("s", "claude-opus-5-5[1m]", null)).contextWindow, 1_000_000);
+  assert.equal((await router.figures("s", "claude-opus-5-5[1m]", null)).contextWindow, null);
   assert.equal((await router.figures("s", "other-model", null)).contextWindow, null);
-  assert.equal((await router.figures("s", "claude-opus-5-5", 200_000)).contextWindow, 200_000);
-  assert.equal(windowReads, 1);
+  assert.equal((await router.figures("s", "claude-opus-5-5", 200_000)).contextWindow, 400_000);
+  assert.equal(windowReads, 4, "a model-only cache must not hide a changed route/window");
+});
+
+test("Astra figures use the resolved window over a cached million-token SDK/native alias", async () => {
+  let source = "gpt-6-astra@high";
+  let target = "gpt-6-astra";
+  let provider = "chatgpt";
+  let body: unknown = {};
+  const router = new RouterClient("http://fixture.invalid", async url => ({ ok: true, status: 200, json: async () => {
+    if (new URL(url).pathname === "/api/context-windows") return body;
+    if (new URL(url).pathname === "/api/requests") return { requests: [{ source, target, provider, at: "2026-10-25T00:00:00Z", ok: true, status: 200, usage: { input: 8400, cached: 250000 } }] };
+    return {};
+  } }));
+  const resolution = (window: number | null) => ({ model: "gpt-6-astra", provider: "chatgpt", contextWindow: window });
+  body = { windows: { "gpt-6-astra": 272000 }, resolvedWindows: { "gpt-6-astra": resolution(258400) } };
+  let f = await router.figures("s", source, 1_000_000);
+  assert.deepEqual([f.contextTokens, f.contextWindow, f.contextPct], [258400, 258400, 100]);
+  body = { resolvedWindows: { "gpt-6-astra": resolution(272000) } };
+  assert.equal((await router.figures("s", source, 1_000_000)).contextWindow, 272000, "same model reads a changed window immediately");
+  source = "claude-opus-4-8[1m]";
+  body = { windows: { [source]: 1_000_000, "gpt-6-astra": 272000 }, resolvedWindows: { [source]: { model: source, provider: null, contextWindow: 1_000_000 }, "gpt-6-astra": resolution(258400) } };
+  f = await router.figures("s", source, 1_000_000);
+  assert.equal(f.contextWindow, 258400, "native alias window cannot override the actual request target");
+  body = { resolvedWindows: { [source]: resolution(200000), "gpt-6-astra": resolution(258400) } };
+  assert.equal((await router.figures("s", source, 1_000_000)).contextWindow, 200000, "a matching explicit route override remains first");
+  target = "unresolved-model";
+  f = await router.figures("s", source, 1_000_000);
+  assert.deepEqual([f.contextWindow, f.contextPct], [null, null], "a fallback cannot inherit the original route's capacity");
+  target = "gpt-6-astra";
+  provider = "other";
+  assert.equal((await router.figures("s", source, 1_000_000)).contextWindow, null, "a same-id model on another provider is not the same resolution");
+  provider = "chatgpt";
+  for (const window of [null, 0, -1, Infinity, NaN]) {
+    body = { windows: { [source]: 1_000_000 }, resolvedWindows: { "gpt-6-astra": resolution(window) } };
+    f = await router.figures("s", source, 1_000_000);
+    assert.deepEqual([f.contextWindow, f.contextPct], [null, null]);
+  }
+  body = { windows: { [source]: 1_000_000, "gpt-6-astra": 272000 } };
+  assert.equal((await router.figures("s", source, 1_000_000)).contextWindow, 272000, "old router compatibility uses the actual target, not the source");
+  body = null;
+  assert.equal((await router.figures("s", source, 1_000_000)).contextWindow, null, "unavailable router metadata does not revive a cached million");
+});
+
+test("an idle same-model session refreshes figures after its snapshot epoch changes", async t => {
+  const f = fixture(t, { status: "idle" });
+  await f.poll();
+  const oldEpoch = f.sessions.log(id).epoch;
+  await f.poll(); // binds the first materialized snapshot
+  fs.appendFileSync(f.transcript, line({ ...user, uuid: "u2", message: { content: "Next epoch" } }));
+  f.advance(); await f.poll();
+  assert.notEqual(f.sessions.log(id).epoch, oldEpoch);
+  await f.poll();
+  assert.equal(f.asked.length, 2, "idle state and the 15-second throttle do not suppress an epoch refresh");
+  assert.equal(f.figureEvents().at(-1)?.kind, "figures");
+});
+
+test("an old figures read cannot overwrite the same model's new epoch", async t => {
+  const pending = Promise.withResolvers<Figures>();
+  let reads = 0;
+  const f = fixture(t, { status: "idle", reply: () => ++reads === 1 ? pending.promise : figures({ contextWindow: 258400 }) });
+  const original = f.sessions.log(id).epoch;
+  await f.poll();
+  fs.appendFileSync(f.transcript, line({ ...user, uuid: "u2", message: { content: "Replacement snapshot" } }));
+  f.advance(); await f.poll();
+  assert.notEqual(f.sessions.log(id).epoch, original);
+  await f.poll();
+  pending.resolve(figures({ contextWindow: 1_000_000 }));
+  await new Promise(resolve => setImmediate(resolve));
+  const events = f.figureEvents();
+  assert.equal(events.length, 1);
+  assert.equal(events[0]?.kind === "figures" && events[0].figures.contextWindow, 258400);
 });

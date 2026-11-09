@@ -14,6 +14,7 @@ import type { CliModel, Config } from "./config.ts";
 import { resolve } from "./routing.ts";
 import { clampEffort } from "./compat.ts";
 import { isJudgeOnlyModel } from "./model-policy.ts";
+import { chatgptModelWindow } from "./providers/chatgpt/windows.ts";
 
 export const BOOTSTRAP_PATHS = ["/edge-api/bootstrap", "/api/bootstrap"];
 
@@ -66,31 +67,77 @@ export function chatPickerModels(cfg: Config): CliModel[] {
   return cfg.cli.extraModels
     .filter(entry => !isJudgeOnlyModel(entry.model) && !isJudgeOnlyModel(resolve(entry.model, {}, cfg)?.model ?? cfg.aliases[entry.model.split("@")[0]!] ?? ""))
     .map(entry => {
+      // A window the operator set on this entry is the one the router advertises, catalogue or not
+      // (`pickerWindowOverride`, §4 2026-10-30).
+      if (pickerWindowOverride(cfg, entry.model) !== undefined) return entry;
+      // Otherwise a ChatGPT-subscription model follows the live catalogue: config carried 272000
+      // for 6.1 Sol while Codex runs 475000 (§4, 2026-10-23).
+      const live = chatgptModelWindow(cfg, entry.model);
+      if (live) return { ...entry, contextWindow: live };
       if (entry.contextWindow) return entry;
       const window = providerModelWindow(cfg, entry.model);
       return window ? { ...entry, contextWindow: window } : entry;
     });
 }
 
+/** The window a provider itself declares for `model`: its `/models` context length, or one set by hand. */
+function declaredModelWindow(cfg: Config, model: string): number | undefined {
+  const base = model.split("@")[0]!;
+  const target = resolve(base, {}, cfg) ?? resolve(cfg.aliases[base] ?? base, {}, cfg);
+  if (!target) return undefined;
+  const undated = target.model.replace(/-\d{8}$/, "");
+  const entry = cfg.providers[target.provider]?.models?.find(m => m.id === target.model || m.id.replace(/-\d{8}$/, "") === undated);
+  return entry?.contextWindow;
+}
+
+/**
+ * The window the operator set on a picker entry (`cli.extraModels[].contextWindow`), or undefined
+ * when the entry says nothing of its own. Ticking a model in the dashboard copies the provider's
+ * declared window onto its entry (`applyPickerSelections`), so an entry equal to that declaration is
+ * the copy and not a choice — today's configs carry 6.1 Sol's stale 272000 exactly that way and
+ * must keep following the live catalogue. An explicit `route.contextWindow` still wins over this
+ * (docs/ARCHITECTURE.md §4, 2026-10-30).
+ */
+export function pickerWindowOverride(cfg: Config, model: string): number | undefined {
+  const base = model.split("@")[0]!;
+  const saved = cfg.cli.extraModels.find(m => m.model.split("@")[0] === base)?.contextWindow;
+  if (!(typeof saved === "number" && Number.isFinite(saved) && saved > 0)) return undefined;
+  return saved === declaredModelWindow(cfg, model) ? undefined : saved;
+}
+
 /**
  * The window a provider declared for `model` (its `/models` context length, or one set by hand),
  * by id without an `@effort` suffix or through an alias. A picker entry saved without a window of
  * its own used to fall to `cli.autoCompactWindow` although its provider knew better: a 1M MiniMax
- * subagent compacted twice at ~240K (2026-10-21).
+ * subagent compacted twice at ~240K (2026-10-21). A ChatGPT-subscription model answers from the
+ * live catalogue first, ahead of the provider's own stored figure (`chatgptModelWindow`, §4
+ * 2026-10-23); an operator's override is handled by the callers above and wins over both.
  */
 export function providerModelWindow(cfg: Config, model: string): number | undefined {
-  const base = model.split("@")[0]!;
-  const ids = new Set([base, cfg.aliases[base] ?? base]);
-  for (const provider of Object.values(cfg.providers)) {
-    for (const entry of ("models" in provider && provider.models) || []) {
-      if (ids.has(entry.id) && typeof entry.contextWindow === "number" && entry.contextWindow > 0) return entry.contextWindow;
-    }
-  }
-  return undefined;
+  const live = chatgptModelWindow(cfg, model);
+  if (live) return live;
+  return declaredModelWindow(cfg, model);
+}
+
+/** Provider-bound capacity, shared by bootstrap's keys and the context-window API. */
+export function resolvedModelWindow(cfg: Config, id: string, nativeWindow?: number): { model: string; provider: string | null; contextWindow: number | null } {
+  const base = id.split("@")[0]!;
+  const route = cfg.routes[base] ?? cfg.routes[base.replace(/-\d{8}$/, "")];
+  const target = resolve(id, {}, cfg) ?? (cfg.aliases[base] ? resolve(cfg.aliases[base], {}, cfg) : null);
+  const model = target?.model.split("@")[0] ?? base;
+  const provider = target ? cfg.providers[target.provider] : undefined;
+  const explicit = target && !cfg.direct.some(d => base.startsWith(d.prefix)) ? route?.contextWindow : undefined;
+  // The window the operator set on the picker entry, then the live catalogue, then whatever the
+  // provider declares (the entry holds a copy of that same figure when nothing was chosen).
+  const chosen = pickerWindowOverride(cfg, base) ?? pickerWindowOverride(cfg, model);
+  const declared = provider?.models?.find(m => m.id === model || m.id.replace(/-\d{8}$/, "") === model.replace(/-\d{8}$/, ""))?.contextWindow;
+  const known = target ? explicit ?? chosen ?? chatgptModelWindow(cfg, id) ?? declared : nativeWindow;
+  return { model, provider: target?.provider ?? null, contextWindow: typeof known === "number" && Number.isFinite(known) && known > 0 ? Math.floor(known) : null };
 }
 
 export type PickerModelEntry = { id: string; name: string };
-export type InjectResult = { injected: number; surfaces: { id: string; models: string[]; entries: PickerModelEntry[] }[] };
+/** `injected` names the ids this call added: an id the app already lists (a Claude model ticked for the picker) is not one. */
+export type InjectResult = { injected: number; surfaces: { id: string; models: string[]; entries: PickerModelEntry[]; injected: string[] }[] };
 
 /**
  * Mutates `json` in place; returns what was done for logging. `effortFor` names the levels a model
@@ -108,6 +155,7 @@ export function injectPickerModels(json: Record<string, unknown>, extra: CliMode
       id,
       models: surface.models.map((m) => String(m.id ?? "?")),
       entries: surface.models.map((m) => ({ id: String(m.id ?? "?"), name: typeof m.name === "string" ? m.name : String(m.id ?? "?") })),
+      injected: [],
     });
     if (!CLI_SURFACES.has(id)) continue;
     const template = pickTemplate(surface.models);
@@ -126,6 +174,9 @@ export function injectPickerModels(json: Record<string, unknown>, extra: CliMode
       const levels = effortFor?.(e.model.split("@")[0]!);
       if (levels) narrowThinking(entry, levels);
       surface.models.push(entry);
+      // The dashboard writes each id once, but a hand-edited list can repeat one: it is still one row.
+      existing.add(e.model);
+      result.surfaces[result.surfaces.length - 1]!.injected.push(e.model);
       result.injected++;
     }
     // Per-entry window first: routed models do not share one, and `contextWindow` is only the fallback.

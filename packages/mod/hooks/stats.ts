@@ -22,19 +22,36 @@ export function sentEffort(model: string, effort: string | number | undefined): 
 }
 
 /**
- * An agent after one of its steps: the raw counts the API reported added to its own (what the
- * Agents pane shows, so it agrees with the host's), the weighted cost as before, the effort the step
- * was sent at and the model that answered.
+ * An agent after one of its steps: its last step's raw counts (not summed — each step re-sends the
+ * whole conversation, so the last prompt is the conversation's size), the step's output added to the
+ * running output total, the weighted cost as before, the effort the step was sent at and the model
+ * that answered. The Claude app counts an agent's tokens this way, and so does the Agents pane
+ * (`agentTokens`).
  */
 export function addAgentStep(agent: AgentRec, usage: Usage & { model?: string }, effort: string | number | undefined): AgentRec {
-  const was = agent.usage ?? { input: 0, cached: 0, cacheWrite: 0, output: 0 }
   return {
     ...agent,
     cost: agent.cost + weighted(usage),
-    usage: { input: was.input + (usage.input_tokens ?? 0), cached: was.cached + (usage.cache_read_input_tokens ?? 0), cacheWrite: was.cacheWrite + (usage.cache_creation_input_tokens ?? 0), output: was.output + (usage.output_tokens ?? 0) },
+    usage: { input: usage.input_tokens ?? 0, cached: usage.cache_read_input_tokens ?? 0, cacheWrite: usage.cache_creation_input_tokens ?? 0, output: usage.output_tokens ?? 0 },
+    outputTotal: (agent.outputTotal ?? 0) + (usage.output_tokens ?? 0),
     ...(effort !== undefined ? { effort } : {}),
     ...(usage.model ? { answeredBy: usage.model } : {}),
   }
+}
+
+/**
+ * The tokens the Claude app's task list counts for an agent: its last response's whole prompt
+ * (uncached + cache write + cache read) plus every response's output. A finished agent takes the
+ * larger of that and its last response's prompt and output, as the app does; the max only bites on
+ * a record whose running output total lags its last step. Undefined before a step reports anything.
+ */
+export function agentTokens(agent: AgentRec): number | undefined {
+  const usage = agent.usage
+  if (!usage) return undefined
+  const prompt = usage.input + usage.cached + (usage.cacheWrite ?? 0)
+  const counted = prompt + (agent.outputTotal ?? usage.output)
+  const ended = agent.state === 'done' || agent.state === 'failed' || agent.state === 'killed'
+  return ended ? Math.max(counted, prompt + usage.output) : counted
 }
 
 export function addRequest(stats: Stats, usage: Usage, effort: Effort): Stats {

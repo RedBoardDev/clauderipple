@@ -146,6 +146,74 @@ test("the target router waits for the surviving installer before allowing tray r
   installerAlive = true; // A reused PID cannot revive the retired installer.
   assert.equal(successor.status().running, false);
 });
+test("router completion reports host application pending and retries it independently of automatic installs", async t => {
+  const { updater, f, deps } = fixture(t);
+  updater.install(f.check); updater.stop();
+  fs.writeFileSync(path.join(f.home, "host-update.json"), JSON.stringify({ version: "1.1.0", status: "pending", retryAt: 0 }));
+  let retries = 0;
+  const successor = new AutoUpdater({ ...deps, version: "1.1.0", enabled: () => false, runCli: async args => {
+    assert.deepEqual(args, ["remote", "refresh", "--pending"]); retries++;
+    if (retries === 2) fs.writeFileSync(path.join(f.home, "host-update.json"), JSON.stringify({ version: "1.1.0", status: "applied", retryAt: 0 }));
+    return { ok: true, output: "" };
+  } });
+  t.after(() => successor.stop());
+  assert.equal(successor.status().lastUpdatedTo, "1.1.0", "router completion is still truthful");
+  assert.equal(successor.status().hostUpdate?.status, "pending", "host completion is not implied");
+  successor.start();
+  await f.clock.advance(60_000); assert.equal(retries, 1);
+  await f.clock.advance(60_000); assert.equal(retries, 2);
+  assert.equal(successor.status().hostUpdate?.status, "applied");
+  successor.stop(); await f.clock.advance(60_000); assert.equal(retries, 2);
+});
+
+test("a host record older than the router is refreshed without --pending (issue #125)", async t => {
+  const { f, deps } = fixture(t);
+  const hostFile = path.join(f.home, "host-update.json");
+  fs.writeFileSync(hostFile, JSON.stringify({ version: "0.9.0", status: "applied", retryAt: 0 }));
+  const calls: string[][] = [];
+  const updater = new AutoUpdater({ ...deps, runCli: async (args) => { calls.push(args); return { ok: true, output: "" }; } });
+  t.after(() => updater.stop());
+  updater.start();
+  await f.clock.advance(60_000);
+  assert.deepEqual(calls, [["remote", "refresh"]], "the CLI writes its own version's request first");
+  // A failed run keeps the record until the host reacts; the retry cadence is the same one minute.
+  await f.clock.advance(60_000);
+  assert.equal(calls.length, 2);
+});
+
+test("a host record at or ahead of the router is never refreshed", async t => {
+  for (const [version, status] of [["1.1.0", "pending"], ["1.0.0", "applied"], ["1.0.0", "skipped"], ["1.0.0-beta", "applied"]] as const) {
+    const { f, deps } = fixture(t);
+    fs.writeFileSync(path.join(f.home, "host-update.json"), JSON.stringify({ version, status, retryAt: 0 }));
+    let calls = 0;
+    const updater = new AutoUpdater({ ...deps, runCli: async () => { calls++; return { ok: true, output: "" }; } });
+    t.after(() => updater.stop());
+    updater.start();
+    await f.clock.advance(60_000);
+    assert.equal(calls, 0, `${version} ${status}`);
+    updater.stop();
+  }
+});
+
+test("host retries remain single-flight under repeated status reads and corrupt host state stays visible", async t => {
+  const { f, deps } = fixture(t);
+  const hostFile = path.join(f.home, "host-update.json");
+  fs.writeFileSync(hostFile, JSON.stringify({ version: deps.version, status: "pending", retryAt: 0 }));
+  const finish = Promise.withResolvers<import("../src/cli-control.ts").CliResult>();
+  let calls = 0;
+  const updater = new AutoUpdater({ ...deps, runCli: async () => { calls++; return finish.promise; } });
+  t.after(() => updater.stop()); updater.start();
+  await f.clock.advance(60_000); assert.equal(calls, 1);
+  for (let i = 0; i < 10; i++) updater.status();
+  await f.clock.advance(60_000); assert.equal(calls, 1);
+  finish.resolve({ ok: true, output: "" }); await f.clock.flush();
+  await f.clock.advance(60_000); assert.equal(calls, 2);
+  updater.stop();
+  fs.writeFileSync(hostFile, "corrupt");
+  assert.match(updater.status().hostUpdate?.error ?? "", /cannot read host update state/);
+  assert.equal(fs.readFileSync(hostFile, "utf8"), "corrupt");
+});
+
 test("old-version restart with a dead installer becomes a backed-off failure", async (t) => {
   const { updater, f, deps } = fixture(t);
   updater.install(f.check);

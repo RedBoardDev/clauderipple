@@ -28,18 +28,25 @@ import { Notifier, loadVapid, webPushSender } from "./push.ts";
 import { ExpoNotifier, expoSender } from "./expo-push.ts";
 import { RelayHost, loadHostKey } from "./relay.ts";
 import type { WsLike } from "./relay.ts";
+import { DesktopProblemAlert, RelayWatch } from "./watch.ts";
+import { OUTAGE_COPY, WATCH_TTL_S, recoveredBody } from "./protocol.ts";
 import { RouterClient } from "./router.ts";
 import { HostServer } from "./server.ts";
 import { LocalControl } from "./local-control.ts";
 import { findClaude, specFor, cliLoginWarning } from "./service.ts";
-import { installService, uninstallService, serviceStatus, servicePaths, renderService, supervisorName, controlShutdown, refreshPlan, hostBusy } from "./host-service.ts";
+import { installService, uninstallService, serviceStatus, servicePaths, renderService, supervisorName, controlShutdown, refreshPlan, hostStatus, refreshRunningHost } from "./host-service.ts";
 import { Sessions } from "./sessions.ts";
+import { REMOTE_USAGE } from "./usage.ts";
 import { desktopHandoff } from "./handoff.ts";
+import { windowsSidebarRoot } from "./sidebar.ts";
 import type { QueryFn } from "./sessions.ts";
 import { claudeBinary, claudeCodeLogin } from "../../cli/src/claude-auth.ts";
+import { ConfigStore, configPath as routerConfigPath, homeDir } from "../../router/src/config.ts";
+import { VERSION } from "../../router/src/version.ts";
+import { requestHostUpdate, refreshHostUpdate } from "./host-update.ts";
+import { applyProcessPriority } from "../../router/src/process-priority.ts";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
-const VERSION = (JSON.parse(fs.readFileSync(path.join(here, "..", "package.json"), "utf8")) as { version: string }).version;
 const out = (s: string): void => { process.stdout.write(s); };
 
 function arg(name: string): string | undefined {
@@ -121,15 +128,16 @@ function stampLines(stream: NodeJS.WriteStream): void {
 async function runHost(): Promise<void> {
   if (!process.stdout.isTTY) stampLines(process.stdout);
   if (!process.stderr.isTTY) stampLines(process.stderr);
+  const log = (line: string): void => { process.stderr.write(`${line}\n`); };
+  applyProcessPriority(new ConfigStore(routerConfigPath()).get().processPriority, { log });
   const dir = remoteHome();
   const cfg = configFromArgs(dir);
   const where = resolveBind(cfg.bind);
   const router = new RouterClient(cfg.adminUrl);
-  const permissions = PermissionQueue.open(path.join(dir, "permissions.json"));
+  const permissions = PermissionQueue.deferred(path.join(dir, "permissions.json"));
   let server: HostServer | null = null;
   const claudePath = findClaude(cfg.claudePath);
   const power = new PowerHold();
-  const log = (line: string): void => { process.stderr.write(`${line}\n`); };
   // A VAPID subject must be an https: or mailto: URL; the relay is this host's one real https origin.
   const vapid = loadVapid(dir, cfg.relay?.startsWith("https:") ? cfg.relay : "mailto:ripple-host@clauderipple.invalid");
   let sessions: Sessions | null = null;
@@ -137,29 +145,79 @@ async function runHost(): Promise<void> {
     dir, send: webPushSender(vapid), log,
     seenRecently: (id) => server?.sessionSeenRecently(id) ?? false,
     summary: (id) => sessions?.summaryOf(id),
+    context: (id, event) => sessions?.pushContext(id, event) ?? {},
   });
+  const hostKey = toB64u(loadHostKey(dir, nacl).publicKey);
   const expoNotifier = new ExpoNotifier({ dir, send: expoSender(), log,
     seenRecently: (id) => server?.sessionSeenRecently(id) ?? false,
     context: (id, event) => sessions?.pushContext(id, event) ?? {},
+    // The identity the phone paired with: a tap from a previous computer must not open a session
+    // id on this one.
+    host: hostKey,
+  });
+  // The Claude login problem is announced once per occurrence, the first moment it holds while this
+  // computer has work. The Claude app's bridge refusing and a host-run turn meeting the CLI's own
+  // missing login are the same computer's login: both feed this one alert, so the occurrence is
+  // counted once. onSessions re-asks each time the work state moves, so a problem that appeared
+  // while idle still notifies when work starts while it persists.
+  let desktopProblem: string | null = null;
+  let cliLoginProblem: string | null = null;
+  const loginAlert = new DesktopProblemAlert(
+    () => sessions?.workActive() ?? false,
+    async () => {
+      const copy = OUTAGE_COPY.loginExpired;
+      await Promise.all([
+        expoNotifier.system((lang) => copy[lang], 86_400),
+        notifier.system((lang) => copy[lang], "login-expired"),
+      ]);
+    },
+    log,
+  );
+  const reportLoginProblem = (): void => { loginAlert.update(desktopProblem ?? cliLoginProblem); };
+  /** The relay's control socket; the dead-man switch sends through it when it is open. */
+  let relayHost: RelayHost | null = null;
+  // While work is active this renews the room's alarm every minute and takes it away after two
+  // idle minutes; the room pushes "PC disconnected" only when a renewal never came (ARCHITECTURE §9).
+  const watch = new RelayWatch({
+    active: () => sessions?.workActive() ?? false,
+    targets: () => expoNotifier.targets(),
+    host: hostKey,
+    send: (msg) => relayHost?.control(msg) ?? false,
+    recover: (minutes) => expoNotifier.system((lang) => recoveredBody(lang, minutes), WATCH_TTL_S),
+    stateFile: path.join(dir, "watch.json"),
+    log,
   });
   // Mac sessions the host is not tailing push only while the Mac is away (screen locked or idle).
   const away = new MacAway({ log });
+  const handoff = claudePath ? desktopHandoff(claudePath) : undefined;
+  let sidebarRoot: string | undefined;
+  if (process.platform === "win32") {
+    try { sidebarRoot = windowsSidebarRoot(); }
+    catch (error) { log(`[desktop sidebar] discovery failed; disabled: ${error instanceof Error ? error.message : String(error)}`); }
+  }
   sessions = new Sessions({
     dir, router, permissions,
     desktopProjects: path.join(os.homedir(), ".claude", "projects"),
-    ...(process.platform === "darwin" ? { desktopSidebar: {} } : {}),
+    ...(process.platform === "darwin" ? { desktopSidebar: {} } : sidebarRoot ? { desktopSidebar: { root: sidebarRoot } } : {}),
     queryFn: query as unknown as QueryFn,
-    ...(claudePath ? { claudePath, ...(process.platform === "darwin" ? { handoff: desktopHandoff(claudePath) } : {}) } : {}),
+    ...(claudePath ? { claudePath } : {}),
+    ...(handoff ? { handoff } : {}),
     log,
-    onEvent: (id, event) => { server?.onEvent(id); void notifier.onEvent(id, event); void expoNotifier.onEvent(id, event); },
+    // A Claude app turn that closed on a wrap_up question pushes that question, not its result.
+    onEvent: (id, event) => {
+      server?.onEvent(id);
+      const push = sessions?.pushEvent(id, event) ?? event;
+      void notifier.onEvent(id, push);
+      void expoNotifier.onEvent(id, push);
+    },
     away: () => away.away(),
     onAlert: (id, body) => { void notifier.onEvent(id, body); void expoNotifier.onEvent(id, body); },
-    onSessions: () => { server?.onSessions(); if (sessions) power.update(sessions.busy()); },
-    onDesktopProblem: (problem) => server?.setDesktopProblem(problem),
+    onSessions: () => { server?.onSessions(); if (sessions) power.update(sessions.busy()); reportLoginProblem(); },
+    onDesktopProblem: (problem) => { desktopProblem = problem; server?.setDesktopProblem(problem); reportLoginProblem(); },
+    onLoginProblem: (problem) => { cliLoginProblem = problem; reportLoginProblem(); },
   });
-  sessions.recover();
   const live = sessions;
-  const host = new HostServer({
+  const host: HostServer = new HostServer({
     listen: where.listen, port: cfg.port, token: cfg.token, webDir: path.resolve(here, "..", "web"), sessions: live, router,
     hostName: os.hostname().replace(/\.local$/, ""), version: VERSION,
     recentCli: async () => (await listSessions({ limit: 300, includeProgrammatic: false })).flatMap((s) => (s.cwd ? [{ path: s.cwd, lastUsed: s.lastModified }] : [])),
@@ -174,22 +232,33 @@ async function runHost(): Promise<void> {
     local: new LocalControl({
       dir, config: cfg, version: VERSION, hostPublicKey: toB64u(loadHostKey(dir, nacl).publicKey),
       phones: () => server?.phones() ?? [],
+      inbox: live.modInbox,
+      settingsJobs: live.settingsJobs,
       rotate: token => { server?.rotateToken(token); },
       shutdown: () => stop(),
       busy: () => live.busy(),
+      prepareRefresh: () => host.prepareRefresh(),
+      refresh: () => stop(75),
     }),
   });
   server = host;
   await host.listen();
+  // Recovery writes restart notices and stopped states. A competing foreground process
+  // must fail to bind before it can append to the running host's session logs.
+  try { permissions.open(); live.recover(); }
+  catch (error) { await host.close(); throw error; }
   power.update(live.busy());
-  const relay = cfg.relay
-    ? new RelayHost({
+  if (cfg.relay) {
+    relayHost = new RelayHost({
       relay: cfg.relay, serverId: cfg.serverId, secret: cfg.relaySecret, hostKey: loadHostKey(dir, nacl), nacl, log,
       makeSocket: (url, headers) => new WebSocket(url, { headers, maxPayload: 2 * 1024 * 1024 }) as unknown as WsLike,
       onPeer: (peer) => host.connected(peer),
-    })
-    : null;
-  relay?.start();
+      // A fired dead-man alert is answered with the recovery notice and cleared (src/watch.ts).
+      onHello: (firedAt) => watch.hello(firedAt),
+    });
+    relayHost.start();
+    watch.start();
+  }
 
   out(`\nRipple Remote ${VERSION} — listening on ${where.listen}:${cfg.port}${cfg.relay ? `, relay ${cfg.relay}` : ""}\n`);
   if (claudePath) out(`Claude Code: ${claudePath}\n`);
@@ -197,15 +266,16 @@ async function runHost(): Promise<void> {
   if (process.stdout.isTTY) printPairing(cfg, dir);
   else out("Pairing QR: run `ripple-host pair` (npm run remote -- pair) in a terminal.\n");
 
-  const stop = (): void => {
+  const stop = (code = 0): void => {
     power.release();
-    relay?.stop();
+    watch.stop();
+    relayHost?.stop();
     live.shutdown();
-    void host.close().then(() => process.exit(0));
-    setTimeout(() => process.exit(0), 3000).unref();
+    void host.close().then(() => process.exit(code));
+    setTimeout(() => process.exit(code), 3000).unref();
   };
-  process.on("SIGTERM", stop);
-  process.on("SIGINT", stop);
+  process.on("SIGTERM", () => stop());
+  process.on("SIGINT", () => stop());
 }
 
 async function status(): Promise<void> {
@@ -246,26 +316,34 @@ function hostSpec(claudePath: string | undefined): ReturnType<typeof specFor> {
   return specFor({ script: fileURLToPath(import.meta.url), claudePath, ...(process.env.RIPPLE_REMOTE_HOME ? { remoteHome: process.env.RIPPLE_REMOTE_HOME } : {}) });
 }
 
-/** Run by `clauderipple update` from the new files: restarts a host this installation registered (refreshPlan). */
+/** Run from the new files. A busy/unknown host stays pending for the router's independent retry. */
 async function refreshCmd(): Promise<void> {
-  const p = servicePaths();
-  let definition: string | null = null;
-  try { definition = fs.readFileSync(p.definition, "utf8"); } catch { /* not registered */ }
-  const plan = refreshPlan({ installed: serviceStatus().installed, definition, script: fileURLToPath(import.meta.url), busy: definition === null ? undefined : await hostBusy() });
-  if (plan === "absent") return;
-  if (plan === "foreign") { out(`phone host: runs from other files (${p.definition}); left as it is\n`); return; }
-  if (plan === "busy") { out("phone host: a turn is in progress, so it keeps the old code; restart it afterwards with: clauderipple remote install\n"); return; }
-  const spec = hostSpec(findClaude(loadConfig(remoteHome(), false).claudePath));
-  for (const line of await installService(spec)) out(`phone host: ${line}\n`);
+  const home = homeDir();
+  if (!process.argv.includes("--pending")) requestHostUpdate(home, VERSION);
+  const state = await refreshHostUpdate(home, VERSION, {
+    plan: async () => {
+      const p = servicePaths();
+      let definition: string | null = null;
+      try { definition = fs.readFileSync(p.definition, "utf8"); }
+      catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+      const status = definition === null ? null : await hostStatus();
+      return refreshPlan({ installed: serviceStatus().installed, definition, script: fileURLToPath(import.meta.url), busy: status?.busy });
+    },
+    apply: () => refreshRunningHost(VERSION),
+    version: async () => (await hostStatus())?.version ?? null,
+  });
+  if (state?.status === "pending") out(`호스트 적용 대기: ${state.error ?? "진행 중인 작업이 끝나면 자동으로 다시 시도합니다."}\n`);
+  else if (state?.status === "applied") out(`휴대폰 호스트에 ${VERSION} 버전을 적용했습니다.\n`);
 }
 
 async function main(): Promise<void> {
+  if (process.argv.slice(2).some(arg => arg === "--help" || arg === "-h")) { out(REMOTE_USAGE); return; }
   const sub = process.argv[2] && !process.argv[2].startsWith("--") ? process.argv[2] : null;
   switch (sub) {
     case null: return runHost();
     case "install": return installCmd();
     case "refresh": return refreshCmd();
-    case "uninstall": for (const line of await uninstallService()) out(`${line}\n`); return;
+    case "uninstall": for (const line of await uninstallService({ explicit: true })) out(`${line}\n`); return;
     case "status": return status();
     case "pair": { const dir = remoteHome(); printPairing(configFromArgs(dir), dir); return; }
     default: throw new Error(`unknown command "${sub}" (install, uninstall, status, pair)`);

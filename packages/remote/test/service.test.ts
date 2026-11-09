@@ -65,6 +65,8 @@ test("install replaces a loaded agent and bootstraps; uninstall boots out and re
     return { status: 0, out: "" };
   };
   const spec = { ...specFor({ script: "/x/packages/remote/src/main.ts", claudePath: undefined, node: "/n/node", home: dir }), log: p.log };
+  fs.mkdirSync(path.dirname(p.plist), { recursive: true });
+  fs.writeFileSync(p.plist, plist(spec));
   install(spec, run, p);
   assert.deepEqual(calls.map((c) => c[1]), ["print", "bootout", "bootstrap"]);
   assert.equal(calls[2]![3], p.plist);
@@ -73,6 +75,20 @@ test("install replaces a loaded agent and bootstraps; uninstall boots out and re
   calls.length = 0;
   uninstall(run, p);
   assert.deepEqual(calls.map((c) => c[1]), ["print", "bootout"]);
+  assert.equal(fs.existsSync(p.plist), false);
+});
+
+test("host uninstall preserves its definition on launchctl lookup or bootout failures", t => {
+  const dir = tmp(t);
+  const p = { home: dir, plist: path.join(dir, "host.plist"), log: path.join(dir, "host.log") };
+  for (const failure of ["print", "bootout"]) {
+    fs.writeFileSync(p.plist, "owned definition");
+    const result = uninstall((_cmd, args) => ({ status: args[0] === failure ? 1 : 0, out: "permission denied" }), p);
+    assert.equal(result.state, failure === "print" ? "lookup-failed" : "stop-failed");
+    assert.equal(fs.readFileSync(p.plist, "utf8"), "owned definition");
+  }
+  const result = uninstall(() => ({ status: 113, out: "" }), p);
+  assert.equal(result.state, "removed");
   assert.equal(fs.existsSync(p.plist), false);
 });
 
@@ -207,6 +223,26 @@ test("pushes go to every device only when nobody saw that session in the last 18
   await n.onEvent("s1", { kind: "state", state: "idle" });
   await n.onEvent("nope", perm);
   assert.equal(sent.length, 0);
+});
+
+test("a web push says what the turn did, as the native push does, and falls back to the fixed words", async (t) => {
+  const sent: { title: string; body: string }[] = [];
+  const dir = tmp(t);
+  const send: Sender = async (_s, payload) => { sent.push(JSON.parse(payload)); };
+  let calls = 0;
+  const n = new Notifier({ dir, send, seenRecently: () => false, summary: (id) => (id === "s1" ? summary : undefined),
+    context: () => { calls++; return { title: summary.title, cwd: summary.cwd, text: "**로그인 버그**를 고쳤습니다" }; } });
+  n.subscribe("a", sub(1), "ko");
+  n.subscribe("b", sub(2), "ko");
+  await n.onEvent("s1", { kind: "result", ok: true, ms: 1, turns: 1 });
+  assert.deepEqual(sent.map((p) => p.body), ["로그인 버그를 고쳤습니다", "로그인 버그를 고쳤습니다"]);
+  assert.equal(sent[0]!.title, "고쳐 줘 로그인 버그");
+  assert.equal(calls, 1, "the context is read once per event, not per device");
+  sent.length = 0;
+  const broken = new Notifier({ dir: tmp(t), send, seenRecently: () => false, summary: () => summary, context: () => { throw new Error("unreadable"); } });
+  broken.subscribe("a", sub(1), "ko");
+  await broken.onEvent("s1", { kind: "result", ok: true, ms: 1, turns: 1 });
+  assert.equal(sent[0]!.body, "작업을 마쳤습니다");
 });
 
 test("a subscription the push service calls gone (404/410) is removed; other failures keep it", async (t) => {

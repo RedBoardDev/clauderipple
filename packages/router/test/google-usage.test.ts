@@ -2,7 +2,8 @@
 // the per-account cache. The response shape is the measured one (2026-10-15); the values are fake.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { GoogleUsage, googleWindowsFromGroups, parseQuotaSummary } from "../src/providers/google/usage.ts";
+import { GoogleUsage, antigravityQuotaScope, googleWindowsFromGroups, parseQuotaSummary } from "../src/providers/google/usage.ts";
+import { antigravityCliUserAgent, antigravityUserAgent } from "../src/providers/google/antigravity.ts";
 
 const measured = {
   groups: [
@@ -62,7 +63,7 @@ test("usage is cached per account and a failed lookup keeps the last good groups
   fail = true;
   const third = await instance.snapshot();
   assert.equal(third["acct-1"]?.length, 2);
-  assert.equal(seen.length, 2);
+  assert.equal(seen.length, 3, "an unreadable CLI summary also tries the IDE UA");
 });
 
 // hasRemainingQuota: cached, positive-only evidence from the last successful lookup.
@@ -76,6 +77,10 @@ const group = (displayName: string, prefix: string, buckets: unknown[]) => ({
 });
 const summary = (gemini: unknown[], thirdParty: unknown[]) => ({ groups: [group("Gemini Models", "gemini", gemini), group("Claude and GPT models", "3p", thirdParty)] });
 const healthy = () => summary([bucket("weekly", 0.5), bucket("5h", 1)], [bucket("weekly", 0.2), bucket("5h", 0.01)]);
+const ARGON = "gemini-4-argon";
+const argonBucket = (remainingFraction: unknown = 0.4, resetTime: unknown = FUTURE) => ({ ...bucket("weekly", remainingFraction, resetTime), bucketId: "gemini-argon-wtu-weekly" });
+const argonGroup = (buckets: unknown[] = [argonBucket()]) => ({ displayName: "Gemini 4 Argon", buckets });
+const withArgon = (buckets: unknown[] = [argonBucket()]) => ({ groups: [...healthy().groups, argonGroup(buckets)] });
 
 type Account = { ownerId: string; accessToken: string; projectId: string };
 function harness(initial: unknown = healthy()) {
@@ -123,6 +128,7 @@ test("every configured host is read, one failing host keeps the other's numbers 
   const shown = await usage.snapshot();
   assert.deepEqual(seen.sort(), [
     "https://daily.test/v1internal:retrieveUserQuotaSummary",
+    "https://prod.test/v1internal:retrieveUserQuotaSummary",
     "https://prod.test/v1internal:retrieveUserQuotaSummary",
   ]);
   assert.equal(shown["acct-1"]?.length, 2, "the reachable host's groups are shown");
@@ -251,6 +257,8 @@ test("hasRemainingQuota rejects invalid fractions, bad resets and missing or amb
     "zero weekly": [bucket("weekly", 0), bucket("5h", 0.5)],
     "negative": [bucket("weekly", -0.1), bucket("5h", 0.5)],
     "above one": [bucket("weekly", 0.5), bucket("5h", 1.0001)],
+    "disabled required bucket": [bucket("weekly", 0.5), { ...bucket("5h", 1), disabled: true }],
+    "malformed disabled flag": [bucket("weekly", 0.5), { ...bucket("5h", 1), disabled: "false" }],
     "null fraction": [bucket("weekly", 0.5), bucket("5h", null)],
     "nonfinite fraction": [bucket("weekly", Number.POSITIVE_INFINITY), bucket("5h", 0.5)],
     "unreadable fraction (dropped by the parse)": [bucket("weekly", 0.5), bucket("5h", "0.5")],
@@ -304,4 +312,267 @@ test("hasRemainingQuota accepts only the exact known group names and a structura
     assert.equal((shown["acct-1"]?.length ?? 0) >= 2, true);
     assert.equal(h.usage.hasRemainingQuota(h.acct(), GEMINI), false, JSON.stringify(bad));
   }
+});
+
+test("quota uses the CLI header and summary endpoint for the full Gemini, 3P and Argon groups", async () => {
+  const seen: { url: string; init: RequestInit | undefined }[] = [];
+  const usage = new GoogleUsage({ credentials: async () => [{ ownerId: "acct-1", accessToken: "tok", projectId: "proj-1" }] } as never, {
+    fetch: async (url, init) => {
+      seen.push({ url, init });
+      return Response.json(withArgon());
+    },
+    now: () => NOW,
+  });
+  const shown = await usage.snapshot();
+  assert.equal(shown["acct-1"]?.length, 3);
+  assert.equal(seen.length, 1, "a readable CLI summary needs neither an IDE nor a catalogue lookup");
+  assert.equal(seen[0]?.url, "https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary");
+  assert.equal(seen[0]?.init?.method, "POST");
+  const headers = new Headers(seen[0]?.init?.headers);
+  assert.equal(headers.get("user-agent"), antigravityCliUserAgent());
+  assert.equal(headers.get("authorization"), "Bearer tok");
+  assert.equal(headers.get("content-type"), "application/json");
+  assert.deepEqual(JSON.parse(seen[0]?.init?.body as string), { project: "proj-1" });
+});
+
+test("Argon's exact weekly bucket is scoped separately, preserving Gemini and 3P window labels", () => {
+  const windows = googleWindowsFromGroups(parseQuotaSummary(withArgon())!);
+  assert.deepEqual(windows.slice(0, -1), googleWindowsFromGroups(parseQuotaSummary(healthy())!));
+  assert.deepEqual(windows.at(-1), {
+    kind: "scoped", label: "Argon weekly", used_percent: 60, window_minutes: 10080, reset_at: Date.parse(FUTURE) / 1000,
+  });
+  assert.equal(windows.filter((w) => w.kind === "seven_day").length, 1);
+  const unknown = googleWindowsFromGroups(parseQuotaSummary({ groups: [argonGroup([{ ...argonBucket(), bucketId: "other-weekly" }])] })!);
+  assert.equal(unknown[0]?.label, "Argon", "a lookalike bucket is not the known Argon weekly window");
+});
+
+test("spent Argon cannot borrow available Flash quota, and available Argon cannot prove Flash quota", async () => {
+  const spent = harness(withArgon([argonBucket(0)]));
+  await spent.usage.snapshot();
+  assert.equal(spent.usage.hasRemainingQuota(spent.acct(), GEMINI), true);
+  for (const model of [ARGON, `${ARGON}-low`, `${ARGON}-medium`, `${ARGON}-high@high`]) {
+    assert.equal(antigravityQuotaScope(model), "argon");
+    assert.equal(spent.usage.hasRemainingQuota(spent.acct(), model), false, model);
+  }
+  const available = harness({ groups: [...summary([bucket("weekly", 0), bucket("5h", 0)], []).groups, argonGroup()] });
+  await available.usage.snapshot();
+  assert.equal(available.usage.hasRemainingQuota(available.acct(), GEMINI), false);
+  for (const model of [ARGON, `${ARGON}-low`, `${ARGON}-medium`, `${ARGON}-high@high`, "GEMINI-4-ARGON@medium"]) {
+    assert.equal(available.usage.hasRemainingQuota(available.acct(), model), true, model);
+  }
+  for (const fraction of [1, 0.00001]) {
+    const h = harness(withArgon([{ ...argonBucket(fraction), disabled: false }]));
+    await h.usage.snapshot();
+    assert.equal(h.usage.hasRemainingQuota(h.acct(), ARGON), true, String(fraction));
+  }
+});
+
+test("missing Argon stays unknown, even with Gemini room or contradictory catalogue quotaInfo", async () => {
+  const seen: string[] = [];
+  const body = { ...healthy(), models: { "gemini-4-argon-high": { quotaInfo: { remainingFraction: 1, resetTime: FUTURE } } } };
+  const usage = new GoogleUsage({ credentials: async () => [{ ownerId: "acct-1", accessToken: "tok", projectId: "proj-1" }] } as never, {
+    fetch: async (url) => {
+      seen.push(url);
+      assert.ok(url.endsWith(":retrieveUserQuotaSummary"), "catalogue quotaInfo must never be requested as quota evidence");
+      return Response.json(body);
+    },
+    now: () => NOW,
+  });
+  const shown = await usage.snapshot();
+  const account = { ownerId: "acct-1", projectId: "proj-1" };
+  assert.equal(usage.hasRemainingQuota(account, GEMINI), true);
+  assert.equal(usage.hasRemainingQuota(account, ARGON), false);
+  assert.equal(googleWindowsFromGroups(shown["acct-1"]!).some((w) => w.label?.startsWith("Argon")), false);
+  assert.equal(seen.length, 1, "an absent group is not an unreadable summary and does not trigger fallback");
+});
+
+test("weekly-only Argon evidence rejects malformed, missing, extra, duplicate or disabled buckets", async () => {
+  const cases: Record<string, unknown[]> = {
+    "missing weekly": [],
+    "spent": [argonBucket(0)],
+    "negative": [argonBucket(-0.1)],
+    "above one": [argonBucket(1.01)],
+    "null fraction": [argonBucket(null)],
+    "string fraction": [argonBucket("0.4")],
+    "nonfinite fraction": [argonBucket(Number.POSITIVE_INFINITY)],
+    "NaN fraction": [argonBucket(Number.NaN)],
+    "missing fraction": [{ bucketId: "gemini-argon-wtu-weekly", window: "weekly", resetTime: FUTURE }],
+    "missing bucket id": [bucket("weekly", 0.4)],
+    "wrong bucket id": [{ ...argonBucket(), bucketId: "gemini-weekly" }],
+    "wrong window": [{ ...argonBucket(), window: "5h" }],
+    "missing window": [{ bucketId: "gemini-argon-wtu-weekly", remainingFraction: 0.4, resetTime: FUTURE }],
+    "missing reset": [{ ...argonBucket(), resetTime: undefined }],
+    "invalid reset": [argonBucket(0.4, "not a date")],
+    "nonstring reset": [argonBucket(0.4, NOW + 60_000)],
+    "past reset": [argonBucket(0.4, new Date(NOW - 1).toISOString())],
+    "reset now": [argonBucket(0.4, new Date(NOW).toISOString())],
+    "disabled": [{ ...argonBucket(), disabled: true }],
+    "malformed disabled flag": [{ ...argonBucket(), disabled: "false" }],
+    "null disabled flag": [{ ...argonBucket(), disabled: null }],
+    "duplicate weekly": [argonBucket(), argonBucket()],
+    "extra exhausted bucket": [argonBucket(), { ...bucket("5h", 0), bucketId: "argon-5h" }],
+    "extra healthy bucket": [argonBucket(), { ...bucket("5h", 1), bucketId: "argon-5h" }],
+    "malformed duplicate": [argonBucket(), { ...argonBucket(), remainingFraction: "0" }],
+    "malformed extra": [argonBucket(), null],
+  };
+  for (const [name, buckets] of Object.entries(cases)) {
+    const h = harness(withArgon(buckets));
+    await h.usage.snapshot();
+    assert.equal(h.usage.hasRemainingQuota(h.acct(), ARGON), false, name);
+    assert.equal(h.state.calls, 1, `${name}: a display-readable CLI answer must not retry malformed evidence under the IDE UA`);
+  }
+  const bodies = [
+    { groups: [...healthy().groups, { displayName: "Gemini 4 Argon", buckets: "nope" }] },
+    { groups: [...healthy().groups, { buckets: [argonBucket()] }] },
+    { groups: [...withArgon().groups, { displayName: "Other", buckets: [null] }] },
+  ];
+  for (const body of bodies) {
+    const h = harness(body);
+    await h.usage.snapshot();
+    assert.equal(h.usage.hasRemainingQuota(h.acct(), ARGON), false, JSON.stringify(body));
+  }
+});
+
+test("Argon needs exactly one known group; case and surrounding whitespace alone are tolerated", async () => {
+  for (const name of ["gemini 4 argon preview", "Gemini Argon", "Gemini Models"]) {
+    const h = harness({ groups: [{ ...argonGroup(), displayName: name }] });
+    await h.usage.snapshot();
+    assert.equal(h.usage.hasRemainingQuota(h.acct(), ARGON), false, name);
+  }
+  const duplicate = harness({ groups: [...withArgon().groups, { ...argonGroup(), displayName: " gemini 4 ARGON " }] });
+  await duplicate.usage.snapshot();
+  assert.equal(duplicate.usage.hasRemainingQuota(duplicate.acct(), ARGON), false);
+  const normalized = harness({ groups: [{ ...argonGroup(), displayName: " gemini 4 ARGON " }] });
+  await normalized.usage.snapshot();
+  assert.equal(normalized.usage.hasRemainingQuota(normalized.acct(), ARGON), true);
+});
+
+test("unreadable CLI responses fall back to the IDE UA without establishing Argon evidence", async () => {
+  for (const failure of ["http", "json", "shape", "network"]) {
+    const headers: string[] = [];
+    const usage = new GoogleUsage({ credentials: async () => [{ ownerId: "acct-1", accessToken: "tok", projectId: "proj-1" }] } as never, {
+      fetch: async (url, init) => {
+        assert.ok(url.endsWith(":retrieveUserQuotaSummary"));
+        const ua = new Headers(init?.headers).get("user-agent")!;
+        headers.push(ua);
+        if (ua === antigravityCliUserAgent()) {
+          if (failure === "http") return new Response("nope", { status: 403 });
+          if (failure === "json") return new Response("not json");
+          if (failure === "shape") return Response.json({ nope: true });
+          throw new Error("offline");
+        }
+        // Even an unexpected Argon group under the IDE UA must not become Argon evidence.
+        return Response.json(withArgon());
+      },
+      now: () => NOW,
+      warn: () => {},
+    });
+    const shown = await usage.snapshot();
+    assert.deepEqual(headers, [antigravityCliUserAgent(), antigravityUserAgent()], failure);
+    assert.equal(shown["acct-1"]?.length, 2, failure);
+    const account = { ownerId: "acct-1", projectId: "proj-1" };
+    assert.equal(usage.hasRemainingQuota(account, GEMINI), true, failure);
+    assert.equal(usage.hasRemainingQuota(account, "claude-sonnet-4-6"), true, failure);
+    assert.equal(usage.hasRemainingQuota(account, ARGON), false, failure);
+  }
+});
+
+test("failed fallback keeps old display numbers but invalidates all quota evidence", async () => {
+  for (const failure of ["http", "json", "shape", "network"]) {
+    let fail = false;
+    let now = NOW;
+    let calls = 0;
+    const usage = new GoogleUsage({ credentials: async () => [{ ownerId: "acct-1", accessToken: "tok", projectId: "proj-1" }] } as never, {
+      fetch: async () => {
+        calls++;
+        if (!fail) return Response.json(withArgon());
+        if (failure === "http") return new Response("nope", { status: 500 });
+        if (failure === "json") return new Response("not json");
+        if (failure === "shape") return Response.json({ nope: true });
+        throw new Error("offline");
+      },
+      now: () => now,
+      ttlMs: 300_000,
+      warn: () => {},
+    });
+    const first = await usage.snapshot();
+    const account = { ownerId: "acct-1", projectId: "proj-1" };
+    assert.equal(usage.hasRemainingQuota(account, ARGON), true);
+    fail = true;
+    now += 300_001;
+    assert.deepEqual(await usage.snapshot(), first, failure);
+    assert.equal(calls, 3, failure);
+    assert.equal(usage.hasRemainingQuota(account, ARGON), false, failure);
+    assert.equal(usage.hasRemainingQuota(account, GEMINI), false, failure);
+  }
+});
+
+test("a successful IDE fallback discards prior CLI Argon evidence and its displayed group", async () => {
+  let fallback = false;
+  let now = NOW;
+  const usage = new GoogleUsage({ credentials: async () => [{ ownerId: "acct-1", accessToken: "tok", projectId: "proj-1" }] } as never, {
+    fetch: async (_url, init) => fallback && new Headers(init?.headers).get("user-agent") === antigravityCliUserAgent()
+      ? new Response("nope", { status: 500 }) : Response.json(fallback ? healthy() : withArgon()),
+    now: () => now,
+    ttlMs: 300_000,
+    warn: () => {},
+  });
+  await usage.snapshot();
+  const account = { ownerId: "acct-1", projectId: "proj-1" };
+  assert.equal(usage.hasRemainingQuota(account, ARGON), true);
+  fallback = true;
+  now += 300_001;
+  const shown = await usage.snapshot();
+  assert.equal(shown["acct-1"]?.length, 2);
+  assert.equal(usage.hasRemainingQuota(account, ARGON), false);
+  assert.equal(usage.hasRemainingQuota(account, GEMINI), true);
+});
+
+test("Argon evidence expires at the TTL or reset and rejects a backwards clock", async () => {
+  const h = harness(withArgon());
+  await h.usage.snapshot();
+  h.state.now = NOW + 299_999;
+  assert.equal(h.usage.hasRemainingQuota(h.acct(), ARGON), true);
+  h.state.now = NOW + 300_000;
+  assert.equal(h.usage.hasRemainingQuota(h.acct(), ARGON), false);
+  h.state.now = NOW - 1;
+  assert.equal(h.usage.hasRemainingQuota(h.acct(), ARGON), false);
+  const reset = NOW + 60_000;
+  const short = harness(withArgon([argonBucket(0.4, new Date(reset).toISOString())]));
+  await short.usage.snapshot();
+  short.state.now = reset - 1;
+  assert.equal(short.usage.hasRemainingQuota(short.acct(), ARGON), true);
+  short.state.now = reset;
+  assert.equal(short.usage.hasRemainingQuota(short.acct(), ARGON), false);
+});
+
+test("Argon evidence is per host, account and project; host merging only changes display", async () => {
+  let now = NOW;
+  const accounts = [{ ownerId: "acct-1", accessToken: "tok", projectId: "proj-1" }, { ownerId: "acct-2", accessToken: "tok2", projectId: "proj-2" }];
+  const usage = new GoogleUsage({ credentials: async () => accounts } as never, {
+    baseUrl: "https://daily.test",
+    hosts: () => ["https://daily.test", "https://prod.test"],
+    fetch: async (url, init) => {
+      const accountOne = JSON.parse(init?.body as string).project === "proj-1";
+      return Response.json(withArgon([argonBucket(accountOne && url.startsWith("https://daily.test/") ? 0.4 : 0)]));
+    },
+    now: () => now,
+    ttlMs: 300_000,
+  });
+  const shown = await usage.snapshot();
+  const one = { ...accounts[0]! };
+  const two = { ...accounts[1]! };
+  assert.equal(googleWindowsFromGroups(shown["acct-1"]!).find((w) => w.label === "Argon weekly")?.used_percent, 100);
+  assert.equal(usage.hasRemainingQuota(one, ARGON), true, "daily evidence is not replaced by prod's spent display bucket");
+  assert.equal(usage.hasRemainingQuota(one, ARGON, "https://prod.test"), false);
+  assert.equal(usage.hasRemainingQuota(one, ARGON, "https://unread.test"), false);
+  assert.equal(usage.hasRemainingQuota(two, ARGON), false, "another account's quota cannot establish room");
+  assert.equal(usage.hasRemainingQuota({ ...one, projectId: "proj-new" }, ARGON), false);
+  assert.equal(usage.hasRemainingQuota({ ...one, ownerId: "acct-3" }, ARGON), false);
+  accounts.shift();
+  now += 300_001;
+  await usage.snapshot();
+  assert.equal(usage.hasRemainingQuota(one, ARGON), false, "a removed account loses its evidence");
+  accounts.push({ ...one, projectId: "proj-new" });
+  assert.equal(usage.hasRemainingQuota({ ...one, projectId: "proj-new" }, ARGON), false);
 });

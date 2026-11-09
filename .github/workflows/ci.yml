@@ -1,0 +1,52 @@
+# Typecheck and test every pull request and every push to main, on macOS, Linux and Windows.
+#
+# `pull_request` (not `pull_request_target`) runs a fork's code with a read-only token and no
+# secrets, so nothing here may need one. The tests must keep to temporary homes: a runner is a
+# throwaway VM, but the same tests also run on a maintainer's Mac next to the live install.
+#
+# Linux and Windows do not block a merge yet (continue-on-error) — the suite has only been run on
+# macOS so far. Drop that once they pass.
+
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    continue-on-error: ${{ matrix.os != 'macos-latest' }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest, windows-latest]
+    env:
+      # The tray's Electron is only a type dependency at build time; its ~270MB binary is not needed.
+      ELECTRON_SKIP_BINARY_DOWNLOAD: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          package-manager-cache: false
+
+      - run: npm ci
+      - run: npm run typecheck
+      # The mod's TSX needs Claude's engine types and its tests need a local Claude installation,
+      # neither of which belongs in CI for a fork's code (G-D12). This parses the mod, resolves
+      # its relative imports and checks the manifests; `claude plugin test packages/mod` stays a
+      # maintainer step on a machine that has the engine.
+      - run: npm run check:mod
+      - run: npm test

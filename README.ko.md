@@ -19,7 +19,7 @@
 
 <p align="center">
   <a href="https://apps.apple.com/kr/app/id6823063731"><img height="40" alt="App Store" src="https://img.shields.io/badge/App%20Store-%EB%8B%A4%EC%9A%B4%EB%A1%9C%EB%93%9C-0D96F6?style=for-the-badge&logo=apple&logoColor=white"></a>
-  <img height="40" alt="Google Play" src="https://img.shields.io/badge/Google%20Play-%EC%A4%80%EB%B9%84%20%EC%A4%91-666666?style=for-the-badge&logo=googleplay&logoColor=white">
+  <a href="https://play.google.com/store/apps/details?id=com.clauderipple.remote&hl=ko"><img height="40" alt="Google Play" src="https://img.shields.io/badge/Google%20Play-%EB%8B%A4%EC%9A%B4%EB%A1%9C%EB%93%9C-01875F?style=for-the-badge&logo=googleplay&logoColor=white"></a>
   <a href="https://discord.gg/R8ZgGSNHjw"><img height="40" alt="Discord" src="https://img.shields.io/badge/Discord-%EC%B0%B8%EC%97%AC%ED%95%98%EA%B8%B0-5865F2?style=for-the-badge&logo=discord&logoColor=white"></a>
 </p>
 
@@ -51,7 +51,7 @@
     <td colspan="2" align="center"><img src="docs/media/mod-band.png" alt="리플 모드: 추론 강도, 컨텍스트, 캐시 타이머, 실제로 답한 모델과 캐시 적중률"><br><sub>리플 모드: 추론 강도, 컨텍스트, 캐시 타이머, 실제로 답한 모델과 캐시 적중률</sub></td>
   </tr>
   <tr>
-    <td align="center" width="50%"><img src="docs/media/mod-alerts.png" alt="캐시가 식거나 한도가 가까우면 경고, 새 대화로 인수인계"><br><sub>캐시가 식거나 한도가 가까우면 경고, 새 대화로 인수인계</sub></td>
+    <td align="center" width="50%"><img src="docs/media/mod-alerts.png" alt="캐시가 식거나 한도가 가까우면 경고하고 압축을 제안합니다"><br><sub>캐시가 식거나 한도가 가까우면 경고하고 압축을 제안합니다</sub></td>
     <td align="center" width="50%"><img src="docs/media/mod-settings.png" alt="빠른 설정: 자동 추론 강도, 판정 모델, 워커 모드"><br><sub>빠른 설정: 자동 추론 강도, 판정 모델, 워커 모드</sub></td>
   </tr>
 </table>
@@ -259,7 +259,7 @@ ClaudeRipple은 Claude Code 프로세스만 신뢰하는 작은 HTTPS 프록시�
   적중률이 보입니다. 작은 판정 모델(Haiku 5.5 또는 Jev)이 프롬프트마다 최근 대화와 함께 읽고 low부터 max까지 추론
   강도를 정합니다. 맡긴 일은 `ripple:auto`로 가고, 판정 모델이 난이도에 따라 워커를 고릅니다. 가벼운 일은 DeepSeek·GLM,
   어려운 일은 GPT·Opus로. 캐시가 식었을 때, 컨텍스트가 무거워졌을 때, 요금제 한도가 80%를 넘었을 때 카드로 알려 주고,
-  압축이나 같은 폴더 새 세션으로의 인수인계를 제안합니다. `Log`(또는 `/ripple-log`)로 요청 로그를 옆 패널에 엽니다.
+  압축을 제안합니다. `Log`(또는 `/ripple-log`)로 요청 로그를 옆 패널에 엽니다.
   클라이언트 화면의 스위치 하나, 또는 `clauderipple mod on`.
 - **ChatGPT 구독으로 이미지 생성.** `clauderipple image "<프롬프트>"`. 참고 이미지와 투명 배경도 됩니다. 서브에이전트에도
   방법이 적혀 있어, GPT나 DeepSeek 워커가 이미지 도구 없이 이미지를 만들고 직접 확인합니다.
@@ -301,8 +301,8 @@ Claude 데스크톱 앱에 일을 맡기고, 노트북을 덮고, 소파에서 �
   회원가입·광고·추적 없음, 무료.
 
 컴퓨터에 ClaudeRipple을 설치하고 대시보드의 **휴대폰** 화면에서 QR 코드를 한 번 스캔하면 끝입니다.
-아이폰: [App Store](https://apps.apple.com/kr/app/id6823063731). 안드로이드: Google Play 비공개 테스트 중이며
-[디스코드](https://discord.gg/R8ZgGSNHjw)에서 신청받습니다. Claude 앱 세션 연동은 macOS에서 되고,
+아이폰: [App Store](https://apps.apple.com/kr/app/id6823063731). 안드로이드:
+[Google Play](https://play.google.com/store/apps/details?id=com.clauderipple.remote&hl=ko). Claude 앱 세션 연동은 macOS에서 되고,
 컴퓨터 없이도 앱 안의 데모로 먼저 써 볼 수 있습니다.
 
 ## 설치
@@ -575,7 +575,7 @@ Codex 앱 / CLI ──/v1/responses──▶ ClaudeRipple 입구 ──▶ Claud
 
 ## 커뮤니티
 
-질문, 버그 제보, Ripple Remote 안드로이드 베타(Google Play 비공개 테스트) 신청은 디스코드에서 받습니다: [https://discord.gg/R8ZgGSNHjw](https://discord.gg/R8ZgGSNHjw). 안드로이드 베타에 참여하려면 Google Play에서 쓰는 Gmail 주소를 @pbj_ripple에게 DM으로 보내 주세요. 모두가 읽는 채널에는 올리지 마세요.
+질문과 버그 제보는 디스코드에서 받습니다: [https://discord.gg/R8ZgGSNHjw](https://discord.gg/R8ZgGSNHjw).
 
 ## 비제휴
 

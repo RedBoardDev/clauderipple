@@ -55,12 +55,12 @@ test("AA projection includes configured/alias-only targets and unmatched ids wit
   assert.equal(buildModelScores(scoreConfig(), null).models.every(m => !m.matched), true);
 });
 
-test("AA projection honors explicit provider precedence and excludes unroutable ambiguous offerings", () => {
+test("AA projection includes both qualified declarations without guessing a bare id's provider", () => {
   const cfg = scoreConfig();
   cfg.providers.second = { type: "chatgpt", models: [{ id: "gpt-6.1-sol" }, { id: "unknown-model" }] };
   const result = buildModelScores(cfg, parseScoreDataset(dataset));
-  assert.deepEqual(result.models.filter(m => m.model === "gpt-6.1-sol").map(m => m.provider), ["codex"]);
-  assert.deepEqual(result.models.filter(m => m.model === "unknown-model"), []);
+  assert.deepEqual(result.models.filter(m => m.model === "gpt-6.1-sol").map(m => m.provider), ["codex", "second"]);
+  assert.deepEqual(result.models.filter(m => m.model === "unknown-model").map(m => m.provider), ["codex", "second"]);
 });
 
 test("AA projection includes explicit fallbacks and CLI slots not declared in provider lists", () => {

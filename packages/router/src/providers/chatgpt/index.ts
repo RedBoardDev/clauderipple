@@ -5,21 +5,25 @@ import crypto from "node:crypto";
 import http from "node:http";
 import type { ChatGptProvider, ProviderModel } from "../../config.ts";
 import type { Logger } from "../../log.ts";
-import { CredentialPool, retryAfterMs } from "../../pool.ts";
+import { CredentialPool, pinnedCredential, retryAfterMs } from "../../pool.ts";
 import { ChatGptAccountPool, type ChatGptAccountSummary, type ChatGptCredential, type FetchLike } from "./accounts.ts";
 import { SseParser } from "./sse.ts";
 import { fetchWithRetry } from "../retry.ts";
+import { StartInputs } from "../start-input.ts";
 import { looksLikeAuth } from "../openai/index.ts";
 import { StreamMapper, conversationKey, estimateTokens, formatSse, serverToolNames, toResponsesRequest, toolNameRestoreMap, type AnthropicRequest, type TranslateOptions } from "./translate.ts";
 import { refusesReplayedReasoning } from "../../reasoning.ts";
 import type { RequestUsage } from "../../requestlog.ts";
-import { providerExhaustion, type ProviderExhaustion } from "../../health.ts";
-import type { SearchBackend, SearchHit, WebSearchQuery } from "../../websearch.ts";
+import { exhaustionHeaders, providerExhaustion, type ProviderExhaustion } from "../../health.ts";
+import type { SearchBackend, SearchHit, SearchOutcome, WebSearchQuery } from "../../websearch.ts";
 import { credentialHeaderValues, redactErrorText } from "../../redact.ts";
 import { codexClientVersion, latestCodexVersion, parseCodexCatalog } from "./catalog.ts";
+import { noteChatgptModelWindows } from "./windows.ts";
 import fs from "node:fs";
 import path from "node:path";
 import { homeDir, fastSwitches } from "../../config.ts";
+import { promptAdditions } from "../../identity.ts";
+import type { RequestKind } from "../../routing.ts";
 
 export const DEFAULT_BASE = "https://chatgpt.com/backend-api";
 const PING_MS = 15_000;
@@ -263,6 +267,7 @@ export type ChatGptAccountStatus = ChatGptAccountSummary & {
   cooldownSeconds?: number;
   quota: Record<string, unknown> | null;
   active: boolean;
+  inUse: boolean;
 };
 
 export class ChatGptAdapter {
@@ -337,24 +342,35 @@ export class ChatGptAdapter {
         ...(report?.cooldownSeconds ? { cooldownSeconds: report.cooldownSeconds } : {}),
         quota: this.rateLimitsByAccount.get(summary.id) ?? null,
         active: summary.id === this.activeOwner,
+        inUse: report?.inUse === true,
       };
     });
   }
 
   /** Put a cooling account back into rotation now (dashboard action). */
   clearCooldown(ownerId: string): void {
-    for (const c of this.accounts.peekCredentials()) if (c.ownerId === ownerId) this.pool.clear(this.name, c.id);
+    this.pool.clear(this.name, ownerId);
   }
 
   /**
-   * An account for one turn: the conversation's own while it is healthy, else the first usable one.
-   * "none" when nothing is signed in; null when every account is cooling or already tried.
+   * An account for one turn: the pinned one while it is present and usable, else the conversation's
+   * own while it is healthy, else the first usable one. "none" when nothing is signed in; null when
+   * every account is cooling or already tried.
    */
-  private async pick(conversation: string | undefined, tried: ReadonlySet<string> = new Set()): Promise<ChatGptCredential | "none" | null> {
+  private async pick(conversation: string | undefined, tried: ReadonlySet<string> = new Set(), pin?: string): Promise<ChatGptCredential | "none" | null> {
     const all = await this.accounts.credentials();
     if (all.length === 0) return "none";
     const rest = all.filter((c) => !tried.has(c.ownerId));
-    return (this.pool.pick(this.name, rest, conversation) as ChatGptCredential | null);
+    const pinned = pinnedCredential(this.name, rest, pin, this.pool);
+    if (pinned) {
+      if (pin && tried.size === 0) this.log.info(`chatgpt ${this.name}: account-pin ${pinned.ownerId.slice(0, 8)}`);
+      return pinned;
+    }
+    const next = this.pool.pick(this.name, rest, conversation) as ChatGptCredential | null;
+    // Once per turn: a retry after the pinned account's own refusal is the normal order, not a pin
+    // that could not be honoured.
+    if (pin && tried.size === 0) this.log.info(`chatgpt ${this.name}: account-pin fallback ${pin} → ${next ? next.ownerId.slice(0, 8) : "none"}`);
+    return next;
   }
 
   /** For side calls (search, catalogue, quota) with no conversation: a usable account, else any. */
@@ -384,7 +400,7 @@ export class ChatGptAdapter {
     };
   }
 
-  private async searchWeb(model: string, query: WebSearchQuery, maxResults = 10, signal?: AbortSignal): Promise<{ hits: SearchHit[]; text?: string }> {
+  private async searchWeb(model: string, query: WebSearchQuery, maxResults = 10, signal?: AbortSignal): Promise<SearchOutcome> {
     // The Responses tool exposes an allowed-domain filter but no exclusion filter. Ignoring a block
     // would violate the caller's request; fail visibly so the proxy can choose another backend.
     if (query.blockedDomains?.length) throw new Error("ChatGPT web search does not support blocked_domains");
@@ -443,6 +459,7 @@ export class ChatGptAdapter {
     const hits: SearchHit[] = [];
     let text = "";
     let searches = 0;
+    let usage: RequestUsage | undefined;
     try {
       for (;;) {
         const { done, value } = await reader.read();
@@ -456,6 +473,13 @@ export class ChatGptAdapter {
           if (event.type === "response.completed") {
             const completed = event.response as { tool_usage?: { web_search?: { num_requests?: unknown } }; usage?: { input_tokens?: number; input_tokens_details?: { cached_tokens?: number }; output_tokens?: number } } | undefined;
             searches = typeof completed?.tool_usage?.web_search?.num_requests === "number" ? completed.tool_usage.web_search.num_requests : searches;
+            // The search spends the account's real quota, so the log records its tokens like any
+            // other turn's: `input_tokens` is what the prompt read, `cached_tokens` the cached part.
+            const u = completed?.usage;
+            if (u) {
+              const cached = u.input_tokens_details?.cached_tokens ?? 0;
+              usage = { input: (u.input_tokens ?? 0) - cached, cached, output: u.output_tokens ?? 0 };
+            }
           }
           if (event.type === "error") throw new Error(`ChatGPT web search: ${String((event.error as { message?: unknown } | undefined)?.message ?? "backend error")}`);
         }
@@ -468,7 +492,11 @@ export class ChatGptAdapter {
     const selected = [...unique.values()].slice(0, maxResults);
     if (searches < 1 || selected.length === 0) throw new Error(`ChatGPT web search: no cited results returned (searches=${searches})`);
     const prose = text.trim();
-    return prose ? { hits: selected, text: prose } : { hits: selected };
+    return {
+      hits: selected,
+      ...(prose ? { text: prose } : {}),
+      ...(usage ? { usage } : {}),
+    };
   }
 
   /**
@@ -495,7 +523,11 @@ export class ChatGptAdapter {
       input: [{ type: "message", role: "user", content }],
       tools: [tool],
       tool_choice: "required",
-      reasoning: { effort: "low", summary: "auto" },
+      // No `reasoning` here (issue #129). Since 2026-11-04 the image tool reads the outer
+      // `reasoning.effort` as its planning `complexity` — openai-python 0152e3a, ImageGeneration.complexity:
+      // "inherits a supported outer reasoning effort" — and the default image model takes no
+      // complexity at all: "Complexity 'low' is not supported for this image model", 'medium' alike.
+      // Codex itself sends images without reasoning (codex-rs/ext/image-generation, Images API).
       store: false,
       stream: true,
       prompt_cache_key: id,
@@ -711,11 +743,13 @@ export class ChatGptAdapter {
       return null;
     }
     this.modelsCache = { at: Date.now(), models };
+    // The windows ClaudeRipple reports to Claude Code follow the catalogue from here (windows.ts).
+    noteChatgptModelWindows(models);
     return models;
   }
 
-  /** Last measured total input (uncached + cached) per conversation, for the next message_start estimate. */
-  private readonly lastInputByKey = new Map<string, number>();
+  /** Last measured input per conversation, for the next message_start estimate (start-input.ts). */
+  private readonly startInputs = new StartInputs();
 
   /**
    * The backend's `x-codex-turn-state` per conversation. Every response carries this opaque
@@ -728,14 +762,6 @@ export class ChatGptAdapter {
    * conversation is to us.
    */
   private readonly turnStateByKey = new Map<string, string>();
-
-  private rememberInput(key: string, u: { input_tokens: number; cache_read_input_tokens: number }): void {
-    const total = u.input_tokens + u.cache_read_input_tokens;
-    if (total > 0) {
-      this.lastInputByKey.set(key, total);
-      if (this.lastInputByKey.size > 500) this.lastInputByKey.delete(this.lastInputByKey.keys().next().value!);
-    }
-  }
 
   /** Troubleshooting aid (provider.debugDump): the failing exchange, secrets excluded (the request carries none). */
   private dump(status: number, anthropic: AnthropicRequest, upstreamReq: unknown, upstreamText: string): void {
@@ -767,6 +793,8 @@ export class ChatGptAdapter {
   async sendToAnAccount(spec: {
     /** Keeps the conversation on its account (the prompt cache lives there). */
     conversation: string | undefined;
+    /** The stored account a pinned worker runs on; absent for ordinary turns. */
+    accountPin?: string;
     /** Backend path under the base, e.g. `/codex/responses`. */
     path: string;
     method?: string;
@@ -781,7 +809,7 @@ export class ChatGptAdapter {
     let last: Extract<SendResult, { kind: "refused" }> | null = null;
     let lastThrown: Error | null = null;
     for (;;) {
-      const credential = await this.pick(spec.conversation, tried);
+      const credential = await this.pick(spec.conversation, tried, spec.accountPin);
       if (credential === "none") return { kind: "no-account" };
       if (credential === null) {
         if (last) return last;
@@ -941,8 +969,10 @@ export class ChatGptAdapter {
         }
         // The backend's own refusal, as Codex would have seen it without us (secrets masked).
         const text = sent.text || JSON.stringify({ error: { message: `HTTP ${sent.status}` } });
-        res.writeHead(sent.status, { "content-type": sent.headers.get("content-type") ?? "application/json", ...(sent.retryAfterSeconds ? { "retry-after": String(sent.retryAfterSeconds) } : {}) }).end(text);
-        return { status: sent.status, bytes: Buffer.byteLength(text), note: `upstream ${sent.status}` };
+        // A used-up quota (`usage_limit_reached` and its kin) is definite: the client is told so.
+        const exhaustion = providerExhaustion(sent.status, sent.text, sent.retryAfterSeconds === undefined ? undefined : sent.retryAfterSeconds * 1000);
+        res.writeHead(sent.status, { "content-type": sent.headers.get("content-type") ?? "application/json", ...(sent.retryAfterSeconds ? { "retry-after": String(sent.retryAfterSeconds) } : {}), ...(exhaustion ? exhaustionHeaders(exhaustion) : {}) }).end(text);
+        return { status: sent.status, bytes: Buffer.byteLength(text), note: `upstream ${sent.status}`, exhaustion };
       }
     }
 
@@ -1006,13 +1036,11 @@ export class ChatGptAdapter {
    * `subagent` is the one bit about the caller the tier needs: Claude Code names the agent in the
    * `x-claude-code-agent-id` header, and only a subagent's request carries it.
    */
-  private responsesOptions(carried: { replayed: number; undecodable: number }, model: string, effort: string | undefined, replay = true, subagent = false, imageHint?: string): TranslateOptions {
+  private responsesOptions(carried: { replayed: number; undecodable: number }, model: string, effort: string | undefined, replay = true, options?: { subagent?: boolean; imageHint?: string; kind?: RequestKind }): TranslateOptions {
     return {
       model,
       effort: effort ?? this.cfg.defaultEffort ?? "high",
-      identity: this.cfg.identity ?? true,
-      ...(this.cfg.instructionsAppend ? { instructionsAppend: this.cfg.instructionsAppend } : {}),
-      ...(imageHint ? { imageHint } : {}),
+      ...promptAdditions(options?.kind ?? "turn", this.cfg, options?.imageHint),
       replay,
       // The envelope names this provider and this model, and the request builder refuses anything
       // else: reasoning outlives the turn that made it, and a conversation moved to another model
@@ -1020,7 +1048,7 @@ export class ChatGptAdapter {
       env: { p: this.name, m: model },
       // The Fast switches are the provider's own, so the tier is the same however the turn arrived.
       fast: fastSwitches(this.cfg),
-      subagent,
+      subagent: options?.subagent === true,
       carried,
       log: (line) => this.log.info(`chatgpt ${this.name}: ${line} (${model})`),
     };
@@ -1032,7 +1060,7 @@ export class ChatGptAdapter {
    * `options.subagent` says the turn was made inside a subagent, which is what the provider's
    * `fast.subagent` switch is about. `options.imageHint` is how the session makes an image (translate.ts).
    */
-  async handle(req: http.IncomingMessage, res: http.ServerResponse, path: string, json: AnthropicRequest, model: string, effort: string | undefined, options?: { subagent?: boolean; imageHint?: string }): Promise<ChatGptOutcome> {
+  async handle(req: http.IncomingMessage, res: http.ServerResponse, path: string, json: AnthropicRequest, model: string, effort: string | undefined, options?: { subagent?: boolean; imageHint?: string; kind?: RequestKind; accountPin?: string }): Promise<ChatGptOutcome> {
     if (path.startsWith("/v1/messages/count_tokens")) {
       const body = JSON.stringify({ input_tokens: estimateTokens(json) });
       res.writeHead(200, { "content-type": "application/json", "content-length": String(body.length) }).end(body);
@@ -1045,12 +1073,10 @@ export class ChatGptAdapter {
     if (serverTools.size > 0) this.log.warn(`chatgpt ${this.name}: dropped server tools for ${model}: ${[...serverTools].join(", ")} (Anthropic runs these; this provider cannot)`);
 
     const carried = { replayed: 0, undecodable: 0 };
-    const subagent = options?.subagent === true;
-    let upstreamReq = toResponsesRequest(json, this.responsesOptions(carried, model, effort, true, subagent, options?.imageHint));
+    let upstreamReq = toResponsesRequest(json, this.responsesOptions(carried, model, effort, true, options));
     let body = JSON.stringify(upstreamReq);
     const cacheKey = upstreamReq.prompt_cache_key;
-    // Input estimate for message_start: a conversation only grows, so the last measured total is a floor.
-    const startInput = Math.max(estimateTokens(json), this.lastInputByKey.get(cacheKey) ?? 0);
+    const startInput = this.startInputs.start(cacheKey, estimateTokens(json));
     const ac = new AbortController();
     const onClose = (): void => ac.abort();
     res.on("close", onClose);
@@ -1060,6 +1086,7 @@ export class ChatGptAdapter {
     // first ask. The conversation stays on the account that answered: moving it costs the cache.
     const ask = (): Promise<SendResult> => this.sendToAnAccount({
       conversation: cacheKey,
+      ...(options?.accountPin ? { accountPin: options.accountPin } : {}),
       path: "/codex/responses",
       body,
       signal: ac.signal,
@@ -1088,7 +1115,7 @@ export class ChatGptAdapter {
     // must never be the reason a user's turn fails (reasoning.ts).
     if (carried.replayed > 0 && sent.kind === "refused" && refusesReplayedReasoning(sent.status, sent.text)) {
       this.log.warn(`chatgpt ${this.name}: upstream ${sent.status} refused ${carried.replayed} replayed reasoning item(s) for ${model}; asking again without them: ${sent.text.slice(0, 200)}`);
-      upstreamReq = toResponsesRequest(json, this.responsesOptions({ replayed: 0, undecodable: 0 }, model, effort, false, subagent, options?.imageHint));
+      upstreamReq = toResponsesRequest(json, this.responsesOptions({ replayed: 0, undecodable: 0 }, model, effort, false, options));
       body = JSON.stringify(upstreamReq);
       carried.replayed = 0;
       sent = await ask();
@@ -1118,11 +1145,14 @@ export class ChatGptAdapter {
         note = `upstream ${sent.status}`;
         if (this.cfg.debugDump) this.dump(sent.status, json, upstreamReq, sent.text);
       }
-      res.writeHead(err.status, { "content-type": "application/json", ...(retryAfterSeconds ? { "retry-after": String(retryAfterSeconds) } : {}) }).end(err.body);
+      const exhaustion = sent.kind === "refused"
+        ? providerExhaustion(sent.status, sent.text, sent.retryAfterSeconds === undefined ? undefined : sent.retryAfterSeconds * 1000)
+        : undefined;
+      res.writeHead(err.status, { "content-type": "application/json", ...(retryAfterSeconds ? { "retry-after": String(retryAfterSeconds) } : {}), ...(exhaustion ? exhaustionHeaders(exhaustion) : {}) }).end(err.body);
       return { status: err.status, bytes: err.body.length, note,
         ...(sent.kind === "no-account" ? { upstreamCalled: false as const, refusal: "no-account" as const } : {}),
         ...(sent.kind === "refused" && upstreamReq.service_tier !== undefined ? { requestedTier: upstreamReq.service_tier } : {}),
-        ...(sent.kind === "refused" ? { exhaustion: providerExhaustion(sent.status, sent.text, sent.retryAfterSeconds === undefined ? undefined : sent.retryAfterSeconds * 1000) } : {}),
+        ...(exhaustion ? { exhaustion } : {}),
       };
     }
     const { upstream, credential } = sent;
@@ -1189,7 +1219,7 @@ export class ChatGptAdapter {
         for (const ev of parser.feed(decoder.decode(value, { stream: true }))) {
           const outEvents = mapper.feed(ev);
           if (mapper.rateLimits && mapper.rateLimits !== this.rateLimitsByAccount.get(credential.ownerId)) this.noteRateLimits(credential, mapper.rateLimits);
-          this.rememberInput(cacheKey, mapper.usage);
+          this.startInputs.note(cacheKey, mapper.usage);
           sendEvents(outEvents);
           if (mapper.isFinished) break;
         }
@@ -1226,7 +1256,7 @@ export class ChatGptAdapter {
     if (!wantStream || (failure && !res.headersSent)) {
       // A failed turn is an error here too, not a 200 carrying whatever arrived before it failed.
       const msg = failure ? anthropicError(failedStatus, failure.type, failure.message).body : JSON.stringify(mapper.message());
-      res.writeHead(failure ? failedStatus : 200, { "content-type": "application/json", "content-length": String(Buffer.byteLength(msg)) }).end(msg);
+      res.writeHead(failure ? failedStatus : 200, { "content-type": "application/json", "content-length": String(Buffer.byteLength(msg)), ...(exhaustion && failedStatus === 429 ? exhaustionHeaders(exhaustion) : {}) }).end(msg);
       bytes = msg.length;
     } else if (!res.writableEnded) {
       res.end();

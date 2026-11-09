@@ -10,6 +10,7 @@ export const icon = {
   chevron: (s?: number) => svg(`<path d="M9 6l6 6-6 6"/>`, s),
   down: (s?: number) => svg(`<path d="M6 9l6 6 6-6"/>`, s),
   folder: (s?: number) => svg(`<path d="M3.5 7.5a2 2 0 0 1 2-2h4l2 2.2h7a2 2 0 0 1 2 2v7.8a2 2 0 0 1-2 2h-13a2 2 0 0 1-2-2z"/>`, s),
+  disk: (s?: number) => svg(`<rect x="3.5" y="6" width="17" height="12" rx="2.4"/><path d="M3.5 12.5h17"/><circle cx="7.6" cy="15.4" r="0.9" fill="currentColor"/>`, s),
   model: (s?: number) => svg(`<path d="M12 3.5l7.5 4.3v8.4L12 20.5l-7.5-4.3V7.8z"/><path d="M12 12l7.3-4.1M12 12v8.3M12 12L4.7 7.9"/>`, s),
   send: (s?: number) => svg(`<path d="M12 19V5M6 11l6-6 6 6"/>`, s),
   stop: (s?: number) => `<svg class="ic" width="${s ?? 20}" height="${s ?? 20}" viewBox="0 0 24 24" aria-hidden="true"><rect x="6.5" y="6.5" width="11" height="11" rx="2.2" fill="currentColor"/></svg>`,
@@ -27,6 +28,9 @@ export const icon = {
   home: (s?: number) => svg(`<path d="M4 11l8-6.5 8 6.5"/><path d="M6 9.5V19h12V9.5"/>`, s),
   bell: (s?: number) => svg(`<path d="M6 16.5V11a6 6 0 0 1 12 0v5.5l1.5 2h-15z"/><path d="M10 20.5a2 2 0 0 0 4 0"/>`, s),
   up: (s?: number) => svg(`<path d="M12 19V7M7 11l5-5 5 5"/><path d="M5 4.5h14"/>`, s),
+  /** A row's own actions: three dots, so the row is not one button with a second button inside it. */
+  more: (s?: number) => `<svg class="ic" width="${s ?? 20}" height="${s ?? 20}" viewBox="0 0 24 24" aria-hidden="true"><circle cx="5.5" cy="12" r="1.7" fill="currentColor"/><circle cx="12" cy="12" r="1.7" fill="currentColor"/><circle cx="18.5" cy="12" r="1.7" fill="currentColor"/></svg>`,
+  copy: (s?: number) => svg(`<path d="M8 8h12v12H8z"/><path d="M16 8V4H4v12h4"/>`, s),
 };
 
 export function toolIcon(name: string): string {
@@ -61,64 +65,24 @@ export function duration(ms: number): string {
 
 export function clock(at: number): string {
   const d = new Date(at);
-  return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+  // The phone's own 12/24-hour choice and language decide the shape; the fixed form is only a
+  // fallback for a runtime without Intl data.
+  try { return new Intl.DateTimeFormat(undefined, { hour: "numeric", minute: "2-digit" }).format(d); }
+  catch { return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`; }
 }
 
-/** The last path segment, the way a folder is named in speech. `~` for the home folder. */
-export function folderName(path: string, home?: string): string {
-  if (home && path === home) return "~";
-  const parts = path.split("/").filter(Boolean);
-  return parts[parts.length - 1] ?? "/";
+/** A file size on a phone: whole bytes below a kilobyte, then KB and MB with one decimal only
+ * where the extra digit says something (8.4 MB, but 74 MB). */
+export function fileSize(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes < 0) return "";
+  if (bytes < 1024) return `${Math.round(bytes)} B`;
+  if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KB`;
+  const mb = bytes / (1024 * 1024);
+  return `${mb < 10 ? mb.toFixed(1) : Math.round(mb)} MB`;
 }
+
+export { folderName } from "./sidebar.ts";
 
 export function shortPath(path: string, home?: string): string {
   return home && (path === home || path.startsWith(home + "/")) ? "~" + path.slice(home.length) : path;
-}
-
-const lastHtml = new WeakMap<Element, string>();
-
-/**
- * Replace a region only when its markup changed. Regions re-render every second for countdowns;
- * replacing an unchanged button under a thumb between touch-down and touch-up swallows the tap.
- */
-export function setHTML(el: Element | null, html: string): void {
-  if (!el || lastHtml.get(el) === html) return;
-  lastHtml.set(el, html);
-  el.innerHTML = html;
-}
-
-/**
- * Keyed list patch: nodes whose key and version are unchanged stay in place (scroll position,
- * text selection and expanded state survive a streaming update); changed ones are replaced.
- */
-export function patchList<T extends { key: string; ver: string }>(parent: HTMLElement, items: readonly T[], render: (item: T) => string): void {
-  const existing = new Map<string, HTMLElement>();
-  for (const child of Array.from(parent.children) as HTMLElement[]) {
-    const k = child.dataset.key;
-    if (k) existing.set(k, child);
-    else child.remove();
-  }
-  let cursor: Element | null = parent.firstElementChild;
-  const tpl = document.createElement("template");
-  for (const item of items) {
-    let node = existing.get(item.key);
-    if (node && node.dataset.ver !== item.ver) {
-      tpl.innerHTML = render(item).trim();
-      const fresh = tpl.content.firstElementChild as HTMLElement;
-      fresh.dataset.key = item.key;
-      fresh.dataset.ver = item.ver;
-      node.replaceWith(fresh);
-      if (cursor === node) cursor = fresh;
-      node = fresh;
-    } else if (!node) {
-      tpl.innerHTML = render(item).trim();
-      node = tpl.content.firstElementChild as HTMLElement;
-      node.dataset.key = item.key;
-      node.dataset.ver = item.ver;
-    }
-    existing.delete(item.key);
-    if (node !== cursor) parent.insertBefore(node, cursor);
-    else cursor = cursor.nextElementSibling;
-  }
-  for (const stale of existing.values()) stale.remove();
 }

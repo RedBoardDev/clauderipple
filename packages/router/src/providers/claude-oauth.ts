@@ -248,8 +248,13 @@ export class ClaudeOAuthSession {
     await this.exchange(code);
   }
 
-  /** Abandons the attempt (a new one may start). */
+  /**
+   * Abandons the attempt (a new one may start). A code already being exchanged is not abandoned:
+   * the browser has been told the subscription is connected, and a user who then returned to the
+   * dashboard and closed its dialog lost that sign-in to the cancel it sent (issue #88, 2026-10-24).
+   */
   cancel(): void {
+    if (this.exchanging) return;
     this.fail(new Error("Claude sign-in cancelled"));
   }
 
@@ -312,8 +317,9 @@ export class ClaudeOAuthSession {
         redirect_uri: this.redirectUri,
         code_verifier: this.verifier,
       });
+      const grant = grantFrom(reply, (this.options.now ?? Date.now)());
       this.finish();
-      this.settle.resolve(grantFrom(reply, (this.options.now ?? Date.now)()));
+      this.settle.resolve(grant);
     } catch (error) {
       this.fail(error as Error);
     }

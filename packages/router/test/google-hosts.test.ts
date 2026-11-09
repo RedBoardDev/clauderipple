@@ -50,7 +50,7 @@ test("the two hosts' catalogues merge, and the host map records who offers what"
   }) as unknown as typeof fetch;
   const merged = await fetchAvailableModels("tok", "proj", { fetchImpl });
   assert.ok(merged);
-  assert.equal(seen.length, 2, "both hosts are asked");
+  assert.equal(seen.length, 4, "both hosts are asked, once per client family (IDE and CLI)");
   const ids = merged.models.map((m) => m.id);
   assert.deepEqual(ids.filter((id) => id.startsWith("gemini-3.1-pro")), ["gemini-3.1-pro"], "prod's Pro tiers collapse to one row");
   assert.equal(ids.filter((id) => id.startsWith("gemini-3.8-flash")).length, 1, "a shared model is listed once");
@@ -94,7 +94,7 @@ test("a pinned url disables the second host", async () => {
     return Response.json(dailyCatalogue);
   }) as unknown as typeof fetch;
   const merged = await fetchAvailableModels("tok", "proj", { hosts: ["https://example.test"], fetchImpl });
-  assert.deepEqual(seen, ["https://example.test/v1internal:fetchAvailableModels"]);
+  assert.deepEqual(seen, ["https://example.test/v1internal:fetchAvailableModels", "https://example.test/v1internal:fetchAvailableModels"], "the pinned host only, once per client family");
   assert.deepEqual(merged?.hosts.get("gemini-3.8-flash"), ["https://example.test"]);
 });
 
@@ -151,7 +151,7 @@ test("a prod-only model is sent to prod, a shared model to daily, through the ad
       assert.equal(calls.length, 2);
       assert.match(calls[1]!.url, /^https:\/\/cloudcode-pa\.googleapis\.com\//, "a prod-only model goes to prod");
       assert.equal(calls[1]!.body.model, "gemini-3.1-pro-low");
-      assert.deepEqual(casts, [`${DAILY}/v1internal:fetchAvailableModels`, `${PROD}/v1internal:fetchAvailableModels`], "the catalogue is fetched once per host, not per turn");
+      assert.deepEqual(casts, [`${DAILY}/v1internal:fetchAvailableModels`, `${DAILY}/v1internal:fetchAvailableModels`, `${PROD}/v1internal:fetchAvailableModels`, `${PROD}/v1internal:fetchAvailableModels`], "the catalogue is fetched once per host and client family, not per turn");
     } finally {
       front.close();
     }

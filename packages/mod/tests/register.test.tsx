@@ -3,8 +3,10 @@ import { expect, mock, test } from 'claude-code/testing'
 import type { Engine } from 'claude-code/testing'
 import type { AgentSpawnInput, ModelCompleteRequest, ModelUsage, On, SessionMessage, ToolCallInput, TurnStepInput } from 'claude-code'
 import { MOD_SETTINGS_SCHEMA_VERSION, DEFAULTS, normalizeModes, normalizeSettings } from '../hooks/settings'
+import { QUICK_PROMPT } from '../hooks/handoff'
+import { t } from '../hooks/i18n'
 import type { Lang } from '../hooks/i18n'
-import type { AgentRec, ModSettingsSnapshot, Settings } from '../types'
+import type { AgentRec, BgTask, ModSettingsSnapshot, Settings } from '../types'
 
 const NOW = 1000000
 const USAGE: ModelUsage = { input_tokens: 100, output_tokens: 10, cache_read_input_tokens: 40000, cache_creation_input_tokens: 0 }
@@ -33,13 +35,15 @@ const MOD_OPTIONS = {
 const CONFIG = { admin: { port: 9992 }, providers: { deepseek: { models: [{ id: 'deepseek-v4.1-flash' }] }, chatgpt: { models: [{ id: 'gpt-6.1-sol' }, { id: 'gpt-6-astra' }] }, anthropic: { models: [{ id: 'claude-sonnet-5-5' }] } } }
 const SPAWN: AgentSpawnInput = { tool_use_id: 'tool1', subagentType: 'ripple:auto', prompt: 'Rename one local variable and verify it.', description: 'Rename variable', parentModel: 'claude-opus-5-5', provider: { plugin: 'engine', tier: 'core' }, background: false, fork: false }
 const MESSAGES: SessionMessage[] = [{ role: 'user', text: 'Implement the specified change and verify it.', toolUses: [] }, { role: 'assistant', text: 'The implementation is ready.', toolUses: [] }]
+// The user naming the workers a test spawns by name (worker.ts userNamed).
+const NAMED: SessionMessage[] = [{ role: 'user', text: 'Use Sol, Astra or DeepSeek for this.', toolUses: [] }]
 
-function boundaries(on: On, patch: Partial<Settings> = {}, options: { config?: unknown; paths?: string[]; key?: string; envFile?: string | (() => string); language?: unknown; env?: Record<string, string>; platform?: string; browserFailure?: 'exit' | 'throw'; appleLocale?: string; appleFail?: boolean; limits?: { kind: string; percentUsed: number; resetsAt?: string }[]; agentMessages?: (agentId: string) => SessionMessage[] } = {}) {
+function boundaries(on: On, patch: Partial<Settings> = {}, options: { config?: unknown; paths?: string[]; key?: string; envFile?: string | (() => string); language?: unknown; env?: Record<string, string>; platform?: string; browserFailure?: 'exit' | 'throw'; appleLocale?: string; appleFail?: boolean; limits?: { kind: string; percentUsed: number; resetsAt?: string }[]; agentMessages?: (agentId: string) => SessionMessage[]; messages?: SessionMessage[]; window?: number; tokens?: number; compactAt?: number | null; engineWindow?: number; context?: { model: string; window: number; tokens: number; raw?: number }; deferUsage?: (kind: 'full' | 'summary' | 'none') => Promise<void> | undefined; phoneSubmit?: (text: string) => 'submitted' | 'drop' | 'throw' } = {}) {
   const clock = mock.clock(on, { now: NOW })
   const saved = new Map<string, unknown>()
   const storeWrites: string[] = []
   const storeReads: string[] = []
-  let router: ModSettingsSnapshot = { settings: normalizeSettings({ setupDone: true, ...patch }), revision: 1, stored: true }
+  let router: ModSettingsSnapshot = { settings: normalizeSettings({ setupDone: true, ...patch }), revision: 1, stored: true, ...(options.compactAt !== undefined ? { compactAt: options.compactAt } : {}) }
   let offline = false
   let conflict: Settings | null = null
   let alwaysConflict = false
@@ -68,6 +72,8 @@ function boundaries(on: On, patch: Partial<Settings> = {}, options: { config?: u
   let percent = 20
   on('store.get', ($, e) => { storeReads.push(e.key); return { value: saved.get(e.key) } })
   on('store.set', ($, e) => { storeWrites.push(e.key); saved.set(e.key, e.value); return { value: undefined } })
+  on('store.delete', ($, e) => { saved.delete(e.key); return { value: undefined } })
+  on('store.keys', () => ({ value: [...saved.keys()] }))
   mock.env(on, { HOME: '/home/test', LANG: 'en_US.UTF-8', ...(options.key ? { TYPESAFE_API_KEY: options.key } : {}), ...options.env })
   let hostLanguage = options.language
   const processes: { argv: readonly string[]; timeoutMs?: number }[] = []
@@ -116,8 +122,20 @@ function boundaries(on: On, patch: Partial<Settings> = {}, options: { config?: u
   on('command.list', () => ({ value: [{ name: 'clear', description: 'Clear', source: 'builtin' }, { name: 'compact', description: 'Compact', source: 'builtin' }, { name: 'model', description: 'Model', source: 'builtin' }] }))
   on('session.id', () => ({ value: 'session-test' }))
   on('session.model', () => ({ value: model }))
-  on('session.messages', ($, e) => ({ value: e.agentId && options.agentMessages ? options.agentMessages(e.agentId) : MESSAGES }))
-  on('session.usage', () => ({ value: { startedAt: NOW, context: { percent, tokens: 40000, window: 200000 }, rateLimits: options.limits ?? [] } }))
+  on('session.messages', ($, e) => ({ value: e.agentId && options.agentMessages ? options.agentMessages(e.agentId) : options.messages ?? MESSAGES }))
+  // `engineWindow`: the window the session's own breakdown measures against, as /context gives it.
+  // `context`: the same, movable by a test, so a model or window switch leaves the tokens alone.
+  const breakdown = (tokens: number, raw: number, modelId = model) => ({ categories: [], totalTokens: tokens, maxTokens: raw, rawMaxTokens: raw, autocompactSource: 'clientdata' as const, percentage: Math.round(tokens / raw * 100), gridRows: [], model: modelId, memoryFiles: [], mcpTools: [], agents: [], isAutoCompactEnabled: true, apiUsage: null })
+  on('session.usage', async ($, e) => {
+    const c = options.context
+    const tokens = c?.tokens ?? options.tokens ?? 40000
+    const window = c?.window ?? options.window ?? 200000
+    const raw = c?.raw ?? c?.window ?? options.engineWindow
+    const reply = { value: { startedAt: NOW, context: { percent: c ? Math.round(tokens / window * 100) : percent, tokens, window, ...(e.breakdown && raw ? { breakdown: breakdown(tokens, raw, c?.model) } : {}) }, rateLimits: options.limits ?? [] } }
+    const wait = options.deferUsage?.(e.breakdown ?? 'none')
+    if (wait) await wait
+    return reply
+  })
   on('ui.status', () => ({ value: undefined }))
   on('ui.toast', ($, e) => { toasts.push(e.text); return { value: undefined } })
   on('ui.log', ($, e) => { logs.push(e.text); return { value: undefined } })
@@ -127,8 +145,14 @@ function boundaries(on: On, patch: Partial<Settings> = {}, options: { config?: u
   on('ui.render', () => ({ type: 'Text', props: {}, children: ['host drawing'] }))
   // What the model reads beside each prompt, as the hooks attached it.
   const contexts: (readonly string[])[] = []
-  on('prompt.submit', ($, e) => { submitted.push(e.text); contexts.push(e.context ?? []); return { text: e.text } })
+  on('prompt.submit', ($, e) => {
+    submitted.push(e.text); contexts.push(e.context ?? [])
+    const action = options.phoneSubmit?.(e.text)
+    if (action === 'throw') throw new Error('private prompt text must not be logged')
+    return action === 'drop' ? { drop: 'not accepted' } : { text: e.text }
+  })
   on('turn.complete', () => ({ text: '' }))
+  on('turn.start', ($, e) => ({ turnId: e.turnId }))
   on('prompt.read', () => ({ value: { text: '', cursor: 0 } }))
   on('prompt.fill', ($, e) => { filled.push(e.text); return { isFilled: true } })
   return { files, failWorkerLog: (value: 'read' | 'write' | null) => { logFailure = value }, registered, clock, saved, storeWrites, storeReads, settingsRequests, router: () => router, remote: (value: ModSettingsSnapshot) => { router = value }, offline: (value: boolean) => { offline = value }, conflict: (value: Settings) => { conflict = value }, alwaysConflict: (value: boolean) => { alwaysConflict = value }, toasts, logs, panes, submitted, contexts, filled, processes, language: () => resolvedLanguage, setLanguage: (value: unknown) => { hostLanguage = value }, setModel: (id: string) => { model = id }, setPercent: (value: number) => { percent = value } }
@@ -142,7 +166,7 @@ function http(on: On, exhausted = false, config: unknown = CONFIG, zen?: (input:
       zen(e)
       return { value: { ok: true, status: 200, headers: {}, text: JSON.stringify({ model: 'jev-1.13', answers: { effort: { choice: 'high', confidence: 0.95 } }, usage: { input_tokens: 50, output_tokens: 10 } }) } }
     }
-    const body = e.url.endsWith('/api/status') ? { chatgpt: { accounts: { chatgpt: [{ state: 'ready', quota: { rate_limits: { primary: { used_percent: exhausted ? 100 : 20 } } } }] } } } : e.url.endsWith('/api/config') ? config : e.url.endsWith('/api/mod-options') ? { ...MOD_OPTIONS, providers: MOD_OPTIONS.providers.map(p => p.name === 'chatgpt' ? { ...p, usable: !exhausted } : p) } : { requests: [] }
+    const body = e.url.includes('/api/phone-inbox?') ? { offers: [] } : e.url.endsWith('/api/status') ? { chatgpt: { accounts: { chatgpt: [{ state: 'ready', quota: { rate_limits: { primary: { used_percent: exhausted ? 100 : 20 } } } }] } } } : e.url.endsWith('/api/config') ? config : e.url.endsWith('/api/mod-options') ? { ...MOD_OPTIONS, providers: MOD_OPTIONS.providers.map(p => p.name === 'chatgpt' ? { ...p, usable: !exhausted } : p) } : { requests: [] }
     return { value: { ok: true, status: 200, headers: {}, text: JSON.stringify(body) } }
   })
   return urls
@@ -156,6 +180,35 @@ function spawnStub(on: On) {
   const sent: AgentSpawnInput[] = []
   on('agent.spawn', ($, e) => { sent.push(e); return { model: e.model ?? 'sonnet', agentId: 'worker-1' } })
   return sent
+}
+/** The records and counts the mod last wrote into its session atoms. */
+function agentWrites(on: On) {
+  let records: AgentRec[] = []
+  let counts: { live: number; total: number } | null = null
+  on('state.set', { plugin: 'ripple', key: 'agents' }, async ($, e, next) => {
+    const result = await next(e)
+    records = e.value as AgentRec[]
+    return result
+  })
+  on('state.set', { plugin: 'ripple', key: 'agentCounts' }, async ($, e, next) => {
+    const result = await next(e)
+    counts = e.value as { live: number; total: number }
+    return result
+  })
+  return { records: () => records, counts: () => counts }
+}
+/** A spawn that names each worker in turn: `<name>1`, `<name>2`, … */
+function numberedSpawn(on: On, name: string): void {
+  let n = 0
+  on('agent.spawn', ($, e) => { n += 1; return { model: e.model ?? 'sonnet', agentId: name + n } })
+}
+/** A session whose model and window a test can move while its tokens stay put, as a model switch leaves them. */
+function movableContext() {
+  return { model: 'claude-opus-5-5', window: 160_000, tokens: 32_000 }
+}
+/** The Context pane, as the band opens it, for a precise count's label. */
+function contextPane($: Engine) {
+  return $.ui.mount({ plugin: 'ripple', component: 'Pane', requestId: 'ripple-context', surface: 'terminal', props: { title: 'Context', isFocused: true, bodyColumns: 80, placement: 'inline', scroll: { offset: 0, bodyRows: 40 }, view: {} } })
 }
 function stepStub(on: On, usage: ModelUsage | null = USAGE) {
   const sent: TurnStepInput[] = []
@@ -306,7 +359,7 @@ test('legacy settings and setup completion migrate once; unrelated store keys su
   b.remote({ settings: normalizeSettings(null), revision: 0, stored: false })
   b.saved.set('settings', { language: 'pt', keepWarm: true, tiers: { light: { agent: 'old-worker' } } })
   b.saved.set('setupDone', true)
-  b.saved.set('handoffChoice', { kind: 'full', after: 'copy' })
+  b.saved.set('bandLayout', { density: 'compact' })
   http(on)
   await start($)
   expect(b.router().settings).toMatchObject({ language: 'pt', keepWarm: true, setupDone: true, rules: { general: { mode: 'ladder', rungs: { light: [{ target: { agent: 'old-worker' } }] } } } })
@@ -318,7 +371,7 @@ test('legacy settings and setup completion migrate once; unrelated store keys su
   expectLanguage(b, 'pt')
   expect(b.storeReads.filter(key => key === 'settings').length).toBe(1)
   expect(b.storeWrites).not.toContain('settings')
-  expect(b.saved.get('handoffChoice')).toEqual({ kind: 'full', after: 'copy' })
+  expect(b.saved.get('bandLayout')).toEqual({ density: 'compact' })
 })
 
 test('a quick change retries a stale revision once and preserves remote sibling fields', async ($, on) => {
@@ -424,6 +477,34 @@ test('offline quick changes stay local, show router notice and retry on next pol
   await ui.unmount()
 })
 
+test('a router that stops answering is said in the band, not hidden behind the last route', async ($, on) => {
+  const b = boundaries(on)
+  const route = { at: '2026-10-25T00:00:00.000Z', source: 'deepseek-v4.1-flash', target: 'deepseek-v4.1-flash', provider: 'deepseek', status: 200, ok: true, ms: 1000, session: 'session-test' }
+  let down = false
+  const lines: unknown[] = []
+  on('state.set', { plugin: 'ripple', key: 'line' }, async ($, e, next) => { const result = await next(e); lines.push(e.value); return result })
+  // A URL handler must come before http()'s catch-all: that one answers this path itself.
+  on('http.fetch', { url: /\/api\/requests/ }, () => down
+    ? { value: { ok: false, status: 503, headers: {}, text: '' } }
+    : { value: { ok: true, status: 200, headers: {}, text: JSON.stringify({ requests: [route] }) } })
+  http(on)
+  await start($)
+  await b.clock.advance(3000)
+  const ui = await band($)
+  expect(await ui.find({ type: 'Text', text: /deepseek-v4\.1-flash/ })).toBeDefined()
+  // The route is the last record; the notice is the router's state now, and one must not stand for the other.
+  down = true
+  await b.clock.advance(3000)
+  expect(lines, 'routerDown line').toContain('ClaudeRipple: router not answering')
+  expect(await ui.find({ type: 'Text', text: /router not answering/ }), 'terminal notice').toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /deepseek-v4\.1-flash/ }), 'terminal stale route').toBeUndefined()
+  await ui.unmount()
+  const desktop = await band($, 'desktop')
+  expect(await desktop.find({ type: 'Text', text: /router not answering/ }), 'desktop notice').toBeDefined()
+  expect(await desktop.find({ type: 'Text', text: /deepseek-v4\.1-flash/ }), 'desktop stale route').toBeUndefined()
+  await desktop.unmount()
+})
+
 function expectLanguage(boundary: ReturnType<typeof boundaries>, language: Lang): void {
   expect(boundary.language()).toBe(language)
 }
@@ -509,7 +590,7 @@ test('dashboard language changes re-resolve auto from current host settings', as
   await ui.unmount()
 })
 
-test('ripple:auto is judged and rewritten to the light rung\'s agent at the rung\'s effort, and the pick is logged', async ($, on) => {
+test('ripple:auto with no tier marker runs general standard on the owner\'s ladder, unjudged, and the pick is logged', async ($, on) => {
   const b = boundaries(on)
   const urls = http(on)
   const judges = judgeStub(on)
@@ -517,16 +598,18 @@ test('ripple:auto is judged and rewritten to the light rung\'s agent at the rung
   await start($)
   const result = await $.agent.spawn(SPAWN)
   expect(result.agentId).toBe('worker-1')
-  // The default ladder runs light work on DeepSeek at max, whatever effort the judge named.
-  expect(sent[0]).toMatchObject({ subagentType: 'deepseek-v4-1-flash', model: 'deepseek-v4.1-flash@max' })
-  expect(judges[0]?.model).toBe('claude-haiku-5-5')
+  // The owner's ladder runs general standard on Sol at medium; nothing judged the task.
+  expect(sent[0]).toMatchObject({ subagentType: 'gpt-6-1-sol', model: 'gpt-6.1-sol@medium' })
+  expect(judges.length).toBe(0)
+  // Provider health is still read at request time; no judge is asked, by any route.
   expect(urls).toContain('http://127.0.0.1:9992/api/status')
+  expect(urls.some(url => url.includes('typesafe') || url.includes('opencode'))).toBe(false)
   // The only debug line is the pick itself: no error was reported on the way.
   expect(b.logs.length).toBe(1)
   expect(b.logs[0]!.startsWith('ClaudeRipple worker pick: ')).toBe(true)
   expect(JSON.parse(b.logs[0]!.slice('ClaudeRipple worker pick: '.length))).toEqual({
-    task: 'Rename variable', domain: 'general', level: 'light', kind: 'do', sure: 0.9, rule: 'general', rung: 'light', position: 1, skipped: [],
-    target: { agent: 'deepseek-v4-1-flash' }, model: 'deepseek-v4.1-flash@max', effort: 'max', by: 'haiku',
+    task: 'Rename variable', domain: 'general', level: 'standard', kind: 'do', rule: 'general', rung: 'standard', position: 1, skipped: [],
+    target: { agent: 'gpt-6-1-sol' }, model: 'gpt-6.1-sol@medium', effort: 'medium', by: 'default',
   })
   const persisted = b.files.get('/home/test/.clauderipple/logs/worker-picks.jsonl')!
   expect(persisted.endsWith('\n')).toBe(true)
@@ -535,28 +618,33 @@ test('ripple:auto is judged and rewritten to the light rung\'s agent at the rung
   expect(typeof row.id).toBe('string')
   expect(row).toEqual({
     ...JSON.parse(b.logs[0]!.slice('ClaudeRipple worker pick: '.length)),
-    type: 'pick', id: row.id, at: new Date(NOW).toISOString(), by: 'judge', judge: 'haiku', ms: 0, promptChars: SPAWN.prompt.length,
-    verdict: { domain: 'general', level: 'light', kind: 'do', effort: 'low', sure: 0.9, why: 'small rename' },
+    type: 'pick', id: row.id, at: new Date(NOW).toISOString(), promptChars: SPAWN.prompt.length,
   })
+  // The worker judge is gone: its keys no longer reach a pick row.
+  for (const key of ['verdict', 'judge', 'ms', 'error', 'sure', 'tier']) expect(row).not.toHaveProperty(key)
   const stats = await $.command.run({ command: 'ripple', origin: { kind: 'composer' }, presentation: { isFullscreen: true, columns: 140 }, args: 'stats' })
-  expect(stats.text).toContain('light 1')
+  expect(stats.text).toContain('standard 1')
 })
 
-test('worker pick persistence keeps the last 3,000 lines and concurrent marker picks, never the prompt', async ($, on) => {
-  const b = boundaries(on, {}, { env: { CLAUDERIPPLE_HOME: '/custom/ripple' } })
+test('worker pick persistence keeps the last 3,000 lines and concurrent reasoned picks, never the prompt', async ($, on) => {
+  const b = boundaries(on, {}, { env: { CLAUDERIPPLE_HOME: '/custom/ripple' }, messages: NAMED })
   http(on)
   const judges = judgeStub(on)
   spawnStub(on)
   const path = '/custom/ripple/logs/worker-picks.jsonl'
   b.files.set(path, Array.from({ length: 3005 }, (_, n) => JSON.stringify({ old: n })).join('\n') + '\n')
   await start($)
-  await Promise.all(['first', 'second'].map(label => $.agent.spawn({ ...SPAWN, description: label + 'x'.repeat(220), prompt: '[[ripple: gpt-6-1-sol@xhigh]]\nPRIVATE_TASK_PROMPT' })))
+  const prompt = '[[ripple: gpt-6-1-sol@xhigh]]\nModel reason: user "Use Sol, Astra"\nPRIVATE_TASK_PROMPT'
+  await Promise.all(['first', 'second'].map(label => $.agent.spawn({ ...SPAWN, description: label + 'x'.repeat(220), prompt })))
   const text = b.files.get(path)!
   const rows = text.trim().split('\n').map(line => JSON.parse(line))
   expect(rows.length).toBe(3000)
   expect(rows[0]).toEqual({ old: 7 })
   expect(rows.slice(-2).map(row => row.task).sort()).toEqual(['first' + 'x'.repeat(195), 'second' + 'x'.repeat(194)])
-  for (const row of rows.slice(-2)) expect(row).toMatchObject({ by: 'marker', verdict: null, judge: null, ms: 0, model: 'gpt-6.1-sol@xhigh', effort: 'xhigh' })
+  for (const row of rows.slice(-2)) {
+    expect(row).toMatchObject({ by: 'user', namedModel: 'gpt-6-1-sol', source: 'user', model: 'gpt-6.1-sol@xhigh', effort: 'xhigh' })
+    expect(row).not.toHaveProperty('rung')
+  }
   expect(text).not.toContain('PRIVATE_TASK_PROMPT')
   expect(b.logs.join('\n')).not.toContain('PRIVATE_TASK_PROMPT')
   expect(judges.length).toBe(0)
@@ -565,7 +653,6 @@ test('worker pick persistence keeps the last 3,000 lines and concurrent marker p
 for (const failure of ['read', 'write'] as const) test(`worker log ${failure} failure reports without changing the spawn and later recovers`, async ($, on) => {
   const b = boundaries(on)
   http(on)
-  judgeStub(on)
   const sent = spawnStub(on)
   const path = '/home/test/.clauderipple/logs/worker-picks.jsonl'
   const previous = JSON.stringify({ previous: true }) + '\n'
@@ -573,7 +660,8 @@ for (const failure of ['read', 'write'] as const) test(`worker log ${failure} fa
   b.failWorkerLog(failure)
   await start($)
   expect((await $.agent.spawn(SPAWN)).agentId).toBe('worker-1')
-  expect(sent[0]).toMatchObject({ subagentType: 'deepseek-v4-1-flash', model: 'deepseek-v4.1-flash@max' })
+  expect(sent.length).toBe(1)
+  expect(sent[0]).toMatchObject({ subagentType: 'gpt-6-1-sol', model: 'gpt-6.1-sol@medium' })
   expect(b.logs.some(log => log.includes('worker pick log') && log.includes(`worker log ${failure} denied`))).toBe(true)
   expect(b.files.get(path)).toBe(previous)
   b.failWorkerLog(null)
@@ -581,39 +669,43 @@ for (const failure of ['read', 'write'] as const) test(`worker log ${failure} fa
   expect(b.files.get(path)!.trim().split('\n').length).toBe(2)
 })
 
-for (const error of ['api-error: overloaded (503)', 'aborted'] as const) test(`failed worker judge persists defaults with ${error}`, async ($, on) => {
+// A model is named only with its source, and the mod checks each claim before it runs anything.
+for (const [label, prompt, said] of [
+  ['no Model reason line', '[[ripple: gpt-6-1-sol@high]]\nReview this.', 'No reason was given for the model gpt-6-1-sol'],
+  ['a quote the user never said', '[[ripple: gpt-6-1-sol@high]]\nModel reason: user "Use Astra now"\nReview this.', "not in the user's recent messages"],
+  ['a name this machine cannot run', '[[ripple: nope-model@high]]\nModel reason: rule CLAUDE.md — always\nReview this.', 'cannot run on this computer'],
+] as const) test(`a model marker is refused with ${label}`, async ($, on) => {
   const b = boundaries(on)
   http(on)
-  on('model.complete', async ($, e) => {
-    expect(e.timeoutMs).toBe(6000)
-    if (error === 'aborted') await b.clock.advance(6000)
-    return { value: error === 'aborted' ? { isAnswered: false, reason: 'aborted', usage: USAGE } : { isAnswered: false, reason: 'api-error', status: 503, error: 'overloaded', usage: USAGE } }
-  })
+  const judges = judgeStub(on)
   const sent = spawnStub(on)
   await start($)
-  expect((await $.agent.spawn(SPAWN)).agentId).toBe('worker-1')
-  const row = JSON.parse(b.files.get('/home/test/.clauderipple/logs/worker-picks.jsonl')!)
-  expect(row).toMatchObject({ by: 'default', verdict: null, judge: null, error, ms: error === 'aborted' ? 12000 : 0, rung: 'standard', model: 'gpt-6.1-sol@medium', effort: 'medium', position: 1, skipped: [] })
-  expect(sent[0]).toMatchObject({ subagentType: 'gpt-6-1-sol', model: 'gpt-6.1-sol@medium' })
+  const result = await $.agent.spawn({ ...SPAWN, prompt })
+  expect(result.deny).toContain(said)
+  expect(sent.length).toBe(0)
+  expect(judges.length).toBe(0)
+  expect(b.logs).toEqual([])
+  expect(b.files.get('/home/test/.clauderipple/logs/worker-picks.jsonl')).toBeUndefined()
 })
 
-// The main chat only delegates; the judge picks among all four workers (2026-10-12 revision).
-for (const prefix of ['ripple:', '']) for (const [level, kind, rung, agent, model, effort] of [
-  ['light', 'do', 'light', 'deepseek-v4-1-flash', 'deepseek-v4.1-flash@max', 'max'],
-  ['standard', 'do', 'standard', 'gpt-6-1-sol', 'gpt-6.1-sol@medium', 'medium'],
-  ['deep', 'do', 'hard', 'gpt-6-astra', 'gpt-6-astra@high', 'high'],
-  ['deep', 'plan', 'plan', 'general-purpose', 'opus', 'high'],
-] as const) test(`${prefix}auto: a ${level} ${kind} verdict runs the ${rung} rung`, async ($, on) => {
+// The session names the tier on the prompt's first line; the owner's ladder names the model.
+for (const prefix of ['ripple:', '']) for (const [tier, level, kind, rung, agent, model, effort] of [
+  ['light', 'light', 'do', 'light', 'deepseek-v4-1-flash', 'deepseek-v4.1-flash@max', 'max'],
+  ['standard', 'standard', 'do', 'standard', 'gpt-6-1-sol', 'gpt-6.1-sol@medium', 'medium'],
+  ['hard', 'deep', 'do', 'hard', 'gpt-6-astra', 'gpt-6-astra@high', 'high'],
+  ['max', 'deep', 'plan', 'plan', 'general-purpose', 'claude-opus-5-5', 'high'],
+] as const) test(`${prefix}auto: a [[ripple: ${tier}]] marker runs the ${rung} rung by the session's word`, async ($, on) => {
   const b = boundaries(on)
   http(on)
-  const judges = judgeStub(on, JSON.stringify({ domain: 'general', level, kind, effort: 'low', sure: 0.9, why: 'judged' }))
+  const judges = judgeStub(on)
   const sent = spawnStub(on)
   const steps = stepStub(on)
   await start($)
-  await $.agent.spawn({ ...SPAWN, subagentType: prefix + 'auto' })
-  expect(judges.length).toBe(1)
-  expect(sent[0]).toMatchObject({ subagentType: agent, model })
-  expect(JSON.parse(b.logs.find(log => log.startsWith('ClaudeRipple worker pick: '))!.slice('ClaudeRipple worker pick: '.length))).toMatchObject({ level, kind, rung, by: 'haiku', effort })
+  await $.agent.spawn({ ...SPAWN, subagentType: prefix + 'auto', prompt: `[[ripple: ${tier}]]\n${SPAWN.prompt}` })
+  expect(judges.length).toBe(0)
+  expect(sent[0]).toMatchObject({ subagentType: agent === 'general-purpose' ? 'ripple:auto' : agent, model, prompt: SPAWN.prompt })
+  expect(JSON.parse(b.logs.find(log => log.startsWith('ClaudeRipple worker pick: '))!.slice('ClaudeRipple worker pick: '.length))).toMatchObject({ level, kind, rung, by: 'session', effort })
+  expect(JSON.parse(b.files.get('/home/test/.clauderipple/logs/worker-picks.jsonl')!)).toMatchObject({ tier, by: 'session' })
   // Named workers carry effort in their model suffix; Claude's own agent gets it on turn.step.
   if (agent === 'general-purpose') {
     await step($, 'claude-opus-5-5', 'low', 'worker-1')
@@ -621,30 +713,24 @@ for (const prefix of ['ripple:', '']) for (const [level, kind, rung, agent, mode
   }
 })
 
-// The main chat may name the tier itself; the judge then only rates it in the shadow (2026-10-15).
-for (const [tier, rung, agent, model] of [
-  ['light', 'light', 'deepseek-v4-1-flash', 'deepseek-v4.1-flash@max'],
-  ['standard', 'standard', 'gpt-6-1-sol', 'gpt-6.1-sol@medium'],
-  ['hard', 'hard', 'gpt-6-astra', 'gpt-6-astra@high'],
-  ['max', 'plan', 'general-purpose', 'opus'],
-] as const) test(`a [[ripple: ${tier}]] marker runs the ${rung} rung, the judge rating it only in the log`, async ($, on) => {
-  const b = boundaries(on)
+// A model marker with the user's own words: the mod checks the quote and never reads it as language.
+test('a model marker with a quoted user reason runs that model at its @effort, by user, and its outcome joins the pick', async ($, on) => {
+  const b = boundaries(on, {}, { messages: [{ role: 'user', text: 'Use Sol, Astra or DeepSeek for this task.', toolUses: [] }] })
   http(on)
-  const judges = judgeStub(on, JSON.stringify({ domain: 'backend', level: 'deep', kind: 'do', effort: 'high', sure: 0.8, why: 'judged' }))
+  const judges = judgeStub(on)
   const sent = spawnStub(on)
   await start($)
-  await $.agent.spawn({ ...SPAWN, prompt: `[[ripple: ${tier}]]\nRename one local variable and verify it.` })
+  await $.agent.spawn({ ...SPAWN, prompt: '[[ripple: gpt-6-1-sol@xhigh]]\nModel reason: user "use sol, astra"\nReview the change.' })
   await b.clock.settle()
-  // The tier marker is the main chat's to the mod, never a model name the router would see.
-  expect(sent[0]).toMatchObject({ subagentType: agent, model, prompt: 'Rename one local variable and verify it.' })
+  // The worker reads neither the marker nor the reason line.
+  expect(sent[0]).toMatchObject({ subagentType: 'gpt-6-1-sol', model: 'gpt-6.1-sol@xhigh', prompt: 'Review the change.' })
+  expect(judges.length).toBe(0)
   const rows = b.files.get('/home/test/.clauderipple/logs/worker-picks.jsonl')!.trim().split('\n').map(line => JSON.parse(line))
   const pick = rows.find(row => row.type === 'pick')
-  expect(pick).toMatchObject({ by: 'session', tier, rung, judge: null, verdict: null })
-  // The judge still rated the same brief, beside the pick, without holding the spawn.
-  expect(judges.length).toBe(1)
-  expect(rows.find(row => row.type === 'shadow')).toMatchObject({ pick: pick.id, rung: 'hard', judge: 'haiku', verdict: { level: 'deep', kind: 'do' } })
+  expect(pick).toMatchObject({ by: 'user', namedModel: 'gpt-6-1-sol', source: 'user', reason: '"use sol, astra"', domain: 'general', level: 'standard', model: 'gpt-6.1-sol@xhigh', effort: 'xhigh' })
+  expect(pick.rung).toBeUndefined()
   // The worker's end joins the same pick.
-  await complete($, 'worker-1', 'Renamed and tested.')
+  await complete($, 'worker-1', 'Reviewed and fixed.')
   const after = b.files.get('/home/test/.clauderipple/logs/worker-picks.jsonl')!.trim().split('\n').map(line => JSON.parse(line))
   expect(after.find(row => row.type === 'outcome')).toMatchObject({ pick: pick.id, agent: 'worker-1', reason: 'answer', aborted: false, ms: 1000, answerChars: 19 })
   // Once: a second completion of the same agent writes no second outcome.
@@ -652,100 +738,295 @@ for (const [tier, rung, agent, model] of [
   expect(b.files.get('/home/test/.clauderipple/logs/worker-picks.jsonl')!.trim().split('\n').filter(line => line.includes('"outcome"')).length).toBe(1)
 })
 
-for (const domain of ['design', 'frontend', 'backend', 'docs'] as const) test(`auto selects the ${domain} task's domain ladder or its own general fallback`, async ($, on) => {
-  const b = boundaries(on, { domainRules: {
-    ui: { mode: 'ladder', rungs: { light: [{ target: { agent: 'gpt-6-astra' }, effort: 'high' }], hard: [{ target: { agent: 'gpt-6-1-sol' }, effort: 'high' }] } },
-    backend: { mode: 'ladder', rungs: { light: [{ target: { agent: 'gpt-6-1-sol' }, effort: 'medium' }] } },
-  } })
+test('a worker that ends before its spawn is recorded is listed as ended, not running', async ($, on) => {
+  const b = boundaries(on)
   http(on)
-  judgeStub(on, JSON.stringify({ domain, level: 'light', kind: 'do', effort: 'low', sure: 0.9, why: 'domain' }))
+  judgeStub(on)
+  let written: AgentRec[] = []
+  on('state.set', { plugin: 'ripple', key: 'agents' }, async ($, e, next) => {
+    const result = await next(e)
+    written = e.value as AgentRec[]
+    return result
+  })
+  // Its first request fails at once: the end arrives while the spawn hook is still at work.
+  const engine = $
+  on('agent.spawn', async () => {
+    await engine.turn.complete({ turnId: 'turn-1', answer: '', reason: 'error', durationMs: 72, isAborted: false, agentId: 'worker-1' })
+    return { model: 'gpt-6.1-sol@high', agentId: 'worker-1' }
+  })
+  await start($)
+  await $.agent.spawn({ ...SPAWN, prompt: '[[ripple: standard]]\nVerify one claim.' })
+  await b.clock.settle()
+  // Its card keeps the time the run took, which a later resume adds to.
+  expect(written.find(a => a.id === 'worker-1')).toMatchObject({ state: 'failed', endedAt: NOW, startedAt: NOW - 72 })
+  const rows = b.files.get('/home/test/.clauderipple/logs/worker-picks.jsonl')!.trim().split('\n').map(line => JSON.parse(line))
+  expect(rows.find(row => row.type === 'outcome')).toMatchObject({ pick: rows.find(row => row.type === 'pick').id, agent: 'worker-1', reason: 'error', ms: 72 })
+})
+
+// 2026-11-07: a SendMessage that woke a finished worker showed it running in the Claude app's
+// background list, while its card stayed under "done" with the first run's time.
+test('a finished worker a message resumes is running again, its earlier time kept and its pick counted once', async ($, on) => {
+  const b = boundaries(on)
+  http(on)
+  judgeStub(on)
+  spawnStub(on)
+  const seen = agentWrites(on)
+  await start($)
+  await $.agent.spawn({ ...SPAWN, prompt: '[[ripple: standard]]\nVerify one claim.' })
+  await b.clock.advance(4000)
+  await complete($, 'worker-1')
+  expect(seen.records().find(a => a.id === 'worker-1')).toMatchObject({ state: 'done' })
+  await b.clock.advance(60000)
+  const woke = NOW + 64000
+  await $.agent.spawn({ ...SPAWN, prompt: 'One more check.', resume: { agentId: 'worker-1' } } as AgentSpawnInput)
+  await b.clock.settle()
+  const resumed = seen.records().find(a => a.id === 'worker-1')!
+  expect(resumed).toMatchObject({ state: 'running', startedAt: woke, ranMs: 4000 })
+  expect(resumed.endedAt).toBeUndefined()
+  expect(seen.counts()?.live).toBe(1)
+  await b.clock.advance(2000)
+  await complete($, 'worker-1')
+  expect(seen.records().find(a => a.id === 'worker-1')).toMatchObject({ state: 'done', startedAt: woke, endedAt: woke + 2000, ranMs: 4000 })
+  expect(b.files.get('/home/test/.clauderipple/logs/worker-picks.jsonl')!.trim().split('\n').filter(line => line.includes('"outcome"')).length).toBe(1)
+})
+
+test('a resumed run that ends or calls a tool before its spawn answers is settled once, and a refused wake leaves the card as it was', async ($, on) => {
+  const b = boundaries(on)
+  http(on)
+  judgeStub(on)
+  const seen = agentWrites(on)
+  const engine = $
+  let mode: 'start' | 'fast' | 'deny' = 'start'
+  on('agent.spawn', async ($, e) => {
+    if (mode === 'deny') return { deny: 'parked' }
+    if (mode === 'fast') {
+      await engine.tool.call({ tool: 'Bash', command: 'date', agentId: 'worker-1' })
+      await engine.turn.complete({ turnId: 'turn-2', answer: 'Again.', reason: 'answer', durationMs: 50, isAborted: false, agentId: 'worker-1' })
+    }
+    return { model: 'gpt-6.1-sol@high', agentId: 'worker-1' }
+  })
+  on('tool.call', () => ({ result: 'ok' }))
+  await start($)
+  await $.agent.spawn({ ...SPAWN, prompt: '[[ripple: standard]]\nVerify one claim.' })
+  await b.clock.advance(4000)
+  await complete($, 'worker-1')
+  mode = 'fast'
+  await b.clock.advance(60000)
+  await $.agent.spawn({ ...SPAWN, prompt: 'One more check.', resume: { agentId: 'worker-1' } } as AgentSpawnInput)
+  await b.clock.settle()
+  const settled = seen.records().find(a => a.id === 'worker-1')!
+  expect(settled).toMatchObject({ state: 'done', ranMs: 4000 })
+  expect(seen.counts()?.live).toBe(0)
+  expect(b.files.get('/home/test/.clauderipple/logs/worker-picks.jsonl')!.trim().split('\n').filter(line => line.includes('"outcome"')).length).toBe(1)
+  mode = 'deny'
+  await b.clock.advance(60000)
+  await $.agent.spawn({ ...SPAWN, prompt: 'Refused.', resume: { agentId: 'worker-1' } } as AgentSpawnInput)
+  await b.clock.settle()
+  expect(seen.records().find(a => a.id === 'worker-1')).toEqual(settled)
+  expect(seen.counts()?.live).toBe(0)
+})
+
+// 2026-10-25: a flat slice(-40) over every record dropped the oldest running worker the moment 41
+// ran at once: its card, the band's live count and every later step's tokens and effort vanished.
+test('workers all stay listed past forty, counted, and still take their steps during long tools', async ($, on) => {
+  const b = boundaries(on)
+  http(on)
+  judgeStub(on)
+  stepStub(on)
+  on('tool.call', async () => { await b.clock.sleep(30000); return { result: 'ok' } })
+  numberedSpawn(on, 'run-')
+  const seen = agentWrites(on)
+  await start($)
+  for (let i = 1; i <= 41; i++) await $.agent.spawn({ ...SPAWN, subagentType: 'Explore', description: 'Worker ' + i })
+  expect(seen.records().map(a => a.id)).toEqual(Array.from({ length: 41 }, (_, i) => 'run-' + (i + 1)))
+  expect(seen.records().every(a => a.state === 'running')).toBe(true)
+  expect(seen.counts()).toEqual({ live: 41, total: 41 })
+  // The oldest keeps its card and its numbers: a step is still added to it.
+  await step($, 'claude-opus-5-5', 'high', 'run-1')
+  expect(seen.records().find(a => a.id === 'run-1')).toMatchObject({ effort: 'high' })
+  expect(seen.records().find(a => a.id === 'run-1')?.usage).toEqual({ input: 100, cached: 40000, cacheWrite: 0, output: 10 })
+  // A worker executing a long tool stays running: it must not be the one dropped past forty.
+  const input: ToolCallInput = { tool: 'Bash', command: 'npm test', agentId: 'run-2', tool_use_id: 'tool-wait' }
+  const waiting = $.tool.call(input)
+  await b.clock.settle()
+  await b.clock.advance(15000)
+  expect(seen.records().find(a => a.id === 'run-2')?.state).toBe('running')
+  // A forty-second worker joins them; long-running tools still count as live.
+  await $.agent.spawn({ ...SPAWN, subagentType: 'Explore', description: 'Worker 42' })
+  expect(seen.records()).toHaveLength(42)
+  expect(seen.records().some(a => a.id === 'run-2' && a.state === 'running')).toBe(true)
+  expect(seen.counts()).toEqual({ live: 42, total: 42 })
+  await b.clock.advance(15000)
+  await waiting
+  // The band and the pane both count them from that list.
+  const bandUi = await band($)
+  expect(String((await bandUi.find({ key: 'agents' }))?.props.label)).toContain('42')
+  await bandUi.unmount()
+  const pane = await $.ui.mount({ plugin: 'ripple', component: 'Pane', requestId: 'ripple-agents', surface: 'terminal', props: { title: 'Agents', isFocused: true, bodyColumns: 100, placement: 'inline', scroll: { offset: 0, bodyRows: 30 }, view: {} } })
+  expect(await pane.find({ type: 'Text', text: /42 running/ })).toBeDefined()
+})
+
+test('only finished workers are capped, at the newest forty; running ones and the order stay', async ($, on) => {
+  const b = boundaries(on)
+  http(on)
+  judgeStub(on)
+  numberedSpawn(on, 'task-')
+  const seen = agentWrites(on)
+  await start($)
+  for (let i = 1; i <= 45; i++) await $.agent.spawn({ ...SPAWN, subagentType: 'Explore', description: 'Task ' + i })
+  for (let i = 1; i <= 45; i++) { await b.clock.advance(1000); await complete($, 'task-' + i) }
+  expect(seen.records().map(a => a.id)).toEqual(Array.from({ length: 40 }, (_, i) => 'task-' + (i + 6)))
+  expect(seen.records().every(a => a.state === 'done')).toBe(true)
+  // Two workers run beside them: the finished cap never touches a running record.
+  await $.agent.spawn({ ...SPAWN, subagentType: 'Explore', description: 'Live one' })
+  await $.agent.spawn({ ...SPAWN, subagentType: 'Explore', description: 'Live two' })
+  expect(seen.records().map(a => a.id)).toEqual([...Array.from({ length: 40 }, (_, i) => 'task-' + (i + 6)), 'task-46', 'task-47'])
+  // One ending adds to the finished side and drops the oldest finished record, not a live one.
+  await b.clock.advance(1000)
+  await complete($, 'task-46')
+  expect(seen.records()).toHaveLength(41)
+  expect(seen.records().filter(a => a.state === 'done').map(a => a.id)).toEqual(Array.from({ length: 40 }, (_, i) => 'task-' + (i + 7)))
+  expect(seen.records().some(a => a.id === 'task-47' && a.state === 'running')).toBe(true)
+  expect(seen.counts()).toEqual({ live: 1, total: 41 })
+})
+
+test('a worker spawned again under the same id is one record, updated in place', async ($, on) => {
+  boundaries(on)
+  http(on)
+  judgeStub(on)
+  let n = 0
+  on('agent.spawn', ($, e) => { n += 1; return { model: e.model ?? 'sonnet', agentId: n === 2 ? 'worker-2' : 'worker-1' } })
+  const seen = agentWrites(on)
+  await start($)
+  await $.agent.spawn({ ...SPAWN, subagentType: 'Explore', description: 'First run' })
+  await $.agent.spawn({ ...SPAWN, subagentType: 'Explore', description: 'Second worker' })
+  await complete($, 'worker-1')
+  expect(seen.records().find(a => a.id === 'worker-1')?.state).toBe('done')
+  await $.agent.spawn({ ...SPAWN, subagentType: 'Explore', description: 'Runs again' })
+  expect(seen.records().map(a => a.id)).toEqual(['worker-2', 'worker-1'])
+  expect(seen.records().find(a => a.id === 'worker-1')).toMatchObject({ description: 'Runs again', state: 'running' })
+  expect(seen.records().find(a => a.id === 'worker-1')?.endedAt).toBeUndefined()
+})
+
+test('a background command and a watch are listed from their calls and ended by notice, stop and Stop', async ($, on) => {
+  const b = boundaries(on)
+  http(on)
+  let written: BgTask[] = []
+  on('state.set', { plugin: 'ripple', key: 'bgTasks' }, async ($, e, next) => {
+    const result = await next(e)
+    written = e.value as BgTask[]
+    return result
+  })
+  // The tools' own results as core answers them (claude-code-tools BuiltinToolResults).
+  on('tool.call', ($, e) => {
+    if (e.tool === 'Bash') return { result: { stdout: '', stderr: '', interrupted: false, backgroundTaskId: e.command.includes('dev') ? 'b-dev' : e.command.includes('scrape') ? 'b-scrape' : 'b-test' } }
+    if (e.tool === 'Monitor') return { result: { taskId: 'm-log', timeoutMs: 300000 } }
+    if (e.tool === 'TaskStop') return { result: { message: 'stopped', task_id: e.task_id!, task_type: 'local_bash' } }
+    return { result: {} }
+  })
+  on('classic.Stop', () => ({}))
+  await start($)
+  await $.tool.call({ tool: 'Bash', command: 'npm run dev', description: 'Start the dev server', run_in_background: true })
+  await $.tool.call({ tool: 'Bash', command: 'npm test', run_in_background: true })
+  await $.tool.call({ tool: 'Monitor', command: 'tail -f app.log', description: 'Watch the app log', timeout_ms: 300000 })
+  expect(written.map(task => [task.id, task.kind, task.title, task.state])).toEqual([
+    ['b-dev', 'shell', 'Start the dev server', 'running'], ['b-test', 'shell', 'npm test', 'running'], ['m-log', 'monitor', 'Watch the app log', 'running'],
+  ])
+  // A watch's event carries no status and ends nothing; the command's notice says it failed, and how.
+  await $.prompt.submit({ text: '<task-notification>\n<task-id>m-log</task-id>\n<event>ready</event>\n</task-notification>', origin: { kind: 'task-notification' }, wait: false })
+  await $.prompt.submit({ text: '<task-notification>\n<task-id>b-test</task-id>\n<status>failed</status>\n<summary>Background command "npm test" failed with exit code 1</summary>\n</task-notification>', origin: { kind: 'task-notification' }, wait: false })
+  expect(written.find(task => task.id === 'm-log')?.state).toBe('running')
+  expect(written.find(task => task.id === 'b-test')).toMatchObject({ state: 'failed', endedAt: NOW, summary: 'Background command "npm test" failed with exit code 1' })
+  await $.tool.call({ tool: 'TaskStop', task_id: 'b-dev' })
+  expect(written.find(task => task.id === 'b-dev')?.state).toBe('stopped')
+  // A worker's command reports its end to that worker's conversation, not to main's prompt.
+  await $.tool.call({ tool: 'Bash', command: 'node scrape.mjs', description: 'Search the web', run_in_background: true, agentId: 'w1' })
+  expect(written.find(task => task.id === 'b-scrape')).toMatchObject({ agentId: 'w1', state: 'running' })
+  const notice = '<task-notification>\n<task-id>b-scrape</task-id>\n<status>failed</status>\n</task-notification>'
+  await $.session.append({ message: { type: 'user', role: 'user', isMeta: true, content: [{ type: 'text', text: notice }] }, door: 'delivery', origin: { kind: 'task-notification' }, uuid: 'u-notice', agentId: 'w1' })
+  expect(written.find(task => task.id === 'b-scrape')).toMatchObject({ state: 'failed', endedAt: NOW })
+  // The watch ended unannounced: a Stop that no longer holds it in flight settles it.
+  await $.classic.Stop({ stop_hook_active: false, background_tasks: [] })
+  expect(written.find(task => task.id === 'm-log')).toMatchObject({ state: 'done', settled: true })
+  await b.clock.settle()
+})
+
+// The tier marker's optional domain word names the ladder; words outside the domains keep general.
+const DOMAIN_RULES = {
+  ui: { mode: 'ladder' as const, rungs: { light: [{ target: { agent: 'gpt-6-astra' }, effort: 'high' as const }], hard: [{ target: { agent: 'gpt-6-1-sol' }, effort: 'high' as const }] } },
+  backend: { mode: 'ladder' as const, rungs: { light: [{ target: { agent: 'deepseek-v4-1-flash' }, effort: 'high' as const }], plan: [{ target: { agent: 'gpt-6-astra' }, effort: 'high' as const }] } },
+  review: { mode: 'ladder' as const, rungs: { light: [{ target: { agent: 'claude-sonnet-5-5' }, effort: 'high' as const }] } },
+}
+for (const [word, domain, rule, agent, model] of [
+  [null, 'general', 'general', 'deepseek-v4-1-flash', 'deepseek-v4.1-flash@max'],
+  ['ui', 'frontend', 'ui', 'gpt-6-astra', 'gpt-6-astra@high'],
+  ['frontend', 'frontend', 'ui', 'gpt-6-astra', 'gpt-6-astra@high'],
+  ['design', 'design', 'ui', 'gpt-6-astra', 'gpt-6-astra@high'],
+  ['backend', 'backend', 'backend', 'deepseek-v4-1-flash', 'deepseek-v4.1-flash@high'],
+  ['server', 'backend', 'backend', 'deepseek-v4-1-flash', 'deepseek-v4.1-flash@high'],
+  ['review', 'review', 'review', 'ripple:auto', 'claude-sonnet-5-5@high'],
+  ['redteam', 'review', 'review', 'ripple:auto', 'claude-sonnet-5-5@high'],
+  ['red-team', 'review', 'review', 'ripple:auto', 'claude-sonnet-5-5@high'],
+  ['docs', 'general', 'general', 'deepseek-v4-1-flash', 'deepseek-v4.1-flash@max'],
+] as const) test(`a [[ripple: light${word ? ' ' + word : ''}]] marker runs the ${rule} ladder's light rung`, async ($, on) => {
+  const b = boundaries(on, { domainRules: DOMAIN_RULES })
+  http(on)
+  const judges = judgeStub(on)
   const sent = spawnStub(on)
   await start($)
-  await $.agent.spawn(SPAWN)
-  const rule = domain === 'design' || domain === 'frontend' ? 'ui' : domain === 'backend' ? 'backend' : 'general'
-  // A light design verdict is raised to the heavy pair (visual taste, not difficulty); frontend keeps its level.
-  const raised = domain === 'design'
-  expect(sent[0]?.subagentType).toBe(rule === 'ui' ? (raised ? 'gpt-6-1-sol' : 'gpt-6-astra') : rule === 'backend' ? 'gpt-6-1-sol' : 'deepseek-v4-1-flash')
+  await $.agent.spawn({ ...SPAWN, prompt: `[[ripple: light${word ? ' ' + word : ''}]]\n${SPAWN.prompt}` })
+  expect(judges.length).toBe(0)
+  expect(sent[0]).toMatchObject({ subagentType: agent, model, prompt: SPAWN.prompt })
   const row = JSON.parse(b.files.get('/home/test/.clauderipple/logs/worker-picks.jsonl')!)
-  expect(row).toMatchObject({ rule, domain, level: 'light', rung: raised ? 'hard' : 'light' })
-  expect(row.raised).toBe(raised ? 'design' : undefined)
+  expect(row).toMatchObject({ rule, domain, level: 'light', rung: 'light', tier: 'light', by: 'session' })
+  expect(row.raised).toBeUndefined()
 })
 
-test('a design task under the ui ladder takes the heavy level past a tier marker', async ($, on) => {
-  const b = boundaries(on, { domainRules: { ui: { mode: 'ladder', rungs: { light: [{ target: { agent: 'gpt-6-astra' }, effort: 'high' }], hard: [{ target: { agent: 'gpt-6-1-sol' }, effort: 'high' }] } } } })
+test('a review word with no saved review ladder runs the general one', async ($, on) => {
+  const b = boundaries(on, {})
   http(on)
-  judgeStub(on, JSON.stringify({ domain: 'design', level: 'deep', kind: 'do', effort: 'high', sure: 0.9, why: 'domain' }))
   const sent = spawnStub(on)
   await start($)
-  await $.agent.spawn({ ...SPAWN, prompt: '[[ripple: light]]\nTweak a color.' })
-  expect(sent[0]?.subagentType).toBe('gpt-6-1-sol')
-  const row = JSON.parse(b.files.get('/home/test/.clauderipple/logs/worker-picks.jsonl')!.trim().split('\n').find(line => line.includes('"type":"pick"'))!)
-  expect(row).toMatchObject({ by: 'session', rule: 'ui', domain: 'design', rung: 'hard', raised: 'design' })
+  await $.agent.spawn({ ...SPAWN, prompt: `[[ripple: light red-team]]\n${SPAWN.prompt}` })
+  expect(sent[0]).toMatchObject({ subagentType: 'deepseek-v4-1-flash', model: 'deepseek-v4.1-flash@max', prompt: SPAWN.prompt })
+  const row = JSON.parse(b.files.get('/home/test/.clauderipple/logs/worker-picks.jsonl')!)
+  expect(row).toMatchObject({ rule: 'general', domain: 'review', level: 'light', rung: 'light', by: 'session' })
 })
 
-for (const domains of [false, true]) test(`tier marker ${domains ? 'awaits' : 'does not await'} one pending shadow judge with domain ladders ${domains ? 'on' : 'off'}`, async ($, on) => {
-  const b = boundaries(on, domains ? { domainRules: { ui: { mode: 'ladder', rungs: { light: [{ target: { agent: 'gpt-6-astra' }, effort: 'high' }] } } } } : {})
+test('a quoted reason ignores case and spacing, and a quote under three letters is refused', async ($, on) => {
+  const b = boundaries(on, {}, { messages: [{ role: 'user', text: 'Please Use   SOL for the review, and use Astra too.', toolUses: [] }] })
   http(on)
-  let release!: () => void
-  const pending = new Promise<void>(resolve => { release = resolve })
-  let calls = 0
-  on('model.complete', async () => {
-    calls++
-    await pending
-    return { value: { isAnswered: true, text: JSON.stringify({ domain: 'frontend', level: 'deep', kind: 'plan', effort: 'max', sure: 0.1, why: 'conflicts with tier' }), usage: USAGE } }
-  })
   const sent = spawnStub(on)
   await start($)
-  const spawn = $.agent.spawn({ ...SPAWN, prompt: '[[ripple: light]]\nBuild the UI.' })
-  await b.clock.settle()
-  expect(calls).toBe(1)
-  expect(sent.length).toBe(domains ? 0 : 1)
-  release()
-  await spawn
-  await b.clock.settle()
-  expect(calls).toBe(1)
-  expect(sent[0]?.subagentType).toBe(domains ? 'gpt-6-astra' : 'deepseek-v4-1-flash')
-  const rows = b.files.get('/home/test/.clauderipple/logs/worker-picks.jsonl')!.trim().split('\n').map(line => JSON.parse(line))
-  const pick = rows.find(row => row.type === 'pick')
-  expect(pick).toMatchObject({ by: 'session', tier: 'light', rung: 'light', level: 'light', kind: 'do', rule: domains ? 'ui' : 'general', domain: domains ? 'frontend' : 'general' })
-  expect(pick.sure).toBeUndefined()
-  expect(rows.filter(row => row.type === 'shadow').length).toBe(1)
-  expect(rows.find(row => row.type === 'shadow')).toMatchObject({ pick: pick.id, rung: 'plan', verdict: { domain: 'frontend', sure: 0.1 } })
+  await $.agent.spawn({ ...SPAWN, prompt: '[[ripple: gpt-6-1-sol@high]]\nModel reason: user "use sol for"\nReview.' })
+  expect(sent[0]).toMatchObject({ subagentType: 'gpt-6-1-sol', model: 'gpt-6.1-sol@high' })
+  // "so" is inside the user's words but too short to stand for a model choice.
+  const short = await $.agent.spawn({ ...SPAWN, prompt: '[[ripple: gpt-6-astra@high]]\nModel reason: user "so"\nReview.' })
+  expect(short.deny).toContain("not in the user's recent messages")
+  expect(sent.length).toBe(1)
+  expect(b.logs.filter(log => log.startsWith('ClaudeRipple worker pick: ')).length).toBe(1)
 })
 
-for (const error of ['api-error', 'aborted'] as const) test(`a marker retains its tier and uses general when its domain judge is ${error}`, async ($, on) => {
-  const b = boundaries(on, { domainRules: { ui: DEFAULTS.rules.general } })
+test('a mode without domain rules uses its general ladder, and a reasoned model still runs over it', async ($, on) => {
+  const b = boundaries(on, { domainRules: { ui: DEFAULTS.rules.general }, modes: [{ id: 'plain', name: 'Plain', rungs: DEFAULTS.rules.general.rungs, delegation: 'normal', until: 'none' }], activeMode: 'plain' }, { messages: NAMED })
   http(on)
-  on('model.complete', async () => {
-    if (error === 'aborted') await b.clock.advance(6000)
-    return { value: error === 'aborted' ? { isAnswered: false, reason: 'aborted', usage: USAGE } : { isAnswered: false, reason: 'api-error', status: 503, error: 'overloaded', usage: USAGE } }
-  })
+  const judges = judgeStub(on)
   const sent = spawnStub(on)
   await start($)
-  await $.agent.spawn({ ...SPAWN, prompt: '[[ripple: light]]\nRename a variable.' })
-  expect(sent[0]?.subagentType).toBe('deepseek-v4-1-flash')
-  const rows = b.files.get('/home/test/.clauderipple/logs/worker-picks.jsonl')!.trim().split('\n').map(line => JSON.parse(line))
-  expect(rows.find(row => row.type === 'pick')).toMatchObject({ by: 'session', domain: 'general', rule: 'general', rung: 'light', tier: 'light', verdict: null })
-  expect(rows.filter(row => row.type === 'shadow').length).toBe(1)
-})
-
-test('a mode without domain rules skips awaiting Base domains; explicit model markers still bypass the judge', async ($, on) => {
-  const b = boundaries(on, { domainRules: { ui: DEFAULTS.rules.general }, modes: [{ id: 'plain', name: 'Plain', rungs: DEFAULTS.rules.general.rungs, delegation: 'normal', until: 'none' }], activeMode: 'plain' })
-  http(on)
-  const judges = judgeStub(on, '{"domain":"frontend","level":"light","effort":"low","sure":0.9}')
-  const sent = spawnStub(on)
-  await start($)
-  await $.agent.spawn({ ...SPAWN, prompt: '[[ripple: light]]\nWork.' })
+  await $.agent.spawn({ ...SPAWN, prompt: '[[ripple: light ui]]\nWork.' })
   await b.clock.settle()
   const rows = b.files.get('/home/test/.clauderipple/logs/worker-picks.jsonl')!.trim().split('\n').map(line => JSON.parse(line))
-  expect(rows.find(row => row.type === 'pick')).toMatchObject({ domain: 'general', rule: 'general', mode: 'Plain', verdict: null })
-  expect(judges.length).toBe(1)
-  // Turn Base on, so its domain override is effective for this explicit marker.
+  // The mode brings no domain rules of its own: the ui word cannot borrow Base's.
+  expect(rows.find(row => row.type === 'pick')).toMatchObject({ domain: 'frontend', rule: 'general', mode: 'Plain', tier: 'light', by: 'session' })
+  expect(sent[0]).toMatchObject({ subagentType: 'deepseek-v4-1-flash', model: 'deepseek-v4.1-flash@max', prompt: 'Work.' })
+  // Back on Base, a model a written rule assigns runs over the ladder, not instead of a refusal.
   b.remote({ settings: normalizeSettings({ setupDone: true, domainRules: { ui: DEFAULTS.rules.general } }), revision: 2, stored: true })
   await b.clock.advance(3000)
-  await $.agent.spawn({ ...SPAWN, prompt: '[[ripple: gpt-6-astra@max]]\nWork.' })
-  expect(judges.length).toBe(1)
+  await $.agent.spawn({ ...SPAWN, prompt: '[[ripple: gpt-6-astra@max]]\nModel reason: rule rules/workers.md — UI copy runs on Astra\nWork.' })
+  expect(judges.length).toBe(0)
   expect(sent[1]).toMatchObject({ subagentType: 'gpt-6-astra', model: 'gpt-6-astra@max' })
+  const after = b.files.get('/home/test/.clauderipple/logs/worker-picks.jsonl')!.trim().split('\n').map(line => JSON.parse(line))
+  expect(after.at(-1)).toMatchObject({ by: 'rule', source: 'rule', namedModel: 'gpt-6-astra' })
 })
 
 test('the limits row shows Claude\'s plan on a chat that runs on another provider', async ($, on) => {
@@ -787,30 +1068,61 @@ test('a failed first limits read is tried again at the next tick, not a minute l
   await ui.unmount()
 })
 
-test('a tier marker on a worker other than ripple:auto is dropped, not routed as a model', async ($, on) => {
-  boundaries(on)
+// 2026-10-25: the owner moved the reset times off the band into a pane the limits row opens. The
+// row is a button (pressed again it closes), and the pane says each window's share and reset.
+test('the limits row opens the limits pane, which says when each window resets', async ($, on) => {
+  const b = boundaries(on, { extras: ['limits'] })
+  const limits = { providers: [{ provider: 'claude', type: 'anthropic', title: 'Claude', accounts: [{ account: 0, at: NOW, windows: [
+    { kind: 'five_hour', used_percent: 28, window_minutes: 300, reset_at: (NOW + 2 * 3_600_000) / 1000 },
+    { kind: 'seven_day', used_percent: 8, window_minutes: 10080, reset_at: (NOW + 7 * 86_400_000) / 1000 },
+  ] }] }] }
+  on('http.fetch', ($, e, next) => {
+    if (e.url.endsWith('/api/mod-settings')) return next(e)
+    return { value: { ok: true, status: 200, headers: {}, text: JSON.stringify(e.url.endsWith('/api/limits') ? limits : { requests: [] }) } }
+  })
+  await start($)
+  await b.clock.advance(15000)
+  const ui = await band($, 'desktop')
+  await ui.press({ key: 'limits-open' })
+  expect(b.panes.has('ripple-limits')).toBe(true)
+  const pane = await $.ui.mount({ plugin: 'ripple', component: 'Pane', requestId: 'ripple-limits', surface: 'terminal', props: { title: 'Limits', isFocused: true, bodyColumns: 100, placement: 'inline', scroll: { offset: 0, bodyRows: 30 }, view: {} } })
+  expect(await pane.find({ type: 'Text', text: 'Claude' })).toBeDefined()
+  expect(await pane.find({ type: 'Text', text: /^(28%|8%)$/ })).toBeDefined()
+  // Each reset reads as its local date and time to the minute, and the time left beside it (2026-10-29).
+  const said = (await pane.findAll({ type: 'Text' })).map(text => text.text).join('\n')
+  expect(/2h left|2시간 남음/.test(said), 'the near reset').toBe(true)
+  expect(/7d left|7일 남음/.test(said), 'the far reset').toBe(true)
+  expect(/Resets \w{3}, \w{3} \d{1,2}, \d{1,2}:\d\d [AP]M|\d{1,2}월 \d{1,2}일 \([월화수목금토일]\) 오[전후] \d{1,2}:\d\d 초기화/.test(said), 'the moment').toBe(true)
+  await pane.unmount()
+  await ui.press({ key: 'limits-open' })
+  expect(b.panes.has('ripple-limits')).toBe(false)
+  await ui.unmount()
+})
+
+for (const subagentType of ['Explore', 'Plan', 'statusline-setup', 'claude-code-guide']) test(`${subagentType} stays native in all mode, including its prompt and model`, async ($, on) => {
+  boundaries(on, { agentAuto: 'all' })
   http(on)
   const judges = judgeStub(on)
   const sent = spawnStub(on)
   await start($)
-  await $.agent.spawn({ ...SPAWN, subagentType: 'Explore', prompt: '[[ripple: hard]]\nFind the router entry point.' })
+  const prompt = '[[ripple: hard]]\nFind the router entry point.'
+  await $.agent.spawn({ ...SPAWN, subagentType, model: 'opus', prompt })
   expect(judges.length).toBe(0)
-  expect(sent[0]).toMatchObject({ subagentType: 'Explore', prompt: 'Find the router entry point.' })
-  expect(sent[0]?.model).toBeUndefined()
+  expect(sent[0]).toEqual({ ...SPAWN, subagentType, prompt, model: 'opus' })
 })
 
-test('a judged spawn uses the default general ladder when general is inherit', async ($, on) => {
+test('a tier marker uses the default general ladder when general is inherit', async ($, on) => {
   boundaries(on, { rules: normalizeSettings({ rules: { general: { mode: 'inherit' } } }).rules })
   http(on)
-  const judges = judgeStub(on, '{"domain":"backend","level":"standard","effort":"low","sure":0.9,"why":"implementation"}')
+  const judges = judgeStub(on)
   const sent = spawnStub(on)
   await start($)
-  await $.agent.spawn(SPAWN)
+  await $.agent.spawn({ ...SPAWN, prompt: `[[ripple: standard]]\n${SPAWN.prompt}` })
   expect(sent[0]).toMatchObject({ subagentType: 'gpt-6-1-sol', model: 'gpt-6.1-sol@medium' })
-  expect(judges.length).toBe(1)
+  expect(judges.length).toBe(0)
 })
 
-test('a judged spawn uses the configured general ladder, then one rung up on a missing worker', async ($, on) => {
+test('a tier marker uses the configured general ladder, then one rung up on a missing worker', async ($, on) => {
   const rules = normalizeSettings({ rules: { general: { mode: 'ladder', rungs: {
     light: { target: { agent: 'missing-worker' }, effort: 'low' },
     standard: { target: { agent: 'gpt-6-astra' }, effort: 'xhigh' },
@@ -820,17 +1132,17 @@ test('a judged spawn uses the configured general ladder, then one rung up on a m
   judgeStub(on)
   const sent = spawnStub(on)
   await start($)
-  await $.agent.spawn(SPAWN)
+  await $.agent.spawn({ ...SPAWN, prompt: `[[ripple: light]]\n${SPAWN.prompt}` })
   expect(sent[0]).toMatchObject({ subagentType: 'gpt-6-astra', model: 'gpt-6-astra@xhigh' })
   expect(b.toasts.some(text => text.includes('missing-worker'))).toBe(true)
-  expect(JSON.parse(b.logs[0]!.slice('ClaudeRipple worker pick: '.length))).toMatchObject({ level: 'light', rung: 'standard', by: 'haiku' })
+  expect(JSON.parse(b.logs[0]!.slice('ClaudeRipple worker pick: '.length))).toMatchObject({ level: 'light', rung: 'standard', by: 'session' })
   const persisted = JSON.parse(b.files.get('/home/test/.clauderipple/logs/worker-picks.jsonl')!)
-  expect(persisted).toMatchObject({ verdict: { level: 'light', effort: 'low' }, rung: 'standard', model: 'gpt-6-astra@xhigh', effort: 'xhigh', by: 'judge' })
+  expect(persisted).toMatchObject({ level: 'light', rung: 'standard', model: 'gpt-6-astra@xhigh', effort: 'xhigh', by: 'session', tier: 'light' })
   expect(persisted.skipped.length).toBeGreaterThan(0)
   expect(persisted.fallbackReason).toContain('missing-worker')
 })
 
-test('exhaustion falls to the session after only one rung up; a plan verdict never moves down', async ($, on) => {
+test('exhaustion leaves nothing: a spawn is refused after one rung up, and plan never moves down', async ($, on) => {
   const rules = normalizeSettings({ rules: { general: { mode: 'ladder', rungs: {
     standard: { target: { agent: 'gpt-6-1-sol' }, effort: 'medium' },
     hard: { target: { agent: 'gpt-6-astra' }, effort: 'high' },
@@ -838,17 +1150,20 @@ test('exhaustion falls to the session after only one rung up; a plan verdict nev
   } } } }).rules
   const b = boundaries(on, { rules })
   http(on, true)
-  const verdicts = [
-    '{"domain":"backend","level":"standard","kind":"do","effort":"low","sure":0.9,"why":"implementation"}',
-    '{"domain":"general","level":"deep","kind":"plan","effort":"high","sure":0.9,"why":"architecture"}',
-  ]
-  on('model.complete', () => ({ value: { isAnswered: true, text: verdicts.shift() ?? verdicts[0] ?? '', usage: USAGE } }))
+  const judges = judgeStub(on)
   const sent = spawnStub(on)
   await start($)
-  for (let i = 0; i < 2; i++) await $.agent.spawn(SPAWN)
-  expect(sent.map(e => [e.subagentType, e.model])).toEqual([['general-purpose', undefined], ['general-purpose', undefined]])
+  const standard = await $.agent.spawn({ ...SPAWN, prompt: `[[ripple: standard]]\n${SPAWN.prompt}` })
+  expect(standard.deny).toContain('No worker on this tier can run now')
+  expect(standard.deny).toContain('ChatGPT')
+  // Plan has nothing above it: a missing worker there is never saved by a lower rung.
+  const plan = await $.agent.spawn({ ...SPAWN, prompt: `[[ripple: max]]\n${SPAWN.prompt}` })
+  expect(plan.deny).toContain('No worker on this tier can run now')
+  expect(plan.deny).toContain('missing-max')
   expect(b.toasts.some(text => text.includes('ChatGPT'))).toBe(true)
   expect(b.toasts.some(text => text.includes('missing-max'))).toBe(true)
+  expect(sent.length).toBe(0)
+  expect(judges.length).toBe(0)
 })
 
 for (const agentAuto of ['off', 'auto', 'all'] as const) test('only ripple:auto is registered, and takeover respects agentAuto ' + agentAuto, async ($, on) => {
@@ -859,50 +1174,56 @@ for (const agentAuto of ['off', 'auto', 'all'] as const) test('only ripple:auto 
   await start($)
   expect([...new Set(registered.map(e => e.name))]).toEqual(agentAuto === 'off' ? [] : ['auto'])
   for (const entry of registered) {
-    expect(entry.description).toContain('[[ripple: standard]]')
+    expect(entry.description).toContain('[[ripple: light]]')
+    expect(entry.description).toContain('Model reason:')
     expect(entry.disallowedTools).toEqual(['Agent'])
   }
   await $.agent.spawn(SPAWN)
-  expect(sent[0]?.subagentType).toBe(agentAuto === 'off' ? 'ripple:auto' : 'deepseek-v4-1-flash')
+  expect(sent[0]?.subagentType).toBe(agentAuto === 'off' ? 'ripple:auto' : 'gpt-6-1-sol')
   // A tier agent from a session started before 2026-10-12 is no longer taken over.
   await $.agent.spawn({ ...SPAWN, subagentType: 'ripple:max' })
   expect(sent[1]?.subagentType).toBe('ripple:max')
   await $.agent.spawn({ ...SPAWN, fork: true })
   expect(sent[2]?.subagentType).toBe('ripple:auto')
-  expect(judges.length).toBe(agentAuto === 'off' ? 0 : 1)
+  expect(judges.length).toBe(0)
 })
 
-test('a rung\'s stored backup is dropped on load: ChatGPT exhaustion moves up, it does not run the backup', async ($, on) => {
+test('a rung\'s stored backup is dropped on load: ChatGPT exhaustion moves up, then nothing runs', async ($, on) => {
   const rules = normalizeSettings({ rules: { general: { mode: 'ladder', rungs: {
     standard: { target: { agent: 'gpt-6-1-sol' }, effort: 'high', backup: { agent: 'general-purpose', model: 'opus' } },
     hard: { target: { agent: 'gpt-6-astra' }, effort: 'xhigh' },
   } } } }).rules
   const b = boundaries(on, { rules })
   http(on, true)
-  judgeStub(on, '{"domain":"backend","level":"standard","effort":"low","why":"implementation"}')
+  judgeStub(on)
   const sent = spawnStub(on)
   await start($)
-  await $.agent.spawn(SPAWN)
-  expect(sent[0]).toMatchObject({ subagentType: 'general-purpose' })
-  expect(sent[0]?.model).toBeUndefined()
-  expect(b.toasts.some(t => t.includes('ChatGPT') && t.includes("the session's model"))).toBe(true)
+  const result = await $.agent.spawn(SPAWN)
+  // Both ChatGPT rungs are spent and the stored backup on General was dropped on load.
+  expect(result.deny).toContain('No worker on this tier can run now')
+  expect(sent.length).toBe(0)
+  expect(b.toasts.some(t => t.includes('ChatGPT'))).toBe(true)
 })
 
-test('without a backup, ChatGPT exhaustion moves one rung up, then to the session model', async ($, on) => {
+test('without a backup, ChatGPT exhaustion moves one rung up, then refuses the spawn', async ($, on) => {
   const b = boundaries(on)
   http(on, true)
-  judgeStub(on, '{"domain":"backend","level":"standard","effort":"high","why":"implementation"}')
+  judgeStub(on)
   const sent = spawnStub(on)
   await start($)
-  await $.agent.spawn(SPAWN)
-  // Standard is Sol and Hard is Astra, both ChatGPT: the subagent runs on the session's model.
-  expect(sent[0]?.subagentType).toBe('general-purpose')
-  expect(sent[0]?.model).toBeUndefined()
-  expect(b.toasts.some(t => t.includes('ChatGPT') && t.includes("the session's model"))).toBe(true)
+  const result = await $.agent.spawn(SPAWN)
+  // Standard is Sol and Hard is Astra, both ChatGPT: nothing is left to run.
+  expect(result.deny).toContain('No worker on this tier can run now')
+  expect(sent.length).toBe(0)
+  expect(b.toasts.some(t => t.includes('ChatGPT'))).toBe(true)
 })
 
 test('each spawn refreshes provider health before picking and toasts the exhaustion reason', async ($, on) => {
-  const b = boundaries(on, { language: 'ko' })
+  const rules = normalizeSettings({ rules: { general: { mode: 'ladder', rungs: {
+    standard: [{ target: { agent: 'deepseek-v4-1-flash' }, effort: 'max' }],
+    hard: [{ target: { agent: 'gpt-6-astra' }, effort: 'high' }],
+  } } } }).rules
+  const b = boundaries(on, { language: 'ko', rules })
   let exhausted = false
   let reads = 0
   on('http.fetch', { url: /\/api\/mod-options$/ }, () => {
@@ -920,15 +1241,15 @@ test('each spawn refreshes provider health before picking and toasts the exhaust
   exhausted = true
   await $.agent.spawn(SPAWN)
   expect(reads).toBeGreaterThan(before)
-  expect(sent[1]?.subagentType).toBe('gpt-6-1-sol')
+  expect(sent[1]?.subagentType).toBe('gpt-6-astra')
   expect(b.toasts.some(text => text.includes('deepseek: 잔액 부족'))).toBe(true)
   exhausted = false
   await $.agent.spawn(SPAWN)
   expect(sent[2]?.subagentType).toBe('deepseek-v4-1-flash')
 })
 
-test('explicit generated worker preserves the old dropped-model and misplaced-marker fix', async ($, on) => {
-  const b = boundaries(on)
+test('auto mode preserves the legacy generated-worker fix outside takeover', async ($, on) => {
+  const b = boundaries(on, { agentAuto: 'auto' }, { messages: NAMED })
   http(on)
   const judges = judgeStub(on)
   const sent = spawnStub(on)
@@ -940,32 +1261,305 @@ test('explicit generated worker preserves the old dropped-model and misplaced-ma
   expect(b.toasts.some(t => t.includes('own model') && t.includes('sonnet'))).toBe(true)
 })
 
-test('an explicit marker on ripple:auto bypasses its judge', async ($, on) => {
-  boundaries(on)
+test('a session pin survives later prompts, authorizes only its model, and releases without persistence', async ($, on) => {
+  const b = boundaries(on, { effortAuto: false })
   http(on)
   const judges = judgeStub(on)
   const sent = spawnStub(on)
   await start($)
-  await $.agent.spawn({ ...SPAWN, prompt: '[[ripple: gpt-6-1-sol@xhigh]]\nReview this.' })
+  await submit($, '이거 솔 시켜')
+  let ui = await band($)
+  expect(await ui.find({ key: 'delegation-pin' })).toBeUndefined()
+  await ui.unmount()
+  await submit($, '앞으로 솔로 해')
+  await submit($, '다음 작업 구현해')
+  await submit($, '테스트도 확인해')
+  ui = await band($)
+  expect(await ui.find({ type: 'Text', text: /Pinned: .*sol/i })).toBeDefined()
+  // The band keeps the person's own sentence that pinned it, beside the pin.
+  expect(await ui.find({ type: 'Text', text: /“앞으로 솔로 해” pinned it/ })).toBeDefined()
+  await $.agent.spawn({ ...SPAWN, prompt: 'Review.' })
+  await $.agent.spawn({ ...SPAWN, subagentType: 'gpt-6-1-sol', prompt: 'Review again.' })
+  expect(sent.slice(0, 2).map(spawn => spawn.subagentType)).toEqual(['gpt-6-1-sol', 'gpt-6-1-sol'])
   expect(judges.length).toBe(0)
-  expect(sent[0]).toMatchObject({ subagentType: 'gpt-6-1-sol', model: 'gpt-6.1-sol@xhigh' })
+  // A pin outranks a written rule: the session cannot move the person's standing choice.
+  await $.agent.spawn({ ...SPAWN, prompt: '[[ripple: gpt-6-astra]]\nModel reason: rule rules/workers.md — Astra for reviews\nOther model.' })
+  expect(sent[2]).toMatchObject({ subagentType: 'gpt-6-1-sol', model: 'gpt-6.1-sol@high' })
+  // The person's own words for this task outrank their pin.
+  await $.agent.spawn({ ...SPAWN, prompt: '[[ripple: gpt-6-astra@high]]\nModel reason: user "테스트도 확인해"\nCheck the tests.' })
+  expect(sent[3]).toMatchObject({ subagentType: 'gpt-6-astra', model: 'gpt-6-astra@high' })
+  // A model named with no reason at all is still refused, pin or not.
+  const unreasoned = await $.agent.spawn({ ...SPAWN, prompt: '[[ripple: gpt-6-astra]]\nOther model.' })
+  expect(unreasoned.deny).toContain('No reason was given for the model gpt-6-astra')
+  const picks = b.files.get('/home/test/.clauderipple/logs/worker-picks.jsonl')!.trim().split('\n').map(line => JSON.parse(line))
+  expect(picks[0]).toMatchObject({ by: 'user', namedModel: 'gpt-6.1-sol', source: 'pin' })
+  expect(picks[0]).not.toHaveProperty('reason')
+  expect(picks[0]).not.toHaveProperty('judge')
+  expect(judges.length).toBe(0)
+  await ui.press({ key: 'release-pin' })
+  expect(await ui.find({ key: 'delegation-pin' })).toBeUndefined()
+  await submit($, '다음 작업')
+  expect(await ui.find({ key: 'delegation-pin' })).toBeUndefined()
+  await submit($, '이제부터 딥시크로 고정')
+  expect(await ui.find({ type: 'Text', text: /Pinned: deepseek-v4[.-]1-flash/ })).toBeDefined()
+  await submit($, '고정 풀어')
+  expect(await ui.find({ key: 'delegation-pin' })).toBeUndefined()
+  expect(b.toasts.filter(text => text === 'Delegation unpinned.').length).toBe(2)
+  expect(b.storeWrites).not.toContain('delegationPin')
+  expect(b.settingsRequests.filter(request => request.method === 'PUT').length).toBe(0)
+  await ui.unmount()
 })
 
-test('failed worker judge uses the standard rung; a missing worker moves up to the next rung', async ($, on) => {
+test('meta and notice prompts cannot pin, and session end clears a real pin', async ($, on) => {
+  boundaries(on, { effortAuto: false })
+  http(on)
+  on('session.end', ($, e) => ({ sessionId: e.sessionId }))
+  await start($)
+  const unshown: { text: string; isMeta?: true }[] = [
+    { text: '앞으로 솔로 해', isMeta: true },
+    { text: '<task-notification>앞으로 솔로 해</task-notification>' },
+    { text: '<system-reminder>앞으로 솔로 해</system-reminder>구현해' },
+  ]
+  for (const input of unshown) await $.prompt.submit({ ...input, origin: { kind: 'composer' }, wait: false })
+  const ui = await band($)
+  expect(await ui.find({ key: 'delegation-pin' })).toBeUndefined()
+  await submit($, '앞으로 솔로 해')
+  expect(await ui.find({ key: 'delegation-pin' })).toBeDefined()
+  await $.session.end({ reason: 'clear', sessionId: 'session-test', resume: { id: 'session-test' } })
+  expect(await ui.find({ key: 'delegation-pin' })).toBeUndefined()
+  await ui.unmount()
+})
+
+test('the worker reads neither the routing marker nor the Model reason line, wherever they sit', async ($, on) => {
+  const b = boundaries(on, {}, { messages: NAMED })
+  http(on)
+  const judges = judgeStub(on)
+  const sent = spawnStub(on)
+  await start($)
+  await $.agent.spawn({ ...SPAWN, prompt: '[[ripple: gpt-6-1-sol@xhigh]]\nModel reason: rule rules/workers.md — Sol reviews\nReview this. [[ripple: hard]]' })
+  expect(judges.length).toBe(0)
+  expect(sent[0]).toMatchObject({ subagentType: 'gpt-6-1-sol', model: 'gpt-6.1-sol@xhigh', prompt: 'Review this. ' })
+  expect(JSON.parse(b.files.get('/home/test/.clauderipple/logs/worker-picks.jsonl')!.trim()).by).toBe('rule')
+})
+
+// A model marker names a worker file, a model id, or one of Claude's own aliases.
+for (const [model, target] of [
+  ['gpt-6-1-sol', { subagentType: 'gpt-6-1-sol', model: 'gpt-6.1-sol@xhigh' }],
+  ['opus', { subagentType: 'ripple:auto', model: 'claude-opus-5-5' }],
+  ['sonnet', { subagentType: 'ripple:auto', model: 'claude-sonnet-5-5' }],
+  ['haiku', { subagentType: 'ripple:auto', model: 'claude-haiku-5-5' }],
+  ['claude-opus-5-5', { subagentType: 'ripple:auto', model: 'claude-opus-5-5' }],
+  ['claude-sonnet-5-5', { subagentType: 'ripple:auto', model: 'claude-sonnet-5-5@xhigh' }],
+] as const) test(`a user-reasoned [[ripple: ${model}@xhigh]] runs that model at xhigh, by user`, async ($, on) => {
+  const b = boundaries(on, {}, { messages: [{ role: 'user', text: '솔한테 시켜', toolUses: [] }] })
+  http(on)
+  const judges = judgeStub(on)
+  const sent = spawnStub(on)
+  const steps = stepStub(on)
+  let records: AgentRec[] = []
+  on('state.set', { plugin: 'ripple', key: 'agents' }, async ($, e, next) => { records = e.value as AgentRec[]; return next(e) })
+  await start($)
+  await $.agent.spawn({ ...SPAWN, prompt: `[[ripple: ${model}@xhigh]]\nModel reason: user "솔한테 시켜"\nReview this.` })
+  expect(judges.length).toBe(0)
+  expect(sent[0]).toMatchObject(target)
+  const row = JSON.parse(b.files.get('/home/test/.clauderipple/logs/worker-picks.jsonl')!.trim())
+  expect(row).toMatchObject({ by: 'user', namedModel: model, source: 'user', effort: 'xhigh' })
+  expect(row).not.toHaveProperty('judge')
+  // Claude's own agent gets its effort on turn.step; a routed worker's is in the model suffix.
+  if (target.subagentType === 'ripple:auto') {
+    // Resolve the exact definition selected by the outgoing spawn, not just the requested model.
+    const definition = b.registered.find(spec => 'ripple:' + spec.name === sent[0]?.subagentType)
+    expect(definition).toBeDefined()
+    expect(definition?.disallowedTools).toContain('Agent')
+    await step($, 'claude-opus-5-5', 'low', 'worker-1')
+    expect(steps[0]?.effort).toBe('xhigh')
+    const rec = records.find(a => a.id === 'worker-1')
+    expect(rec?.type).toBe('ripple:auto')
+    expect(rec?.provider).toBe('anthropic')
+    expect(rec?.effort).toBe('xhigh')
+  }
+})
+
+test('a user reason is checked against the last ten human messages and the last two prompts', async ($, on) => {
+  const older = 'an older line'
+  const tenth = 'the tenth line says Sol'
+  boundaries(on, { effortAuto: false }, { messages: [
+    { role: 'user' as const, text: older, toolUses: [] },
+    ...Array.from({ length: 10 }, (_, n) => ({ role: 'user' as const, text: n === 0 ? tenth : `line ${n}`, toolUses: [] })),
+  ] })
+  http(on)
+  const judges = judgeStub(on)
+  const sent = spawnStub(on)
+  await start($)
+  // Eleven human messages: the oldest is outside the ten the check reads.
+  const tooOld = await $.agent.spawn({ ...SPAWN, prompt: `[[ripple: gpt-6-1-sol@high]]\nModel reason: user "${older}"\nReview.` })
+  expect(tooOld.deny).toContain("not in the user's recent messages")
+  await $.agent.spawn({ ...SPAWN, prompt: `[[ripple: gpt-6-1-sol@high]]\nModel reason: user "${tenth}"\nReview.` })
+  expect(sent[0]).toMatchObject({ subagentType: 'gpt-6-1-sol' })
+  // A prompt sent this turn is heard too, even before it reaches the session's messages.
+  await submit($, 'Use Astra for this review', 'turn-1')
+  await $.agent.spawn({ ...SPAWN, prompt: '[[ripple: gpt-6-astra@high]]\nModel reason: user "use astra for this"\nReview.' })
+  expect(sent[1]).toMatchObject({ subagentType: 'gpt-6-astra' })
+  expect(judges.length).toBe(0)
+  expect(sent.length).toBe(2)
+})
+
+for (const [label, spawn, expected] of [
+  ['a worker agent called directly', { subagentType: 'gpt-6-1-sol', prompt: '[[ripple: hard]]\nFix the race.' }, { subagentType: 'gpt-6-1-sol' }],
+  ['general-purpose given a model', { subagentType: 'general-purpose', model: 'sonnet', prompt: '[[ripple: hard]]\nFix the race.' }, { subagentType: 'general-purpose', model: 'claude-sonnet-5-5' }],
+] as const) test(`${label} runs as the main chat picked it`, async ($, on) => {
+  boundaries(on, { agentAuto: 'auto' })
+  http(on)
+  judgeStub(on)
+  const sent = spawnStub(on)
+  await start($)
+  await $.agent.spawn({ ...SPAWN, ...spawn })
+  expect(sent[0]).toMatchObject(expected)
+  expect(sent[0]?.subagentType).not.toBe('gpt-6-astra')
+})
+
+test("a Workflow's ripple:auto whose marker names a worker runs on that worker's model; a tier marker or none is left alone", async ($, on) => {
+  // 2026-10-23: 31 Workflow workers sent as ripple:auto with [[ripple: gpt-6-1-sol@medium]] ran on Sol
+  // through the router but showed as Opus 5.5, and their later turns lost the marker.
+  boundaries(on, {}, { messages: MESSAGES })
+  http(on)
+  const judges = judgeStub(on)
+  const sent = spawnStub(on)
+  await start($)
+  // A workflow agent's spawn carries the run it belongs to (AgentSpawnInput.workflow).
+  const WORKFLOW: AgentSpawnInput = { ...SPAWN, workflow: { runId: 'workflow-test', agentIndex: 0 } }
+  await $.agent.spawn({ ...WORKFLOW, prompt: "[[ripple: gpt-6-1-sol@medium]]\nWrite the review." })
+  // The engine keeps a workflow agent's type and description; its model is what can change.
+  expect(sent[0]).toMatchObject({ subagentType: "ripple:auto", prompt: "Write the review.", model: "gpt-6.1-sol@medium", description: "Rename variable" })
+  await $.agent.spawn({ ...WORKFLOW, prompt: "[[ripple: hard]]\nWrite the review." })
+  expect(sent[1]?.model).toBeUndefined()
+  await $.agent.spawn({ ...WORKFLOW, prompt: "Write the review." })
+  expect(sent[2]?.model).toBeUndefined()
+  expect(judges.length).toBe(0)
+})
+
+test('a model the session proposed in chat is never a reason: a worker called by type needs its own', async ($, on) => {
+  const b = boundaries(on, { agentAuto: 'all' }, { messages: [
+    { role: 'user', text: '이 문구들 다듬어 줘', toolUses: [] },
+    { role: 'assistant', text: '솔에게 교정안을 받겠습니다. 진행할까요?', toolUses: [] },
+    { role: 'user', text: 'ㄱㄱ', toolUses: [] },
+  ] })
+  http(on)
+  const judges = judgeStub(on)
+  const sent = spawnStub(on)
+  await start($)
+  // The assistant's suggestion and a two-letter go-ahead authorize nothing.
+  const named = await $.agent.spawn({ ...SPAWN, subagentType: 'gpt-6-1-sol', prompt: 'Model reason: user "ㄱㄱ"\nPropose fixes.' })
+  expect(named.deny).toContain("not in the user's recent messages")
+  // The ladder still runs the task when no model is named.
+  await $.agent.spawn({ ...SPAWN, prompt: 'Propose fixes.' })
+  expect(judges.length).toBe(0)
+  expect(sent[0]).toMatchObject({ subagentType: 'gpt-6-1-sol', model: 'gpt-6.1-sol@medium', prompt: 'Propose fixes.' })
+  expect(b.logs.filter(text => text.startsWith('ClaudeRipple worker pick: ')).length).toBe(1)
+})
+
+test('the default tier uses the standard rung, and a missing worker moves one rung up', async ($, on) => {
   const rules = normalizeSettings({ rules: { general: { mode: 'ladder', rungs: {
     standard: { target: { agent: 'missing-worker' }, effort: 'medium' }, hard: { target: { agent: 'general-purpose', model: 'sonnet' }, effort: 'high' },
   } } } }).rules
   boundaries(on, { rules })
   http(on, true)
-  on('model.complete', () => ({ value: { isAnswered: false, reason: 'empty-reply', usage: USAGE } }))
+  const judges = judgeStub(on)
   const sent = spawnStub(on)
   await start($)
   await $.agent.spawn(SPAWN)
-  expect(sent[0]).toMatchObject({ subagentType: 'general-purpose', model: 'sonnet' })
+  expect(sent[0]).toMatchObject({ subagentType: 'ripple:auto', model: 'claude-sonnet-5-5' })
+  expect(judges.length).toBe(0)
   const debug = await $.command.run({ command: 'ripple', origin: { kind: 'composer' }, presentation: { isFullscreen: true, columns: 140 }, args: 'debug' })
   expect(debug.text).toContain('"effort": "high"')
   expect(debug.text).toContain('"rung": "hard"')
   expect(debug.text).toContain('"by": "default"')
+})
+
+test('a written rule assigns the model like a user ask, needing no quote', async ($, on) => {
+  const b = boundaries(on)
+  http(on)
+  const judges = judgeStub(on)
+  const sent = spawnStub(on)
+  await start($)
+  await $.agent.spawn({ ...SPAWN, prompt: '[[ripple: gpt-6-astra@high]]\nModel reason: rule memory/translation.md — 번역 초안은 아스트라\nReview the draft.' })
+  expect(sent[0]).toMatchObject({ subagentType: 'gpt-6-astra', model: 'gpt-6-astra@high', prompt: 'Review the draft.' })
+  expect(judges.length).toBe(0)
+  const row = JSON.parse(b.files.get('/home/test/.clauderipple/logs/worker-picks.jsonl')!)
+  expect(row).toMatchObject({ by: 'rule', source: 'rule', namedModel: 'gpt-6-astra', reason: 'memory/translation.md — 번역 초안은 아스트라' })
+  expect(row).not.toHaveProperty('judge')
+})
+
+test('an empty or shapeless rule reason is refused; a file and a rule run', async ($, on) => {
+  boundaries(on)
+  http(on)
+  const sent = spawnStub(on)
+  await start($)
+  for (const rule of ['', 'CLAUDE.md', 'rules/workers.md —', 'translate first']) {
+    const refused = await $.agent.spawn({ ...SPAWN, prompt: `[[ripple: gpt-6-astra@high]]\nModel reason: rule ${rule}\nReview.` })
+    expect(refused.deny).toContain('No reason was given for the model gpt-6-astra')
+  }
+  expect(sent.length).toBe(0)
+  await $.agent.spawn({ ...SPAWN, prompt: '[[ripple: gpt-6-astra@high]]\nModel reason: rule CLAUDE.md — always use Astra\nReview.' })
+  expect(sent.length).toBe(1)
+  expect(sent[0]).toMatchObject({ subagentType: 'gpt-6-astra', model: 'gpt-6-astra@high', prompt: 'Review.' })
+})
+
+test('a managed spawn is refused when its worker policy cannot be read; an engine spawn still runs once', async ($, on) => {
+  const b = boundaries(on)
+  http(on)
+  const sent = spawnStub(on)
+  b.files.set('/home/test/.clauderipple/generated-agents.json', '{ not json')
+  await start($)
+  const managed = await $.agent.spawn(SPAWN)
+  expect(managed.deny).toContain('ClaudeRipple:')
+  expect(sent.length).toBe(0)
+  expect(b.logs.some(log => log.includes('agent.spawn prepare'))).toBe(true)
+  // A native agent is the engine's: the same broken catalogue does not stop it, and its own
+  // post-execution record failing must not run it a second time.
+  await $.agent.spawn({ ...SPAWN, subagentType: 'Explore' })
+  expect(sent.length).toBe(1)
+  expect(sent[0]?.subagentType).toBe('Explore')
+})
+
+test('the logged reason keeps only its first 200 characters', async ($, on) => {
+  const b = boundaries(on)
+  http(on)
+  spawnStub(on)
+  await start($)
+  const rule = 'rules/workers.md — ' + 'x'.repeat(300)
+  await $.agent.spawn({ ...SPAWN, prompt: `[[ripple: opus@max]]\nModel reason: rule ${rule}\nInvestigate.` })
+  const row = JSON.parse(b.files.get('/home/test/.clauderipple/logs/worker-picks.jsonl')!)
+  expect(row.reason).toBe(rule.slice(0, 200))
+  expect(row.reason).toHaveLength(200)
+})
+
+test('a named model that cannot run now falls to the ladder and says why', async ($, on) => {
+  const b = boundaries(on, { language: 'ko' }, { messages: NAMED })
+  let deepseek = true
+  on('http.fetch', { url: /\/api\/mod-options$/ }, () => ({ value: { ok: true, status: 200, headers: {}, text: JSON.stringify({ ...MOD_OPTIONS, providers: MOD_OPTIONS.providers.map(p => p.name === 'deepseek' ? { ...p, usable: deepseek, ...(!deepseek ? { reason: 'insufficient_balance', exhaustedUntil: NOW + 1_800_000 } : {}) } : p) }) } }))
+  http(on)
+  deepseek = false
+  const sent = spawnStub(on)
+  await start($)
+  await $.agent.spawn({ ...SPAWN, prompt: '[[ripple: deepseek-v4-1-flash@max]]\nModel reason: user "Use Sol, Astra"\nReview.' })
+  // The named worker is spent: the ladder's standard rung runs, and the toast names the spent model.
+  expect(sent[0]).toMatchObject({ subagentType: 'gpt-6-1-sol', model: 'gpt-6.1-sol@medium' })
+  expect(b.toasts.some(text => text.includes('deepseek-v4.1-flash') && text.includes('지금 실행할 수 없습니다'))).toBe(true)
+  const row = JSON.parse(b.files.get('/home/test/.clauderipple/logs/worker-picks.jsonl')!)
+  // The ladder chose what ran; the model asked for and its source stay beside the reason.
+  expect(row).toMatchObject({ by: 'default', namedModel: 'deepseek-v4-1-flash', source: 'user' })
+  expect(row.fallbackReason).toContain('지금 실행할 수 없습니다')
+})
+
+test('a Model reason line never reaches a worker the mod does not route', async ($, on) => {
+  boundaries(on, { agentAuto: 'auto' })
+  http(on)
+  const sent = spawnStub(on)
+  await start($)
+  await $.agent.spawn({ ...SPAWN, subagentType: 'gpt-6-1-sol', prompt: '[[ripple: gpt-6-1-sol@high]]\nModel reason: rule memory/x.md — review is Sol\nReview.' })
+  expect(sent[0]?.prompt).not.toContain('Model reason')
+  expect(sent[0]?.prompt).toContain('Review.')
 })
 
 test('Zen Jev uses the exact config authorization and first Jev model with CLAUDERIPPLE_HOME', async ($, on) => {
@@ -1001,17 +1595,68 @@ test('Zen without a key explains the missing key and falls back to Haiku', async
   expect(b.toasts.some(text => text.includes('No OpenCode Zen authorization key'))).toBe(true)
 })
 
-test('provider off refuses named workers and every-provider-off refuses automatic spawning', async ($, on) => {
-  boundaries(on, { providers: { chatgpt: false, deepseek: false, anthropic: false } })
+test('provider off refuses a user-named target; no enabled provider refuses the ladder', async ($, on) => {
+  const b = boundaries(on, { agentAuto: 'all', providers: { chatgpt: false, deepseek: false, anthropic: false } }, { messages: NAMED })
   http(on)
-  judgeStub(on)
   const sent = spawnStub(on)
   await start($)
-  const explicit = await $.agent.spawn({ ...SPAWN, subagentType: 'gpt-6-1-sol' })
+  // The named model's provider is switched off: refused, even with a sound reason.
+  const explicit = await $.agent.spawn({ ...SPAWN, subagentType: 'gpt-6-1-sol', prompt: 'Model reason: user "Use Sol, Astra"\nDo it.' })
   expect(explicit.deny).toContain('switched off')
   const automatic = await $.agent.spawn(SPAWN)
-  expect(automatic.deny).toContain('No enabled worker')
+  expect(automatic.deny).toContain('No worker on this tier can run now')
+  expect(b.toasts.some(text => text.includes('No worker on this tier can run now'))).toBe(true)
   expect(sent.length).toBe(0)
+})
+
+test('a project agent called by type in all mode takes the ladder and needs no reason', async ($, on) => {
+  boundaries(on, { agentAuto: 'all' })
+  http(on)
+  const judges = judgeStub(on)
+  const sent = spawnStub(on)
+  await start($)
+  await $.agent.spawn({ ...SPAWN, subagentType: 'opus-xhigh', model: 'opus', prompt: '[[ripple: hard]]\nInvestigate.' })
+  expect(judges.length).toBe(0)
+  expect(sent[0]).toMatchObject({ subagentType: 'gpt-6-astra', model: 'gpt-6-astra@high', prompt: 'Investigate.' })
+})
+
+test('general-purpose without a model in all mode takes the ladder and needs no reason', async ($, on) => {
+  boundaries(on, { agentAuto: 'all' })
+  http(on)
+  const judges = judgeStub(on)
+  const sent = spawnStub(on)
+  await start($)
+  await $.agent.spawn({ ...SPAWN, subagentType: 'general-purpose', prompt: '[[ripple: hard]]\nInvestigate.' })
+  expect(judges.length).toBe(0)
+  expect(sent[0]).toMatchObject({ subagentType: 'gpt-6-astra', model: 'gpt-6-astra@high', prompt: 'Investigate.' })
+})
+
+test('general-purpose on a model in all mode names that model: refused unreasoned, run at its @effort with one', async ($, on) => {
+  const b = boundaries(on, { agentAuto: 'all' }, { messages: [{ role: 'user', text: 'Use Opus for this review', toolUses: [] }] })
+  http(on)
+  const sent = spawnStub(on)
+  await start($)
+  const unreasoned = await $.agent.spawn({ ...SPAWN, subagentType: 'general-purpose', model: 'opus@xhigh', prompt: '[[ripple: hard]]\nInvestigate.' })
+  expect(unreasoned.deny).toContain('No reason was given for the model opus')
+  await $.agent.spawn({ ...SPAWN, subagentType: 'general-purpose', model: 'opus@xhigh', prompt: '[[ripple: hard]]\nModel reason: user "Use Opus for this"\nInvestigate.' })
+  expect(sent[0]).toMatchObject({ subagentType: 'general-purpose', model: 'claude-opus-5-5', prompt: 'Investigate.' })
+  const row = JSON.parse(b.files.get('/home/test/.clauderipple/logs/worker-picks.jsonl')!)
+  expect(row).toMatchObject({ by: 'user', namedModel: 'opus', source: 'user', effort: 'xhigh' })
+  // A Claude id is a model this machine runs, so a reasoned one passes the name check too; a model
+  // with no @effort anywhere runs at high.
+  await $.agent.spawn({ ...SPAWN, subagentType: 'general-purpose', model: 'claude-opus-5-5', prompt: 'Model reason: user "Use Opus for this"\nInvestigate again.' })
+  expect(sent[1]).toMatchObject({ subagentType: 'general-purpose', model: 'claude-opus-5-5' })
+  const rows = b.files.get('/home/test/.clauderipple/logs/worker-picks.jsonl')!.trim().split('\n').map(line => JSON.parse(line))
+  expect(rows.at(-1)).toMatchObject({ namedModel: 'claude-opus-5-5', effort: 'high', by: 'user' })
+})
+
+test('a plugin agent stays the engine\'s in all mode: no ladder, no reason needed', async ($, on) => {
+  boundaries(on, { agentAuto: 'all' })
+  http(on)
+  const sent = spawnStub(on)
+  await start($)
+  await $.agent.spawn({ ...SPAWN, subagentType: 'my-plugin:reviewer', model: 'opus', prompt: 'Do it.' })
+  expect(sent[0]).toMatchObject({ subagentType: 'my-plugin:reviewer', model: 'opus', prompt: 'Do it.' })
 })
 
 test('a subagent may not start a worker; the main chat still delegates', async ($, on) => {
@@ -1165,6 +1810,74 @@ test('a cache-reading ping keeps the card, a real reply and /clear drop it, and 
   expect(await demo.find({ type: 'Text', text: /held 312k tokens in cache/ })).toBeDefined()
 })
 
+test('a restarted process takes its chat\'s keep-warm back from the store and pings on the stored context', async ($, on) => {
+  // The live count is 0 until a reply lands (the app restarts the CLI before its first prompt):
+  // only the store's 220k keeps the chat over the minimum, and only with a memo to ping for.
+  const b = boundaries(on, { keepWarm: true }, { tokens: 0 })
+  http(on)
+  judgeStub(on)
+  stepStub(on)
+  let forks = 0
+  on('model.fork', () => { forks += 1; return { value: { isAnswered: true, text: 'ok', usage: USAGE } } })
+  b.saved.set('keepWarm.session-test', { memo: { ttlMs: 3600000, lastReplyAt: NOW - 600000, expiresAt: NOW + 240000 }, lastRealReplyAt: NOW - 600000, contextTokens: 220000, model: 'claude-opus-5-5' })
+  await start($)
+  await b.clock.advance(1)
+  expect(forks).toBe(1)
+  // The ping refreshed the memo for another hour, and the store follows it across a restart.
+  const entry = b.saved.get('keepWarm.session-test') as { memo: { lastReplyAt: number; expiresAt: number }; lastRealReplyAt: number; contextTokens: number }
+  expect(entry.memo.lastReplyAt).toBe(NOW + 1)
+  expect(entry.lastRealReplyAt).toBe(NOW - 600000)
+  expect(entry.contextTokens).toBe(220000)
+  // A resume counted from the person's reply reads lower than the ping refreshed: nothing shortens it.
+  await $.classic.SessionStart({ source: 'resume', seconds_since_last_response: 601, prompt_cache_likely_expired: false, model: 'claude-opus-5-5' })
+  const out = await $.command.run({ command: 'ripple', origin: { kind: 'composer' }, presentation: { isFullscreen: true, columns: 140 }, args: 'debug' })
+  expect(out.text).toContain(`"lastReplyAt": ${NOW + 1}`)
+  expect(out.text).toContain(`"expiresAt": ${NOW + 1 + 3600000}`)
+})
+
+test('an expired entry and another model\'s are not brought back, and the store drops them', async ($, on) => {
+  const b = boundaries(on, { keepWarm: true })
+  http(on)
+  judgeStub(on)
+  stepStub(on)
+  let forks = 0
+  on('model.fork', () => { forks += 1; return { value: { isAnswered: true, text: 'ok', usage: USAGE } } })
+  b.saved.set('keepWarm.session-test', { memo: { ttlMs: 3600000, lastReplyAt: NOW - 3600000, expiresAt: NOW - 1 }, lastRealReplyAt: NOW - 3600000, contextTokens: 220000, model: 'claude-opus-5-5' })
+  await start($)
+  await b.clock.advance(1)
+  // An expired cache is never revived by a restart, as a ping never revives it.
+  expect(forks).toBe(0)
+  expect(b.saved.has('keepWarm.session-test')).toBe(false)
+  const out = await $.command.run({ command: 'ripple', origin: { kind: 'composer' }, presentation: { isFullscreen: true, columns: 140 }, args: 'debug' })
+  expect(out.text).toContain('"cache": null')
+  b.saved.set('keepWarm.session-test', { memo: { ttlMs: 3600000, lastReplyAt: NOW - 600000, expiresAt: NOW + 240000 }, lastRealReplyAt: NOW - 600000, contextTokens: 220000, model: 'claude-sonnet-5-5' })
+  await start($)
+  await b.clock.advance(1)
+  expect(forks).toBe(0)
+  expect(b.saved.has('keepWarm.session-test')).toBe(false)
+})
+
+test('a real reply records the chat in the store; clear and a model change take it back out', async ($, on) => {
+  const b = boundaries(on, { keepWarm: true })
+  http(on)
+  judgeStub(on)
+  stepStub(on)
+  b.saved.set('keepWarm.other', { memo: { ttlMs: 3600000, lastReplyAt: 0, expiresAt: 1 }, lastRealReplyAt: 0, contextTokens: 1, model: 'old-worker' })
+  await start($)
+  await b.clock.advance(1)
+  await step($)
+  const entry = b.saved.get('keepWarm.session-test') as { memo: { expiresAt: number }; lastRealReplyAt: number; contextTokens: number; model: string }
+  expect(entry).toMatchObject({ lastRealReplyAt: NOW + 1, contextTokens: 40000, model: 'claude-opus-5-5' })
+  expect(entry.memo.expiresAt).toBe(NOW + 1 + 3600000)
+  // Another chat's entry past its expiry goes with the write: the store does not grow by sessions.
+  expect(b.saved.has('keepWarm.other')).toBe(false)
+  await $.classic.SessionStart({ source: 'clear' })
+  expect(b.saved.has('keepWarm.session-test')).toBe(false)
+  b.setModel('claude-sonnet-5-5')
+  await step($, 'claude-sonnet-5-5')
+  expect(b.saved.get('keepWarm.session-test')).toMatchObject({ model: 'claude-sonnet-5-5' })
+})
+
 test('fork turn.step is not effort-steered, busy or main-request cost', async ($, on) => {
   const b = boundaries(on, { keepWarm: true })
   http(on)
@@ -1205,38 +1918,390 @@ test('the flame turns keep-warm off for this chat only; Settings stay as they ar
   expect(b.router().settings.keepWarm).toBe(true)
 })
 
-test('Haiku compaction returns replacement messages and forwards the keep note', async ($, on) => {
-  boundaries(on)
-  http(on)
-  const calls = judgeStub(on, 'Verified continuation summary. '.repeat(20))
+test('typed compaction passes core input and output unchanged, with no model call or pick POST', async ($, on) => {
+  boundaries(on, { compactModel: 'gpt-6.1-sol@high' })
+  const urls = http(on)
+  const calls = judgeStub(on)
+  const input = { trigger: 'manual' as const, messages: MESSAGES, instructions: 'Keep file paths.' }
   let engine = 0
-  on('session.compact', () => { engine++; return { messages: MESSAGES } })
+  on('session.compact', ($, e) => { engine++; expect(e).toMatchObject(input); return { messages: MESSAGES } })
   await start($)
-  const out = await $.session.compact({ trigger: 'manual', messages: MESSAGES, instructions: 'Keep file paths.' })
-  expect(calls[0]).toMatchObject({ model: 'claude-haiku-5-5', maxTokens: 16000, timeoutMs: 240000, effort: 'medium' })
-  expect(calls[0]?.prompt).toContain('Keep file paths.')
-  expect(out.messages?.[0]?.text.includes('Continuation record')).toBe(true)
-  expect(engine).toBe(0)
+  const out = await $.session.compact(input)
+  expect(out.messages).toEqual(MESSAGES)
+  expect(engine).toBe(1)
+  expect(calls).toEqual([])
+  expect(urls.some(url => url.endsWith('/api/compact-pick'))).toBe(false)
 })
 
-test('failed Haiku compaction falls back; precompute skips; subagent stays with engine', async ($, on) => {
+for (const failure of ['http', 'throw'] as const) test(`card pick ${failure} failure reports and still calls core once`, async ($, on) => {
+  const b = boundaries(on)
+  on('http.fetch', { url: /\/api\/compact-pick$/ }, () => {
+    if (failure === 'throw') throw new Error('router unavailable')
+    return { value: { ok: false, status: 503, headers: {}, text: '' } }
+  })
+  http(on)
+  const calls = judgeStub(on)
+  let engine = 0
+  on('session.compact', () => { engine++; return { messages: MESSAGES } })
+  on('command.run', { command: 'compact' }, async () => { await $.session.compact({ trigger: 'manual', messages: MESSAGES }); return { text: 'done' } })
+  await start($)
+  const ui = await band($, 'desktop')
+  await ui.press({ key: 'compact' }); await ui.press({ key: 'tidy' })
+  await ui.input({ key: 'note', text: 'keep' })
+  expect(engine).toBe(1); expect(calls).toEqual([])
+  expect(b.logs.some(log => log.includes('session.compact pick'))).toBe(true)
+  await ui.unmount()
+})
+
+test('compact card warns only for an expired known cache and session compactor', async ($, on) => {
+  const b = boundaries(on, { compactModel: 'session', compactModels: ['claude-haiku-5-5'] })
+  let memo: { ttlMs: number; lastReplyAt: number; expiresAt: number } | null = null
+  on('state.get', { plugin: 'ripple', key: 'cache' }, () => ({ value: { value: memo, version: 0 } }))
+  http(on)
+  await start($)
+  const ui = await band($, 'desktop')
+  await ui.press({ key: 'compact' })
+  expect(JSON.stringify(await ui.drawn())).not.toContain('The cache has expired')
+  memo = { ttlMs: 1000, lastReplyAt: NOW - 1000, expiresAt: NOW }
+  await ui.press({ key: 'compact-model-claude-haiku-5-5' })
+  expect(JSON.stringify(await ui.drawn())).not.toContain('The cache has expired')
+  await ui.press({ key: 'compact-model-session' })
+  expect(JSON.stringify(await ui.drawn())).toContain('The cache has expired')
+  memo = { ...memo, expiresAt: NOW + 1000 }
+  await ui.press({ key: 'compact-model-claude-haiku-5-5' })
+  await ui.press({ key: 'compact-model-session' })
+  expect(JSON.stringify(await ui.drawn())).not.toContain('The cache has expired')
+  await ui.unmount()
+  await b.clock.settle()
+})
+
+// 2026-10-31: the card's model applies once, including after its tidy turn.
+for (const tidyFirst of [false, true]) test(`compact card model is one-shot, tidy ${tidyFirst}`, async ($, on) => {
+  const b = boundaries(on, { compactModel: 'claude-haiku-5-5', compactModels: ['claude-opus-5-5', 'session'] })
+  const picks: unknown[] = []
+  on('http.fetch', { url: /\/api\/compact-pick$/ }, ($, e) => {
+    expect(e.url).toBe('http://127.0.0.1:9992/api/compact-pick')
+    expect(e.init?.method).toBe('POST')
+    picks.push(JSON.parse(e.init?.body ?? '{}'))
+    return { value: { ok: true, status: 200, headers: {}, text: '{}' } }
+  })
+  http(on)
+  const calls = judgeStub(on)
+  let native = 0
+  on('session.compact', () => { native++; return { messages: MESSAGES } })
+  on('command.run', { command: 'compact' }, async () => { await $.session.compact({ trigger: 'manual', messages: MESSAGES }); return { text: 'done' } })
+  await start($)
+  const ui = await band($, 'desktop')
+  await ui.press({ key: 'compact' })
+  await ui.press({ key: 'compact-model-claude-opus-5-5' })
+  if (!tidyFirst) await ui.press({ key: 'tidy' })
+  await ui.input({ key: 'note', text: 'keep' })
+  if (tidyFirst) {
+    await $.turn.start({ text: TIDY, turnId: 'tidy-choice' })
+    await $.turn.complete({ turnId: 'tidy-choice', answer: 'done', reason: 'answer', durationMs: 10, isAborted: false })
+    await b.clock.advance(10)
+  }
+  // The pick goes before core's compaction and is forgotten after it, used or not.
+  expect(picks).toEqual([{ session: 'session-test', model: 'claude-opus-5-5' }, { session: 'session-test', model: null }])
+  await $.session.compact({ trigger: 'manual', messages: MESSAGES })
+  expect(picks.length).toBe(2)
+  expect(calls).toEqual([])
+  expect(native).toBe(2)
+  await ui.press({ key: 'dismiss' })
+  await ui.press({ key: 'compact' })
+  expect(JSON.stringify(await ui.drawn())).toContain('[Claude Haiku]')
+  await ui.press({ key: 'compact-model-session' })
+  if (tidyFirst) await ui.press({ key: 'tidy' })
+  await ui.input({ key: 'note', text: 'keep' })
+  expect(native).toBe(3)
+  expect(picks).toEqual([{ session: 'session-test', model: 'claude-opus-5-5' }, { session: 'session-test', model: null }, { session: 'session-test', model: 'session' }, { session: 'session-test', model: null }])
+  await ui.unmount()
+})
+
+// 2026-10-25: the band's Compact asks the chat to tidy up first, as a prompt of its own, and only
+// the turn that prompt became compacts — never another prompt's end.
+const TIDY = t('en', 'alerts.tidyPrompt')
+
+function compacts(on: On) {
+  const args: string[] = []
+  on('command.run', { command: 'compact' }, ($, e) => { args.push(e.args); return { text: 'Compacted.' } })
+  return args
+}
+
+/** The band's Compact pressed on the desktop, its note sent with Enter, and the band left mounted. */
+async function pressCompact($: Engine, note: string) {
+  const ui = await band($, 'desktop')
+  await ui.press({ key: 'compact' })
+  await ui.input({ key: 'note', text: note })
+  return ui
+}
+
+test('a Compact press tidies up first, and only its own turn\'s answer compacts', async ($, on) => {
   const b = boundaries(on)
   http(on)
-  const calls = judgeStub(on, 'too short')
+  const notes = compacts(on)
+  await start($)
+  const ui = await pressCompact($, 'Keep the router decision.')
+  expect(b.submitted).toEqual([TIDY])
+  expect(notes).toEqual([])
+  expect(await ui.find({ type: 'Text', text: 'Tidying up…' })).toBeDefined()
+  // A prompt queued before it ends first: nothing is compacted and the card still says tidying.
+  await $.turn.start({ text: 'the prompt queued before it', turnId: 'turn-2' })
+  await $.turn.complete({ turnId: 'turn-2', answer: 'done', reason: 'answer', durationMs: 10, isAborted: false })
+  await b.clock.advance(10)
+  expect(notes).toEqual([])
+  expect(await ui.find({ type: 'Text', text: 'Tidying up…' })).toBeDefined()
+  // The tidy prompt's own turn, answered, compacts with the note the card carried.
+  await $.turn.start({ text: TIDY, turnId: 'turn-3' })
+  await $.turn.complete({ turnId: 'turn-3', answer: 'Everything is written down.', reason: 'answer', durationMs: 10, isAborted: false })
+  await b.clock.advance(10)
+  expect(notes).toEqual(['Keep the router decision.'])
+  expect(await ui.find({ type: 'Text', text: 'Compacted' })).toBeDefined()
+  await ui.unmount()
+})
+
+test('a tidy turn that is stopped compacts nothing and says the chat was left alone', async ($, on) => {
+  const b = boundaries(on)
+  http(on)
+  const notes = compacts(on)
+  await start($)
+  const ui = await pressCompact($, 'Keep the router decision.')
+  await $.turn.start({ text: TIDY, turnId: 'turn-2' })
+  await $.turn.complete({ turnId: 'turn-2', answer: '', reason: 'aborted', durationMs: 10, isAborted: true })
+  await b.clock.advance(10)
+  expect(notes).toEqual([])
+  expect(b.toasts.some(text => text.includes('the tidy-up did not finish'))).toBe(true)
+  expect(await ui.find({ type: 'Text', text: /did not finish, so the chat was not compacted/ })).toBeDefined()
+  await ui.unmount()
+})
+
+test('the tidy switch is on by default, kept, and off compacts at once', async ($, on) => {
+  const b = boundaries(on)
+  http(on)
+  const notes = compacts(on)
+  await start($)
+  const ui = await band($, 'desktop')
+  await ui.press({ key: 'compact' })
+  expect(JSON.stringify(await ui.drawn())).toContain('Tidy up first: On')
+  await ui.press({ key: 'tidy' })
+  expect(JSON.stringify(await ui.drawn())).toContain('Tidy up first: Off')
+  await ui.input({ key: 'note', text: 'Keep the router decision.' })
+  expect(b.submitted).toEqual([])
+  expect(notes).toEqual(['Keep the router decision.'])
+  // The last choice is the next card's too.
+  await ui.press({ key: 'dismiss' })
+  await ui.press({ key: 'compact' })
+  expect(JSON.stringify(await ui.drawn())).toContain('Tidy up first: Off')
+  await ui.unmount()
+})
+
+test('a Compact pressed again while the tidy turn runs sends one prompt', async ($, on) => {
+  const b = boundaries(on)
+  http(on)
+  const notes = compacts(on)
+  await start($)
+  const ui = await pressCompact($, 'Keep the router decision.')
+  await $.turn.start({ text: TIDY, turnId: 'turn-2' })
+  // The card let go, the band is back: a second press waits on the tidy turn already running.
+  await ui.press({ key: 'dismiss' })
+  await ui.press({ key: 'compact' })
+  await ui.input({ key: 'note', text: 'Keep the router decision.' })
+  expect(b.submitted).toEqual([TIDY])
+  await $.turn.complete({ turnId: 'turn-2', answer: 'Done.', reason: 'answer', durationMs: 10, isAborted: false })
+  await b.clock.advance(10)
+  expect(notes).toEqual(['Keep the router decision.'])
+  await ui.unmount()
+})
+
+// 2026-10-25: a tidy prompt that never became a turn (the person dropped it from the queue, the
+// engine let it go) used to leave the wait standing, and the Compact button dead until the mod
+// reloaded. Pressing again now gives that wait up and sends the prompt again.
+test('a Compact pressed again before the tidy prompt becomes a turn sends it again', async ($, on) => {
+  const b = boundaries(on)
+  http(on)
+  const notes = compacts(on)
+  await start($)
+  const ui = await pressCompact($, 'Keep the router decision.')
+  expect(b.submitted).toEqual([TIDY])
+  await ui.press({ key: 'dismiss' })
+  await ui.press({ key: 'compact' })
+  await ui.input({ key: 'note', text: 'Keep the router decision.' })
+  expect(b.submitted).toEqual([TIDY, TIDY])
+  // The prompt sent again is the one that becomes a turn, and its answer compacts once.
+  await $.turn.start({ text: TIDY, turnId: 'turn-2' })
+  await $.turn.complete({ turnId: 'turn-2', answer: 'Done.', reason: 'answer', durationMs: 10, isAborted: false })
+  await b.clock.advance(10)
+  expect(notes).toEqual(['Keep the router decision.'])
+  await ui.unmount()
+})
+
+test('the band measures context against the compaction window, not the whole model window', async ($, on) => {
+  // 40k of a 1M model is 4%; with Claude Code compacting at 400k it is 10%, and that is the share.
+  const b = boundaries(on, { extras: ['context'] }, { window: 1_000_000, tokens: 40_000, compactAt: 400_000 })
+  http(on)
+  await start($)
+  await b.clock.advance(15_000)
+  const ui = await band($, 'desktop')
+  expect(await ui.find({ type: 'Text', text: '10%' })).toBeDefined()
+  await ui.unmount()
+})
+
+test('the band shows the session\'s own compaction window, as the Context pane does, over settings.json', async ($, on) => {
+  // settings.json says 500k but the running session compacts at 400k: 200k is 50%, not 40%.
+  const b = boundaries(on, { extras: ['context'] }, { window: 1_000_000, tokens: 200_000, compactAt: 500_000, engineWindow: 400_000 })
+  http(on)
+  await start($)
+  await b.clock.advance(15_000)
+  const ui = await band($, 'desktop')
+  expect(await ui.find({ type: 'Text', text: '50%' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: '40%' })).toBeUndefined()
+  await ui.unmount()
+})
+
+test('a precise context count does not outlive a model or window switch', async ($, on) => {
+  const ctx = movableContext()
+  const b = boundaries(on, { extras: ['context'] }, { context: ctx })
+  http(on)
+  stepStub(on)
+  await start($)
+  await step($, ctx.model)
+  await b.clock.advance(15_000)
+  const pane = await contextPane($)
+  await pane.press({ key: 'context-refresh' })
+  expect(await pane.find({ type: 'Text', text: /Counted by the token-count API/ })).toBeDefined()
+  await pane.unmount()
+  // The same tokens now sit in an 800k window: 4%, not the old count's 20%.
+  ctx.model = 'claude-opus-6-0'
+  ctx.window = 800_000
+  b.setModel(ctx.model)
+  await step($, ctx.model)
+  await b.clock.advance(15_000)
+  const ui = await band($, 'desktop')
+  expect(await ui.find({ type: 'Text', text: '4%' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: '20%' })).toBeUndefined()
+  await ui.unmount()
+})
+
+test('a precise context count does not outlive a cleared chat', async ($, on) => {
+  const ctx = movableContext()
+  const b = boundaries(on, { extras: ['context'] }, { context: ctx })
+  http(on)
+  await start($)
+  await b.clock.advance(15_000)
+  let pane = await contextPane($)
+  await pane.press({ key: 'context-refresh' })
+  expect(await pane.find({ type: 'Text', text: /Counted by the token-count API/ })).toBeDefined()
+  await pane.unmount()
+  // /clear keeps the same tokens and window here, so only the session it counted can say it is old.
+  await $.classic.SessionStart({ source: 'clear' })
+  await b.clock.advance(15_000)
+  pane = await contextPane($)
+  expect(await pane.find({ type: 'Text', text: /Local estimate/ })).toBeDefined()
+  expect(await pane.find({ type: 'Text', text: /Counted by the token-count API/ })).toBeUndefined()
+})
+
+test('a precise context count does not outlive a compaction', async ($, on) => {
+  const ctx = movableContext()
+  const b = boundaries(on, { compactModel: 'session', extras: ['context'] }, { context: ctx })
+  http(on)
+  on('session.compact', () => ({ messages: MESSAGES }))
+  await start($)
+  await b.clock.advance(15_000)
+  let pane = await contextPane($)
+  await pane.press({ key: 'context-refresh' })
+  expect(await pane.find({ type: 'Text', text: /Counted by the token-count API/ })).toBeDefined()
+  await pane.unmount()
+  await $.session.compact({ trigger: 'manual', messages: MESSAGES })
+  await b.clock.advance(15_000)
+  pane = await contextPane($)
+  expect(await pane.find({ type: 'Text', text: /Local estimate/ })).toBeDefined()
+  expect(await pane.find({ type: 'Text', text: /Counted by the token-count API/ })).toBeUndefined()
+})
+
+test('a precise count that answers after a clear, a resume, a model switch or a compaction is discarded', async ($, on) => {
+  const ctx = movableContext()
+  let hold = false
+  let release: (() => void) | null = null
+  let rejectFull: ((error: Error) => void) | null = null
+  const b = boundaries(on, { compactModel: 'session', extras: ['context'] }, { context: ctx, deferUsage: kind => {
+    if (!hold || kind !== 'full') return undefined
+    return new Promise<void>((resolve, reject) => { release = resolve; rejectFull = reject })
+  } })
+  http(on)
+  on('session.compact', () => ({ messages: MESSAGES }))
+  stepStub(on)
+  await start($)
+  await step($, ctx.model)
+  await b.clock.advance(15_000)
+  const pane = await contextPane($)
+  const trip = async (change: () => Promise<unknown>, outcome: 'ok' | 'error' = 'ok') => {
+    hold = true
+    const pressed = pane.press({ key: 'context-refresh' })
+    await b.clock.settle()
+    expect(release, 'full count started').not.toBeNull()
+    hold = false
+    await change()
+    if (outcome === 'error') rejectFull!(new Error('token count unavailable'))
+    else release!()
+    release = null
+    rejectFull = null
+    await pressed
+    await b.clock.settle()
+    expect(await pane.find({ type: 'Text', text: /Counted by the token-count API/ }), 'old count').toBeUndefined()
+    expect(await pane.find({ type: 'Text', text: /Precise count failed/ }), 'old error').toBeUndefined()
+    expect(await pane.find({ type: 'Text', text: /Counting/ }), 'stale busy').toBeUndefined()
+  }
+  await trip(() => $.classic.SessionStart({ source: 'clear' }))
+  await trip(() => $.classic.SessionStart({ source: 'resume', seconds_since_last_response: 120, prompt_cache_likely_expired: false, model: 'claude-opus-5-5' }))
+  await trip(async () => { ctx.model = 'claude-opus-6-0'; b.setModel(ctx.model); await step($, ctx.model) })
+  // A compaction while the count runs, whose answer then fails: neither the count nor its error lands.
+  await trip(() => $.session.compact({ trigger: 'manual', messages: MESSAGES }), 'error')
+})
+
+test('a summary that answers after a clear is not published', async ($, on) => {
+  const ctx = { model: 'claude-opus-5-5', window: 200_000, tokens: 32_000, raw: 160_000 }
+  let hold = false
+  let release: (() => void) | null = null
+  const b = boundaries(on, { extras: ['context'] }, { context: ctx, deferUsage: kind => {
+    if (!hold || kind !== 'summary') return undefined
+    return new Promise<void>(resolve => { release = resolve })
+  } })
+  http(on)
+  const writes: ({ percent: number } | null)[] = []
+  on('state.set', { plugin: 'ripple', key: 'context' }, async ($, e, next) => { const result = await next(e); writes.push(e.value as { percent: number } | null); return result })
+  await start($)
+  await b.clock.advance(15_000)
+  expect(writes.at(-1)?.percent).toBe(20)
+  // A different token count asks for a fresh summary: 25% of its 160k window, where the 200k estimate is 20%.
+  ctx.tokens = 40_000
+  hold = true
+  await b.clock.advance(15_000)
+  expect(release, 'summary started').not.toBeNull()
+  await $.classic.SessionStart({ source: 'clear' })
+  hold = false
+  release!()
+  await b.clock.settle()
+  expect(writes.at(-1)?.percent).toBe(20)
+})
+
+test('auto, precompute and worker compaction always use core and POST no pick', async ($, on) => {
+  boundaries(on)
+  const urls = http(on)
+  const calls = judgeStub(on)
   let engine = 0
   on('session.compact', () => { engine++; return { messages: MESSAGES } })
   await start($)
-  await $.session.compact({ trigger: 'manual', messages: MESSAGES })
-  const skipped = await $.session.compact({ trigger: 'precompute', messages: MESSAGES })
+  await $.session.compact({ trigger: 'auto', messages: MESSAGES })
+  const computed = await $.session.compact({ trigger: 'precompute', messages: MESSAGES })
   await $.session.compact({ trigger: 'auto', messages: MESSAGES, agentId: 'worker' })
-  expect(engine).toBe(2)
-  expect(calls.length).toBe(1)
-  expect('skip' in skipped).toBe(true)
-  expect(b.toasts.some(t => t.includes('session compactor'))).toBe(true)
+  expect(engine).toBe(3)
+  expect(calls).toEqual([])
+  expect(computed.messages).toEqual(MESSAGES)
+  expect(urls.some(url => url.endsWith('/api/compact-pick'))).toBe(false)
 })
 
 test('the Compact icon counts the main chat\'s finished compactions; /clear zeroes it', async ($, on) => {
-  boundaries(on, { compactWith: 'session' })
+  boundaries(on, { compactModel: 'session' })
   http(on)
   on('session.compact', () => ({ messages: MESSAGES }))
   await start($)
@@ -1265,8 +2330,8 @@ test('the Compact icon counts the main chat\'s finished compactions; /clear zero
 
 const BURN = normalizeModes([{ id: 'burn', name: 'Burn GPT', rungs: { ...DEFAULTS.rules.general.rungs, light: [{ target: { agent: 'gpt-6-1-sol' }, effort: 'low' }] }, delegation: 'eager' }])
 
-test('an eager mode notes the main chat once, and again after a compaction; its tiers route spawns and each pick names it', async ($, on) => {
-  const b = boundaries(on, { modes: BURN, activeMode: 'burn', activeSince: NOW, compactWith: 'session' })
+test('an eager mode notes every prompt, whether or not it follows a compaction; its tiers route spawns and each pick names it', async ($, on) => {
+  const b = boundaries(on, { modes: BURN, activeMode: 'burn', activeSince: NOW, compactModel: 'session' })
   http(on)
   judgeStub(on)
   const sent = spawnStub(on)
@@ -1274,7 +2339,7 @@ test('an eager mode notes the main chat once, and again after a compaction; its 
   await start($)
   await submit($)
   await submit($)
-  // A slash command is not the user's prompt: no note, and the turn after it is still noted.
+  // A slash command is not the user's prompt: no note.
   await submit($, '/model')
   await $.session.compact({ trigger: 'auto', messages: MESSAGES })
   // A subagent's compaction is not the main chat's.
@@ -1282,12 +2347,13 @@ test('an eager mode notes the main chat once, and again after a compaction; its 
   await $.session.compact({ trigger: 'auto', messages: MESSAGES, agentId: 'worker' })
   await submit($)
   const note = 'ClaudeRipple mode Burn GPT: delegate everything except judgment and final review to ripple:auto.'
-  expect(b.contexts).toEqual([[note], [], [], [note], []])
-  // Prefer ChatGPT: Low leaves DeepSeek for the cheaper of Sol and Astra (AA cost), at Low's effort.
-  await $.agent.spawn(SPAWN)
+  expect(b.contexts).toEqual([[note], [note], [], [note], [note]])
+  // The mode's light rung runs Sol at low, not the base ladder's DeepSeek.
+  await $.agent.spawn({ ...SPAWN, prompt: `[[ripple: light]]\n${SPAWN.prompt}` })
   expect(sent[0]).toMatchObject({ subagentType: 'gpt-6-1-sol', model: 'gpt-6.1-sol@low' })
   const pick = b.logs.find(text => text.startsWith('ClaudeRipple worker pick: '))!
   expect(JSON.parse(pick.slice('ClaudeRipple worker pick: '.length))).toMatchObject({ level: 'light', rung: 'light', mode: 'Burn GPT' })
+  expect(JSON.parse(b.files.get('/home/test/.clauderipple/logs/worker-picks.jsonl')!)).toMatchObject({ tier: 'light', by: 'session' })
   // The band names the mode.
   const ui = await band($, 'desktop')
   expect(await ui.find({ type: 'Text', text: 'Burn GPT' })).toBeDefined()
@@ -1509,6 +2575,35 @@ test('host survey wins; minimal layout renders through SessionMode', async ($, o
   expect(await footer.find({ type: 'Text', text: 'host drawing' })).toBeDefined()
 })
 
+test('a desktop survey draws over the band instead of blanking it', async ($, on) => {
+  boundaries(on)
+  http(on)
+  await start($)
+  const plain = await band($, 'desktop')
+  expect(await plain.find({ key: 'compact' }), 'band without a survey').toBeDefined()
+  await plain.unmount()
+  const survey = await band($, 'desktop', true)
+  expect(await survey.find({ type: 'Text', text: 'host drawing' }), 'host survey').toBeDefined()
+  expect(await survey.find({ key: 'compact' }), 'band under the survey').toBeDefined()
+  await survey.unmount()
+})
+
+test('the dashboard keeps what another mod drew above the prompt, on the terminal and the desktop', async ($, on) => {
+  boundaries(on)
+  http(on)
+  await start($)
+  for (const surface of ['terminal', 'desktop'] as const) {
+    const ui = await band($, surface)
+    expect(await ui.find({ type: 'Text', text: 'host drawing' }), `${surface}: the other mod's drawing`).toBeDefined()
+    expect(await ui.find({ key: surface === 'terminal' ? 'auto' : 'compact' }), `${surface}: the band beside it`).toBeDefined()
+    await ui.unmount()
+  }
+  await command($, 'settings')
+  const settings = await band($)
+  expect(await settings.find({ type: 'Text', text: 'host drawing' }), 'settings card').toBeDefined()
+  await settings.unmount()
+})
+
 test('log queries by session and reopening follows engine panes, not stale atoms', async ($, on) => {
   const b = boundaries(on)
   const urls = http(on)
@@ -1578,7 +2673,7 @@ test('an unsure Jev still decides: no Haiku call, no alert, key only to TypeSafe
   expect(await (await band($)).find({ type: 'Text', text: /not answering/ })).toBeUndefined()
 })
 
-test('Jev times out at three seconds without blocking the person prompt, and says so only the second time running', async ($, on) => {
+test('Jev times out at five seconds without blocking the person prompt, and says so only the second time running', async ($, on) => {
   const b = boundaries(on, { judge: 'jev' }, { key: 'test-secret' })
   const judges = judgeStub(on, '{"effort":"medium","why":"fallback"}')
   on('http.fetch', async ($, e, next) => {
@@ -1589,7 +2684,9 @@ test('Jev times out at three seconds without blocking the person prompt, and say
   await start($)
   const pending = submit($)
   await b.clock.settle()
-  await b.clock.advance(3000)
+  // The judge's own timeout rose from three seconds to five on 2026-10-22 (register.tsx judge);
+  // advancing the old three would leave the race pending and hang the prompt.
+  await b.clock.advance(5000)
   const out = await pending
   expect(out.text).toContain('Implement')
   expect(judges.length).toBe(1)
@@ -1597,7 +2694,7 @@ test('Jev times out at three seconds without blocking the person prompt, and say
   expect(b.toasts.some(t => t.includes('timed out'))).toBe(false)
   const again = submit($, 'Refactor the parser across three files and verify.')
   await b.clock.settle()
-  await b.clock.advance(3000)
+  await b.clock.advance(5000)
   await again
   expect(b.toasts.some(t => t.includes('timed out'))).toBe(true)
 })
@@ -1667,7 +2764,18 @@ test('Jev Test displays latency and a missing-key result', async ($, on) => {
   await ui.unmount()
 })
 
-test('known agents show waiting after an eight-second tool and finish with cost', async ($, on) => {
+test('reload restores the retired waiting classification to running without losing its tool', async ($, on) => {
+  boundaries(on)
+  http(on)
+  let legacy = true
+  let records: AgentRec[] = []
+  on('state.get', { plugin: 'ripple', key: 'agents' }, ($, e, next) => legacy ? { value: { value: [{ id: 'old', state: 'waiting', startedAt: NOW - 30_000, cost: 0, now: 'Bash npm test', toolSince: NOW - 30_000 }], version: 0 } } : next(e))
+  on('state.set', { plugin: 'ripple', key: 'agents' }, async ($, e, next) => { legacy = false; records = e.value as AgentRec[]; return next(e) })
+  await start($)
+  expect(records[0]).toMatchObject({ id: 'old', state: 'running', now: 'Bash npm test', toolSince: NOW - 30_000 })
+})
+
+test('known agents stay running through a long tool and finish with cost', async ($, on) => {
   const b = boundaries(on)
   http(on)
   judgeStub(on)
@@ -1682,18 +2790,24 @@ test('known agents show waiting after an eight-second tool and finish with cost'
   await b.clock.settle()
   await b.clock.advance(15000)
   const ui = await $.ui.mount({ plugin: 'ripple', component: 'Pane', requestId: 'ripple-agents', surface: 'terminal', props: { title: 'Agents', isFocused: true, bodyColumns: 100, placement: 'inline', scroll: { offset: 0, bodyRows: 30 }, view: {} } })
-  expect(await ui.find({ type: 'Text', text: /waiting/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /waiting/ })).toBeUndefined()
+  expect(await ui.find({ type: 'Text', text: /Bash npm test · 15s/ })).toBeDefined()
+  const desktop = await $.ui.mount({ plugin: 'ripple', component: 'Pane', requestId: 'ripple-agents', surface: 'desktop', props: { title: 'Agents', isFocused: true, bodyColumns: 100, placement: 'inline', scroll: { offset: 0, bodyRows: 30 }, view: {} } })
+  const age = await desktop.find({ type: 'Text', text: '15s' })
+  expect(age?.props.color).toBe('#f2f0eb')
+  await desktop.unmount()
   await b.clock.advance(15000)
   await tool
   await complete($, 'worker-1')
   expect(await ui.find({ type: 'Text', text: 'Rename variable' })).toBeDefined()
-  // The API's own counts (100 + 40000 cached in, 10 out), not the weighted cost.
-  expect(await ui.find({ type: 'Text', text: 'in 40k · cache 100% · out 10 · tools 1' })).toBeDefined()
+  // The Claude app's count: one step's prompt (100 + 40000 cached) plus its output (10), not the weighted cost.
+  // The cached share is rounded down, so 40000/40100 reads 99%, never a whole 100.
+  expect(await ui.find({ type: 'Text', text: 'tokens 40k · cache 99% · tools 1' })).toBeDefined()
 })
 
 test('an agent keeps the API\'s token counts, its tools and the effort it was sent at; its card opens its conversation and goes back', async ($, on) => {
   const reads: string[] = []
-  boundaries(on, {}, { agentMessages: id => {
+  const b = boundaries(on, {}, { agentMessages: id => {
     reads.push(id)
     return [{ role: 'user', text: 'Rename one local variable and verify it.', toolUses: [] }, { role: 'assistant', text: 'Renamed it.', toolUses: [{ tool_use_id: 't1', tool: 'Bash', input: { command: 'npm test' }, text: 'ok' }] }]
   } })
@@ -1709,27 +2823,53 @@ test('an agent keeps the API\'s token counts, its tools and the effort it was se
     return result
   })
   await start($)
-  await $.agent.spawn(SPAWN)
-  // The routed id's @low is what the router sends, whatever the request's own effort says.
+  // The light rung runs DeepSeek, whose routed id carries @low whatever the request's effort says.
+  await $.agent.spawn({ ...SPAWN, prompt: `[[ripple: light]]\n${SPAWN.prompt}` })
   await step($, 'deepseek-v4.1-flash@low', 'high', 'worker-1')
   await step($, 'deepseek-v4.1-flash@low', 'high', 'worker-1')
   const input: ToolCallInput = { tool: 'Bash', command: 'npm test', agentId: 'worker-1', tool_use_id: 'tool-a' }
   await $.tool.call(input)
   const rec = written.find(a => a.id === 'worker-1')
-  expect(rec?.usage).toEqual({ input: 600, cached: 18_000, cacheWrite: 1400, output: 100 })
+  // The last step's counts, not a sum of both steps' prompts; the output totals every step.
+  expect(rec?.usage).toEqual({ input: 300, cached: 9000, cacheWrite: 700, output: 50 })
+  expect(rec?.outputTotal).toBe(100)
   expect(rec?.tools).toBe(1)
   expect(rec?.effort).toBe('low')
   expect(rec?.answeredBy).toBe('deepseek-v4.1-flash@low')
   expect(rec?.provider).toBe('deepseek')
   const ui = await $.ui.mount({ plugin: 'ripple', component: 'Pane', requestId: 'ripple-agents', surface: 'terminal', props: { title: 'Agents', isFocused: true, bodyColumns: 100, placement: 'inline', scroll: { offset: 0, bodyRows: 30 }, view: {} } })
-  expect(await ui.find({ type: 'Text', text: /in 20k · cache 90% · out 100 · tools 1/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /tokens 10k · cache 90% · tools 1/ })).toBeDefined()
   expect(reads).toEqual([])
   await ui.press({ key: 'open-worker-1' })
   expect(reads).toContain('worker-1')
+  // The app's own agent view is asked first; the test engine draws no main view, so the refusal
+  // goes to the debug log and the conversation is read here. Opened, the pane is asked to go to
+  // the conversation's end, its newest words; the test engine scrolls nothing either.
+  expect(b.logs.filter(log => log.includes('agents view'))).toEqual(['ClaudeRipple agents view: no implementation for ui.view'])
+  expect(b.logs.filter(log => log.includes('agents scroll'))).toEqual(['ClaudeRipple agents scroll: no implementation for ui.scroll'])
   expect(await ui.find({ type: 'Text', text: 'Renamed it.' })).toBeDefined()
   expect(await ui.find({ type: 'Text', text: 'npm test' })).toBeDefined()
   await ui.press({ key: 'back' })
   expect(await ui.find({ type: 'Text', text: 'Renamed it.' })).toBeUndefined()
+  expect(await ui.find({ type: 'Button', key: 'open-worker-1' })).toBeDefined()
+})
+
+test('an agent\'s card takes the app to the agent\'s own view, and the pane stays on its list', async ($, on) => {
+  const reads: string[] = []
+  boundaries(on, {}, { agentMessages: id => { reads.push(id); return [] } })
+  http(on)
+  judgeStub(on)
+  spawnStub(on)
+  stepStub(on, { input_tokens: 300, output_tokens: 50, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 })
+  const viewed: unknown[] = []
+  on('ui.view', ($, e) => { viewed.push(e); return { value: {} } })
+  await start($)
+  await $.agent.spawn(SPAWN)
+  await step($, 'deepseek-v4.1-flash@low', 'high', 'worker-1')
+  const ui = await $.ui.mount({ plugin: 'ripple', component: 'Pane', requestId: 'ripple-agents', surface: 'terminal', props: { title: 'Agents', isFocused: true, bodyColumns: 100, placement: 'inline', scroll: { offset: 0, bodyRows: 30 }, view: {} } })
+  await ui.press({ key: 'open-worker-1' })
+  expect(viewed).toEqual([{ agentId: 'worker-1' }])
+  expect(reads).toEqual([])
   expect(await ui.find({ type: 'Button', key: 'open-worker-1' })).toBeDefined()
 })
 
@@ -1754,7 +2894,7 @@ test('an agent\'s run of tool calls unfolds on press, its paths short against th
   await $.agent.spawn(SPAWN)
   const ui = await $.ui.mount({ plugin: 'ripple', component: 'Pane', requestId: 'ripple-agents', surface: 'terminal', props: { title: 'Agents', isFocused: true, bodyColumns: 100, placement: 'inline', scroll: { offset: 0, bodyRows: 30 }, view: {} } })
   await ui.press({ key: 'open-worker-1' })
-  expect(await ui.find({ type: 'Button', text: /^Ran 1 command, Read 1 file/ })).toBeDefined()
+  expect(await ui.find({ type: 'Button', text: /^Ran a command, read a file/ })).toBeDefined()
   expect(await ui.find({ type: 'Text', text: './gradlew test' })).toBeUndefined()
   await ui.press({ key: 'run-c1' })
   expect(await ui.find({ type: 'Text', text: /^\.\/gradlew test$/ })).toBeDefined()
@@ -1770,65 +2910,120 @@ test('an agent\'s run of tool calls unfolds on press, its paths short against th
   expect(await ui.find({ type: 'Text', text: './gradlew test' })).toBeUndefined()
 })
 
+// ---- Handoff (2026-10-24: one press, the session's model writes it in a fork) -------------------
+
 /** The claude:// link a handoff opened, and its query. */
 function opened(b: { processes: { argv: readonly string[] }[] }): URLSearchParams | undefined {
   const link = b.processes.map(p => p.argv.at(-1) ?? '').find(arg => arg.startsWith('claude://code/new?'))
   return link ? new URLSearchParams(link.slice('claude://code/new?'.length)) : undefined
 }
 
-// 2026-10-13: "Confirm first" cleared the chat at once (it only told the new chat to wait), and
-// the owner lost the chat to it. A handoff now never clears: it opens a new session in the folder.
-test('full handoff with Ask first stops on a card, then opens a new session in the folder without clearing', async ($, on) => {
-  const b = boundaries(on, { handoffSkill: 'custom-handoff', handoffAfter: 'confirm' })
+// 2026-10-13: a handoff that cleared the chat lost the owner the chat. It never clears, and it
+// sends nothing to this chat: the note waits in the new session's prompt box.
+test('the band\'s Handoff has the session write the note in a fork and opens a new session in the folder, this chat untouched', async ($, on) => {
+  const b = boundaries(on)
   http(on)
   const commands: string[] = []
-  on('command.run', { command: 'custom-handoff' }, () => { commands.push('skill'); return {} })
   on('command.run', { command: 'clear' }, () => { commands.push('clear'); return {} })
+  const prompts: string[] = []
+  on('model.fork', ($, e) => { prompts.push(e.prompt); return { value: { isAnswered: true, text: 'Resume: the band fix is half done.', usage: USAGE } } })
   await start($)
-  await command($, 'handoff full')
+  const ui = await band($)
+  expect(await ui.find({ type: 'Button', key: 'handoff' })).toBeDefined()
+  await ui.press({ key: 'handoff' })
   await b.clock.advance(15000)
-  expect(commands).toEqual(['skill'])
-  await complete($, undefined, 'Saved /work/HANDOFF.md; verify the pending tests.')
-  await b.clock.advance(15000)
-  expect(opened(b)).toBeUndefined()
-  const ui = await band($, 'desktop')
-  expect(await ui.find({ type: 'Text', text: 'Handoff ready' })).toBeDefined()
-  await ui.press({ key: 'open-new' })
+  expect(prompts).toEqual([QUICK_PROMPT])
   const query = opened(b)
   expect(query?.get('folder')).toBe('/work')
-  expect(query?.get('q')).toContain('First read the saved handoff files')
-  expect(query?.get('q')).toContain('verify the pending tests')
-  expect(commands).toEqual(['skill'])
-  // Nothing is sent here: the continuation waits in the new session's prompt box.
+  expect(query?.get('source')).toBe('services')
+  expect(query?.get('q')).toContain('the band fix is half done')
+  expect(query?.get('q')).toContain('Continue with the justified next action')
+  expect(b.submitted).toEqual([])
+  expect(b.filled).toEqual([])
+  expect(commands).toEqual([])
+  const card = await band($, 'desktop')
+  expect(await card.find({ type: 'Text', text: 'Handoff done' })).toBeDefined()
+  expect(await card.find({ type: 'Text', text: /^A new session opened with the handoff filled in/ })).toBeDefined()
+})
+
+test('a long handoff is saved under handoffs and the new session\'s box only names the file', async ($, on) => {
+  const b = boundaries(on)
+  http(on)
+  const note = 'Resume: ' + 'verify the pending step. '.repeat(600)
+  on('model.fork', () => ({ value: { isAnswered: true, text: note, usage: USAGE } }))
+  await start($)
+  await (await band($)).press({ key: 'handoff' })
+  await b.clock.advance(15000)
+  const path = [...b.files.keys()].find(p => p.startsWith('/home/test/.clauderipple/handoffs/handoff-') && p.endsWith('.md'))
+  expect(path).toBeDefined()
+  expect(b.files.get(path!)).toContain(note.trim())
+  expect(opened(b)?.get('q')).toBe(`Read the handoff in ${path} and continue from it.`)
+})
+
+test('a handoff that cannot open a new session is copied; without a clipboard it fills this prompt', async ($, on) => {
+  const b = boundaries(on, {}, { browserFailure: 'exit' })
+  http(on)
+  const copied: string[] = []
+  let clipboard = true
+  on('ui.copy', ($, e) => { copied.push(e.text); return { value: clipboard ? { isCopied: true } : { isCopied: false, reason: 'no-clipboard' } } as never })
+  on('model.fork', () => ({ value: { isAnswered: true, text: 'Pending: verify the changed files.', usage: USAGE } }))
+  await start($)
+  await (await band($)).press({ key: 'handoff' })
+  await b.clock.advance(15000)
+  expect(copied.length).toBe(1)
+  expect(copied[0]).toContain('Pending: verify the changed files.')
+  expect(b.toasts.some(t => t.includes('Could not open a new session'))).toBe(true)
+  expect(b.filled).toEqual([])
+  const card = await band($, 'desktop')
+  expect(await card.find({ type: 'Text', text: 'The resume note was copied; this chat was kept.' })).toBeDefined()
+  // Copy again, with the clipboard gone: the note goes into this chat's prompt box, not sent.
+  clipboard = false
+  await card.press({ key: 'copy' })
+  expect(b.filled[0]).toContain('Pending: verify the changed files.')
+  expect(b.toasts.some(t => t.includes('clipboard unavailable'))).toBe(true)
   expect(b.submitted).toEqual([])
 })
 
-test('quick handoff with New session now opens the new session at once, this chat kept', async ($, on) => {
-  const b = boundaries(on, { handoffAfter: 'continue' })
+test('a handoff whose fork fails or answers nothing fails with a toast and sends nothing here', async ($, on) => {
+  const b = boundaries(on)
   http(on)
-  const commands: string[] = []
-  on('command.run', { command: 'clear' }, () => { commands.push('clear'); return {} })
-  on('model.fork', () => ({ value: { isAnswered: true, text: 'Resume: the band fix is half done.', usage: { input_tokens: 1, output_tokens: 1 } } }) as never)
+  let forks = 0
+  on('model.fork', () => ({ value: ++forks === 1 ? { isAnswered: false, reason: 'nothing-to-fork' } : { isAnswered: true, text: '  ', usage: USAGE } }) as never)
   await start($)
-  await command($, 'handoff')
+  const first = await band($)
+  await first.press({ key: 'handoff' })
+  await first.unmount()
   await b.clock.advance(15000)
-  expect(opened(b)?.get('q')).toContain('the band fix is half done')
-  expect(commands).toEqual([])
+  expect(forks).toBe(1)
+  expect(b.toasts.filter(t => t.includes('handoff failed')).length).toBe(1)
+  const card = await band($, 'desktop')
+  expect(await card.find({ type: 'Text', text: 'That did not finish' })).toBeDefined()
+  await card.press({ key: 'dismiss' })
+  await (await band($)).press({ key: 'handoff' })
+  await b.clock.advance(15000)
+  expect(forks).toBe(2)
+  expect(b.toasts.filter(t => t.includes('handoff failed')).length).toBe(2)
+  expect(b.submitted).toEqual([])
+  expect(b.filled).toEqual([])
+  expect(opened(b)).toBeUndefined()
 })
 
-test('failed quick fork uses an ordinary summary turn and copy falls back to prompt fill', async ($, on) => {
-  const b = boundaries(on, { handoffAfter: 'copy' })
+test('a handoff pressed mid-turn is written once the turn ends', async ($, on) => {
+  const b = boundaries(on, { effortAuto: false })
   http(on)
-  on('model.fork', () => ({ value: { isAnswered: false, reason: 'nothing-to-fork' } }))
-  on('ui.copy', () => ({ value: { isCopied: false, reason: 'no-clipboard' } }))
+  let forks = 0
+  on('model.fork', () => { forks++; return { value: { isAnswered: true, text: 'Resume: tests pending.', usage: USAGE } } })
   await start($)
-  await command($, 'handoff')
+  await submit($)
+  await (await band($)).press({ key: 'handoff' })
   await b.clock.advance(15000)
-  expect(b.submitted[0]).toContain('Prepare a concise resume note')
-  await complete($, undefined, 'The pending work is in /work.')
+  expect(forks).toBe(0)
+  await complete($)
   await b.clock.advance(15000)
-  expect(b.filled[0]).toContain('The pending work is in /work.')
-  expect(b.toasts.some(t => t.includes('clipboard unavailable'))).toBe(true)
+  expect(forks).toBe(1)
+  expect(opened(b)?.get('q')).toContain('tests pending')
+  // Only the person's own prompt went to this chat.
+  expect(b.submitted).toEqual(['Implement the bounded change and verify the tests.'])
 })
 
 test('a restored manual pick yields to the first app effort, but a fresh manual pick applies', async ($, on) => {
@@ -1901,58 +3096,25 @@ test('Save caps an existing high pick without another judge and records sent eff
 })
 
 test('fork aggregate usage wins over the last step without main cost contamination', async ($, on) => {
-  const b = boundaries(on, { handoffAfter: 'copy' })
+  const b = boundaries(on, { keepWarm: true })
   http(on)
+  judgeStub(on)
   stepStub(on)
+  let forks = 0
   on('model.fork', async () => {
+    forks++
     await step($)
     await step($)
-    return { value: { isAnswered: true, text: 'Resume the verified work.', usage: { input_tokens: 200, output_tokens: 20, cache_read_input_tokens: 80000, cache_creation_input_tokens: 0 } } }
+    return { value: { isAnswered: true, text: 'ok', usage: { input_tokens: 200, output_tokens: 20, cache_read_input_tokens: 80000, cache_creation_input_tokens: 0 } } }
   })
-  on('ui.copy', () => ({ value: { isCopied: true } }))
   await start($)
-  await command($, 'handoff')
-  await b.clock.advance(15000)
+  await step($)
+  await complete($)
+  await b.clock.advance(3375000)
+  expect(forks).toBe(1)
   const out = await command($, 'stats')
   expect(out.text).toContain('Auto: 0 prompts, 0 requests')
   expect(out.text).toContain('Warm: 1 pings, 8300 weighted tokens')
-})
-
-test('handoff advice counts eligible prompts, not short followups', async ($, on) => {
-  const b = boundaries(on, { effortAuto: false })
-  b.setPercent(35)
-  http(on)
-  const calls = judgeStub(on, '{"handoff":"A different task starts now"}')
-  await start($)
-  await b.clock.advance(1)
-  await submit($)
-  await complete($)
-  await submit($, 'go')
-  await complete($)
-  await b.clock.advance(15000)
-  expect(calls.length).toBe(0)
-  await submit($, 'Start the separate implementation task next.')
-  await complete($)
-  await b.clock.advance(15000)
-  expect(calls.length).toBe(1)
-  const ui = await band($)
-  expect(await ui.find({ key: 'handoff' })).toBeDefined()
-})
-
-test('quick handoff runs on the timer and copies without clearing', async ($, on) => {
-  const b = boundaries(on, { handoffAfter: 'copy' })
-  http(on)
-  let copied = ''
-  let forks = 0
-  on('model.fork', () => { forks++; return { value: { isAnswered: true, text: 'Pending: verify the changed files.', usage: USAGE } } })
-  on('ui.copy', ($, e) => { copied = e.text; return { value: { isCopied: true } } })
-  await start($)
-  await $.command.run({ command: 'ripple', origin: { kind: 'composer' }, presentation: { isFullscreen: true, columns: 140 }, args: 'handoff' })
-  expect(forks).toBe(0)
-  await b.clock.advance(15000)
-  expect(forks).toBe(1)
-  expect(copied).toContain('Pending: verify the changed files.')
-  expect(copied).toContain('Continue with the justified next action')
 })
 
 // ---- Regressions of 2026-10-10 (setup step 2, the band) ----------------------------------------
@@ -2000,6 +3162,39 @@ test('a poll that finds nothing new writes no state, and the band draws the same
   await b.clock.advance(3000)
   expect(writes).toEqual([])
   expect(JSON.stringify(await ui.drawn())).toBe(before)
+  await ui.unmount()
+})
+
+// 2026-10-24: with workers running, 리플이 and the water stopped short and started over — the band
+// read the agent list, written on every agent step and tool call, and took each worker request as
+// its route. Each redraw is a new picture, so every one restarts the motion.
+test('workers do not redraw the band: it reads agent counts, not the list, and its route is the chat\'s own', async ($, on) => {
+  const b = boundaries(on)
+  const request = (at: string, target: string, subagent: boolean) => ({ at, source: target, target, provider: 'anthropic', status: 200, ok: true, ms: 1000, session: 'session-test', ...(subagent ? { subagent: true } : {}) })
+  let requests = [request('2026-10-10T13:19:10', 'claude-opus-5-5', false)]
+  on('http.fetch', { url: /\/api\/requests/ }, () => ({ value: { ok: true, status: 200, headers: {}, text: JSON.stringify({ requests }) } }))
+  http(on)
+  const reads: string[] = []
+  const writes: string[] = []
+  let reading = false
+  let writing = false
+  on('state.get', { plugin: 'ripple' }, ($, e, next) => { if (reading) reads.push(e.key); return next(e) })
+  on('state.set', { plugin: 'ripple' }, async ($, e, next) => { if (writing) writes.push(e.key); return next(e) })
+  await start($)
+  await b.clock.advance(3000)
+  reading = true
+  const ui = await band($, 'desktop')
+  await ui.drawn()
+  reading = false
+  expect(reads).toContain('agentCounts')
+  expect(reads).not.toContain('agents')
+  writing = true
+  requests = [request('2026-10-10T13:19:20', 'deepseek-v4.1-flash', true), ...requests]
+  await b.clock.advance(3000)
+  expect(writes).not.toContain('last')
+  requests = [request('2026-10-10T13:19:30', 'claude-opus-5-5', false), ...requests]
+  await b.clock.advance(3000)
+  expect(writes).toContain('last')
   await ui.unmount()
 })
 
@@ -2133,5 +3328,287 @@ test('the band Clear asks first, and confirming runs the clear once', async ($, 
   await b.clock.advance(3000)
   expect(commands).toEqual(['clear'])
   expect(await ui.find({ type: 'Text', text: 'Start this conversation over?' })).toBeUndefined()
+  await ui.unmount()
+})
+
+// The phone inbox is a first-wins handoff, never a retry of a submitted prompt.
+// Only the app's own CLI process polls it: the app sets this entrypoint, the host's runs do not.
+const APP_ENV = { CLAUDE_CODE_ENTRYPOINT: 'claude-desktop' }
+test('a session the app does not run never polls the phone inbox', async ($, on) => {
+  const calls: string[] = []
+  const b = boundaries(on, {}, { env: { CLAUDE_CODE_ENTRYPOINT: 'sdk-ts' } })
+  on('http.fetch', { url: /\/api\/phone-inbox/ }, ($, e) => { calls.push(e.url); return { value: { ok: true, status: 200, headers: {}, text: '{"offers":[]}' } } })
+  http(on)
+  await start($)
+  await b.clock.advance(4500)
+  expect(calls).toEqual([])
+})
+for (const outcome of ['submitted', 'drop', 'throw', 'refused'] as const) test(`phone inbox ${outcome} claims before submitting and reports the outcome`, async ($, on) => {
+  const events: string[] = []
+  let offered = true
+  const b = boundaries(on, {}, { env: APP_ENV, phoneSubmit: text => {
+    events.push(`submit:${text}`)
+    return outcome === 'refused' ? 'submitted' : outcome
+  } })
+  on('http.fetch', { url: /\/api\/phone-inbox/ }, ($, e) => {
+    const url = new URL(e.url)
+    if (url.pathname === '/api/phone-inbox') {
+      events.push(`poll:${url.searchParams.get('session')}`)
+      return { value: { ok: true, status: 200, headers: {}, text: JSON.stringify({ offers: offered ? [{ sessionId: 'session-test', itemId: 'item-1', text: 'private message', offeredAt: NOW }] : [] }) } }
+    }
+    const body = JSON.parse(e.init?.body ?? '{}')
+    if (url.pathname.endsWith('/claim')) {
+      events.push(`claim:${body.itemId}`)
+      offered = false
+      return { value: { ok: outcome !== 'refused', status: outcome === 'refused' ? 409 : 200, headers: {}, text: '{}' } }
+    }
+    events.push(`result:${body.itemId}:${body.outcome}`)
+    return { value: { ok: true, status: 200, headers: {}, text: '{}' } }
+  })
+  http(on)
+  await start($)
+  await b.clock.advance(1500)
+  expect(events).toEqual(outcome === 'refused' ? ['poll:session-test', 'claim:item-1'] : ['poll:session-test', 'claim:item-1', 'submit:private message', `result:item-1:${outcome === 'submitted' ? 'submitted' : 'failed'}`])
+  expect(b.logs.join('\n')).not.toContain('private message')
+})
+
+test('phone inbox handles offers in order and refuses a different session', async ($, on) => {
+  const events: string[] = []
+  const b = boundaries(on, {}, { env: APP_ENV, phoneSubmit: text => { events.push(`submit:${text}`); return 'submitted' } })
+  let wrong = false
+  on('http.fetch', { url: /\/api\/phone-inbox/ }, ($, e) => {
+    const url = new URL(e.url)
+    if (url.pathname === '/api/phone-inbox') return { value: { ok: true, status: 200, headers: {}, text: JSON.stringify({ offers: wrong ? [{ sessionId: 'other', itemId: 'three', text: 'wrong' }] : [{ sessionId: 'session-test', itemId: 'one', text: 'first' }, { sessionId: 'session-test', itemId: 'two', text: 'second' }] }) } }
+    const body = JSON.parse(e.init?.body ?? '{}')
+    events.push(url.pathname.endsWith('/claim') ? `claim:${body.itemId}` : `result:${body.itemId}:${body.outcome}`)
+    return { value: { ok: true, status: 200, headers: {}, text: '{}' } }
+  })
+  http(on)
+  await start($)
+  await b.clock.advance(1500)
+  expect(events).toEqual(['claim:one', 'submit:first', 'result:one:submitted', 'claim:two', 'submit:second', 'result:two:submitted'])
+  wrong = true
+  await b.clock.advance(1500)
+  expect(events).toHaveLength(6)
+})
+
+test('a claim response delayed past the safe window never submits the message', async ($, on) => {
+  const b = boundaries(on, {}, { env: APP_ENV })
+  const results: string[] = []
+  on('http.fetch', { url: /\/api\/phone-inbox/ }, async ($, e) => {
+    if (e.url.includes('?session=')) return { value: { ok: true, status: 200, headers: {}, text: JSON.stringify({ offers: [{ sessionId: 'session-test', itemId: 'one', text: 'late' }] }) } }
+    if (e.url.endsWith('/claim')) await b.clock.sleep(11_000)
+    else results.push(JSON.parse(e.init?.body ?? '{}').outcome)
+    return { value: { ok: true, status: 200, headers: {}, text: '{}' } }
+  })
+  http(on)
+  await start($)
+  await b.clock.advance(1500)
+  await b.clock.advance(11_000)
+  expect(b.submitted).toEqual([])
+  expect(results).toEqual(['failed'])
+})
+
+test('phone inbox skips overlapping polls and backs off after a failed request', async ($, on) => {
+  const b = boundaries(on, {}, { env: APP_ENV })
+  let calls = 0
+  let release: (() => void) | undefined
+  on('http.fetch', { url: /\/api\/phone-inbox/ }, async () => {
+    calls++
+    if (calls === 1) await new Promise<void>(resolve => { release = resolve })
+    if (calls === 1) return { value: { ok: false, status: 503, headers: {}, text: '{}' } }
+    return { value: { ok: true, status: 200, headers: {}, text: '{"offers":[]}' } }
+  })
+  http(on)
+  await start($)
+  await b.clock.advance(1500)
+  await b.clock.advance(4500)
+  expect(calls).toBe(1)
+  release!()
+  await b.clock.settle()
+  await b.clock.advance(13_500)
+  expect(calls).toBe(1)
+  await b.clock.advance(1500)
+  expect(calls).toBe(2)
+})
+
+// Settings jobs use another app process, and only after the host grants its claim.
+const SETTINGS_JOB = { jobId: 'job-1', appSessionId: 'local_target', cliSessionId: 'cli-target', model: 'opus', effort: 'high' }
+function settingsMcp(on: On, events: string[], options: { mode?: () => string; failure?: 'isError' | 'throw'; missing?: boolean } = {}) {
+  on('mcp.call', ($, e) => {
+    expect(e.server).toBe('ccd_session_mgmt')
+    if (e.tool === 'get_session') {
+      events.push('self')
+      expect(e.args).toEqual({ session_id: 'self' })
+      if (options.missing) throw new Error('server unavailable')
+      return { value: { isError: false, content: [{ type: 'text', text: JSON.stringify({ sessionId: 'local_helper', permissionMode: options.mode?.() ?? 'bypassPermissions' }) }] } }
+    }
+    events.push(`${e.tool}:${JSON.stringify(e.args)}`)
+    if (options.failure === 'throw') throw new Error('private session text')
+    return { value: { isError: options.failure === 'isError', content: [{ type: 'text', text: options.failure ? 'private session text' : 'ok' }] } }
+  })
+}
+function settingsHttp(on: On, events: string[], options: { status?: number; jobs?: unknown[] } = {}) {
+  on('http.fetch', { url: /\/api\/settings-jobs/ }, ($, e) => {
+    const url = new URL(e.url)
+    if (url.pathname === '/api/settings-jobs') {
+      events.push(`poll:${url.searchParams.get('exclude')}`)
+      return { value: { ok: true, status: 200, headers: {}, text: JSON.stringify({ jobs: options.jobs ?? [SETTINGS_JOB] }) } }
+    }
+    const body = JSON.parse(e.init?.body ?? '{}')
+    if (url.pathname.endsWith('/claim')) {
+      events.push(`claim:${body.jobId}:${body.helper}`)
+      const status = options.status ?? 200
+      return { value: { ok: status === 200, status, headers: {}, text: '{}' } }
+    }
+    events.push(`result:${body.jobId}:${body.outcome}:${body.detail ?? ''}`)
+    return { value: { ok: true, status: 200, headers: {}, text: '{}' } }
+  })
+}
+
+test('settings jobs are not polled outside an app process', async ($, on) => {
+  const events: string[] = []
+  const b = boundaries(on, {}, { env: { CLAUDE_CODE_ENTRYPOINT: 'sdk-ts' } })
+  settingsMcp(on, events); settingsHttp(on, events); http(on)
+  await start($); await b.clock.advance(6000)
+  expect(events).toEqual([])
+})
+
+for (const mode of ['default', 'acceptEdits', 'plan', 'auto', '']) test(`settings jobs do not poll in ${mode || 'unknown'} permission mode`, async ($, on) => {
+  const events: string[] = []
+  const b = boundaries(on, {}, { env: APP_ENV })
+  settingsMcp(on, events, { mode: () => mode }); settingsHttp(on, events); http(on)
+  await start($); await b.clock.advance(6000)
+  expect(events).toEqual(['self'])
+})
+
+test('settings jobs claim in order, use the target app id and report success', async ($, on) => {
+  const events: string[] = []
+  const b = boundaries(on, {}, { env: APP_ENV })
+  settingsMcp(on, events)
+  settingsHttp(on, events, { jobs: [SETTINGS_JOB, { ...SETTINGS_JOB, jobId: 'job-2', model: undefined }] }); http(on)
+  await start($); await b.clock.advance(3000)
+  expect(events).toEqual([
+    'self', 'poll:local_helper', 'claim:job-1:local_helper', 'self',
+    'set_session_model:{"session_id":"local_target","model":"opus"}', 'self',
+    'set_session_effort:{"session_id":"local_target","effort":"high"}', 'result:job-1:applied:',
+    'claim:job-2:local_helper', 'self', 'set_session_effort:{"session_id":"local_target","effort":"high"}', 'result:job-2:applied:',
+  ])
+})
+
+for (const failure of ['isError', 'throw'] as const) test(`settings jobs report a ${failure} tool failure without logging private text`, async ($, on) => {
+  const events: string[] = []
+  const b = boundaries(on, {}, { env: APP_ENV })
+  settingsMcp(on, events, { failure }); settingsHttp(on, events); http(on)
+  await start($); await b.clock.advance(3000)
+  expect(events).toEqual(['self', 'poll:local_helper', 'claim:job-1:local_helper', 'self', 'set_session_model:{"session_id":"local_target","model":"opus"}', 'result:job-1:failed:settings change failed'])
+  expect(b.logs.join('\n')).not.toContain('private session text')
+  await b.clock.advance(12_000)
+  expect(events.filter(event => event.startsWith('claim:'))).toHaveLength(1)
+})
+
+test('the helper refreshes its permission mode after three minutes', async ($, on) => {
+  const events: string[] = []
+  let mode = 'default'
+  const b = boundaries(on, {}, { env: APP_ENV })
+  settingsMcp(on, events, { mode: () => mode }); settingsHttp(on, events, { jobs: [] }); http(on)
+  await start($); await b.clock.advance(3000)
+  mode = 'bypassPermissions'
+  await b.clock.advance(177_000)
+  expect(events).toEqual(['self'])
+  await b.clock.advance(3000)
+  expect(events).toEqual(['self', 'self', 'poll:local_helper'])
+})
+
+test('a malformed or self-targeted job is never claimed', async ($, on) => {
+  const events: string[] = []
+  const b = boundaries(on, {}, { env: APP_ENV })
+  settingsMcp(on, events); settingsHttp(on, events, { jobs: [{ ...SETTINGS_JOB, appSessionId: 'local_helper' }] }); http(on)
+  await start($); await b.clock.advance(3000)
+  expect(events).toEqual(['self', 'poll:local_helper'])
+})
+
+test('settings job claim conflict never calls a setter', async ($, on) => {
+  const events: string[] = []
+  const b = boundaries(on, {}, { env: APP_ENV })
+  settingsMcp(on, events); settingsHttp(on, events, { status: 409 }); http(on)
+  await start($); await b.clock.advance(3000)
+  expect(events).toEqual(['self', 'poll:local_helper', 'claim:job-1:local_helper'])
+})
+
+test('a changed helper permission after a claim fails the job without an approval', async ($, on) => {
+  const events: string[] = []
+  let reads = 0
+  const b = boundaries(on, {}, { env: APP_ENV })
+  settingsMcp(on, events, { mode: () => ++reads === 1 ? 'bypassPermissions' : 'default' }); settingsHttp(on, events); http(on)
+  await start($); await b.clock.advance(3000)
+  expect(events).toEqual(['self', 'poll:local_helper', 'claim:job-1:local_helper', 'self', 'result:job-1:failed:settings change failed'])
+})
+
+test('a missing session server backs off and never polls', async ($, on) => {
+  const events: string[] = []
+  const b = boundaries(on, {}, { env: APP_ENV })
+  settingsMcp(on, events, { missing: true }); settingsHttp(on, events); http(on)
+  await start($); await b.clock.advance(15_000)
+  expect(events).toEqual(['self'])
+  await b.clock.advance(3000)
+  expect(events).toEqual(['self', 'self'])
+})
+
+test('settings jobs skip overlapping polls and back off after an HTTP failure', async ($, on) => {
+  const events: string[] = []
+  const b = boundaries(on, {}, { env: APP_ENV })
+  let calls = 0
+  let release: (() => void) | undefined
+  settingsMcp(on, events)
+  on('http.fetch', { url: /\/api\/settings-jobs/ }, async () => {
+    calls++
+    if (calls === 1) await new Promise<void>(resolve => { release = resolve })
+    return { value: { ok: calls !== 1, status: calls === 1 ? 503 : 200, headers: {}, text: '{"jobs":[]}' } }
+  })
+  http(on)
+  await start($); await b.clock.advance(3000); await b.clock.advance(6000)
+  expect(calls).toBe(1)
+  release!(); await b.clock.settle(); await b.clock.advance(12_000)
+  expect(calls).toBe(1)
+  await b.clock.advance(3000)
+  expect(calls).toBe(2)
+  expect(events).toEqual(['self', 'self'])
+})
+
+test('a late settings claim is failed without changing the target', async ($, on) => {
+  const events: string[] = []
+  const b = boundaries(on, {}, { env: APP_ENV })
+  settingsMcp(on, events)
+  on('http.fetch', { url: /\/api\/settings-jobs/ }, async ($, e) => {
+    if (e.url.includes('?exclude=')) return { value: { ok: true, status: 200, headers: {}, text: JSON.stringify({ jobs: [SETTINGS_JOB] }) } }
+    if (e.url.endsWith('/claim')) await b.clock.sleep(26_000)
+    else events.push(JSON.parse(e.init?.body ?? '{}').outcome)
+    return { value: { ok: true, status: 200, headers: {}, text: '{}' } }
+  })
+  http(on)
+  await start($); await b.clock.advance(3000); await b.clock.advance(26_000)
+  expect(events).toEqual(['self', 'self', 'failed'])
+})
+
+// The host keeps what the phone queued (packages/remote/src/queue.ts); the band reads its file and
+// floats a strip over itself while this chat has something waiting, then lets it go.
+for (const surface of ['terminal', 'desktop'] as const) test(`the phone queue strip shows over the ${surface} band only while this chat has something queued`, async ($, on) => {
+  const b = boundaries(on)
+  http(on)
+  const file = '/home/test/.clauderipple/remote/queue.json'
+  b.files.set(file, JSON.stringify({ other: { items: [{ id: 'x', text: 'not this chat', attachments: [], at: 1 }], held: false } }))
+  await start($)
+  const ui = await band($, surface)
+  await b.clock.advance(3000)
+  expect(JSON.stringify(await ui.drawn())).not.toContain('Phone queue')
+  b.files.set(file, JSON.stringify({ phone: { desktopId: 'session-test', items: [{ id: 'a', text: 'fix the header', attachments: [], at: 1 }, { id: 'b', text: 'then the footer', attachments: [], at: 2 }], held: false } }))
+  await b.clock.advance(3000)
+  const shown = JSON.stringify(await ui.drawn())
+  expect(shown).toContain('Phone queue 2')
+  expect(shown).toContain('fix the header')
+  b.files.set(file, JSON.stringify({}))
+  await b.clock.advance(3000)
+  expect(JSON.stringify(await ui.drawn())).not.toContain('Phone queue')
   await ui.unmount()
 })

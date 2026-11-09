@@ -12,7 +12,7 @@
 
 <p align="center">
   <a href="https://apps.apple.com/br/app/id6823063731"><img height="40" alt="App Store" src="https://img.shields.io/badge/App%20Store-Baixar-0D96F6?style=for-the-badge&logo=apple&logoColor=white"></a>
-  <img height="40" alt="Google Play" src="https://img.shields.io/badge/Google%20Play-Em%20breve-666666?style=for-the-badge&logo=googleplay&logoColor=white">
+  <a href="https://play.google.com/store/apps/details?id=com.clauderipple.remote&hl=pt-BR"><img height="40" alt="Google Play" src="https://img.shields.io/badge/Google%20Play-Baixar-01875F?style=for-the-badge&logo=googleplay&logoColor=white"></a>
   <a href="https://discord.gg/R8ZgGSNHjw"><img height="40" alt="Discord" src="https://img.shields.io/badge/Discord-Entrar-5865F2?style=for-the-badge&logo=discord&logoColor=white"></a>
 </p>
 
@@ -44,7 +44,7 @@
     <td colspan="2" align="center"><img src="docs/media/mod-band.png" alt="O mod ripple: esforço, contexto, timer do cache e qual modelo respondeu, com o acerto de cache"><br><sub>O mod ripple: esforço, contexto, timer do cache e qual modelo respondeu, com o acerto de cache</sub></td>
   </tr>
   <tr>
-    <td align="center" width="50%"><img src="docs/media/mod-alerts.png" alt="Avisos quando o cache esfria ou um limite está perto, e passagem para um chat novo"><br><sub>Avisos quando o cache esfria ou um limite está perto, e passagem para um chat novo</sub></td>
+    <td align="center" width="50%"><img src="docs/media/mod-alerts.png" alt="Avisos quando o cache esfria ou um limite está perto, e oferta de compactação"><br><sub>Avisos quando o cache esfria ou um limite está perto, e oferta de compactação</sub></td>
     <td align="center" width="50%"><img src="docs/media/mod-settings.png" alt="Ajustes rápidos: esforço automático, o juiz, modos de workers"><br><sub>Ajustes rápidos: esforço automático, o juiz, modos de workers</sub></td>
   </tr>
 </table>
@@ -315,7 +315,7 @@ que você mapeia vão para o seu provedor, e todo o resto vai para a Anthropic b
   o esforço, de low a max. O trabalho delegado vai para `ripple:auto`, e o juiz manda cada
   tarefa para um worker conforme a dificuldade: o leve para DeepSeek ou GLM, o difícil para
   GPT ou Opus. Cartões avisam quando o cache esfriou, o contexto ficou pesado ou uma janela do
-  plano passou de 80%, e oferecem compactar ou passar para uma sessão nova na mesma pasta.
+  plano passou de 80%, e oferecem compactar a sessão.
   `Log` (ou `/ripple-log`) abre o log de requisições em um painel lateral. Basta um botão na
   tela **Clientes**, ou `clauderipple mod on`.
 - **Imagens pela sua assinatura do ChatGPT.** `clauderipple image "<prompt>"`, com imagens
@@ -373,8 +373,7 @@ qual for o modelo que as executa, no seu celular — e sem te derrubar depois de
 
 Instale o ClaudeRipple no computador, abra a visão **Celular** do painel e escaneie o
 código QR uma vez. iPhone: [App Store](https://apps.apple.com/br/app/id6823063731). Android:
-em teste fechado no Google Play — peça acesso no
-[Discord](https://discord.gg/R8ZgGSNHjw). As sessões do app do Claude funcionam no macOS;
+[Google Play](https://play.google.com/store/apps/details?id=com.clauderipple.remote&hl=pt-BR). As sessões do app do Claude funcionam no macOS;
 o app tem uma demonstração para testar sem computador.
 
 ## Instalação
@@ -699,7 +698,7 @@ Em uso diário pelo autor, mas ainda jovem. Espere algumas arestas:
 
 ## Comunidade
 
-Perguntas, relatos de bugs e o beta do Ripple Remote para Android (um teste fechado no Google Play) ficam no Discord: [https://discord.gg/R8ZgGSNHjw](https://discord.gg/R8ZgGSNHjw). Para entrar no beta do Android, envie o endereço do Gmail que você usa no Google Play para @pbj_ripple por mensagem direta, não em um canal onde todos podem lê-lo.
+Perguntas e relatos de bugs ficam no Discord: [https://discord.gg/R8ZgGSNHjw](https://discord.gg/R8ZgGSNHjw).
 
 ## Sem afiliação
 

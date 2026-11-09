@@ -12,7 +12,7 @@
 
 <p align="center">
   <a href="https://apps.apple.com/es/app/id6823063731"><img height="40" alt="App Store" src="https://img.shields.io/badge/App%20Store-Descargar-0D96F6?style=for-the-badge&logo=apple&logoColor=white"></a>
-  <img height="40" alt="Google Play" src="https://img.shields.io/badge/Google%20Play-Pr%C3%B3ximamente-666666?style=for-the-badge&logo=googleplay&logoColor=white">
+  <a href="https://play.google.com/store/apps/details?id=com.clauderipple.remote&hl=es"><img height="40" alt="Google Play" src="https://img.shields.io/badge/Google%20Play-Descargar-01875F?style=for-the-badge&logo=googleplay&logoColor=white"></a>
   <a href="https://discord.gg/R8ZgGSNHjw"><img height="40" alt="Discord" src="https://img.shields.io/badge/Discord-Unirse-5865F2?style=for-the-badge&logo=discord&logoColor=white"></a>
 </p>
 
@@ -44,7 +44,7 @@
     <td colspan="2" align="center"><img src="docs/media/mod-band.png" alt="El mod ripple: esfuerzo, contexto, temporizador de caché y qué modelo respondió, con su acierto de caché"><br><sub>El mod ripple: esfuerzo, contexto, temporizador de caché y qué modelo respondió, con su acierto de caché</sub></td>
   </tr>
   <tr>
-    <td align="center" width="50%"><img src="docs/media/mod-alerts.png" alt="Avisos cuando la caché se enfría o un límite está cerca, y traspaso a un chat nuevo"><br><sub>Avisos cuando la caché se enfría o un límite está cerca, y traspaso a un chat nuevo</sub></td>
+    <td align="center" width="50%"><img src="docs/media/mod-alerts.png" alt="Avisos cuando la caché se enfría o un límite está cerca, y una oferta de compactación"><br><sub>Avisos cuando la caché se enfría o un límite está cerca, y una oferta de compactación</sub></td>
     <td align="center" width="50%"><img src="docs/media/mod-settings.png" alt="Ajustes rápidos: esfuerzo automático, el juez, modos de workers"><br><sub>Ajustes rápidos: esfuerzo automático, el juez, modos de workers</sub></td>
   </tr>
 </table>
@@ -320,9 +320,9 @@ los modelos que asignas van a tu proveedor, y todo lo demás va a Anthropic byte
   turnos recientes y fija el esfuerzo, de low a max. El trabajo delegado va a `ripple:auto`,
   y el juez envía cada tarea a un worker según su dificultad: lo ligero a DeepSeek o GLM, lo
   difícil a GPT u Opus. Unas tarjetas avisan cuando la caché se ha enfriado, el contexto pesa
-  demasiado o una ventana del plan pasa del 80 %, y ofrecen compactar o traspasar a una sesión
-  nueva en la misma carpeta. `Log` (o `/ripple-log`) abre el registro de solicitudes en un
-  panel lateral. Un solo interruptor en la pantalla Clientes, o `clauderipple mod on`.
+  demasiado o una ventana del plan pasa del 80 %, y ofrecen compactar la sesión. `Log` (o
+  `/ripple-log`) abre el registro de solicitudes en un panel lateral. Un solo interruptor en la
+  pantalla Clientes, o `clauderipple mod on`.
 - **Imágenes con tu suscripción de ChatGPT.** `clauderipple image "<prompt>"`, con
   imágenes de referencia y fondos transparentes. A los subagentes se les explica cómo
   hacerlo, así que un worker de GPT o DeepSeek puede crear una imagen y verla sin una
@@ -381,8 +381,7 @@ sesiones, sea cual sea el modelo que las ejecute, en tu teléfono, y no te desco
 
 Instala ClaudeRipple en tu computadora, abre la vista **Teléfono** del panel y escanea el
 código QR una vez. iPhone: [App Store](https://apps.apple.com/es/app/id6823063731). Android:
-en prueba cerrada en Google Play; pide acceso en
-[Discord](https://discord.gg/R8ZgGSNHjw). Las sesiones de la app de Claude funcionan en
+[Google Play](https://play.google.com/store/apps/details?id=com.clauderipple.remote&hl=es). Las sesiones de la app de Claude funcionan en
 macOS; la app incluye una demo para probarla sin computadora.
 
 ## Instalación
@@ -716,7 +715,7 @@ El autor lo usa a diario, pero es un proyecto joven. Cuenta con algunas aspereza
 
 ## Comunidad
 
-Las preguntas, los informes de errores y la beta de Ripple Remote para Android (una prueba cerrada en Google Play) están en Discord: [https://discord.gg/R8ZgGSNHjw](https://discord.gg/R8ZgGSNHjw). Para unirte a la beta de Android, envía la dirección de Gmail que usas en Google Play a @pbj_ripple por mensaje directo, no en un canal donde todos pueden leerla.
+Las preguntas y los informes de errores están en Discord: [https://discord.gg/R8ZgGSNHjw](https://discord.gg/R8ZgGSNHjw).
 
 ## Sin afiliación
 

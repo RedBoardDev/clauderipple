@@ -21,6 +21,7 @@
 
 import crypto from "node:crypto";
 import { phoneRequest } from "./phone.ts";
+import { settingsId, validSettingsJobAction } from "../../remote/src/settings-jobs.ts";
 import type { PhoneDeps } from "./phone.ts";
 import fs from "node:fs";
 import net from "node:net";
@@ -31,26 +32,32 @@ import { runCli, startCliDetached, parseUpdateCheck, type DetachedCli } from "./
 import { AutoUpdater } from "./autoupdate.ts";
 export { parseUpdateCheck, type UpdateCheck } from "./cli-control.ts";
 import { fileURLToPath } from "node:url";
-import type { Config, Provider, ProviderModel } from "./config.ts";
+import type { Config, Provider, ProviderCredential, ProviderModel } from "./config.ts";
+import { withFileLock } from "./locked-file.ts";
 import { adminPort, headerValueProblem, homeDir, searchProviderFor, ssidProblem, validate } from "./config.ts";
 export { adminPort } from "./config.ts";
-import { generatedAgents } from "./agents.ts";
+import { agentRenames, generatedAgents } from "./agents.ts";
 import { isJudgeOnlyModel } from "./model-policy.ts";
-import { ModSettingsInputError, readModSettings, validateSettings, validateSettingsSchema, writeModSettings } from "./mod-settings.ts";
+import { ModSettingsInputError, readModSettings, validateSettings, validateSettingsSchema, writeAutoCompactWindow, writeModSettings } from "./mod-settings.ts";
 import { billingOf, claudeChoices, fillLadder, ladderNeedsFill } from "../../mod/hooks/ladder.ts";
 import { normalizeSettings, twoLevelRungs } from "../../mod/hooks/settings.ts";
-import type { Billing, DomainRules, Effort, LadderChoice, Settings } from "../../mod/types/index.d.ts";
+import type { Billing, DomainRules, Effort, LadderChoice, Rungs, Settings, Step } from "../../mod/types/index.d.ts";
 import { chatPickerModels } from "./picker.ts";
+import { accountPinFor, declaredBy, resolve } from "./routing.ts";
 import type { Logger } from "./log.ts";
-import type { ProviderExhaustion } from "./health.ts";
+import { CredentialPool } from "./pool.ts";
+import { ClaudeAccountAuthPool } from "./providers/anthropic-account-pool.ts";
+import type { ModelHealth, ProviderExhaustion } from "./health.ts";
 import type { Stats } from "./proxy.ts";
 import type { RequestLog } from "./requestlog.ts";
 import { PRESETS, type ProviderPreset } from "./presets.ts";
-import { resolveCompatibleCaps } from "./compat.ts";
+import { answersWebSearch, effortLevels, targetWarnings } from "./targets.ts";
+export { effortLevels } from "./targets.ts";
 import { redactErrorText } from "./redact.ts";
 import { CHATGPT_FALLBACK_MODELS } from "./providers/chatgpt/catalog.ts";
-import { measureModel, refusedByPlan, type Measured, type WireCandidate } from "./capabilities.ts";
-import { catalogEntry } from "./catalog.ts";
+import { contextWindowSnapshot, syncContextWindows } from "./context-windows.ts";
+import { measureModel, ollamaApiBase, ollamaModelFacts, refusedByPlan, type Measured, type WireCandidate } from "./capabilities.ts";
+import { catalogEntry, catalogueWindow } from "./catalog.ts";
 import { ModelScoreCatalog, buildModelScores } from "./model-scores.ts";
 import { ClaudeCodeAuthStore, nativeAnthropicHeaders, type ClaudeCodeCredentialReaders } from "./providers/anthropic.ts";
 import type { ObservedClaudeCodeAuth } from "./providers/anthropic-observed.ts";
@@ -63,23 +70,25 @@ import { desktopClaudeCodeDirs } from "../../cli/src/claude-auth.ts";
 import { statusModEnabled, syncModelSlots } from "../../cli/src/settings.ts";
 import { ClaudeOAuthSession, type ClaudeOAuthState } from "./providers/claude-oauth.ts";
 import { readClaudeAuthFile } from "./providers/anthropic-token-file.ts";
-import { isCurrentClaudeLoginPaused, listClaudeAccounts, removeClaudeAccount, setCurrentClaudeLoginPaused, renameClaudeAccount, setPreferredClaudeAccount } from "./providers/anthropic-accounts.ts";
+import { isCurrentClaudeLoginPaused, listClaudeAccounts, listClaudeAccountsWithSubject, removeClaudeAccount, setCurrentClaudeLoginPaused, updateClaudeAccount, setPreferredClaudeAccount } from "./providers/anthropic-accounts.ts";
+import { storedAccountsFor } from "./pinned-accounts.ts";
 import { readChatGptAccounts, removeChatGptAccount, summarize as summarizeChatGptAccount, updateChatGptAccount } from "./providers/chatgpt/accounts.ts";
 import { exhaustedForMs, IMAGE_ASPECTS, IMAGE_BACKGROUNDS, IMAGE_FORMATS, type ChatGptAccountStatus, type ImageRequest, type ImageResult } from "./providers/chatgpt/index.ts";
 import type { GoogleAccountStatus } from "./providers/google/index.ts";
 import { googleWindowsFromGroups, type QuotaGroup } from "./providers/google/usage.ts";
 import { isOpenCodeGo, type OpenCodeWindow } from "./providers/opencode-usage.ts";
+import { isMiniMaxPlan, type MiniMaxWindow } from "./providers/minimax-usage.ts";
+import type { UsageWindow } from "./providers/usage-cache.ts";
 import type { GrokWindow } from "./providers/grok/usage.ts";
 import { ANTIGRAVITY_WARNING, staticAntigravityModels } from "./providers/google/antigravity.ts";
 import { readGoogleAccounts, removeGoogleAccount, summarize as summarizeGoogleAccount, updateGoogleAccount } from "./providers/google/accounts.ts";
 import { GoogleOAuthSession, type GoogleOAuthState } from "./providers/google/login.ts";
 import { GROK_AUTH_HINT, grokAuthPath, grokHome, readGrokToken, sharedGrokAuth } from "./providers/grok/auth.ts";
-import { GROK_DEFAULT_URL, GROK_EFFORT_LEVELS, GROK_FALLBACK_MODELS, grokModelsFromListing } from "./providers/grok/catalog.ts";
+import { GROK_DEFAULT_URL, GROK_FALLBACK_MODELS, grokModelsFromListing } from "./providers/grok/catalog.ts";
 import { GROK_WARNING, grokHeaders } from "./providers/grok/index.ts";
 import type { TunnelStatus } from "./remote-tunnel.ts";
 import { parsePowerChange, persistPowerChange, type PowerApi } from "./power.ts";
-import { buildLimitsAccount, type LimitsAccount, type LimitsWindow } from "./limits.ts";
-export type { LimitsAccount, LimitsWindow } from "./limits.ts";
+import { processPriorityState, type ProcessPriorityState } from "./process-priority.ts";
 
 const MAX_BODY = 1024 * 1024;
 /** `/api/image` carries reference images inline, so it gets more room than a config save. */
@@ -100,17 +109,35 @@ const MIME: Record<string, string> = {
   ".ico": "image/x-icon",
 };
 
+/** One row of a provider's credential-pool report: ids, flags and health, never a header value. */
+export type CredentialRow = { id: string; label?: string; state: string; cooldownSeconds?: number; failures: number; paused?: boolean; preferred?: boolean; inUse?: boolean };
+
 export type AdminDeps = {
   /** External boundaries for the host-local control bridge; no production side effects in tests. */
   phone?: PhoneDeps;
   config: () => Config;
   configFile: string;
+  /**
+   * Validation errors from the config file as last read. An invalid file is still adopted on the
+   * first read so the router can serve the fix, but readiness must not call that healthy (G-D14).
+   */
+  configErrors?: () => string[];
   log: Logger;
   stats: () => Stats;
   health: () => number;
+  processPriority?: () => ProcessPriorityState;
   providerHealth?: () => Record<string, ProviderExhaustion>;
+  modelHealth?: ModelHealth["snapshot"];
   version: string;
+  /**
+   * The installation identity this process captured at start: its home's opaque id (immutable for
+   * this process, even if the file changes) and its own pid. Status reports both, and a shutdown
+   * request is accepted only from the installation this process actually is (B01/D6).
+   */
+  instance?: { installId: string | null; pid: number };
   requests: RequestLog;
+  /** Registers a main conversation's RAM-only, one-shot compaction model; null forgets it. */
+  compactPick?: (session: string, model: string | null) => void;
   /** Optional: chatgpt providers' latest rate-limit snapshot and credential status. */
   chatgpt?: () => {
     quota: Record<string, Record<string, unknown> | null>;
@@ -136,6 +163,8 @@ export type AdminDeps = {
     models?: (name: string) => Promise<ProviderModel[] | null>;
     /** Each antigravity account's quota groups by owner id, for the status bar's limits row (`/api/limits`). Absent in tests. */
     usage?: (name: string) => Promise<Record<string, QuotaGroup[]>>;
+    /** The pool scope a turn for one model rests in (its quota group on its host), the key of `quotaCooldowns`. */
+    quotaScope?: (name: string, model: string) => string | undefined;
     /** Put one resting account back into rotation now. */
     clearCooldown?: (accountId: string) => void;
     /** Ask Google again whether an account still needs its verification page. */
@@ -149,7 +178,9 @@ export type AdminDeps = {
    * Optional: per-credential cooldowns and quarantines, for providers that declare a pool. Ids and
    * labels only — never a header value.
    */
-  credentials?: () => Record<string, { id: string; label?: string; state: string; cooldownSeconds?: number; failures: number; active?: boolean }[]>;
+  credentials?: () => Record<string, CredentialRow[]>;
+  clearCredentialCooldown?: (provider: string, id: string) => void;
+  claudeClearCooldown?: (id: string) => void;
   /** Optional: picker-mode state and the last bootstrap injection. */
   picker?: () => { enabled: boolean; hosts: string[]; last: unknown };
   /** Optional: observed CLI credentials held by the live proxy, never serialized directly. */
@@ -172,6 +203,12 @@ export type AdminDeps = {
   modelCatalog?: () => Promise<unknown>;
   /** Agent directory boundary; defaults to ~/.claude/agents, isolated in admin tests. */
   agentDir?: string;
+  /**
+   * Re-derive the generated worker files after a stored account (Claude, ChatGPT or Google) was
+   * added, removed, relabelled or reauthorized: pinned workers are named and pinned from those
+   * stores. Supplied by the router; absent in tests, which then have no account store to follow.
+   */
+  agentsChanged?: () => void;
   /** External AA dataset fetch boundary; the same cache/TTL is used in tests and production. */
   modelScoresFetch?: typeof fetch;
   /** Test seams for the Claude subscription sign-in: the token endpoint and the browser. */
@@ -185,13 +222,19 @@ export type AdminDeps = {
    * Usage of each Claude subscription account, keyed by owner id ("current" for the Claude Code
    * login, otherwise the account id `/api/claude-accounts` lists). Absent in tests.
    */
-  claudeUsage?: (force?: boolean) => Promise<Record<string, Record<string, unknown>>>;
-  /** Last successful owner per Claude provider, including owners whose login has since expired. */
-  claudeActive?: () => Record<string, string | null>;
+  claudeUsage?: () => Promise<Record<string, Record<string, unknown>>>;
+  /**
+   * The current Claude login's own account: its email and the pool's one-way subject hash, so a
+   * stored account that is the same person is not listed as a second one (`/api/claude-accounts`).
+   * Null when the login's identity is unknown. Absent in tests.
+   */
+  claudeIdentity?: () => Promise<{ email: string; subjectHash: string } | null>;
   /** The Claude models the signed-in account can use (`GET /v1/models`); null until one answer. Absent in tests. */
   claudeModels?: () => Promise<ClaudeModel[] | null>;
   /** An OpenCode Go provider's usage windows, for the status bar's limits row (`/api/limits`). Absent in tests. */
-  opencodeUsage?: (name: string) => Promise<OpenCodeWindow[]>;
+  opencodeUsage?: (name: string, credentialId?: string) => Promise<OpenCodeWindow[]>;
+  /** A MiniMax plan provider's usage windows, for the status bar's limits row (`/api/limits`). Absent in tests. */
+  minimaxUsage?: (name: string, credentialId?: string) => Promise<MiniMaxWindow[]>;
   /** A Grok provider's usage pool, for the status bar's limits row (`/api/limits`). Absent in tests. */
   grokUsage?: (name: string) => Promise<GrokWindow[]>;
   /**
@@ -203,27 +246,76 @@ export type AdminDeps = {
   power?: PowerApi;
 };
 
+/** Without a configured adapter there is no runtime cooldown, but account previews still name the next choice. */
+function previewAccounts<T extends { id: string; paused: boolean; preferred: boolean; needsReauth: boolean; expiresAt: number }>(accounts: T[]): (T & { state: string; inUse: boolean })[] {
+  const credentials = accounts.filter((account) => !account.paused && !account.needsReauth && account.expiresAt > Date.now())
+    .map((account) => ({ id: account.id, preferred: account.preferred, headers: {} }));
+  const next = new CredentialPool().pick("preview", credentials)?.id;
+  return accounts.map((account) => ({ ...account, state: account.paused ? "paused" : credentials.some((credential) => credential.id === account.id) ? "ready" : "needs-login", inUse: account.id === next }));
+}
+
 /** Claude usage is looked up only where a Claude subscription provider is configured. */
 function hasClaudeSubscription(cfg: Config): boolean {
   return Object.values(cfg.providers).some((p) => p.type === "anthropic" && p.auth === "claude-code");
 }
 
 /**
- * One row per Claude account with a known usage, current login first. Labels only: the status is
- * polled every few seconds and has no use for an email address.
+ * The Claude auth pool's rows for one provider, keyed by owner id ("current" for the app login,
+ * otherwise the stored account id). The live proxy's report when there is one; a provider with no
+ * declared pool is read from the stored accounts the same way `/api/claude-accounts` does.
  */
-async function claudeAccountUsage(deps: AdminDeps): Promise<{ id: string; label: string; quota: Record<string, unknown> }[]> {
+function claudePoolReports(deps: AdminDeps, name: string | undefined): CredentialRow[] {
+  const live = name ? deps.credentials?.()[name] : undefined;
+  if (live) return live;
+  const projection = new ClaudeAccountAuthPool({ home: homeDir(), current: claudeAuthStore(deps), log: deps.log }).peekCredentials();
+  return new CredentialPool().report(name ?? "claude", projection).map((row) => ({ ...row, id: projection.find((credential) => credential.id === row.id)!.ownerId! }));
+}
+
+/**
+ * The owner id of the Claude account the pool answers with now, or undefined when none is known.
+ * A login provider without `accountPool` passes requests through on the app login, whatever the
+ * stored accounts prefer.
+ */
+function claudeInUseId(deps: AdminDeps, name: string | undefined): string | undefined {
+  const provider = name ? deps.config().providers[name] : undefined;
+  if (provider?.type === "anthropic" && provider.accountPool !== true) return "current";
+  try {
+    return claudePoolReports(deps, name).find((row) => row.inUse === true)?.id;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * The Claude Code login provider requests are routed through: the account pool when one is declared,
+ * else the first, in config order. One saved with `limits: false` (a classifier-only pool) is not it.
+ */
+function firstClaudeProvider(cfg: Config): string | undefined {
+  const logins = Object.entries(cfg.providers).filter(([, provider]) => provider.type === "anthropic" && provider.auth === "claude-code" && provider.limits !== false);
+  return (logins.find(([, provider]) => provider.type === "anthropic" && provider.accountPool === true) ?? logins[0])?.[0];
+}
+
+/**
+ * One row per Claude account with a known usage, current login first. Labels only: the status is
+ * polled every few seconds and has no use for an email address. `inUse` marks the account the pool
+ * serves with now (a preferred stored account), which the mod reads for the plan windows; a router
+ * without the flag leaves the mod on the login.
+ */
+async function claudeAccountUsage(deps: AdminDeps): Promise<{ id: string; label: string; quota: Record<string, unknown>; inUse?: boolean }[]> {
   let usage: Record<string, Record<string, unknown>>;
   try {
     usage = (await deps.claudeUsage?.()) ?? {};
   } catch {
     return [];
   }
-  const rows: { id: string; label: string; quota: Record<string, unknown> }[] = [];
-  if (usage.current) rows.push({ id: "current", label: "Current Claude login", quota: usage.current });
+  const inUse = claudeInUseId(deps, firstClaudeProvider(deps.config()));
+  const rows: { id: string; label: string; quota: Record<string, unknown>; inUse?: boolean }[] = [];
+  // The account in use is listed even while its usage is unknown, with no windows, so no reader
+  // takes another account's figures for the one that is actually spending.
+  if (usage.current || inUse === "current") rows.push({ id: "current", label: "Current Claude login", quota: usage.current ?? {}, ...(inUse === "current" ? { inUse: true } : {}) });
   for (const account of listClaudeAccounts(homeDir())) {
     const quota = usage[account.id];
-    if (quota) rows.push({ id: account.id, label: account.label, quota });
+    if (quota || inUse === account.id) rows.push({ id: account.id, label: account.label, quota: quota ?? {}, ...(inUse === account.id ? { inUse: true } : {}) });
   }
   return rows;
 }
@@ -231,13 +323,21 @@ async function claudeAccountUsage(deps: AdminDeps): Promise<{ id: string; label:
 // ---- Limits (`GET /api/limits`) ----------------------------------------------------------------
 //
 // One shape for every provider whose quota can be read, so the status bar's second row instrument
-// them all the same way: Claude's plan windows and per-model weeklies, each ChatGPT account's
+// them all the same way: each Claude account's plan windows and per-model weeklies, each ChatGPT account's
 // windows, each Antigravity account's Gemini and third-party windows, OpenCode Go's three windows
 // and a Grok subscription's usage pool. Providers with no way to read a quota (OpenCode Zen, the
 // compatible APIs) are simply not listed, and a provider
 // saved with `limits: false` opts out. Read in the provider's config order; the mod keeps Claude
 // first and otherwise follows this order.
 
+/** One window the limits row reads. `reset_at` is epoch seconds, as the other readers use. */
+export type LimitsWindow = { kind: "five_hour" | "seven_day" | "scoped" | "window"; label?: string; used_percent: number; window_minutes?: number; reset_at?: number };
+/**
+ * One account's windows. `account` is the account's own index, stable while others come and go, so
+ * the mod's "Claude 1"/"Claude 2" do not swap. `label` is the name the owner gave it (absent for the
+ * Claude app login); `inUse` marks the account the router serves new turns with now.
+ */
+export type LimitsAccount = { account: number; label?: string; inUse?: true; windows: LimitsWindow[]; at: number };
 export type LimitsProvider = { provider: string; type: string; title: string; accounts: LimitsAccount[] };
 
 /** A `{used_percent, window_minutes, reset_at}` snapshot window as `/api/limits` reads it, or null. */
@@ -277,59 +377,75 @@ function claudeLimitWindows(quota: Record<string, unknown>): LimitsWindow[] {
   return out;
 }
 
-/** All Claude accounts, including those awaiting their first quota snapshot or a new sign-in. */
-async function anthropicLimitAccounts(deps: AdminDeps, name: string, refresh: boolean): Promise<LimitsAccount[]> {
-  const usage: Record<string, Record<string, unknown>> = await deps.claudeUsage?.(refresh).catch(() => ({})) ?? {};
-  const reports = deps.credentials?.()[name] ?? [];
-  const stored = listClaudeAccounts(homeDir());
-  const active = deps.claudeActive?.()[name];
-  // The live proxy reports the current login even before its first usage fetch succeeds. Reuse that
-  // metadata rather than rediscovering local credentials on every limits poll.
-  const hasCurrent = active === "current" || !!usage.current || reports.some((r) => r.id === "current");
-  const accounts = [
-    ...(hasCurrent ? [{ id: "current", label: "Current Claude login", preferred: !stored.some((a) => a.preferred), needsReauth: false, expiresAt: Infinity }] : []),
-    ...stored,
-  ];
-  const now = Date.now();
-  const listed = accounts.map((account, index) => {
-    const report = reports.find((r) => r.id === account.id);
-    const state = account.needsReauth ? "needs-login" : report?.state ?? (account.id === "current" || account.expiresAt <= now ? "needs-login" : "ready");
-    const quota = usage[account.id];
-    return buildLimitsAccount({
-      id: account.id, label: account.label, preferred: account.preferred, active: active !== undefined ? account.id === active : report?.active === true,
-      health: { state, ...(report?.cooldownSeconds ? { pausedUntil: now + report.cooldownSeconds * 1000 } : {}) },
-    }, index, quota ? claudeLimitWindows(quota) : [], quota, now, 5 * 60_000);
-  });
-  // The mod's status bar reads the legacy `windows` and shows Claude as one group: only the account
-  // serving turns (else the preferred one, else the first with figures) keeps them. Every account's
-  // figures stay in `usageWindows` for the Status page.
-  const shown = listed.find((a) => a.active && a.windows.length) ?? listed.find((a) => a.preferred && a.windows.length) ?? listed.find((a) => a.windows.length);
-  return listed.map((a) => a === shown ? a : { ...a, windows: [] });
+/**
+ * The Claude accounts in the order the limits are numbered by: the app login first (index 0), then
+ * the stored accounts in their saved order. Paused and needs-login accounts are left out before
+ * numbering, as ChatGPT's are: one that cannot answer would otherwise hold a number and the pane
+ * would read "Claude 1, Claude 3". The mod settings' account tabs number by the same list.
+ */
+function claudeNumberedAccounts(): { id: string; label?: string; email?: string }[] {
+  const stored = listClaudeAccounts(homeDir()).filter((a) => !a.paused && !a.needsReauth && a.expiresAt > Date.now());
+  return [{ id: "current" }, ...stored.map((a) => ({ id: a.id, label: a.label, ...(a.email ? { email: a.email } : {}) }))];
 }
 
-/** ChatGPT has no stored preference: the first account in rotation is the default for new turns. */
+/** A ChatGPT or Google provider's accounts as the limits number them: paused and needs-login left out. */
+function numberedAccounts<T extends { state: string }>(accounts: readonly T[]): T[] {
+  return accounts.filter((a) => a.state !== "paused" && a.state !== "needs-login");
+}
+
+/**
+ * Every Claude account's plan windows, one entry each, numbered by claudeNumberedAccounts so an
+ * account keeps its number while another's usage comes and goes. Only accounts whose usage is
+ * known are listed; `inUse` marks the one the pool serves with now (claudeInUseId), and when that
+ * one's usage is not known yet no entry is marked, so no reader takes another account's figures
+ * for the one that is actually spending.
+ */
+async function anthropicLimitAccounts(deps: AdminDeps, name: string): Promise<LimitsAccount[]> {
+  let usage: Record<string, Record<string, unknown>>;
+  try {
+    usage = (await deps.claudeUsage?.()) ?? {};
+  } catch {
+    return [];
+  }
+  const inUse = claudeInUseId(deps, name);
+  const owners = claudeNumberedAccounts();
+  const out: LimitsAccount[] = [];
+  owners.forEach((owner, account) => {
+    const quota = usage[owner.id];
+    if (!quota) return;
+    const windows = claudeLimitWindows(quota);
+    if (!windows.length) return;
+    const at = typeof quota.at === "number" ? quota.at : Date.now();
+    out.push({ account, ...(owner.label ? { label: owner.label } : {}), ...(owner.id === inUse ? { inUse: true as const } : {}), windows, at });
+  });
+  return out;
+}
+
+/** Every ChatGPT account's windows, paused and needs-login accounts left out and unnumbered. */
 function chatgptLimitAccounts(accounts: ChatGptAccountStatus[]): LimitsAccount[] {
-  const preferred = accounts.find((a) => a.state === "ready");
-  const now = Date.now();
-  return accounts.map((account, index) => {
-    // The quota map keeps an account's last figures forever: a paused or signed-out account would
-    // show them frozen (and at 0% after its reset) in the mod band and the phone, which read only
-    // `windows`. Such an account is listed with its state and no windows.
-    const live = account.state !== "paused" && account.state !== "needs-login";
-    return buildLimitsAccount({
-      id: account.id, label: account.email || account.label, preferred: account.id === preferred?.id, active: account.active,
-      health: { state: account.state, ...(account.cooldownSeconds ? { pausedUntil: now + account.cooldownSeconds * 1000 } : {}) },
-    }, index, live && account.quota ? claudeLimitWindows(account.quota) : [], live ? account.quota : undefined, now, 10 * 60_000);
+  const kept = numberedAccounts(accounts);
+  const out: LimitsAccount[] = [];
+  kept.forEach((account, index) => {
+    const quota = account.quota;
+    if (!quota || typeof quota.at !== "number") return;
+    const limits = quota.rate_limits as { primary?: unknown; secondary?: unknown } | undefined;
+    const windows: LimitsWindow[] = [];
+    for (const w of [limits?.primary, limits?.secondary]) {
+      const win = limitWindowFrom(w);
+      if (win) windows.push({ kind: windowKind(win.window_minutes), used_percent: win.used_percent, ...(win.window_minutes !== undefined ? { window_minutes: win.window_minutes } : {}), ...(win.reset_at !== undefined ? { reset_at: win.reset_at } : {}) });
+    }
+    if (windows.length) out.push({ account: index, ...(account.label ? { label: account.label } : {}), ...(account.inUse ? { inUse: true as const } : {}), windows, at: quota.at });
   });
+  return out;
 }
 
-/** Every Antigravity account's windows (Gemini's own plus the third-party ones), paused left out. */
+/** Every Antigravity account's windows (Gemini, Argon and selected third-party ones), paused left out. */
 async function googleLimitAccounts(deps: AdminDeps, name: string): Promise<LimitsAccount[]> {
   const google = deps.google?.();
   if (!google) return [];
   const statuses = google.accounts()[name] ?? [];
   const groups = (await google.usage?.(name)) ?? {};
-  const kept = statuses.filter((a) => a.state !== "paused" && a.state !== "needs-login");
+  const kept = numberedAccounts(statuses);
   const at = Date.now();
   // The third-party (Claude and GPT) windows only when this provider has such a model selected:
   // beside Gemini's own they made four figures, two of them a pool nobody here spends (2026-10-20).
@@ -340,22 +456,22 @@ async function googleLimitAccounts(deps: AdminDeps, name: string): Promise<Limit
   kept.forEach((account, index) => {
     const quotient = groups[account.id];
     if (!quotient || !quotient.length) return;
-    const windows: LimitsWindow[] = googleWindowsFromGroups(quotient).filter((w) => thirdParty || w.kind !== "scoped");
-    if (windows.length) out.push({ account: index, windows, at });
+    // Scoped is a display kind, not a third-party marker: Argon's own weekly quota is scoped too.
+    const windows: LimitsWindow[] = googleWindowsFromGroups(quotient).filter((w) => thirdParty || w.kind !== "scoped" || w.label !== "3P");
+    if (windows.length) out.push({ account: index, ...(account.label ? { label: account.label } : {}), ...(account.inUse ? { inUse: true as const } : {}), windows, at });
   });
   return out;
 }
 
 /** Every provider whose quota can be read, in one shape, for `GET /api/limits`. */
-async function buildLimits(deps: AdminDeps, refresh = false): Promise<{ providers: LimitsProvider[] }> {
+async function buildLimits(deps: AdminDeps): Promise<{ providers: LimitsProvider[] }> {
   const providers: LimitsProvider[] = [];
-  // Limits is a standalone reader: do not rely on a Status request to refresh ChatGPT first.
-  const chatgpt = await chatgptStatus(deps, { refresh });
-  const accounts = chatgpt.accounts;
+  const chatgpt = deps.chatgpt?.();
+  const accounts = chatgpt?.accounts?.() ?? {};
   for (const [name, p] of Object.entries(deps.config().providers)) {
     if (p.limits === false) continue;
     if (p.type === "anthropic" && p.auth === "claude-code") {
-      const rows = await anthropicLimitAccounts(deps, name, refresh);
+      const rows = await anthropicLimitAccounts(deps, name);
       if (rows.length) providers.push({ provider: name, type: "anthropic", title: "Claude", accounts: rows });
     } else if (p.type === "chatgpt") {
       const rows = chatgptLimitAccounts(accounts[name] ?? []);
@@ -364,8 +480,23 @@ async function buildLimits(deps: AdminDeps, refresh = false): Promise<{ provider
       const rows = await googleLimitAccounts(deps, name);
       if (rows.length) providers.push({ provider: name, type: "google", title: "Gemini", accounts: rows });
     } else if (p.type === "openai-compatible" && isOpenCodeGo(p)) {
-      const windows = (await deps.opencodeUsage?.(name)) ?? [];
-      if (windows.length) providers.push({ provider: name, type: "opencode-go", title: "Go", accounts: [{ account: 0, windows: windows.map((w) => ({ ...w })), at: Date.now() }] });
+      const credentials = p.credentials?.length ? p.credentials : [undefined];
+      const rows = await Promise.all(credentials.map(async (credential, account): Promise<LimitsAccount> => ({
+        account,
+        ...(credential?.label !== undefined ? { label: credential.label } : {}),
+        windows: ((await deps.opencodeUsage?.(name, credential?.id)) ?? []).map((w) => ({ ...w })),
+        at: Date.now(),
+      })));
+      if (rows.some((row) => row.windows.length)) providers.push({ provider: name, type: "opencode-go", title: "Go", accounts: rows });
+    } else if (p.type === "anthropic-compatible" && isMiniMaxPlan(p)) {
+      const credentials = p.credentials?.length ? p.credentials : [undefined];
+      const rows = await Promise.all(credentials.map(async (credential, account): Promise<LimitsAccount> => ({
+        account,
+        ...(credential?.label !== undefined ? { label: credential.label } : {}),
+        windows: ((await deps.minimaxUsage?.(name, credential?.id)) ?? []).map((w) => ({ ...w })),
+        at: Date.now(),
+      })));
+      if (rows.some((row) => row.windows.length)) providers.push({ provider: name, type: "minimax", title: "MiniMax", accounts: rows });
     } else if (p.type === "grok") {
       const windows = (await deps.grokUsage?.(name)) ?? [];
       if (windows.length) providers.push({ provider: name, type: "grok", title: "Grok", accounts: [{ account: 0, windows: windows.map((w) => ({ ...w })), at: Date.now() }] });
@@ -402,83 +533,21 @@ type ProbeRequest = {
   wire?: "chat" | "responses";
 };
 
-// The CLI's `--effort` takes the same five; Opus, Sonnet and Haiku 5.5 answered `xhigh` (requests.jsonl, 2026-10-14, #56).
-const ANTHROPIC_EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max"];
-const CHATGPT_DEFAULT_EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max"];
-
 type ChatgptLogin = { running: boolean; startedAt?: string; finishedAt?: string; ok?: boolean; output?: string };
 let chatgptLogin: ChatgptLogin = { running: false };
 /** The Claude subscription sign-in in progress (or the last one), for GET /api/claude-oauth. */
 let claudeOAuth: ClaudeOAuthSession | null = null;
 /** The Google (Antigravity) sign-in in progress (or the last one), for GET /api/google-login. */
 let googleOAuth: GoogleOAuthSession | null = null;
-/** Shared catalog for the GUI: model-specific values override provider defaults. */
-export function effortLevels(cfg: Config): { providers: Record<string, { default: string[]; models?: Record<string, string[]> }> } {
-  const providers: Record<string, { default: string[]; models?: Record<string, string[]> }> = {
-    anthropic: { default: ANTHROPIC_EFFORT_LEVELS },
-  };
-  for (const [name, provider] of Object.entries(cfg.providers)) {
-    if (provider.type === "chatgpt") {
-      // The backend's catalogue is the truth about which models exist and what each supports, but
-      // it lives behind a login and a network call, so the measured fallback list carries the
-      // per-model ladders (ultra on astra/sol/5.6 terra+sol, not on either Luna) and any config
-      // entries the user has saved override them.
-      const models: Record<string, string[]> = Object.fromEntries(
-        CHATGPT_FALLBACK_MODELS.filter((model) => model.effortLevels !== undefined).map((model) => [model.id, [...model.effortLevels!]]),
-      );
-      for (const model of provider.models ?? []) if (model.effortLevels !== undefined) models[model.id] = [...model.effortLevels];
-      providers[name] = { default: CHATGPT_DEFAULT_EFFORT_LEVELS, ...(Object.keys(models).length ? { models } : {}) };
-      continue;
-    }
-    const modelLevels = Object.fromEntries(
-      (provider.models ?? [])
-        .filter((model) => model.effortLevels !== undefined)
-        .map((model) => [model.id, [...model.effortLevels!]]),
-    );
-    if (provider.type === "openai-compatible") {
-      providers[name] = {
-        default: provider.caps?.reasoning === "effort" ? (provider.caps.effortLevels ?? []) : [],
-        ...(Object.keys(modelLevels).length ? { models: modelLevels } : {}),
-      };
-      continue;
-    }
-    if (provider.type === "google") {
-      // Gemini exposes its ladder per model (the probe fills `effortLevels`); there is no
-      // provider-wide default, so the union of what the models declared is the fallback.
-      const levels = [...new Set((provider.models ?? []).flatMap((model) => model.effortLevels ?? []))];
-      providers[name] = { default: levels, ...(Object.keys(modelLevels).length ? { models: modelLevels } : {}) };
-      continue;
-    }
-    if (provider.type === "anthropic") {
-      providers[name] = { default: ANTHROPIC_EFFORT_LEVELS };
-      continue;
-    }
-    if (provider.type === "grok") {
-      // The proxy's listing gives each model its ladder (the probe saves it); a model it has not
-      // described gets the common one, which is also what the adapter sends it.
-      providers[name] = { default: [...GROK_EFFORT_LEVELS], ...(Object.keys(modelLevels).length ? { models: modelLevels } : {}) };
-      continue;
-    }
-    const preset = provider.preset ? PRESETS.find((entry) => entry.id === provider.preset) : undefined;
-    providers[name] = {
-      default: resolveCompatibleCaps(preset ? { effortLevels: preset.effortLevels, thinking: preset.thinking, ...(preset.serverTools ? { serverTools: true } : {}) } : undefined, provider.caps).effortLevels,
-      ...(Object.keys(modelLevels).length ? { models: modelLevels } : {}),
-    };
-  }
-  return { providers };
-}
-
 /** One routed model's ladder, from the provider that declares it — what the picker's effort menu
  * should offer for it. Undefined when no provider declares the id: the menu is then left alone. */
 export function effortLevelsForModel(cfg: Config, modelId: string): string[] | undefined {
-  const catalog = effortLevels(cfg).providers;
-  for (const [name, provider] of Object.entries(cfg.providers)) {
-    if (provider.type === "anthropic") continue;
-    const own = catalog[name];
-    if (own?.models?.[modelId]) return own.models[modelId];
-    if (own && provider.models?.some((model) => model.id === modelId)) return own.default;
-  }
-  return undefined;
+  const base = modelId.split("@")[0]!;
+  const target = resolve(base, {}, cfg) ?? resolve(cfg.aliases[base] ?? base, {}, cfg);
+  if (!target) return undefined;
+  const own = effortLevels(cfg).providers[target.provider];
+  const id = cfg.providers[target.provider]?.models?.find(m => m.id === target.model || m.id.replace(/-\d{8}$/, "") === target.model.replace(/-\d{8}$/, ""))?.id ?? target.model;
+  return own?.models?.[id] ?? own?.default;
 }
 
 // Only for when Anthropic's own list cannot be had (no sign-in yet, offline): the live list is
@@ -633,17 +702,129 @@ async function chatgptStatus(deps: AdminDeps, opts: { refresh?: boolean } = {}):
 
 export type ModOptions = {
   /** Each worker with its model's effort ladder (mod efforts only) and how it is paid for. */
-  agents: (ReturnType<typeof generatedAgents>[number] & { efforts: Effort[]; billing: Billing })[];
+  /**
+   * A pinned worker's `accountNumber` is its account's number in the provider's `accounts`, the
+   * same `n` the limits show as "Claude n"/"GPT n" (`account` + 1 there).
+   */
+  agents: (ReturnType<typeof generatedAgents>[number] & { efforts: Effort[]; billing: Billing; accountNumber?: number })[];
   models: { model: string; provider: string; name: string; judgeOnly: boolean }[];
-  providers: { name: string; type: Provider["type"]; usable: boolean; billing: Billing; reason?: string; exhaustedAt?: number; exhaustedUntil?: number }[];
+  /**
+   * `accounts`, only on a provider with pinned workers: its accounts numbered as the limits number
+   * them, then any stored account the limits leave out (paused, waiting for a sign-in) after them,
+   * so every pinned worker has one. `label` is the account's name and email, when known.
+   */
+  providers: { name: string; type: Provider["type"]; usable: boolean; billing: Billing; reason?: string; exhaustedAt?: number; exhaustedUntil?: number; models?: Record<string, ModelUnavailable>; accounts?: ModAccount[] }[];
   zen: { configured: boolean; model: string | null };
   scores: ReturnType<typeof buildModelScores>;
   /** Claude's own models' effort ladder, for the rungs that run Claude Code's own agent. */
   claudeEfforts: Effort[];
 };
 
+/** One account of a provider with pinned workers, as the mod settings' account tabs show it. */
+export type ModAccount = { number: number; label?: string };
+
+/** An account's name and its email beside it when the name is not already the email. */
+function accountTitle(account: { label?: string; email?: string }): string | undefined {
+  const label = account.label?.trim();
+  const email = account.email?.trim();
+  if (label && email && label.toLowerCase() !== email.toLowerCase()) return `${label} · ${email}`;
+  return label || email || undefined;
+}
+
+/**
+ * The accounts of each provider that has pinned workers, numbered as `/api/limits` numbers them,
+ * and each pinned worker's number. A pinned worker is `<worker>-<account id prefix>`
+ * (agents.ts pinnedTargets), which is how it is matched to its account here.
+ */
+async function numberPinnedAccounts(deps: AdminDeps, cfg: Config, agents: ModOptions["agents"], chatgpt: Record<string, ChatGptAccountStatus[]>, google: Record<string, GoogleAccountStatus[]>): Promise<Map<string, ModAccount[]>> {
+  const out = new Map<string, ModAccount[]>();
+  for (const name of new Set(agents.filter((a) => a.account !== undefined).map((a) => a.provider))) {
+    const provider = cfg.providers[name];
+    if (!provider) continue;
+    let numbered: { id: string; label?: string; email?: string }[] = [];
+    if (provider.type === "anthropic") {
+      numbered = claudeNumberedAccounts();
+      // The app login's own email, for the first tab's title; the lookup is cached for minutes.
+      const identity = await deps.claudeIdentity?.().catch(() => null);
+      if (identity) numbered[0] = { id: "current", email: identity.email };
+    } else if (provider.type === "chatgpt") numbered = numberedAccounts(chatgpt[name] ?? []);
+    else if (provider.type === "google") numbered = numberedAccounts(google[name] ?? []);
+    const ids = new Set(numbered.map((a) => a.id));
+    const all = [...numbered, ...storedAccountsFor(provider, homeDir()).filter((a) => !ids.has(a.id))];
+    out.set(name, all.map((account, index) => {
+      const label = accountTitle(account);
+      return { number: index + 1, ...(label ? { label } : {}) };
+    }));
+    for (const agent of agents) {
+      if (agent.provider !== name || agent.account === undefined) continue;
+      const at = all.findIndex((account) => account.id !== "current" && agent.name.endsWith(`-${accountPinFor(account.id)}`));
+      if (at >= 0) agent.accountNumber = at + 1;
+    }
+  }
+  return out;
+}
+
+/** One model out while its provider still answers others: a spent quota group, until it resets. */
+export type ModelUnavailable ={ reason: string; exhaustedAt?: number; exhaustedUntil?: number };
+
+/**
+ * An Antigravity provider's spent quota groups: a group resting on every account that is otherwise
+ * in rotation (`quotaCooldowns`, set only by a 429 that proves the group spent). Google counts Gemini
+ * and Claude/GPT models separately, and each host its own, so a spent group takes only its own models
+ * on that host out of the ladder. The accounts are the one source, so clearing an account's cooldown
+ * or signing in a fresh one puts the models back at once.
+ *
+ * An account that is only cooling still counts: it takes the group's turns again once both its own
+ * rest and the group's are over, so the group is back at the soonest of those per-account waits.
+ */
+function antigravityGroupsOut(accounts: readonly GoogleAccountStatus[], now: number): Record<string, ModelUnavailable> {
+  const out: Record<string, ModelUnavailable> = {};
+  const inRotation = accounts.filter(a => a.state === "ready" || a.state === "cooling");
+  for (const scope of new Set(inRotation.flatMap(a => Object.keys(a.quotaCooldowns ?? {})))) {
+    const waits = inRotation.map(a => Math.max(a.state === "cooling" ? a.cooldownSeconds ?? 0 : 0, a.quotaCooldowns?.[scope] ?? 0));
+    if (waits.some(seconds => seconds <= 0)) continue;
+    out[scope] = { reason: "quota_exhausted", exhaustedUntil: now + Math.min(...waits) * 1000 };
+  }
+  return out;
+}
+
 const MOD_EFFORTS: readonly string[] = ["low", "medium", "high", "xhigh", "max"];
 const modEfforts = (levels: readonly string[] | undefined): Effort[] => (levels ?? []).filter((level): level is Effort => MOD_EFFORTS.includes(level));
+
+/**
+ * A plan subscription's spent windows, from the same read `/api/limits` shows (OpenCode Go's
+ * `/usage`, MiniMax M Plan's `coding_plan/remains`). One key is out once any of its windows reads
+ * 100%, because the plan refuses every model on that key; it is back when the latest of its full
+ * windows resets. The provider leaves the ladder only while every key is out, as rotation would
+ * otherwise find one to use (#95). No reader, a failed read or an empty answer is not evidence: the
+ * answer stays today's.
+ */
+async function spentWindowsOut(
+  read: ((name: string, credentialId?: string) => Promise<UsageWindow[]>) | undefined,
+  name: string,
+  credentials: readonly ProviderCredential[] | undefined,
+  now: number,
+): Promise<{ reason: "quota_exhausted"; until: number } | undefined> {
+  if (!read) return undefined;
+  const keys = credentials?.length ? credentials : [undefined];
+  const backs: number[] = [];
+  for (const credential of keys) {
+    let windows: UsageWindow[];
+    try {
+      windows = await read(name, credential?.id);
+    } catch {
+      return undefined;
+    }
+    if (!windows.length) return undefined;
+    const full = windows.filter((w) => w.used_percent >= 100);
+    if (!full.length) return undefined;
+    // Every window must have room again, so the latest full one is when this key returns. The
+    // subscription's own reset is the honest answer; without one, the runtime default applies.
+    backs.push(Math.max(...full.map((w) => (w.reset_at !== undefined ? w.reset_at * 1000 : now + 30 * 60_000))));
+  }
+  const until = Math.min(...backs);
+  return until > now ? { reason: "quota_exhausted", until } : undefined;
+}
 
 async function modOptions(deps: AdminDeps, scores: ModelScoreCatalog): Promise<ModOptions> {
   const cfg = deps.config();
@@ -651,8 +832,18 @@ async function modOptions(deps: AdminDeps, scores: ModelScoreCatalog): Promise<M
   const google = deps.google?.().accounts() ?? {};
   const credentials = deps.credentials?.() ?? {};
   const health = deps.providerHealth?.() ?? {};
-  const providers = Object.entries(cfg.providers).map(([name, p]) => {
+  const catalog = effortLevels(cfg).providers;
+  const agents: ModOptions["agents"] = generatedAgents(cfg, deps.agentDir, undefined, deps.log, (provider) => storedAccountsFor(provider, homeDir())).map(a => ({
+    ...a,
+    efforts: modEfforts(catalog[a.provider]?.models?.[a.model] ?? catalog[a.provider]?.default),
+    billing: billingOf(cfg.providers[a.provider] as { type: string; auth?: string; preset?: string; url?: string }, a.model),
+  }));
+  const accountsOf = await numberPinnedAccounts(deps, cfg, agents, chatgpt.accounts, google);
+  const now = Date.now();
+  const providers = await Promise.all(Object.entries(cfg.providers).map(async ([name, p]) => {
     let usable = true;
+    // A spent OpenCode Go window, which the picker must skip before it hands out the work (#95).
+    let usageOut: { reason: "quota_exhausted"; until: number } | undefined;
     if (p.type === "chatgpt") {
       const accounts = chatgpt.accounts[name];
       usable = accounts ? accounts.some(a => a.state === "ready" && !exhaustedForMs(a.quota))
@@ -665,14 +856,39 @@ async function modOptions(deps: AdminDeps, scores: ModelScoreCatalog): Promise<M
       // due token before each turn, so only an account that must sign in again is out.
       usable = p.auth === "api-key" ? !!(p.apiKey || process.env.ANTHROPIC_API_KEY)
         : claudeAuthStore(deps).describeSource() !== null || listClaudeAccounts(homeDir()).some(a => !a.needsReauth);
+    } else if (p.type === "openai-compatible" && isOpenCodeGo(p)) {
+      usageOut = await spentWindowsOut(deps.opencodeUsage, name, p.credentials, now);
+      if (usageOut) usable = false;
+    } else if (p.type === "anthropic-compatible" && isMiniMaxPlan(p)) {
+      usageOut = await spentWindowsOut(deps.minimaxUsage, name, p.credentials, now);
+      if (usageOut) usable = false;
     }
-    if (credentials[name]) usable = usable && credentials[name]!.some(c => c.state === "ready");
+    if (credentials[name]) usable = usable && credentials[name]!.some(c => c.state === "ready" && !c.paused);
     const exhausted = health[name];
-    return { name, type: p.type, usable: usable && !exhausted, billing: billingOf(p as { type: string; auth?: string; preset?: string; url?: string }),
-      ...(exhausted ? { reason: exhausted.reason, exhaustedAt: exhausted.at, exhaustedUntil: exhausted.until } : {}),
+    // A runtime exhaustion mark and a spent subscription window can both be true; the later reset
+    // is the one the ladder has to wait for.
+    let out: { reason: string; exhaustedAt?: number; exhaustedUntil: number } | undefined;
+    if (exhausted) out = { reason: exhausted.reason, exhaustedAt: exhausted.at, exhaustedUntil: exhausted.until };
+    if (usageOut && (!out || usageOut.until > out.exhaustedUntil)) out = { reason: usageOut.reason, exhaustedUntil: usageOut.until };
+    const modelsOut: Record<string, ModelUnavailable> = Object.fromEntries(
+      Object.entries(deps.modelHealth?.()[name] ?? {}).map(([model, state]) => [model, { reason: state.reason, exhaustedAt: state.at }]),
+    );
+    if (p.type === "google" && p.auth === "antigravity") {
+      const groups = antigravityGroupsOut(google[name] ?? [], now);
+      const scopeOf = deps.google?.().quotaScope;
+      const ids = new Set([...(p.models ?? []).map(m => m.id), ...agents.filter(a => a.provider === name).map(a => a.model)]);
+      for (const id of ids) {
+        const scope = scopeOf?.(name, id);
+        if (scope && groups[scope] && !modelsOut[id]) modelsOut[id] = groups[scope];
+      }
+    }
+    return { name, type: p.type, usable: usable && !out, billing: billingOf(p as { type: string; auth?: string; preset?: string; url?: string }),
+      ...(out ? { reason: out.reason, ...(out.exhaustedAt !== undefined ? { exhaustedAt: out.exhaustedAt } : {}), exhaustedUntil: out.exhaustedUntil } : {}),
+      ...(Object.keys(modelsOut).length ? { models: modelsOut } : {}),
+      ...(accountsOf.has(name) ? { accounts: accountsOf.get(name)! } : {}),
     };
-  });
-  const models = Object.entries(cfg.providers).flatMap(([provider, p]) => (p.models ?? []).map(m => ({ model: m.id, provider, name: m.name ?? m.id, judgeOnly: isJudgeOnlyModel(m.id) })));
+  }));
+  const models = Object.entries(cfg.providers).flatMap(([provider, p]) => (p.models ?? []).map(m => ({ model: declaredBy(m.id, cfg).length > 1 ? `${provider}:${m.id}` : m.id, provider, name: m.name ?? m.id, judgeOnly: isJudgeOnlyModel(m.id) })));
   const zen = Object.values(cfg.providers).find(p => {
     if (!p.models?.some(m => isJudgeOnlyModel(m.id))) return false;
     if ("preset" in p && p.preset === "opencode-zen") return true;
@@ -681,12 +897,6 @@ async function modOptions(deps: AdminDeps, scores: ModelScoreCatalog): Promise<M
     return url.hostname === "opencode.ai" && /^\/zen\/v1(?:\/|$)/.test(url.pathname);
   });
   const model = zen?.models?.find(m => isJudgeOnlyModel(m.id))?.id ?? null;
-  const catalog = effortLevels(cfg).providers;
-  const agents = generatedAgents(cfg, deps.agentDir, undefined, deps.log).map(a => ({
-    ...a,
-    efforts: modEfforts(catalog[a.provider]?.models?.[a.model] ?? catalog[a.provider]?.default),
-    billing: billingOf(cfg.providers[a.provider] as { type: string; auth?: string; preset?: string; url?: string }, a.model),
-  }));
   const scored = buildModelScores(cfg, await scores.get());
   const claudeEfforts = modEfforts(catalog.anthropic?.default);
   return { agents, models, providers, zen: { configured: model !== null, model }, scores: scored, claudeEfforts };
@@ -698,8 +908,9 @@ async function modOptions(deps: AdminDeps, scores: ModelScoreCatalog): Promise<M
  */
 function ladderChoices(options: ModOptions): LadderChoice[] {
   const usable = new Set(options.providers.filter(p => p.usable).map(p => p.name));
+  const modelOut = (a: { provider: string; model: string }): boolean => !!options.providers.find(p => p.name === a.provider)?.models?.[a.model];
   return [
-    ...options.agents.filter(a => usable.has(a.provider)).map(a => {
+    ...options.agents.filter(a => usable.has(a.provider) && !modelOut(a)).map(a => {
       const costs = (options.scores.models.find(m => m.model === a.model && m.provider === a.provider)?.variants ?? []).flatMap(v => typeof v.costPerTask === "number" ? [v.costPerTask] : []);
       return { target: { agent: a.name }, model: a.model, provider: a.provider, billing: a.billing, efforts: a.efforts, ...(costs.length ? { cost: Math.min(...costs) } : {}) };
     }),
@@ -708,10 +919,43 @@ function ladderChoices(options: ModOptions): LadderChoice[] {
 }
 
 /**
+ * Worker names saved by the build that sanitised a model id without lower-casing it first (#111):
+ * the ladder, the allow-list and the fallback name workers by their generated name, so a renamed
+ * worker would read as missing and its rung skipped. Migrated wherever settings are read or written,
+ * so a ladder the user saved keeps the worker it named; the next save stores the new name.
+ */
+function migrateWorkerNames(settings: Settings, renames: Record<string, string>): Settings {
+  if (Object.keys(renames).length === 0) return settings;
+  const agent = (name: string): string => renames[name] ?? name;
+  const steps = (list: Step[] | undefined): Step[] | undefined =>
+    list?.map(step => ({ ...step, target: { ...step.target, agent: agent(step.target.agent) } }));
+  const rungs = (saved: Rungs): Rungs =>
+    Object.fromEntries(Object.entries(saved).map(([rung, list]) => [rung, steps(list)])) as Rungs;
+  const domains = (rules: DomainRules): DomainRules =>
+    Object.fromEntries(Object.entries(rules).map(([domain, rule]) => [domain, { mode: "ladder", rungs: rungs(rule.rungs) }])) as DomainRules;
+  const names = (list: string[]): string[] => [...new Set(list.map(agent))];
+  const modes = settings.modes.map(mode => ({
+    ...mode,
+    rungs: rungs(mode.rungs),
+    ...(mode.domainRules ? { domainRules: domains(mode.domainRules) } : {}),
+  }));
+  return {
+    ...settings,
+    rules: { general: { mode: "ladder", rungs: rungs(settings.rules.general.rungs) } },
+    ...(settings.domainRules ? { domainRules: domains(settings.domainRules) } : {}),
+    modes,
+    allow: names(settings.allow),
+    allowKnown: names(settings.allowKnown),
+    fallback: { ...settings.fallback, agent: agent(settings.fallback.agent) },
+  };
+}
+
+/**
  * Fill empty ordered lists in Base and saved modes from the same ticked, connected choices.
  * Existing lists survive availability and allow-list changes; dispatch handles skips.
  */
 async function withFilledLadder(deps: AdminDeps, scores: ModelScoreCatalog, settings: Settings): Promise<Settings> {
+  settings = migrateWorkerNames(settings, agentRenames(deps.config(), deps.agentDir, deps.log));
   const general = settings.rules.general;
   const sets = [settings, ...settings.modes];
   const domains = sets.flatMap(set => Object.values(set.domainRules ?? {}));
@@ -751,6 +995,7 @@ async function buildStatus(deps: AdminDeps, opts: { refresh?: boolean } = {}): P
         reachable,
         usable: reachable && !health[name],
         ...(health[name] ? { exhaustion: health[name] } : {}),
+        ...(deps.modelHealth ? { models: Object.fromEntries(Object.entries(deps.modelHealth()[name] ?? {}).map(([model, state]) => [model, { usable: false, ...state }])) } : {}),
         // Whether the router could run a `WebSearch` side request through this provider, so the
         // Clients screen can say so beside a model name. Nothing on that screen said which ones
         // those are, and a `smallFast` slot pointed at one turns every search into a visible failure
@@ -762,7 +1007,7 @@ async function buildStatus(deps: AdminDeps, opts: { refresh?: boolean } = {}): P
         // and cites real pages, but the wire is OpenAI-shaped while its hits come back as Responses
         // events — a backend the router does not have, so a search still cannot go through it.
         // Naming the provider's own capability instead would be a promise the router cannot keep.
-        ...(providerCanSearch(name, cfg) ? { webSearch: true } : {}),
+        ...(answersWebSearch(cfg, name) ? { webSearch: true } : {}),
         // A provider whose plan searches on another endpoint does so for some models only.
         ...(() => {
           const models = (("models" in p && p.models) || []).map((m) => typeof m === "string" ? m : m.id).filter((id) => searchProviderFor(p, id));
@@ -792,6 +1037,10 @@ async function buildStatus(deps: AdminDeps, opts: { refresh?: boolean } = {}): P
   // can go through. In picker mode a missing certificate trust or app proxy entry looks, from the
   // app, exactly like a dead router. Each problem is a code the tray and the GUI can name.
   const problems: string[] = [];
+  // A config that failed validation is not a healthy router: the routes it names may be missing,
+  // and the file has to be fixed before anything else can be trusted (G-D14).
+  const configErrors = deps.configErrors?.() ?? [];
+  if (configErrors.length) problems.push("config");
   if (env.HTTPS_PROXY !== wantProxy) problems.push("settings");
   if (deps.health() > 0) problems.push("upstream");
   if (picker.enabled) {
@@ -803,11 +1052,24 @@ async function buildStatus(deps: AdminDeps, opts: { refresh?: boolean } = {}): P
   return {
     version: deps.version,
     autoUpdate: deps.autoUpdater?.status() ?? { enabled: cfg.autoUpdate !== false, running: false },
+    processPriority: deps.processPriority?.() ?? processPriorityState(cfg.processPriority),
     readiness: { ready: problems.length === 0, problems },
+    // The errors themselves, so a reader can name the line to fix rather than only "config".
+    config: { errors: configErrors },
+    // Outbound provider calls run on undici's own dispatcher, never the environment's proxy
+    // variables, so a network that requires a proxy is bypassed silently. Names only: a proxy URL
+    // can carry a credential (G-D11). The dashboard says so; readiness is unaffected, since a
+    // proxy that is set but not needed is not a fault.
+    envProxy: { set: ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NODE_USE_ENV_PROXY"].filter((name) => (process.env[name] ?? "") !== "") },
     // Which files this process is running, so the app can tell an old router from its own after
     // an update: a zip unpacked next to the previous install left the old one serving (2026-09-15).
     runtime: { node: process.execPath, router: process.argv[1] ?? null, startedAt: STARTED_AT },
     home: homeDir(),
+    // The identity captured when this process started: a caller accepts this status as its own only
+    // when both the installation id and the pid match what it would act on. A file changed while
+    // this process runs does not rewrite what it is.
+    installId: deps.instance?.installId ?? null,
+    pid: deps.instance?.pid ?? null,
     listen: cfg.listen,
     upstream: cfg.upstream,
     adminPort: adminPort(cfg),
@@ -851,26 +1113,6 @@ function pickerTrust(): { caTrusted: boolean; appProxy: boolean } {
 }
 
 /**
- * Whether this provider can actually run a web search — measured capability, not an assumption from
- * the vendor name. The rule is the router's own (`Proxy.canRunServerTools`, mirrored here because
- * that one is private to a live request): Anthropic runs its own server tools; an
- * `anthropic-compatible` provider only when its preset says it was measured doing so; a `chatgpt`
- * provider through its hosted search; an `openai-compatible` provider never — its web plugin is a
- * vendor extension, and OpenCode Go's silently ignores it, leaving the model to answer with invented
- * results. A configured `webSearch` backend is deliberately not counted here: it serves the search
- * for the session, but a model still cannot search by itself, which is what a slot points at.
- */
-function providerCanSearch(name: string, cfg: Config): boolean {
-  const p = cfg.providers[name];
-  if (!p) return false;
-  if (p.type === "chatgpt") return true;
-  if (p.type === "anthropic") return p.accountPool === true && p.auth === "claude-code";
-  if (p.type !== "anthropic-compatible") return false;
-  const preset = p.preset ? PRESETS.find((entry) => entry.id === p.preset) : undefined;
-  return resolveCompatibleCaps(preset ? { ...(preset.serverTools ? { serverTools: true } : {}) } : undefined, p.caps).serverTools;
-}
-
-/**
  * Write `cli.models` into `~/.claude/settings.json` right after a GUI save, so a slot chosen on the
  * Clients screen takes effect in the next session instead of waiting for an `install`.
  *
@@ -878,7 +1120,7 @@ function providerCanSearch(name: string, cfg: Config): boolean {
  * does nothing is the exact bug this closes, so a failure has to come back to the screen rather
  * than being swallowed into the router log.
  */
-function syncModelSlotsForGui(cfg: Config): string | null {
+function syncModelSlotsForGui(cfg: Config, agentDir?: string): string | null {
   try {
     const home = homeDir();
     syncModelSlots({
@@ -889,6 +1131,7 @@ function syncModelSlotsForGui(cfg: Config): string | null {
       // Claude, and `syncModelSlots` reads an absent `models` as "do not touch these".
       models: cfg.cli.models ?? {},
     });
+    syncContextWindows(cfg, agentDir ? [agentDir] : undefined);
     return null;
   } catch (e) {
     const message = (e as Error).message;
@@ -953,14 +1196,30 @@ function sendJson(res: http.ServerResponse, status: number, body: unknown): void
   res.end(out);
 }
 
-/** Write the config file atomically. The one save path: the GUI's PUT and the capability
- * measurement both go through it, so the router never picks up a half-written file either way. */
+/** Write the config file atomically under its lock. The one save path: the GUI's PUT, the
+ * capability measurements and the CLI's picker toggle all go through it or take the same lock, so
+ * the router never picks up a half-written file and two writers never replace it mid-change. */
 function writeConfigFile(configFile: string, config: Config): void {
+  withFileLock(configFile, () => writeConfigFileLocked(configFile, config));
+}
+
+function writeConfigFileLocked(configFile: string, config: Config): void {
   const tmp = `${configFile}.tmp-${process.pid}-${Date.now()}`;
   fs.mkdirSync(path.dirname(configFile), { recursive: true });
   // Owner-only: the config carries provider keys. The rename replaces the old file's mode too.
   fs.writeFileSync(tmp, JSON.stringify(config, null, 2) + "\n", { mode: 0o600 });
   fs.renameSync(tmp, configFile);
+}
+
+/** The disk fingerprint also detects CLI edits and background measurements, without persisting API metadata. */
+function configSnapshot(deps: AdminDeps): { config: Config; configRevision: string } {
+  let text: string;
+  try { text = fs.readFileSync(deps.configFile, "utf8"); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    text = JSON.stringify(deps.config());
+  }
+  return { config: JSON.parse(text) as Config, configRevision: crypto.createHash("sha256").update(text).digest("hex") };
 }
 
 function headerValue(headers: Record<string, string> | undefined): { name: string; value: string } | null {
@@ -1440,6 +1699,11 @@ function effortUndeclared(p: Provider): boolean {
   return false;
 }
 
+/** Ollama's native API base when this provider is Ollama (local daemon or cloud), else null. */
+function ollamaBase(p: Provider): string | null {
+  return p.type === "openai-compatible" ? ollamaApiBase(p.url, p.preset) : null;
+}
+
 /**
  * Fold measurements into the config on disk.
  *
@@ -1448,30 +1712,32 @@ function effortUndeclared(p: Provider): boolean {
  * Only a model that is still present is touched, and only into a blank field — a `wire`,
  * `effortLevels` or `contextWindow` already on the model is the user's or the vendor's, and an
  * explicitly empty ladder is a decision
- * (it disables the provider fallback), not an empty slot. A model whose measurement errored is
- * left entirely alone. The result is validated with the same `validate` the GUI's save uses, so a
- * bad edit is refused rather than written.
+ * (it disables the provider fallback), not an empty slot. Ollama is the exception
+ * (`replaceEmptyEffort`): there the empty ladder is what an unread capability was saved as, so the
+ * vendor's own `/api/show` answer takes its place. A model whose measurement errored is left
+ * entirely alone. The result is validated with the same `validate` the GUI's save uses, so a bad
+ * edit is refused rather than written.
  */
-function applyMeasurements(configFile: string, results: Measured[]): { applied: number } | { error: string } {
+function applyMeasurements(configFile: string, providerName: string, results: Measured[], options: { replaceEmptyEffort?: boolean } = {}): { applied: number } | { error: string } {
   let current: Config;
   try {
     current = JSON.parse(fs.readFileSync(configFile, "utf8")) as Config;
   } catch (e) {
     return { error: `could not re-read config: ${errorText(e)}` };
   }
+  const provider = current.providers[providerName];
+  if (!provider?.models) return { applied: 0 };
   let applied = 0;
   for (const result of results) {
     if (result.error || !result.wire) continue;
-    for (const provider of Object.values(current.providers)) {
-      if (!("models" in provider) || !provider.models) continue;
-      const model = provider.models.find((entry) => entry.id === result.id);
-      if (!model) continue;
-      const before = `${model.wire ?? ""}|${model.effortLevels ? model.effortLevels.join(",") : "∅"}|${model.contextWindow ?? "∅"}`;
-      if (model.wire === undefined) model.wire = result.wire;
-      if (model.effortLevels === undefined && result.effortLevels !== undefined) model.effortLevels = result.effortLevels;
-      if (model.contextWindow === undefined && result.contextWindow !== undefined) model.contextWindow = result.contextWindow;
-      if (`${model.wire ?? ""}|${model.effortLevels ? model.effortLevels.join(",") : "∅"}|${model.contextWindow ?? "∅"}` !== before) applied++;
-    }
+    const model = provider.models.find((entry) => entry.id === result.id);
+    if (!model) continue;
+    const before = `${model.wire ?? ""}|${model.effortLevels ? model.effortLevels.join(",") : "∅"}|${model.contextWindow ?? "∅"}`;
+    if (model.wire === undefined) model.wire = result.wire;
+    const blankEffort = model.effortLevels === undefined || (options.replaceEmptyEffort === true && model.effortLevels.length === 0);
+    if (blankEffort && result.effortLevels !== undefined) model.effortLevels = result.effortLevels;
+    if (model.contextWindow == null && result.contextWindow !== undefined) model.contextWindow = result.contextWindow;
+    if (`${model.wire ?? ""}|${model.effortLevels ? model.effortLevels.join(",") : "∅"}|${model.contextWindow ?? "∅"}` !== before) applied++;
   }
   const errors = validate(current);
   if (errors.length > 0) return { error: `measured config did not validate: ${errors[0]}` };
@@ -1494,14 +1760,20 @@ function startMeasureJob(providerName: string, models: string[], deps: AdminDeps
  * for a save in the GUI. A model was measured only when its provider was saved, so a provider set up
  * before effort discovery — every DeepSeek, Kimi or GLM key on 0.8.1 and earlier — would otherwise
  * stay without effort until its owner happened to save it again. A model with a ladder (measured,
- * or typed) is the config's and left alone; so is one whose provider declares a ladder.
+ * or typed) is the config's and left alone; so is one whose provider declares a ladder. Ollama is
+ * the exception: an empty ladder there is what a probe that could never see its thinking levels left
+ * behind, so it is measured again and replaced by what `/api/show` states.
  */
 export function measureUnsettledModels(deps: AdminDeps): number {
   let started = 0;
   for (const [name, provider] of Object.entries(deps.config().providers)) {
     if (provider.type !== "openai-compatible" && provider.type !== "anthropic-compatible") continue;
-    if (!effortUndeclared(provider)) continue;
-    const models = (provider.models ?? []).filter((model) => model.effortLevels === undefined).map((model) => model.id);
+    const ollama = ollamaBase(provider) !== null;
+    const undeclared = effortUndeclared(provider);
+    if (!undeclared && !ollama) continue;
+    const models = (provider.models ?? [])
+      .filter((model) => (undeclared && model.effortLevels === undefined) || (ollama && model.effortLevels !== undefined && model.effortLevels.length === 0))
+      .map((model) => model.id);
     if (models.length === 0) continue;
     startMeasureJob(name, models, deps);
     started++;
@@ -1514,10 +1786,12 @@ export function measureUnsettledModels(deps: AdminDeps): number {
  *
  * OpenCode's `/models` reports ids alone, so a provider set up before the catalogue's `limit.context`
  * was read keeps no window and falls back to `cli.autoCompactWindow` — a quarter of a 1M model's real
- * window. The measurement folds the catalogue's window in, but only over the models it runs on and
- * only through its own write; this pass reaches the models already on disk, once, at start-up. Only
- * into a blank field, through the same validated write, so a window the user or the vendor set is
- * never overwritten. Returns the `provider/model` ids it filled.
+ * window. Hive's `/models` states even less, and it has no catalogue block of its own, so a model
+ * saved there is matched against the catalogue by id (`catalogueWindow`). The measurement folds the
+ * catalogue's window in, but only over the models it runs on and only through its own write; this
+ * pass reaches the models already on disk, once, at start-up. Only into a blank field, through the
+ * same validated write, so a window the user or the vendor set is never overwritten. Returns the
+ * `provider/model` ids it filled.
  */
 export async function backfillContextWindows(deps: AdminDeps): Promise<string[]> {
   const catalog = deps.modelCatalog ? await deps.modelCatalog().catch(() => undefined) : undefined;
@@ -1537,12 +1811,13 @@ export async function backfillContextWindows(deps: AdminDeps): Promise<string[]>
     if (!("models" in provider) || !provider.models) continue;
     const preset = "preset" in provider ? provider.preset : undefined;
     for (const model of provider.models) {
-      if (model.contextWindow !== undefined) continue;
-      const entry = catalogEntry(catalog, preset, model.id);
-      if (entry?.contextWindow === undefined) continue;
-      model.contextWindow = entry.contextWindow;
+      // A saved `null` is as blank as a missing field (configs written by older dashboards carry it).
+      if (model.contextWindow != null) continue;
+      const stated = catalogEntry(catalog, preset, model.id)?.contextWindow ?? catalogueWindow(catalog, model.id);
+      if (stated === undefined) continue;
+      model.contextWindow = stated;
       filled.push(`${name}/${model.id}`);
-      deps.log.info(`admin: ${name}/${model.id} context window ${entry.contextWindow} (catalogue)`);
+      deps.log.info(`admin: ${name}/${model.id} context window ${stated} (catalogue)`);
     }
   }
   if (filled.length === 0) return [];
@@ -1617,6 +1892,7 @@ async function runMeasureJob(jobId: string, providerName: string, models: string
   const headers = "headers" in provider ? provider.headers : undefined;
   const sessionHeader = "sessionHeader" in provider ? provider.sessionHeader : undefined;
   const preset = "preset" in provider ? provider.preset : undefined;
+  const ollama = ollamaBase(provider);
   const catalog = deps.modelCatalog ? await deps.modelCatalog().catch(() => undefined) : undefined;
   const measureOne = async (id: string): Promise<void> => {
     const listed = catalogEntry(catalog, preset, id);
@@ -1626,14 +1902,25 @@ async function runMeasureJob(jobId: string, providerName: string, models: string
     // one request is also what finds a model the plan refuses (403 FreeTierError, DataPolicyError).
     const stated = ladder.length > 0 || discover ? listed?.effortLevels : undefined;
     const known = stated !== undefined;
-    const measured = await measureModel(id, candidates, known ? [] : ladder, { fetch: fetchImpl, ...(sessionHeader ? { sessionHeader } : {}), ...(headers ? { headers } : {}) }, { discover: discover && !known });
+    // Ollama states thinking levels and the context length itself; a probe cannot see either, and
+    // its unknown-field probe measures every thinking model as taking no effort. Its own `/api/show`
+    // answers first, and the ladder probing it would only answer wrongly is skipped.
+    const facts = ollama ? await ollamaModelFacts(ollama, id, { fetch: fetchImpl, ...(sessionHeader ? { sessionHeader } : {}), ...(headers ? { headers } : {}) }) : undefined;
+    const measured = await measureModel(id, candidates, known || facts ? [] : ladder, { fetch: fetchImpl, ...(sessionHeader ? { sessionHeader } : {}), ...(headers ? { headers } : {}) }, { discover: discover && !known && !facts });
     if (stated && measured.wire) measured.effortLevels = stated;
+    if (facts) {
+      // An answer without levels is a model that takes no effort: a fact, not a blank.
+      measured.effortLevels = facts.effortLevels ?? [];
+      if (facts.contextWindow !== undefined) measured.contextWindow = facts.contextWindow;
+    }
     // The wire was answered, so the model exists: the catalogue's own window travels with the result
-    // and is written only into a model that has none (see applyMeasurements).
-    if (measured.wire && listed?.contextWindow !== undefined) measured.contextWindow = listed.contextWindow;
+    // and is written only into a model that has none (see applyMeasurements). A provider without a
+    // catalogue block of its own is matched by id instead (`catalogueWindow`).
+    const window = listed?.contextWindow ?? catalogueWindow(catalog, id);
+    if (measured.wire && window !== undefined) measured.contextWindow = window;
     job.results.push(measured);
     job.done++;
-    deps.log.info(`admin: measured ${providerName}/${id} -> ${measured.error ? `error ${measured.error}` : `wire ${measured.wire}${measured.effortLevels ? ` effort ${measured.effortLevels.join(",")}${known ? " (catalogue)" : ""}` : ""}`}`);
+    deps.log.info(`admin: measured ${providerName}/${id} -> ${measured.error ? `error ${measured.error}` : `wire ${measured.wire}${measured.effortLevels ? ` effort ${measured.effortLevels.join(",")}${known ? " (catalogue)" : facts ? " (ollama)" : ""}` : ""}`}`);
   };
   // Models are independent, so a few run at once and a slow upstream answer holds up only its own
   // model. Levels inside one model stay sequential: a burst there invites 429s, and a level that
@@ -1643,7 +1930,7 @@ async function runMeasureJob(jobId: string, providerName: string, models: string
     for (let id = queue.shift(); id !== undefined; id = queue.shift()) await measureOne(id);
   }));
   try {
-    const outcome = applyMeasurements(deps.configFile, job.results);
+    const outcome = applyMeasurements(deps.configFile, providerName, job.results, { replaceEmptyEffort: ollama !== null });
     if ("error" in outcome) {
       MEASURE_JOBS.set(jobId, { ...job, state: "failed", error: outcome.error, finishedAt: Date.now() });
       deps.log.warn(`admin: measurement for ${providerName} was not applied: ${outcome.error}`);
@@ -1658,8 +1945,9 @@ async function runMeasureJob(jobId: string, providerName: string, models: string
 
 async function pickerModels(deps: AdminDeps): Promise<{ models: { id: string; name: string }[]; source: "picker" | "fallback" }> {  const last = deps.picker?.().last;
   if (last && typeof last === "object" && Array.isArray((last as { surfaces?: unknown }).surfaces)) {
-    const entries = (last as { surfaces: { id?: unknown; entries?: unknown }[] }).surfaces
-      .filter((surface) => surface.id === "code" || surface.id === "ccd")
+    const surfaces = (last as { surfaces: { id?: unknown; entries?: unknown; injected?: unknown }[] }).surfaces
+      .filter((surface) => surface.id === "code" || surface.id === "ccd");
+    const entries = surfaces
       .flatMap((surface) => (Array.isArray(surface.entries) ? surface.entries : []))
       .flatMap((entry) => {
         if (!entry || typeof entry !== "object") return [];
@@ -1668,8 +1956,13 @@ async function pickerModels(deps: AdminDeps): Promise<{ models: { id: string; na
       });
     // The surfaces carry the same catalog, so "code" + "ccd" lists every model twice. And the
     // snapshot is taken *after* injection, so our own entries are in it — offering GPT ids as
-    // mapping *sources* is meaningless, they are what a source maps to.
-    const injected = new Set(deps.config().cli.extraModels.map((m) => m.model));
+    // mapping *sources* is meaningless, they are what a source maps to. The snapshot names what it
+    // added: a Claude model ticked for the picker is in `extraModels` but was the app's own, and
+    // dropping it by config hid Opus 5.5 from the mapping sources and the dashboard's picker order.
+    const recorded = surfaces.flatMap((surface) => (Array.isArray(surface.injected) ? surface.injected : []));
+    const injected = new Set<unknown>(surfaces.some((surface) => Array.isArray(surface.injected))
+      ? recorded
+      : deps.config().cli.extraModels.map((m) => m.model));
     const seen = new Set<string>();
     const models = entries.filter((e) => {
       if (injected.has(e.id) || seen.has(e.id) || isJudgeOnlyModel(e.id)) return false;
@@ -1682,22 +1975,17 @@ async function pickerModels(deps: AdminDeps): Promise<{ models: { id: string; na
 }
 
 /**
- * Each model's context window, for a client that reads a session's context use without the CLI's own
- * figure (the phone, for a Claude app session). Claude's from Anthropic's catalog, the CLI's injected
- * models from their config (else `cli.autoCompactWindow`), providers' from theirs. Unknown is absent.
+ * Each model's context window for the phone and dashboard. ChatGPT-served models use the same
+ * effective resolution as bootstrap/picker: a window the operator saved on a picker entry wins, then
+ * the catalogue figure, and an explicit route window wins over both. Without a catalogue window, the
+ * stored values retain their old precedence. Unknown is absent. `catalogWindows` carries each
+ * catalogue-backed id's own figure — also when an override is in effect — for the picker editor's
+ * default; `windows` is the value actually resolved. `resolvedWindows` binds a capacity (null when
+ * unknown) to its target/provider for usage readers; unlike the legacy editor maps it never
+ * substitutes a native alias or global compaction window.
  */
-async function contextWindows(deps: AdminDeps): Promise<{ windows: Record<string, number> }> {
-  const cfg = deps.config();
-  const windows: Record<string, number> = {};
-  const put = (id: string, value: number | undefined): void => {
-    if (typeof value === "number" && Number.isFinite(value) && value > 0 && windows[id] === undefined) windows[id] = Math.floor(value);
-  };
-  for (const model of await claudeModelList(deps)) put(model.id, model.contextWindow);
-  for (const model of cfg.cli.extraModels) put(model.model, model.contextWindow ?? cfg.cli.autoCompactWindow);
-  for (const provider of Object.values(cfg.providers)) {
-    for (const model of ("models" in provider && provider.models) || []) put(model.id, model.contextWindow);
-  }
-  return { windows };
+async function contextWindows(deps: AdminDeps): Promise<ReturnType<typeof contextWindowSnapshot>> {
+  return contextWindowSnapshot(deps.config(), await claudeModelList(deps), deps.agentDir ? [deps.agentDir] : undefined);
 }
 
 function tailLines(file: string, n: number): string {
@@ -1774,35 +2062,16 @@ export function startAdmin(deps: AdminDeps): Promise<{ port: number; close(): vo
     void handle(req, res);
   });
 
-  /**
-   * Binding to 127.0.0.1 keeps other machines out, but not the browser on this one: any page the
-   * user visits can POST here, and a simple request (no custom header, no JSON content type) is
-   * not stopped by CORS — the response is unreadable, the side effect still happens. That is how
-   * a web page could turn the picker off, or shut the router down and take Claude Desktop with it.
-   *
-   * A browser always sends Origin on a cross-site POST, so requiring it to be our own origin is
-   * enough. Clients that are not browsers (the CLI, the tray app) send none and are let through.
-   */
-  function crossSitePost(req: http.IncomingMessage): boolean {
+  /** Binding to loopback alone does not stop DNS rebinding: check Host even on reads. */
+  function localHost(req: http.IncomingMessage): boolean {
+    return [`127.0.0.1:${boundPort}`, `localhost:${boundPort}`, `[::1]:${boundPort}`].includes(req.headers.host ?? "");
+  }
+
+  /** Cross-site browser writes still act despite CORS. CLI and tray forwarding send no Origin. */
+  function crossSiteOrigin(req: http.IncomingMessage): boolean {
     const origin = req.headers.origin;
-    if (!origin) return false;
-    return !origin.startsWith("http://") || !loopbackHosts().has(origin.slice("http://".length));
-  }
-
-  /** `host:port` of this server as a client on this machine names it. */
-  function loopbackHosts(): Set<string> {
-    return new Set([`127.0.0.1:${boundPort}`, `localhost:${boundPort}`, `[::1]:${boundPort}`]);
-  }
-
-  /**
-   * Reads need a guard too: GET /api/config returns provider keys. A page on another site cannot
-   * read the response, but DNS rebinding makes it same-origin to the browser — its Host is then
-   * the attacker's name, never one of ours. `sec-fetch-site` turns away the plain cross-site
-   * request in browsers that send it. The CLI, the tray (protocol.ts sets Host to 127.0.0.1), the
-   * mod and the phone host all connect to 127.0.0.1 and send neither.
-   */
-  function foreignRequest(req: http.IncomingMessage): boolean {
-    return req.headers["sec-fetch-site"] === "cross-site" || !loopbackHosts().has(req.headers.host ?? "");
+    if (origin === undefined) return false;
+    return ![`http://127.0.0.1:${boundPort}`, `http://localhost:${boundPort}`, `http://[::1]:${boundPort}`].includes(origin);
   }
 
   async function handle(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
@@ -1814,15 +2083,73 @@ export function startAdmin(deps: AdminDeps): Promise<{ port: number; close(): vo
     const method = req.method === "HEAD" ? "GET" : (req.method ?? "GET");
     const pathname = url.split("?")[0] ?? "/";
     try {
-      if (foreignRequest(req) || (method !== "GET" && crossSitePost(req))) {
-        deps.log.warn(`admin: refused ${method} ${pathname} from host ${String(req.headers.host)}, origin ${String(req.headers.origin)}`);
+      if (!localHost(req)) {
+        deps.log.warn(`admin: refused ${method} ${pathname} with non-loopback Host`);
+        sendJson(res, 403, { error: "local admin host required" });
+        return;
+      }
+      // Reads too: a browser marks a request another site made, while the CLI, the tray, the mod and
+      // the phone host send no such header. Writes also need a loopback Origin when one is sent.
+      if (req.headers["sec-fetch-site"] === "cross-site" || (method !== "GET" && crossSiteOrigin(req))) {
+        deps.log.warn(`admin: refused ${method} ${pathname} from origin ${String(req.headers.origin)}, sec-fetch-site ${String(req.headers["sec-fetch-site"])}`);
         sendJson(res, 403, { error: "cross-site request refused" });
+        return;
+      }
+      if (pathname === "/api/settings-jobs" || pathname === "/api/settings-jobs/claim" || pathname === "/api/settings-jobs/result") {
+        res.setHeader("cache-control", "no-store");
+        if (crossSiteOrigin(req) || req.headers["sec-fetch-site"] === "cross-site") { sendJson(res, 403, { error: "same-origin phone control required" }); return; }
+        const isList = pathname === "/api/settings-jobs";
+        if (method !== (isList ? "GET" : "POST")) { sendJson(res, 404, { error: "unknown phone endpoint or method" }); return; }
+        let body: string | undefined, exclude: string | undefined;
+        if (isList) {
+          const query = new URL(url, "http://127.0.0.1").searchParams;
+          exclude = query.get("exclude") ?? undefined;
+          if (!settingsId(exclude) || query.getAll("exclude").length !== 1) { sendJson(res, 400, { error: "invalid helper" }); return; }
+        } else {
+          try { body = (await readBody(req, 4096, new Error("settings job body too large"))).toString("utf8"); }
+          catch { sendJson(res, 400, { error: "invalid settings job request" }); return; }
+          let raw: unknown;
+          try { raw = JSON.parse(body); } catch { sendJson(res, 400, { error: "invalid settings job request" }); return; }
+          if (!validSettingsJobAction(raw, pathname.endsWith("/result"))) { sendJson(res, 400, { error: "invalid settings job request" }); return; }
+        }
+        const route = isList ? "settings-jobs" : `settings-jobs/${pathname.endsWith("/claim") ? "claim" : "result"}`;
+        const result = await phoneRequest(route, method, body, deps.phone, exclude);
+        sendJson(res, result.status, result.body); return;
+      }
+      if (pathname === "/api/phone-inbox" || pathname === "/api/phone-inbox/claim" || pathname === "/api/phone-inbox/result") {
+        res.setHeader("cache-control", "no-store");
+        if (crossSiteOrigin(req) || req.headers["sec-fetch-site"] === "cross-site") {
+          sendJson(res, 403, { error: "same-origin phone control required" }); return;
+        }
+        const isList = pathname === "/api/phone-inbox";
+        if (method !== (isList ? "GET" : "POST")) { sendJson(res, 404, { error: "unknown phone endpoint or method" }); return; }
+        let body: string | undefined;
+        let session: string | undefined;
+        if (isList) {
+          const query = new URL(url, "http://127.0.0.1").searchParams;
+          session = query.get("session") ?? undefined;
+          if (!session || session.length > 200 || query.getAll("session").length !== 1) { sendJson(res, 400, { error: "invalid session" }); return; }
+        } else {
+          try { body = (await readBody(req, 4096, new Error("inbox body too large"))).toString("utf8"); }
+          catch { sendJson(res, 400, { error: "invalid inbox request" }); return; }
+          let raw: unknown;
+          try { raw = JSON.parse(body); } catch { sendJson(res, 400, { error: "invalid inbox request" }); return; }
+          if (!raw || typeof raw !== "object" || Array.isArray(raw)) { sendJson(res, 400, { error: "invalid inbox request" }); return; }
+          const value = raw as Record<string, unknown>;
+          const result = pathname.endsWith("/result");
+          if (typeof value.itemId !== "string" || !/^[\w-]{1,100}$/.test(value.itemId) || Object.keys(value).some(key => key !== "itemId" && (!result || key !== "outcome")) || result && value.outcome !== "submitted" && value.outcome !== "failed") {
+            sendJson(res, 400, { error: "invalid inbox request" }); return;
+          }
+        }
+        const route = isList ? "inbox" : `inbox/${pathname.endsWith("/claim") ? "claim" : "result"}`;
+        const result = await phoneRequest(route, method, body, deps.phone, session);
+        sendJson(res, result.status, result.body);
         return;
       }
       if (pathname.startsWith("/api/phone/")) {
         res.setHeader("cache-control", "no-store");
-        // Pairing is a credential read: a foreign Origin is refused on GETs too.
-        if (crossSitePost(req)) {
+        // Pairing is a credential read: guard cross-site GETs too. Host is checked above.
+        if (crossSiteOrigin(req) || req.headers["sec-fetch-site"] === "cross-site") {
           sendJson(res, 403, { error: "same-origin phone control required" });
           return;
         }
@@ -1839,6 +2166,16 @@ export function startAdmin(deps: AdminDeps): Promise<{ port: number; close(): vo
         if (!deps.shutdown) {
           sendJson(res, 501, { error: "shutdown not available" });
           return;
+        }
+        // A caller that names an installation must name the one this process actually is (captured
+        // at start, not read from disk now). A caller that names none is an older CLI.
+        const claimed = req.headers["x-clauderipple-install-id"];
+        if (typeof claimed === "string") {
+          const ours = deps.instance?.installId ?? null;
+          if (ours && claimed !== ours) {
+            sendJson(res, 409, { error: "installation mismatch" });
+            return;
+          }
         }
         // Answer before draining: the caller needs to know the request was accepted, and the
         // drain can outlive the connection (it waits for in-flight model calls, up to 90s).
@@ -1932,8 +2269,22 @@ export function startAdmin(deps: AdminDeps): Promise<{ port: number; close(): vo
       }
       // One shape for every provider whose quota can be read, for the status bar's limits row.
       if (pathname === "/api/limits" && method === "GET") {
-        const refresh = new URL(url, "http://127.0.0.1").searchParams.get("refresh") === "1";
-        sendJson(res, 200, await buildLimits(deps, refresh));
+        sendJson(res, 200, await buildLimits(deps));
+        return;
+      }
+      if (pathname === "/api/compact-pick" && method === "POST") {
+        let input: unknown;
+        try { input = JSON.parse((await readBody(req, 4096, new Error("compact pick too large"))).toString("utf8")); }
+        catch { sendJson(res, 400, { error: "invalid compact pick" }); return; }
+        const value = input && typeof input === "object" && !Array.isArray(input) ? input as Record<string, unknown> : {};
+        if (Object.keys(value).some(key => key !== "session" && key !== "model") ||
+            typeof value.session !== "string" || !/^[\w-]{1,128}$/.test(value.session) ||
+            value.model !== null && (typeof value.model !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._:/\[\]-]*(?:@[a-z]+)?$/.test(value.model) || value.model.length > 256)) {
+          sendJson(res, 400, { error: "expected {session, model}" }); return;
+        }
+        if (!deps.compactPick) { sendJson(res, 501, { error: "compact picks unavailable" }); return; }
+        deps.compactPick(value.session, value.model);
+        sendJson(res, 200, { ok: true });
         return;
       }
       if (pathname === "/api/mod-settings" && method === "GET") {
@@ -1948,11 +2299,27 @@ export function startAdmin(deps: AdminDeps): Promise<{ port: number; close(): vo
         try { parsed = JSON.parse(bytes.toString("utf8")); }
         catch { throw new ModSettingsInputError("invalid JSON"); }
         validateSettingsSchema(parsed);
-        const body = parsed as { settings?: unknown };
+        const body = parsed as { settings?: unknown; compactAt?: unknown };
+        // The compaction point lives in Claude Code's own settings.json, not the mod's store: a
+        // dashboard save writes the same key `/autocompact` does, or removes it for the default.
+        if (body && typeof body === "object" && body.compactAt !== undefined) {
+          if (body.compactAt !== null && typeof body.compactAt !== "number") throw new ModSettingsInputError("compactAt must be a number of tokens or null");
+          writeAutoCompactWindow(body.compactAt);
+          syncContextWindows(deps.config(), deps.agentDir ? [deps.agentDir] : undefined);
+        }
         if (body && typeof body === "object" && body.settings && typeof body.settings === "object" && !Array.isArray(body.settings)) {
           // Checked before normalizing, which would drop a credential field the check is there to refuse.
           validateSettings(body.settings);
           body.settings = await withFilledLadder(deps, scores, normalizeSettings(body.settings));
+        }
+        if (!body || typeof body !== "object" || body.settings === undefined) {
+          if (body && typeof body === "object" && body.compactAt !== undefined) {
+            // A compaction-point-only save: its answer is the same snapshot shape the dashboard reads.
+            const snapshot = readModSettings();
+            sendJson(res, 200, { ...snapshot, settings: await withFilledLadder(deps, scores, snapshot.settings) });
+            return;
+          }
+          throw new ModSettingsInputError("settings must be a JSON object");
         }
         const result = writeModSettings(parsed);
         sendJson(res, result.stale ? 409 : 200, result.current);
@@ -2067,6 +2434,18 @@ export function startAdmin(deps: AdminDeps): Promise<{ port: number; close(): vo
           ...(typeof probe.probeModel === "string" ? { probeModel: probe.probeModel } : {}),
           ...(probe.wire === "chat" || probe.wire === "responses" ? { wire: probe.wire } : {}),
         }, deps.probeModelFetch ?? fetchWithTimeout);
+        // A provider being added gets the same blank-only fill as one already saved: Hive's `/models`
+        // names its models and nothing else, and the form saves what the probe returns. A window the
+        // vendor did report is kept, and one the catalogue cannot match is left blank.
+        const missing = result.models.filter((model) => model.contextWindow == null);
+        if (missing.length > 0 && deps.modelCatalog) {
+          const catalog = await deps.modelCatalog().catch(() => undefined);
+          const preset = typeof probe.preset === "string" && probe.preset ? probe.preset : undefined;
+          for (const model of missing) {
+            const stated = catalogEntry(catalog, preset, model.id)?.contextWindow ?? catalogueWindow(catalog, model.id);
+            if (stated !== undefined) model.contextWindow = stated;
+          }
+        }
         sendJson(res, 200, result);
         return;
       }
@@ -2107,7 +2486,9 @@ export function startAdmin(deps: AdminDeps): Promise<{ port: number; close(): vo
         return;
       }
       if (pathname === "/api/config" && method === "GET") {
-        sendJson(res, 200, deps.config());
+        res.setHeader("cache-control", "no-store");
+        const { configRevision } = configSnapshot(deps);
+        sendJson(res, 200, { ...deps.config(), configRevision });
         return;
       }
       if (pathname === "/api/config" && method === "PUT") {
@@ -2118,11 +2499,26 @@ export function startAdmin(deps: AdminDeps): Promise<{ port: number; close(): vo
           sendJson(res, 400, { error: (e as Error).message });
           return;
         }
-        let parsed: Config;
+        let input: unknown;
         try {
-          parsed = JSON.parse(body.toString("utf8")) as Config;
+          input = JSON.parse(body.toString("utf8"));
         } catch (e) {
           sendJson(res, 400, { errors: [`invalid JSON: ${(e as Error).message}`] });
+          return;
+        }
+        if (!input || typeof input !== "object" || Array.isArray(input)) {
+          sendJson(res, 400, { errors: ["config must be a JSON object"] });
+          return;
+        }
+        const { configRevision, ...parsed } = input as Config & { configRevision?: unknown };
+        if (configRevision !== undefined && (typeof configRevision !== "string" || !/^[a-f0-9]{64}$/.test(configRevision))) {
+          sendJson(res, 400, { errors: ["configRevision must be a SHA-256 hex string"] });
+          return;
+        }
+        // No await between comparison and atomic rename: two admin windows cannot both win.
+        const current = configSnapshot(deps);
+        if (configRevision !== undefined && configRevision !== current.configRevision) {
+          sendJson(res, 409, { error: "config revision conflict", ...current });
           return;
         }
         const errors = validate(parsed);
@@ -2130,13 +2526,15 @@ export function startAdmin(deps: AdminDeps): Promise<{ port: number; close(): vo
           sendJson(res, 400, { errors });
           return;
         }
+        if (configRevision === undefined) deps.log.warn("admin: accepting legacy PUT /api/config without configRevision; conflict protection unavailable");
         writeConfigFile(deps.configFile, parsed);
         deps.log.info(`admin: config saved via GUI (${Object.keys(parsed.routes).length} routes, ${Object.keys(parsed.providers).length} providers)`);
         // `cli.models` cannot take effect through the router at all: Claude Code reads the slots
         // before a request exists. So a GUI save has to write them to settings.json itself;
         // otherwise the Clients screen shows a choice that only a later `install` would honour.
-        const slotWarning = syncModelSlotsForGui(parsed);
-        sendJson(res, 200, { ok: true, ...(slotWarning ? { warning: slotWarning } : {}) });
+        const slotWarning = syncModelSlotsForGui(parsed, deps.agentDir);
+        const warnings = [...(slotWarning ? [slotWarning] : []), ...targetWarnings(parsed)];
+        sendJson(res, 200, { ok: true, configRevision: configSnapshot(deps).configRevision, ...(warnings.length ? { warning: warnings.join("\n") } : {}) });
         return;
       }
       if (pathname === "/api/codex" && method === "GET") {
@@ -2167,11 +2565,36 @@ export function startAdmin(deps: AdminDeps): Promise<{ port: number; close(): vo
       }
       // Safe account metadata only: labels, emails, plan, rotation state and quota. Tokens and the
       // workspace id stay in the router.
+      if (pathname === "/api/credentials/clear-cooldown" && method === "POST") {
+        let change: { provider?: unknown; id?: unknown };
+        try {
+          change = JSON.parse((await readBody(req)).toString("utf8")) as typeof change;
+        } catch {
+          sendJson(res, 400, { error: "invalid JSON" });
+          return;
+        }
+        if (!change || typeof change.provider !== "string" || typeof change.id !== "string") {
+          sendJson(res, 400, { error: "expected {provider: string, id: string}" });
+          return;
+        }
+        const provider = deps.config().providers[change.provider];
+        if (!provider || !("credentials" in provider) || !provider.credentials?.some((credential) => credential.id === change.id)) {
+          sendJson(res, 404, { error: "credential not found" });
+          return;
+        }
+        if (!deps.clearCredentialCooldown) {
+          sendJson(res, 501, { error: "credential cooldown control unavailable" });
+          return;
+        }
+        deps.clearCredentialCooldown(change.provider, change.id);
+        sendJson(res, 200, { ok: true });
+        return;
+      }
       if (pathname === "/api/chatgpt-accounts" && method === "GET") {
         const all = deps.chatgpt?.().accounts?.() ?? {};
         const wanted = new URL(url, "http://127.0.0.1").searchParams.get("provider");
         const name = wanted && all[wanted] ? wanted : Object.keys(all)[0];
-        const accounts = name ? all[name]! : readChatGptAccounts(homeDir()).map(summarizeChatGptAccount);
+        const accounts = name ? all[name]! : previewAccounts(readChatGptAccounts(homeDir()).map(summarizeChatGptAccount));
         sendJson(res, 200, { provider: name ?? null, accounts });
         return;
       }
@@ -2198,32 +2621,38 @@ export function startAdmin(deps: AdminDeps): Promise<{ port: number; close(): vo
             return;
           }
           deps.log.info(`admin: removed ChatGPT account ${id.slice(0, 8)}`);
+          deps.agentsChanged?.();
           sendJson(res, 200, { ok: true });
           return;
         }
-        let change: { label?: unknown; paused?: unknown; clearCooldown?: unknown };
+        let change: { label?: unknown; paused?: unknown; preferred?: unknown; clearCooldown?: unknown };
         try {
           change = JSON.parse((await readBody(req)).toString("utf8")) as typeof change;
         } catch {
           sendJson(res, 400, { error: "invalid JSON" });
           return;
         }
-        if ((change.label !== undefined && (typeof change.label !== "string" || !change.label.trim())) || (change.paused !== undefined && typeof change.paused !== "boolean")) {
-          sendJson(res, 400, { error: "expected {label?: non-empty string, paused?: boolean, clearCooldown?: true}" });
+        if (!change || (change.label !== undefined && (typeof change.label !== "string" || !change.label.trim())) || (change.paused !== undefined && typeof change.paused !== "boolean") || (change.preferred !== undefined && typeof change.preferred !== "boolean") || (change.clearCooldown !== undefined && change.clearCooldown !== true)) {
+          sendJson(res, 400, { error: "expected {label?: non-empty string, paused?: boolean, preferred?: boolean, clearCooldown?: true}" });
           return;
         }
-        if (change.clearCooldown === true) deps.chatgpt?.().clearCooldown?.(id);
-        if (change.label !== undefined || change.paused !== undefined) {
+        if (id !== "codex" && !readChatGptAccounts(homeDir()).some((account) => account.id === id)) {
+          sendJson(res, 404, { error: "ChatGPT account not found" });
+          return;
+        }
+        if (change.label !== undefined || change.paused !== undefined || change.preferred !== undefined) {
           if (id === "codex") {
             sendJson(res, 409, { error: "the Codex CLI's login cannot be renamed or paused here" });
             return;
           }
-          if (!updateChatGptAccount(homeDir(), id, { ...(typeof change.label === "string" ? { label: change.label } : {}), ...(typeof change.paused === "boolean" ? { paused: change.paused } : {}) })) {
+          if (!updateChatGptAccount(homeDir(), id, { ...(typeof change.label === "string" ? { label: change.label } : {}), ...(typeof change.paused === "boolean" ? { paused: change.paused } : {}), ...(typeof change.preferred === "boolean" ? { preferred: change.preferred } : {}) })) {
             sendJson(res, 404, { error: "ChatGPT account not found" });
             return;
           }
         }
+        if (change.clearCooldown === true) deps.chatgpt?.().clearCooldown?.(id);
         deps.log.info(`admin: updated ChatGPT account ${id.slice(0, 8)}`);
+        deps.agentsChanged?.();
         sendJson(res, 200, { ok: true });
         return;
       }
@@ -2238,6 +2667,7 @@ export function startAdmin(deps: AdminDeps): Promise<{ port: number; close(): vo
           (result) => {
             chatgptLogin = { ...chatgptLogin, running: false, finishedAt: new Date().toISOString(), ok: result.ok, output: result.output };
             deps.log.info(`admin: chatgpt-login via GUI -> ${result.ok ? "ok" : "failed"}`);
+            if (result.ok) deps.agentsChanged?.();
           },
           (error) => {
             chatgptLogin = { ...chatgptLogin, running: false, finishedAt: new Date().toISOString(), ok: false, output: errorText(error) };
@@ -2253,9 +2683,44 @@ export function startAdmin(deps: AdminDeps): Promise<{ port: number; close(): vo
         const source = claudeAuthStore(deps).describeSource();
         let usage: Record<string, Record<string, unknown>> = {};
         if (hasClaudeSubscription(deps.config())) usage = (await deps.claudeUsage?.().catch(() => null)) ?? {};
+        // Only a known current login can point out a stored copy of itself; unknown adds nothing,
+        // so the response stays exactly what it was before there was an identity lookup.
+        const identity = source ? (await deps.claudeIdentity?.().catch(() => null)) ?? null : null;
+        const wanted = new URL(url, "http://127.0.0.1").searchParams.get("provider");
+        const providers = Object.entries(deps.config().providers).filter(([, provider]) => provider.type === "anthropic" && provider.auth === "claude-code");
+        const name = providers.find(([key]) => key === wanted)?.[0] ?? providers[0]?.[0];
+        const reports = claudePoolReports(deps, name);
+        const accounts = listClaudeAccountsWithSubject(homeDir()).map(({ subjectHash: hash, ...account }) => {
+          const same = identity !== null && (hash !== undefined
+            ? hash === identity.subjectHash
+            : account.email !== undefined && account.email.toLowerCase() === identity.email.toLowerCase());
+          const report = reports.find((row) => row.id === account.id);
+          return {
+            ...account,
+            state: account.paused ? "paused" : account.needsReauth || account.expiresAt <= Date.now() ? "needs-login" : report?.state ?? "ready",
+            inUse: report?.inUse === true,
+            ...(report?.cooldownSeconds !== undefined ? { cooldownSeconds: report.cooldownSeconds } : {}),
+            ...(usage[account.id] ? { quota: usage[account.id] } : {}),
+            ...(same ? { sameAsCurrent: true } : {}),
+          };
+        });
+        const currentReport = reports.find((row) => row.id === "current");
+        const currentPaused = isCurrentClaudeLoginPaused(homeDir());
         sendJson(res, 200, {
-          current: source ? { id: "current", label: "Current Claude login", source, external: true, paused: isCurrentClaudeLoginPaused(homeDir()), ...(usage.current ? { quota: usage.current } : {}) } : null,
-          accounts: listClaudeAccounts(homeDir()).map((account) => (usage[account.id] ? { ...account, quota: usage[account.id] } : account)),
+          current: source ? {
+            id: "current",
+            label: "Current Claude login",
+            source,
+            external: true,
+            paused: currentPaused,
+            preferred: false,
+            state: currentPaused ? "paused" : currentReport?.state ?? "needs-login",
+            inUse: currentReport?.inUse === true,
+            ...(currentReport?.cooldownSeconds !== undefined ? { cooldownSeconds: currentReport.cooldownSeconds } : {}),
+            ...(identity ? { email: identity.email } : {}),
+            ...(usage.current ? { quota: usage.current } : {}),
+          } : null,
+          accounts,
         });
         return;
       }
@@ -2317,25 +2782,32 @@ export function startAdmin(deps: AdminDeps): Promise<{ port: number; close(): vo
             return;
           }
           deps.log.info(`admin: removed Claude account ${id.slice(0, 8)}`);
+          deps.agentsChanged?.();
           sendJson(res, 200, { ok: true });
           return;
         }
-        let label: unknown;
+        let change: { label?: unknown; paused?: unknown; preferred?: unknown; clearCooldown?: unknown };
         try {
-          label = (JSON.parse((await readBody(req)).toString("utf8")) as { label?: unknown }).label;
+          change = JSON.parse((await readBody(req)).toString("utf8")) as typeof change;
         } catch {
           sendJson(res, 400, { error: "invalid JSON" });
           return;
         }
-        if (typeof label !== "string" || !label.trim()) {
-          sendJson(res, 400, { error: "expected {label: non-empty string}" });
+        if (!change || (change.label !== undefined && (typeof change.label !== "string" || !change.label.trim())) || (change.paused !== undefined && typeof change.paused !== "boolean") || (change.preferred !== undefined && typeof change.preferred !== "boolean") || (change.clearCooldown !== undefined && change.clearCooldown !== true)) {
+          sendJson(res, 400, { error: "expected {label?: non-empty string, paused?: boolean, preferred?: boolean, clearCooldown?: true}" });
           return;
         }
-        if (!renameClaudeAccount(homeDir(), id, label)) {
+        if (!updateClaudeAccount(homeDir(), id, {
+          ...(typeof change.label === "string" ? { label: change.label } : {}),
+          ...(typeof change.paused === "boolean" ? { paused: change.paused } : {}),
+          ...(typeof change.preferred === "boolean" ? { preferred: change.preferred } : {}),
+        })) {
           sendJson(res, 404, { error: "Claude account not found" });
           return;
         }
-        deps.log.info(`admin: renamed Claude account ${id.slice(0, 8)}`);
+        if (change.clearCooldown === true) deps.claudeClearCooldown?.(id);
+        deps.log.info(`admin: updated Claude account ${id.slice(0, 8)}`);
+        deps.agentsChanged?.();
         sendJson(res, 200, { ok: true });
         return;
       }
@@ -2365,7 +2837,11 @@ export function startAdmin(deps: AdminDeps): Promise<{ port: number; close(): vo
         const opened = deps.openBrowser ? deps.openBrowser(url) : openBrowser(url);
         deps.log.info(`admin: claude sign-in via GUI -> started (${needsCode ? "paste the code" : "loopback callback"}, browser ${opened ? "opened" : "not opened"})`);
         void session.result.then(
-          () => deps.log.info("admin: claude sign-in via GUI -> ok"),
+          () => {
+            deps.log.info("admin: claude sign-in via GUI -> ok");
+            // A new account gets its pinned workers; a reauthorized one keeps the same names.
+            deps.agentsChanged?.();
+          },
           (error: Error) => deps.log.info(`admin: claude sign-in via GUI -> failed: ${error.message}`),
         );
         sendJson(res, 200, { ...session.snapshot, opened });
@@ -2386,6 +2862,7 @@ export function startAdmin(deps: AdminDeps): Promise<{ port: number; close(): vo
         }
         await session.submitCode(code);
         await session.result.catch(() => {});
+        if (session.snapshot.ok) deps.agentsChanged?.();
         sendJson(res, session.snapshot.ok ? 200 : 400, session.snapshot);
         return;
       }
@@ -2403,6 +2880,7 @@ export function startAdmin(deps: AdminDeps): Promise<{ port: number; close(): vo
       if (pathname === "/api/claude-logout" && method === "POST") {
         const r = await (deps.runCli ?? runCli)(["claude-logout"]);
         deps.log.info(`admin: claude-logout via GUI -> ${r.ok ? "ok" : "failed"}`);
+        if (r.ok) deps.agentsChanged?.();
         sendJson(res, r.ok ? 200 : 500, { ok: r.ok, output: r.output });
         return;
       }
@@ -2430,7 +2908,10 @@ export function startAdmin(deps: AdminDeps): Promise<{ port: number; close(): vo
         const opened = deps.openBrowser ? deps.openBrowser(started.url) : openBrowser(started.url);
         deps.log.info(`admin: google sign-in via GUI -> started (browser ${opened ? "opened" : "not opened"})`);
         void session.result.then(
-          () => deps.log.info("admin: google sign-in via GUI -> ok"),
+          () => {
+            deps.log.info("admin: google sign-in via GUI -> ok");
+            deps.agentsChanged?.();
+          },
           (error: Error) => deps.log.info(`admin: google sign-in via GUI -> failed: ${error.message}`),
         );
         sendJson(res, 200, { ...session.snapshot, opened, termsWarning: ANTIGRAVITY_WARNING });
@@ -2451,6 +2932,7 @@ export function startAdmin(deps: AdminDeps): Promise<{ port: number; close(): vo
         }
         await session.submitCode(code);
         await session.result.catch(() => {});
+        if (session.snapshot.ok) deps.agentsChanged?.();
         sendJson(res, session.snapshot.ok ? 200 : 400, session.snapshot);
         return;
       }
@@ -2462,6 +2944,7 @@ export function startAdmin(deps: AdminDeps): Promise<{ port: number; close(): vo
       if (pathname === "/api/google-logout" && method === "POST") {
         const r = await (deps.runCli ?? runCli)(["google-logout"]);
         deps.log.info(`admin: google-logout via GUI -> ${r.ok ? "ok" : "failed"}`);
+        if (r.ok) deps.agentsChanged?.();
         sendJson(res, r.ok ? 200 : 500, { ok: r.ok, output: r.output });
         return;
       }
@@ -2471,7 +2954,7 @@ export function startAdmin(deps: AdminDeps): Promise<{ port: number; close(): vo
         const all = deps.google?.().accounts?.() ?? {};
         const wanted = new URL(url, "http://127.0.0.1").searchParams.get("provider");
         const name = wanted && all[wanted] ? wanted : Object.keys(all)[0];
-        const accounts = name ? all[name]! : readGoogleAccounts(homeDir()).map(summarizeGoogleAccount);
+        const accounts = name ? all[name]! : previewAccounts(readGoogleAccounts(homeDir()).map(summarizeGoogleAccount));
         sendJson(res, 200, { provider: name ?? null, accounts });
         return;
       }
@@ -2493,18 +2976,23 @@ export function startAdmin(deps: AdminDeps): Promise<{ port: number; close(): vo
             return;
           }
           deps.log.info(`admin: removed Google account ${id.slice(0, 8)}`);
+          deps.agentsChanged?.();
           sendJson(res, 200, { ok: true });
           return;
         }
-        let change: { label?: unknown; paused?: unknown; clearCooldown?: unknown; recheck?: unknown };
+        let change: { label?: unknown; paused?: unknown; preferred?: unknown; clearCooldown?: unknown; recheck?: unknown };
         try {
           change = JSON.parse((await readBody(req)).toString("utf8")) as typeof change;
         } catch {
           sendJson(res, 400, { error: "invalid JSON" });
           return;
         }
-        if ((change.label !== undefined && (typeof change.label !== "string" || !change.label.trim())) || (change.paused !== undefined && typeof change.paused !== "boolean")) {
-          sendJson(res, 400, { error: "expected {label?: non-empty string, paused?: boolean, clearCooldown?: true, recheck?: true}" });
+        if (!change || (change.label !== undefined && (typeof change.label !== "string" || !change.label.trim())) || (change.paused !== undefined && typeof change.paused !== "boolean") || (change.preferred !== undefined && typeof change.preferred !== "boolean") || (change.clearCooldown !== undefined && change.clearCooldown !== true)) {
+          sendJson(res, 400, { error: "expected {label?: non-empty string, paused?: boolean, preferred?: boolean, clearCooldown?: true, recheck?: true}" });
+          return;
+        }
+        if (!readGoogleAccounts(homeDir()).some((account) => account.id === id)) {
+          sendJson(res, 404, { error: "Google account not found" });
           return;
         }
         if (change.recheck === true) {
@@ -2514,13 +3002,14 @@ export function startAdmin(deps: AdminDeps): Promise<{ port: number; close(): vo
           return;
         }
         if (change.clearCooldown === true) deps.google?.().clearCooldown?.(id);
-        if (change.label !== undefined || change.paused !== undefined) {
-          if (!updateGoogleAccount(homeDir(), id, { ...(typeof change.label === "string" ? { label: change.label } : {}), ...(typeof change.paused === "boolean" ? { paused: change.paused } : {}) })) {
+        if (change.label !== undefined || change.paused !== undefined || change.preferred !== undefined) {
+          if (!updateGoogleAccount(homeDir(), id, { ...(typeof change.label === "string" ? { label: change.label } : {}), ...(typeof change.paused === "boolean" ? { paused: change.paused } : {}), ...(typeof change.preferred === "boolean" ? { preferred: change.preferred } : {}) })) {
             sendJson(res, 404, { error: "Google account not found" });
             return;
           }
         }
         deps.log.info(`admin: updated Google account ${id.slice(0, 8)}`);
+        deps.agentsChanged?.();
         sendJson(res, 200, { ok: true });
         return;
       }

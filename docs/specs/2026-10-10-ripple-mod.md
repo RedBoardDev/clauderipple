@@ -3,7 +3,7 @@
 The status mod in `packages/mod` grows into ClaudeRipple's in-session control surface: it picks
 the reasoning effort for every prompt, picks the worker for every delegated task, can keep the
 prompt cache warm, and carries the session tools a heavy Claude Code user needs (context, cache,
-limits, compact/handoff). The open-source mod "effortless" (HeyCubit, MIT) proved most of the
+limits, compact). The open-source mod "effortless" (HeyCubit, MIT) proved most of the
 main-chat ideas; it is a **behavioral reference only** — no code is copied from it, as with the
 other reference implementations (project CLAUDE.md).
 
@@ -199,18 +199,27 @@ prose when they disagree.
 - **Context:** `$.session.usage().context` (percent, tokens, window); unknown shows nothing.
 - **Limits:** `rateLimits` `five_hour` / `seven_day` (max shown); ≥ 80 % shows the hot band with
   Save mode (caps Auto at medium until the window resets).
-- **Bands** (priority): settings → compact note → handoff choice → setup → judge down → hot →
-  result cards → cold (cache expired on a ≥ 150k chat) → swamp (context ≥ `swampAt`, default 50 %)
-  → dashboard. Each alert dismisses until it worsens.
-- **Compact with Haiku:** `session.compact` for the main chat (not subagents, not `precompute`,
-  which is skipped): serialize the transcript (last 6 messages' tool I/O 20k chars, older inputs
-  400 / results 2k; 2.4M char budget, then tighter, then engine fallback), Haiku 5.5, 16k tokens,
-  240 s; success needs > 200 chars; failure falls back to the engine's own compaction with a toast.
-  Setting `compactWith: haiku | session`.
-- **Handoff:** Quick (fork writes a resumable summary; fallback: ordinary turn) or Full (configured
-  skill, else an ordinary turn that checks git and writes `HANDOFF.md`); then continue (clear +
-  resume), confirm (clear + state + wait) or copy. Haiku advice from 30 % context, every second
-  real prompt, turns Compact into a lit Handoff when a fresh chat clearly pays.
+- **Bands** (priority): settings → compact note → setup → judge down → hot →
+  result cards → cold (cache expired on a ≥ 150k chat) → swamp (context at or past 80 % of the
+  compaction window) → dashboard. Each alert dismisses until it worsens.
+- **Compaction:** `session.compact` for the main chat (not subagents, not `precompute`, which is
+  skipped): serialize the transcript (last 6 messages' tool I/O 20k chars, older inputs
+  400 / results 2k; 2.4M char budget, then tighter, then engine fallback), run the summary on
+  `compactModel` (default Claude Haiku 5.5, 16k tokens, 240 s; `'session'` means the engine's own
+  compactor; a router model id runs by name, with an optional `@effort` split off); success needs
+  > 200 chars; failure falls back to the engine's own compaction with a toast. The context share
+  and the heavy band are measured against the compaction window: Claude Code's own
+  `autoCompactWindow` (settings.json, the same value `/autocompact` writes) when it is below the
+  model's window, else the model's window. The dashboard's Compaction card picks the model
+  (the app's compactor / Claude Haiku·Sonnet·Opus / router models by provider) and the point
+  (400k / 500k / 600k / a typed value in k / model default).
+- **Handoff (restored 2026-10-24, one button):** the band's Handoff has the session's own model
+  write a resume note in a fork (nothing is sent to this chat; it is never cleared), then opens a
+  new Code session in the same folder with the note in its prompt box (`claude://code/new`, which
+  fills the box and waits for Enter). A note past 12k characters goes to
+  `~/.clauderipple/handoffs/` and the box says to read it; no link → clipboard; a failed fork →
+  a failed card. Why: app changes reach only new sessions (a `/clear` keeps the old one), so moving
+  on is a routine step. The advice judge, choices and settings removed in 8480bae stay removed.
 - **Stats** (`/ripple stats`): Auto-steered prompts by effort, weighted cost (input 1, write 1.25,
   read 0.1, output 5), judge counts/time/tokens, worker picks by tier, keep-warm pings and cost.
 
@@ -218,13 +227,13 @@ prose when they disagree.
 
 - **Band (desktop, SVG-drawn):** effort (Deciding glow / Paused / Off) · model · context ring ·
   cache countdown (with a keep-warm mark) · limits · last route (provider colour, cache hit) ·
-  Auto · Warm · Compact/Handoff · Log · Agents · ⚙. Terminal: the same in text with hotkeys.
+  Handoff · Auto · Warm · Compact · Log · Agents · ⚙. Terminal: the same in text with hotkeys.
   Minimal layout: footer controls only.
 - **Panes:** Log (existing request log) and Agents (each subagent: tier/agent/effort/why, state,
   current tool, elapsed, cost).
 - **Settings panel** (cards): Effort · Workers (tier → agent selects, fallback, agentAuto) · Judge
-  (Haiku / Jev with key + Test / router model) · Cache (keep warm, hours, min tokens) · Compact &
-  Handoff · Look (dashboard/minimal, appearance auto/dark/light).
+  (Haiku / Jev with key + Test / router model) · Cache (keep warm, hours, min tokens) · Compaction
+  (model, compaction window) · Look (dashboard/minimal, appearance auto/dark/light).
 - **First run:** a short setup (judge, worker tiers, keep warm) opens once.
 - Colours: ClaudeRipple accent `#6a56d6` (from packages/ui), provider hues from the existing
   `providerColor`; status green/amber/red stay semantic.

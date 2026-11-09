@@ -20,6 +20,8 @@ import { chOf } from './theme.ts'
 export const CELL_PX = 7.917
 /** One desktop row (the host's line height), px. */
 export const ROW_PX = 19
+/** The most an Svg may be a side, px: past it the engine refuses the whole tree and draws its own. */
+export const SVG_MAX_PX = 4096
 
 // ---- Colours ------------------------------------------------------------------------------------
 
@@ -117,7 +119,9 @@ export type Sea = {
   reach?: number
   /** A sonar sweep across the water: the judge sounding how deep to think. */
   sweep?: boolean
-  /** A current along the floor: work going on. */
+  /** A current along the floor: work going on. The capsule draws it at its own true bottom
+   * (kit.tsx `currentArt`), never inside this picture: the sea is drawn taller than the capsule,
+   * so a floor placed at its height lands wherever the host's row metrics put it. */
   current?: boolean
   /** Motes drifting up (the deep's plankton), quiet life at rest. */
   motes?: boolean
@@ -200,11 +204,6 @@ export function seaArt(width: number, height: number, sea: Sea): string {
       '<rect class="sw" x="-120" width="120" height="' + full + '" fill="url(#sw)"/>'
     css += '.sw{animation:sw 2.2s cubic-bezier(.45,0,.25,1) infinite;animation-delay:-.3s}@keyframes sw{0%{transform:translateX(' + r(ax) + 'px)}100%{transform:translateX(' + (w + 120) + 'px)}}'
   }
-  if (sea.current) {
-    body += '<defs><linearGradient id="cu" x1="0" x2="1"><stop offset="0" stop-color="#67e8f9" stop-opacity="0"/><stop offset=".5" stop-color="#67e8f9" stop-opacity=".9"/><stop offset="1" stop-color="' + t.hi + '" stop-opacity="0"/></linearGradient></defs>' +
-      '<rect class="cu" x="-180" y="' + (h - 1.6) + '" width="180" height="1.6" fill="url(#cu)"/>'
-    css += '.cu{animation:cu 1.7s linear infinite;animation-delay:-.6s}@keyframes cu{0%{transform:translateX(0)}100%{transform:translateX(' + (w + 180) + 'px)}}'
-  }
   if (sea.weather) {
     const made = weather(sea.weather, w, h, t, ax)
     body += made.body
@@ -269,6 +268,29 @@ function weather(kind: NonNullable<Sea['weather']>, w: number, h: number, t: Lig
   return { body, css }
 }
 
+/** The work current's height, px: the line and the air under it that keeps it off the edge. */
+export const CURRENT_PX = 2
+
+/**
+ * The current that says work is going on, `width` × 2 px: a cyan streak crossing the capsule's
+ * floor and out at the right. The capsule draws it at its own true bottom (kit.tsx `capsule`), not
+ * in the sea, whose height is only an estimate of the capsule's: a floor placed there crossed the
+ * limits' words (2026-10-25).
+ *
+ * Nothing but the width goes into the document, rounded: the same band within a pixel or so is the
+ * same string, so a host that keeps a plain picture whose source did not change keeps its motion
+ * running instead of starting it over. No negative delay opens the loop part way: a loop that does
+ * start over opens off the left edge, which reads as carrying on.
+ */
+export function currentArt(width: number): string {
+  const w = Math.max(80, Math.round(width))
+  const body =
+    '<defs><linearGradient id="cu" x1="0" x2="1"><stop offset="0" stop-color="#67e8f9" stop-opacity="0"/><stop offset=".5" stop-color="#67e8f9" stop-opacity=".9"/><stop offset="1" stop-color="#67e8f9" stop-opacity="0"/></linearGradient></defs>' +
+    '<rect class="cu" x="-180" y=".2" width="180" height="1.6" fill="url(#cu)"/>'
+  const css = '.cu{animation:cu 1.7s linear infinite}@keyframes cu{0%{transform:translateX(0)}100%{transform:translateX(' + (w + 180) + 'px)}}'
+  return svg(w, CURRENT_PX, body, css)
+}
+
 /**
  * A plate of the water's middle shade, faded in at its left: laid behind words that take another's
  * place (a hover tip over the reason), so the words beneath do not show through.
@@ -319,7 +341,7 @@ export function extraHoverArt(widthPx: number): string {
 export type PillLook = 'primary' | 'ghost'
 
 /** Glyphs a button may lead with, drawn on a 12 px square. */
-export type Glyph = 'open' | 'close' | 'gear' | 'back' | 'next' | 'copy' | 'save' | 'compact' | 'handoff'
+export type Glyph = 'open' | 'close' | 'gear' | 'back' | 'next' | 'copy' | 'save' | 'compact'
 
 export const GLYPH: Record<Glyph, string> = {
   open: '<path d="M7 2.2h2.8V5M9.8 2.2L5.6 6.4M8.8 7.4v2.4H2.2V3.2h2.4"/>',
@@ -330,7 +352,6 @@ export const GLYPH: Record<Glyph, string> = {
   copy: '<rect x="4" y="4" width="6" height="6" rx="1.2"/><path d="M8 4V2.8A.8.8 0 0 0 7.2 2H2.8a.8.8 0 0 0-.8.8v4.4a.8.8 0 0 0 .8.8H4"/>',
   save: '<path d="M6 1.5v9M2.5 7l3.5 3.5L9.5 7"/>',
   compact: '<path d="M3.5 1.8L6 4.3l2.5-2.5M3.5 10.2L6 7.7l2.5 2.5M1.8 6h8.4"/>',
-  handoff: '<path d="M1.8 6h6.4M5.8 3.4L8.4 6 5.8 8.6M10.4 2.2v7.6"/>',
 }
 
 /**
@@ -340,9 +361,11 @@ export const GLYPH: Record<Glyph, string> = {
 export function pillArt(label: string, look: PillLook, tone: Tone = 'violet', glyph?: Glyph): { source: string; cells: number } {
   const t = TONE[tone]
   const size = 12
-  const pad = 13
+  // Exact, not whole cells, and 10 px of air a side: rounded up and at 13 px the Handoff pill read
+  // as padded once the app's type widened a cell (2026-10-25). The press is laid over its Box.
+  const pad = 10
   const gw = glyph ? 12 + 6 : 0
-  const cells = Math.ceil((labelPx(label, size) + pad * 2 + gw) / CELL_PX)
+  const cells = (labelPx(label, size) + pad * 2 + gw) / CELL_PX
   const w = cells * CELL_PX
   const h = 26
   const ink = look === 'primary' ? t.on : LABEL
@@ -556,26 +579,25 @@ export function gaugeArt(kind: string): string {
   return svg(16, 16, arc + '<path d="' + needle + '" fill="none" stroke="' + stroke + '" stroke-width="1.4" stroke-linecap="round"/><circle cx="8" cy="11.4" r="1.2" fill="' + stroke + '"/>')
 }
 
-/** A limit window's share as a small horizontal bar, 36 × 6 px with round ends: the track white at
- * low strength, the fill the ring's own teal-to-violet while all is well, amber, then red. Whole
- * percents only, like the ring: the same figure is the same picture. */
-export function barArt(percent: number, tone: Tone | 'ink'): string {
-  const W = 36
-  const H = 6
+/** A limit window's share as a horizontal bar, 36 × 6 px on the band (the limits pane draws it
+ * wider), with round ends: the track white at low strength, the fill the ring's own teal-to-violet
+ * while all is well, amber, then red. Whole percents only, like the ring: the same figure is the
+ * same picture. */
+export function barArt(percent: number, tone: Tone | 'ink', W = 36, H = 6): string {
   // Rounded to the integer: neighbouring readings draw byte-identical pictures.
   const share = Math.max(0, Math.min(1, Math.round(percent) / 100))
   const fill = tone === 'ink' ? 'url(#g)' : TONE[tone].hi
   return svg(W, H,
     '<defs><linearGradient id="g" x1="0" x2="1" y1="0" y2="0"><stop offset="0" stop-color="#67e8f9"/><stop offset="1" stop-color="#a78bfa"/></linearGradient>' +
-    '<clipPath id="c"><rect x="0" y="0" width="' + W + '" height="' + H + '" rx="3"/></clipPath></defs>' +
-    '<rect x="0" y="0" width="' + W + '" height="' + H + '" rx="3" fill="#fff" fill-opacity=".14"/>' +
+    '<clipPath id="c"><rect x="0" y="0" width="' + W + '" height="' + H + '" rx="' + r(H / 2) + '"/></clipPath></defs>' +
+    '<rect x="0" y="0" width="' + W + '" height="' + H + '" rx="' + r(H / 2) + '" fill="#fff" fill-opacity=".14"/>' +
     '<g clip-path="url(#c)"><rect x="0" y="0" width="' + r(W * share) + '" height="' + H + '" fill="' + fill + '"/></g>')
 }
 
 export const ICON_PX = 16
 
 /** Line icons of the band's controls, 16 px. */
-export type Icon = 'flame' | 'gear' | 'agents' | 'log' | 'compact' | 'clear'
+export type Icon = 'flame' | 'gear' | 'agents' | 'log' | 'compact' | 'clear' | 'pin'
 
 export const FLAME = 'M8.1 14.3c2.8 0 4.5-1.9 4.5-4.4 0-2.8-2.4-4.2-2.8-7.2-1.7 1.1-2.6 2.8-2.5 4.3-1-.4-1.5-1.4-1.6-2.3-1.4 1.3-2 2.9-2 5.2 0 2.5 1.6 4.4 4.4 4.4z'
 
@@ -584,6 +606,8 @@ export const ICON: Record<Icon, string> = {
   gear: '<circle cx="8" cy="8" r="2.3"/><path d="M8 1.7v1.8M8 12.5v1.8M1.7 8h1.8M12.5 8h1.8M3.5 3.5l1.3 1.3M11.2 11.2l1.3 1.3M3.5 12.5l1.3-1.3M11.2 4.8l1.3-1.3"/><circle cx="8" cy="8" r="4.8"/>',
   agents: '<circle cx="4.8" cy="5" r="2.1"/><circle cx="11.4" cy="5" r="2.1"/><path d="M1.6 13.4c.4-2.4 1.7-3.6 3.2-3.6s2.8 1.2 3.2 3.6M8.2 13.4c.4-2.4 1.7-3.6 3.2-3.6s2.8 1.2 3.2 3.6"/>',
   log: '<path d="M2.4 3.8h11.2M2.4 8h11.2M2.4 12.2h6.8"/>',
+  // A pin: a round head and its needle.
+  pin: '<circle cx="9.8" cy="5.6" r="3.2"/><path d="M7.6 7.8L2.8 12.6"/>',
   // Two arrows coming in from the corners to the middle: the chat drawn down into itself.
   compact: '<path d="M3.2 3.2L7.1 7.1M7.1 7.1H4.9M7.1 7.1V4.9M12.8 12.8L8.9 8.9M8.9 8.9h2.2M8.9 8.9v2.2"/>',
   // An eraser laid on its edge, the sleeve band bold, a short line being swept away below.
@@ -607,16 +631,26 @@ export function iconArt(icon: Icon, on: boolean, tone: Tone = 'violet'): string 
   return svg(ICON_PX, ICON_PX, glow + '<g fill="none" stroke="' + stroke + '" stroke-width="1.45" stroke-linecap="round" stroke-linejoin="round">' + ICON[icon] + '</g>', '', lit(on))
 }
 
-export const AGENTS_W = 26
+/**
+ * A counted icon's width with its count: the 16 px glyph and its badge's overhang. The disc starts
+ * just past the agents' second head (x 13.5) and above their shoulders: over the glyph's corner it
+ * covered that head (2026-10-25).
+ */
+export const AGENTS_W = 24
+
+/** A counted icon's width: the glyph alone at zero, so no blank shoulder follows it (2026-10-25). */
+export function countedWidth(count: number): number {
+  return count > 0 ? AGENTS_W : ICON_PX
+}
 
 /** A control's icon with a count in a lit disc on its shoulder, one width whatever the count. */
 export function countedArt(icon: Icon, count: number, on: boolean): string {
   const stroke = on ? TONE.violet.hi : SOFT
   const label = count > 9 ? '9+' : String(count)
   const badge = count > 0
-    ? '<circle cx="20" cy="5.5" r="5.5" fill="#22d3ee"/><text x="20" y="8.6" text-anchor="middle" font-size="' + (label.length > 1 ? 7 : 8.5) + '" font-weight="750" fill="#04252e">' + label + '</text>'
+    ? '<circle cx="19.2" cy="4.8" r="4.8" fill="#22d3ee"/><text x="19.2" y="7.6" text-anchor="middle" font-size="' + (label.length > 1 ? 6 : 7.8) + '" font-weight="750" fill="#04252e">' + label + '</text>'
     : ''
-  return svg(AGENTS_W, 16, '<g transform="translate(0 .5)" fill="none" stroke="' + stroke + '" stroke-width="1.45" stroke-linecap="round" stroke-linejoin="round">' + ICON[icon] + '</g>' + badge, '', lit(on))
+  return svg(countedWidth(count), 16, '<g transform="translate(0 .5)" fill="none" stroke="' + stroke + '" stroke-width="1.45" stroke-linecap="round" stroke-linejoin="round">' + ICON[icon] + '</g>' + badge, '', lit(on))
 }
 
 /** The agents icon with the live count on its shoulder. */

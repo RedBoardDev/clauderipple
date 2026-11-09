@@ -3,6 +3,7 @@ import { createCipheriv, randomBytes } from "node:crypto";
 import path from "node:path";
 import { pushContent, type PushContent, type PushContext } from "./push-content.ts";
 import { readJson, writeFileAtomic } from "./fsutil.ts";
+import { EXPO_PUSH_URL, EXPO_TOKEN_RE } from "./protocol.ts";
 import type { PushEvent } from "./protocol.ts";
 
 export interface ExpoPayload {
@@ -20,6 +21,9 @@ interface Stored { token: string; lang: "ko" | "en"; platform?: "ios" | "android
 interface NotifierOptions {
   dir: string; send: ExpoSender; seenRecently: (session: string) => boolean; log: (line: string) => void;
   context?: (session: string, event: PushEvent) => PushContext | Promise<PushContext>;
+  /** The identity the phone pairs with (the relay pairing's host key). It rides in the payload so a
+   * tap from a previous computer is not opened against this one. */
+  host?: string;
 }
 
 export function validPushKey(key: string): boolean {
@@ -35,10 +39,13 @@ export function encryptPush(key: string, content: PushContent): string {
   return Buffer.concat([nonce, ciphertext, cipher.getAuthTag()]).toString("base64url");
 }
 
-export const validExpoToken = (token: string): boolean => /^(ExponentPushToken|ExpoPushToken)\[[A-Za-z0-9_-]+\]$/.test(token);
+export const validExpoToken = (token: string): boolean => EXPO_TOKEN_RE.test(token);
 
 export function expoBody(event: PushEvent, lang: "ko" | "en"): string | null {
   if (event.kind === "permission") return lang === "ko" ? "승인을 기다립니다" : "Waiting for approval";
+  // Fixed words only: this body travels in the clear beside the encrypted content (iOS `body`, the
+  // Android fallback), and the question itself is the model's text — it goes only inside `e`.
+  if (event.kind === "question") return lang === "ko" ? "답변이 필요합니다" : "Answer needed";
   if (event.kind !== "result") return null;
   if (event.ok) return lang === "ko" ? "작업을 마쳤습니다" : "Work finished";
   return lang === "ko" ? "작업이 실패했습니다" : "Work failed";
@@ -47,7 +54,7 @@ export function expoBody(event: PushEvent, lang: "ko" | "en"): string | null {
 /** Inject only external boundaries: HTTP and the wait for Expo's asynchronous receipts. */
 export function expoSender(fetcher: typeof fetch = fetch, wait: () => Promise<void> = () => new Promise(resolve => { setTimeout(resolve, 15_000).unref(); })): ExpoSender {
   return async (payload) => {
-    const response = await fetcher("https://exp.host/--/api/v2/push/send", {
+    const response = await fetcher(EXPO_PUSH_URL, {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload), signal: AbortSignal.timeout(15_000),
     });
@@ -86,6 +93,29 @@ export class ExpoNotifier {
     this.tokens = readJson<Record<string, Stored>>(this.file) ?? {};
   }
   devices(): string[] { return Object.keys(this.tokens); }
+  /**
+   * Every device and its language, for the relay's dead-man switch (src/watch.ts sends these to the
+   * host's own room). Tokens are the relay's only stored data about this host — see ARCHITECTURE §9.
+   */
+  targets(): { token: string; lang: "ko" | "en" }[] {
+    return Object.values(this.tokens).map((stored) => ({ token: stored.token, lang: stored.lang }));
+  }
+  /**
+   * One host-wide notice to every native device, independent of which session a phone is looking
+   * at (SEEN_MS does not apply: the news is not about a conversation). The copy is fixed and public,
+   * so it travels in the clear beside the usual identity and no session id.
+   */
+  async system(body: (lang: "ko" | "en") => string, ttl: number): Promise<void> {
+    await Promise.all(Object.entries(this.tokens).map(async ([id, stored]) => {
+      try {
+        const identity = this.opts.host ? { host: this.opts.host } : {};
+        const result = await this.opts.send({ to: stored.token, title: "Ripple Remote", body: body(stored.lang), data: { session: "", ...identity }, sound: "default", ttl });
+        if (result === "gone" && this.tokens[id] === stored) this.unsubscribe(id);
+      } catch (error) {
+        this.opts.log(`expo push: send failed for device ${id.slice(0, 8)}: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }));
+  }
   subscribe(clientId: string, token: string, lang: "ko" | "en", platform?: "ios" | "android", key?: string): void {
     if (!clientId || typeof token !== "string" || !validExpoToken(token)) throw new Error("invalid Expo push token");
     if (key !== undefined && (!validPushKey(key) || (platform !== "ios" && platform !== "android"))) throw new Error("invalid push key or platform");
@@ -105,14 +135,15 @@ export class ExpoNotifier {
       const body = expoBody(event, stored.lang);
       if (!body) return;
       try {
-        let payload: ExpoPayload = { to: stored.token, title: "Ripple Remote", body, data: { session }, sound: "default", ttl: event.kind === "permission" ? 3600 : 86400 };
+        const identity = this.opts.host ? { host: this.opts.host } : {};
+        let payload: ExpoPayload = { to: stored.token, title: "Ripple Remote", body, data: { session, ...identity }, sound: "default", ttl: event.kind === "permission" || event.kind === "question" ? 3600 : 86400 };
         if (stored.key) {
           try {
             context ??= Promise.resolve(this.opts.context?.(session, event) ?? {});
             const e = encryptPush(stored.key, pushContent(event, stored.lang, await context, body));
             payload = stored.platform === "android"
-              ? { to: stored.token, data: { session, e, fallback: body }, priority: "high", ttl: payload.ttl }
-              : { ...payload, mutableContent: true, data: { session, e } };
+              ? { to: stored.token, data: { session, ...identity, e, fallback: body }, priority: "high", ttl: payload.ttl }
+              : { ...payload, mutableContent: true, data: { session, ...identity, e } };
           } catch {
             // No private exception text in logs; a context/crypto failure must still deliver fallback.
             this.opts.log(`expo push: content unavailable for device ${id.slice(0, 8)}; sending fallback`);

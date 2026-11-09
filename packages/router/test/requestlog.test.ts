@@ -83,10 +83,44 @@ test("RequestLog computes success, usage, cache and latency summaries", () => {
     log.add(record("c", { at: "2026-09-13T10:02:00.000Z", ms: 200, provider: "anthropic", usage: { input: 2, cached: 98, cacheWrite: 100, output: 1 } }));
     log.add(record("old", { at: "2026-09-13T09:00:00.000Z", usage: { input: 999, cached: 0, output: 999 } }));
     const summary = log.summary(Date.parse("2026-09-13T09:59:00.000Z"));
-    assert.deepEqual(summary.total, { count: 3, ok: 2, failed: 1, input: 72, cached: 178, cacheWrite: 100, output: 10, cacheHitPercent: 50.9, avgMs: 200 });
-    assert.deepEqual(summary.providers.chatgpt, { count: 1, ok: 1, failed: 0, input: 20, cached: 80, cacheWrite: 0, output: 9, cacheHitPercent: 80, avgMs: 100 });
-    assert.deepEqual(summary.providers.moonshot, { count: 1, ok: 0, failed: 1, input: 50, cached: 0, cacheWrite: 0, output: 0, cacheHitPercent: 0, avgMs: 300 });
-    assert.deepEqual(summary.providers.anthropic, { count: 1, ok: 1, failed: 0, input: 2, cached: 98, cacheWrite: 100, output: 1, cacheHitPercent: 49, avgMs: 200 });
+    assert.deepEqual(summary.total, { count: 3, ok: 2, failed: 1, input: 72, cached: 178, cacheWrite: 100, output: 10, cacheHitPercent: 50.9, avgMs: 200, conversationTokens: 360, ungroupedRequests: 3 });
+    assert.deepEqual(summary.providers.chatgpt, { count: 1, ok: 1, failed: 0, input: 20, cached: 80, cacheWrite: 0, output: 9, cacheHitPercent: 80, avgMs: 100, conversationTokens: 109, ungroupedRequests: 1 });
+    assert.deepEqual(summary.providers.moonshot, { count: 1, ok: 0, failed: 1, input: 50, cached: 0, cacheWrite: 0, output: 0, cacheHitPercent: 0, avgMs: 300, conversationTokens: 50, ungroupedRequests: 1 });
+    assert.deepEqual(summary.providers.anthropic, { count: 1, ok: 1, failed: 0, input: 2, cached: 98, cacheWrite: 100, output: 1, cacheHitPercent: 49, avgMs: 200, conversationTokens: 201, ungroupedRequests: 1 });
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a web search is its own model row, and a record from before the flag reads the same way", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cr-request-websearch-"));
+  try {
+    const log = new RequestLog(path.join(dir, "requests.jsonl"));
+    // The router's shape now: the flag, the model id the search ran on, and the tokens it read.
+    log.add(record("search", { at: "2026-10-26T10:00:00.000Z", provider: "chatgpt", target: "gpt-6-luna", purpose: "web-search", note: "web search via chatgpt", usage: { input: 60, cached: 40, output: 10 } }));
+    // The old shape: no flag, "<provider>/<model>" in target, and no tokens at all.
+    log.add(record("old-search", { at: "2026-10-26T10:01:00.000Z", provider: "chatgpt", target: "chatgpt/gpt-6-luna", note: "web search via chatgpt" }));
+    // The same model's own turn and a vendor-namespaced model id under a provider of that name.
+    log.add(record("turn", { at: "2026-10-26T10:02:00.000Z", provider: "chatgpt", target: "gpt-6-luna", usage: { input: 1000, cached: 0, output: 50 } }));
+    log.add(record("vendor", { at: "2026-10-26T10:03:00.000Z", provider: "zai-org", target: "zai-org/glm-5.3-flash", usage: { input: 10, cached: 0, output: 1 } }));
+
+    // Readers see the old search as the current code writes one.
+    const old = log.list(10).find((entry) => entry.id === "old-search")!;
+    assert.equal(old.purpose, "web-search");
+    assert.equal(old.target, "gpt-6-luna");
+
+    const rows = log.summary(Date.parse("2026-10-26T00:00:00.000Z")).models;
+    const rowOf = (model: string, purpose?: "web-search") => rows.find((entry) => entry.model === model && entry.purpose === purpose);
+    assert.deepEqual(
+      { count: rowOf("gpt-6-luna", "web-search")?.count, input: rowOf("gpt-6-luna", "web-search")?.input, cached: rowOf("gpt-6-luna", "web-search")?.cached, output: rowOf("gpt-6-luna", "web-search")?.output },
+      { count: 2, input: 60, cached: 40, output: 10 },
+    );
+    // The model's own turn stays a row of its own.
+    assert.equal(rowOf("gpt-6-luna")?.count, 1);
+    assert.equal(rowOf("gpt-6-luna")?.input, 1000);
+    // A vendor-namespaced id is a model row, not a search row.
+    assert.equal(rowOf("zai-org/glm-5.3-flash")?.count, 1);
+    assert.equal(rowOf("zai-org/glm-5.3-flash")?.purpose, undefined);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
@@ -213,6 +247,80 @@ test("ResponseUsageTap observes only the message id and reported tier, across sp
   assert.deepEqual(absent.finish(), { usage: { input: 1, cached: 0, output: 0 } });
 });
 
+function tapJson(chunks: Buffer[]): ReturnType<ResponseUsageTap["finish"]> {
+  const tap = new ResponseUsageTap("application/json", undefined);
+  for (const chunk of chunks) tap.feed(chunk);
+  return tap.finish();
+}
+
+test("ResponseUsageTap reads the top-level usage, not one nested in a tool input (B12)", () => {
+  const body = {
+    id: "msg_top",
+    content: [
+      {
+        type: "tool_use",
+        id: "toolu_1",
+        name: "probe",
+        input: {
+          usage: { input_tokens: 999, cache_read_input_tokens: 888, cache_creation_input_tokens: 777, output_tokens: 666, service_tier: "bogus" },
+          items: [{ usage: { input_tokens: 555, output_tokens: 444 } }],
+          note: 'quoted "usage":{"input_tokens":333,"output_tokens":222}',
+        },
+      },
+      { type: "tool_result", content: [{ type: "text", text: "plain" }] },
+    ],
+    usage: { input_tokens: 10, cache_read_input_tokens: 20, cache_creation_input_tokens: 5, output_tokens: 3, service_tier: "standard" },
+  };
+  const text = JSON.stringify(body);
+  const expected = { messageId: "msg_top", servedTier: "standard", usage: { input: 10, cached: 20, cacheWrite: 5, output: 3 } };
+  // A non-streaming body often arrives whole; the nested and top-level usage share that chunk.
+  assert.deepEqual(tapJson([Buffer.from(text)]), expected);
+  assert.deepEqual(tapJson([Buffer.from(text.slice(0, 40)), Buffer.from(text.slice(40))]), expected);
+  assert.deepEqual(tapJson([...text].map((char) => Buffer.from(char))), expected);
+  // The top-level object can also precede the tool input; a later nested usage must not replace it.
+  const reordered = '{"usage":{"input_tokens":6,"output_tokens":1},"content":[{"type":"tool_use","input":{"usage":{"input_tokens":999,"output_tokens":888}}}]}';
+  assert.deepEqual(tapJson([Buffer.from(reordered)]), { usage: { input: 6, cached: 0, output: 1 } });
+});
+
+test("ResponseUsageTap does not inherit fields from a nested usage across chunks (B12)", () => {
+  const head = '{"id":"msg_x","content":[{"input":{"usage":{"input_tokens":999,"cache_read_input_tokens":888,"output_tokens":777}}}],';
+  const tail = '"usage":{"input_tokens":5,"output_tokens":2}}';
+  // The nested usage completes in the first chunk; the top-level one arrives in the next and
+  // reports no cache read, so a leaked 888 from the tool input would show.
+  assert.deepEqual(tapJson([Buffer.from(head), Buffer.from(tail)]), { messageId: "msg_x", usage: { input: 5, cached: 0, output: 2 } });
+});
+
+test("ResponseUsageTap ignores usage-shaped text inside JSON strings (B12)", () => {
+  const body = {
+    id: "msg_text",
+    content: [{ type: "text", text: 'note: "usage":{"input_tokens":999,"cache_read_input_tokens":888,"output_tokens":777}' }],
+    usage: { input_tokens: 4, output_tokens: 2 },
+  };
+  const text = JSON.stringify(body);
+  const expected = { messageId: "msg_text", usage: { input: 4, cached: 0, output: 2 } };
+  assert.deepEqual(tapJson([Buffer.from(text)]), expected);
+  assert.deepEqual(tapJson([...text].map((char) => Buffer.from(char))), expected);
+});
+
+test("ResponseUsageTap finds the top-level usage after a large tool input and survives a truncated body (B12)", () => {
+  const filler = '{"usage":{"input_tokens":999,"output_tokens":888}}' + "a".repeat(100 * 1024);
+  const body = { id: "msg_big", content: [{ type: "text", text: filler }], usage: { input_tokens: 7, cache_read_input_tokens: 8, output_tokens: 9 } };
+  const text = JSON.stringify(body);
+  assert.ok(text.length > 100 * 1024);
+  const chunks: Buffer[] = [];
+  for (let i = 0; i < text.length; i += 8192) chunks.push(Buffer.from(text.slice(i, i + 8192)));
+  assert.deepEqual(tapJson(chunks), { messageId: "msg_big", usage: { input: 7, cached: 8, output: 9 } });
+
+  assert.deepEqual(tapJson([Buffer.from('{"id":"msg_trunc","usage":{"input_tokens":12,"cache_read')]), { messageId: "msg_trunc" });
+  assert.deepEqual(tapJson([Buffer.from('{"id":"msg_trunc","content":[{"usage":{"input_tokens":12')]), { messageId: "msg_trunc" });
+});
+
+test("ResponseUsageTap reports no usage for empty, missing or non-object usage (B12)", () => {
+  assert.deepEqual(tapJson([Buffer.from("{}")]), {});
+  assert.deepEqual(tapJson([Buffer.from('{"id":"msg_only"}')]), { messageId: "msg_only" });
+  assert.deepEqual(tapJson([Buffer.from('{"id":"msg_null","usage":null}')]), { messageId: "msg_null" });
+});
+
 test("ResponseUsageTap drops an over-long SSE line whole and reads the events after it", () => {
   const tap = new ResponseUsageTap("text/event-stream", "identity");
   tap.feed(Buffer.from('event: message_start\ndata: {"type":"message_start","message":{"usage":{"input_tokens":5,"output_tokens":1}}}\n\n'));
@@ -220,4 +328,21 @@ test("ResponseUsageTap drops an over-long SSE line whole and reads the events af
   tap.feed(Buffer.from('data: {"type":"message_delta"}\n\n'));
   tap.feed(Buffer.from('event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":9}}\n\n'));
   assert.deepEqual(tap.finish(), { usage: { input: 5, cached: 0, output: 9 }, stopReason: "end_turn" });
+});
+
+test("thinking provenance holds no oversized or unbounded fields while blocks are open", () => {
+  const seen: string[] = [];
+  const tap = new ResponseUsageTap("text/event-stream", undefined, block => seen.push(String(block.data ?? block.signature)));
+  const sse = (body: unknown): Buffer => Buffer.from(`data: ${JSON.stringify(body)}\n\n`);
+  // One field over the per-block bound is never held, so its origin stays unknown.
+  tap.feed(sse({ type: "content_block_start", index: 0, content_block: { type: "redacted_thinking", data: "x".repeat(64 * 1024 + 1) } }));
+  // Many open blocks under the per-block bound stop being held once the response-wide bound is reached.
+  for (let index = 1; index <= 8; index++) tap.feed(sse({ type: "content_block_start", index, content_block: { type: "redacted_thinking", data: `${index}:` + "y".repeat(60 * 1024) } }));
+  for (let index = 0; index <= 8; index++) tap.feed(sse({ type: "content_block_stop", index }));
+  assert.deepEqual(seen.map(data => data.split(":")[0]), ["1", "2", "3", "4"]);
+  // Closing them returns the budget: a later small block is held again.
+  tap.feed(sse({ type: "content_block_start", index: 9, content_block: { type: "thinking", signature: "" } }));
+  tap.feed(sse({ type: "content_block_delta", index: 9, delta: { type: "signature_delta", signature: "small" } }));
+  tap.feed(sse({ type: "content_block_stop", index: 9 }));
+  assert.equal(seen.at(-1), "small");
 });

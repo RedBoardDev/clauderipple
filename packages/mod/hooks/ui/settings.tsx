@@ -12,6 +12,7 @@ import type { RenderNode } from 'claude-code'
 
 import type { Settings, Skin } from '../../types'
 import { SKINS } from '../settings'
+import { DISPLAY, displayText } from './display'
 import { CELL_PX, TILE_PX } from './art'
 import type { TileArt } from './art'
 import { capsule, pill, pic, ripple, segmented, slider, toggle, well } from './kit'
@@ -116,9 +117,9 @@ export function judgeRows(el: Els, frame: Frame, view: SettingsView, a: Settings
       jev.test.state === 'testing' ? (
         <Text dimColor>{t(frame.lang, 'settings.testing')}</Text>
       ) : jev.test.state === 'ok' ? (
-        <Text color={tone.ok} wrap="wrap">{'✓ ' + (jev.test.message ?? t(frame.lang, 'settings.keyWorks'))}</Text>
+        <Text color={tone.ok} wrap="wrap">{'✓ ' + displayText(jev.test.message ?? t(frame.lang, 'settings.keyWorks'))}</Text>
       ) : jev.test.state === 'fail' ? (
-        <Text color={tone.bad} wrap="wrap">{'✕ ' + (jev.test.message ?? t(frame.lang, 'settings.keyRejected'))}</Text>
+        <Text color={tone.bad} wrap="wrap">{'✕ ' + displayText(jev.test.message ?? t(frame.lang, 'settings.keyRejected'))}</Text>
       ) : null
     out.push(
       row(
@@ -155,7 +156,7 @@ export function keepWarmRow(el: Els, frame: Frame, d: Settings, a: SettingsActio
 }
 
 export function modeItems(frame: Frame, d: Settings): { value: string; label: string }[] {
-  return [{ value: '', label: t(frame.lang, 'settings.modeNone') }, ...d.modes.map(m => ({ value: m.id, label: m.name }))]
+  return [{ value: '', label: t(frame.lang, 'settings.modeNone') }, ...d.modes.map(m => ({ value: m.id, label: displayText(m.name, DISPLAY.name) }))]
 }
 
 function judgeName(frame: Frame, judge: Settings['judge']): string {
@@ -250,7 +251,7 @@ export function judgeTile(el: Els, frame: Frame, view: SettingsView, a: Settings
       { value: 'model', label: t(L, 'settings.routerModel') },
     ] as const, d.judge, judge => a.patch({ judge }), 'teal'),
   ]
-  if (d.judge === 'model' && d.judgeModel) body.push(note(el, frame, 'judge-model-name', t(L, 'settings.routerModel') + ' · ' + d.judgeModel))
+  if (d.judge === 'model' && d.judgeModel) body.push(note(el, frame, 'judge-model-name', t(L, 'settings.routerModel') + ' · ' + displayText(d.judgeModel, DISPLAY.name)))
   if (needsKey(view)) {
     const jev = view.jev
     const placeholder = t(L, 'settings.keyPaste')
@@ -259,8 +260,8 @@ export function judgeTile(el: Els, frame: Frame, view: SettingsView, a: Settings
       : <Text {...k.mute}>{placeholder}</Text>
     const result =
       jev.test.state === 'testing' ? <Text {...k.sub}>{t(L, 'settings.testing')}</Text>
-        : jev.test.state === 'ok' ? <Text color={k.tone('green')} wrap="wrap">{'✓ ' + (jev.test.message ?? t(L, 'settings.keyWorks'))}</Text>
-          : jev.test.state === 'fail' ? <Text color={k.tone('red')} wrap="wrap">{'✕ ' + (jev.test.message ?? t(L, 'settings.keyRejected'))}</Text>
+        : jev.test.state === 'ok' ? <Text color={k.tone('green')} wrap="wrap">{'✓ ' + displayText(jev.test.message ?? t(L, 'settings.keyWorks'))}</Text>
+          : jev.test.state === 'fail' ? <Text color={k.tone('red')} wrap="wrap">{'✕ ' + displayText(jev.test.message ?? t(L, 'settings.keyRejected'))}</Text>
             : null
     body.push(
       field,

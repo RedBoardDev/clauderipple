@@ -5,7 +5,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import {
-  adminOsascriptArgs, asString, awakeRemove, awakeSetup, insomniaCleanupSteps, installScript, releaseAwake, removeScript, shQuote, sudoersRule,
+  adminOsascriptArgs, asString, awakeRemove, awakeSetup, insomniaCleanupSteps, installScript, releaseAwake, remainingAwakeGrantHint, removeScript, shQuote, sudoersRule,
   type SetupDeps,
 } from "../src/awake-setup.ts";
 import { readJournal, type RunResult } from "../../router/src/awake.ts";
@@ -210,4 +210,18 @@ test("releaseAwake (stop, uninstall, awake off with no router): sudo -n only whe
   assert.equal(await releaseAwake(run, home, "stop", "darwin"), "released");
   assert.deepEqual(calls, ["/usr/bin/sudo -n /usr/bin/pmset -a disablesleep 0"]);
   assert.equal(readJournal(path.join(home, "awake.json"))?.applied, false);
+});
+
+// Uninstall clears the sleep bit but cannot silently remove /etc/sudoers.d/clauderipple: that needs
+// an administrator, and an unattended prompt is not an approval. The remaining grant is named with
+// the command that revokes it (G-D02). Nothing here reads the real file: existence is injected.
+test("an admin grant left behind is named with the command that removes it", () => {
+  assert.equal(remainingAwakeGrantHint({ platform: "linux", exists: () => true }), null);
+  assert.equal(remainingAwakeGrantHint({ platform: "win32", exists: () => true }), null);
+  assert.equal(remainingAwakeGrantHint({ platform: "darwin", exists: () => false }), null);
+  const hint = remainingAwakeGrantHint({ platform: "darwin", exists: (file) => file === "/etc/sudoers.d/clauderipple" });
+  assert.ok(hint);
+  assert.match(hint, /sudo rm \/etc\/sudoers\.d\/clauderipple/);
+  assert.match(hint, /awake setup --remove/);
+  assert.doesNotMatch(hint, /남아 있어요|저절로/);
 });

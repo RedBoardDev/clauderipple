@@ -11,7 +11,7 @@
 
 <p align="center">
   <a href="https://apps.apple.com/jp/app/id6823063731"><img height="40" alt="App Store" src="https://img.shields.io/badge/App%20Store-%E3%83%80%E3%82%A6%E3%83%B3%E3%83%AD%E3%83%BC%E3%83%89-0D96F6?style=for-the-badge&logo=apple&logoColor=white"></a>
-  <img height="40" alt="Google Play" src="https://img.shields.io/badge/Google%20Play-%E6%BA%96%E5%82%99%E4%B8%AD-666666?style=for-the-badge&logo=googleplay&logoColor=white">
+  <a href="https://play.google.com/store/apps/details?id=com.clauderipple.remote&hl=ja"><img height="40" alt="Google Play" src="https://img.shields.io/badge/Google%20Play-%E3%83%80%E3%82%A6%E3%83%B3%E3%83%AD%E3%83%BC%E3%83%89-01875F?style=for-the-badge&logo=googleplay&logoColor=white"></a>
   <a href="https://discord.gg/R8ZgGSNHjw"><img height="40" alt="Discord" src="https://img.shields.io/badge/Discord-%E5%8F%82%E5%8A%A0%E3%81%99%E3%82%8B-5865F2?style=for-the-badge&logo=discord&logoColor=white"></a>
 </p>
 
@@ -43,7 +43,7 @@
     <td colspan="2" align="center"><img src="docs/media/mod-band.png" alt="rippleモッド：推論強度、コンテキスト、キャッシュタイマー、実際に応答したモデルとキャッシュヒット率"><br><sub>rippleモッド：推論強度、コンテキスト、キャッシュタイマー、実際に応答したモデルとキャッシュヒット率</sub></td>
   </tr>
   <tr>
-    <td align="center" width="50%"><img src="docs/media/mod-alerts.png" alt="キャッシュが冷えたり上限が近づくと警告、新しいチャットへの引き継ぎ"><br><sub>キャッシュが冷えたり上限が近づくと警告、新しいチャットへの引き継ぎ</sub></td>
+    <td align="center" width="50%"><img src="docs/media/mod-alerts.png" alt="キャッシュが冷えたり上限が近づくと警告し、圧縮を提案"><br><sub>キャッシュが冷えたり上限が近づくと警告し、圧縮を提案</sub></td>
     <td align="center" width="50%"><img src="docs/media/mod-settings.png" alt="クイック設定：自動推論強度、判定モデル、ワーカーモード"><br><sub>クイック設定：自動推論強度、判定モデル、ワーカーモード</sub></td>
   </tr>
 </table>
@@ -177,7 +177,7 @@ Claude Codeのシステムプロンプトとツールの説明はClaude向けに
 - **設計段階で正しさを確保**。プロンプトキャッシュを保持（Anthropicのキャッシュブレークポイントと、安定したOpenAIのプレフィックス）、Claude Codeのサーバー側スレッドを処理、ツール呼び出しと画像を往復で変換、推論強度を各モデルが受け付ける範囲に調整、互換ベンダー向けにはAnthropic専用のリクエストフィールドを除去。
 - **本物のリクエストログ**。誰が依頼し、どのモデルが応答したか、入力 / キャッシュ / 出力のトークン数、レイテンシ、ステータスをリクエストごとに記録し、直近1時間のサマリーも表示します。
 - **サブエージェントの名前タグ**。バックグラウンドタスクパネルに、汎用の「Agent」ではなく`Terra·high · Review`のように表示されます。
-- **プロンプトの上のrippleモッド**。帯1本に推論強度、コンテキスト、キャッシュタイマー、直前のリクエストに実際に応答したモデルとキャッシュヒット率を表示します。小さな判定モデル（Haiku 5.5またはJev）がプロンプトごとに直近の会話と合わせて読み、lowからmaxまで推論強度を決めます。任せた作業は`ripple:auto`に渡り、判定モデルが難しさに応じてワーカーを選びます。軽い作業はDeepSeekやGLM、難しい作業はGPTやOpusへ。キャッシュが冷えたとき、コンテキストが重くなったとき、プランの上限が80%を超えたときにカードで知らせ、圧縮か、同じフォルダの新しいセッションへの引き継ぎを提案します。`Log`（または`/ripple-log`）でリクエストログをサイドペインに開きます。「クライアント」画面のスイッチ1つ、または`clauderipple mod on`で有効にできます。
+- **プロンプトの上のrippleモッド**。帯1本に推論強度、コンテキスト、キャッシュタイマー、直前のリクエストに実際に応答したモデルとキャッシュヒット率を表示します。小さな判定モデル（Haiku 5.5またはJev）がプロンプトごとに直近の会話と合わせて読み、lowからmaxまで推論強度を決めます。任せた作業は`ripple:auto`に渡り、判定モデルが難しさに応じてワーカーを選びます。軽い作業はDeepSeekやGLM、難しい作業はGPTやOpusへ。キャッシュが冷えたとき、コンテキストが重くなったとき、プランの上限が80%を超えたときにカードで知らせ、圧縮を提案します。`Log`（または`/ripple-log`）でリクエストログをサイドペインに開きます。「クライアント」画面のスイッチ1つ、または`clauderipple mod on`で有効にできます。
 - **ChatGPTのサブスクリプションで画像を生成**。`clauderipple image "<prompt>"`で、参照画像や透明背景にも対応します。サブエージェントにもやり方が伝えられているので、GPTやDeepSeekのワーカーでも、画像ツールなしで画像を作って確認できます。
 - **ノートPCのふたを閉じても、Claudeは作業を続けます**。macOSとWindowsでは、Claudeが作業している間（終わってから10分間も）ふたを閉じたままでもノートPCがスリープしないので、スマホから頼んだ作業が最後まで進みます。Wi-Fiがインターネットにつながらなくなると、スマホのインターネット共有（iPhoneまたはAndroid）に切り替え、あとで登録済みのWi-Fiに戻ります。ダッシュボードの「ノートPC の管理」画面でオンにするまでは無効です。[ふたを閉じたときとスマートフォンのインターネット共有](#ふたを閉じたときとスマートフォンのインターネット共有)を参照してください。
 - **必要なら軽量なワーカーを**。スイッチ1つで、生成されるサブエージェントに、セッションのすべてのMCPサーバーとプラグインではなく、ワーカーが使うツールだけを渡します。あるワーカーの最初のリクエストは33kトークンから9kトークンに減りました。
@@ -215,8 +215,8 @@ Claudeデスクトップアプリで作業を始めて、ノートPCを閉じ、
 
 コンピュータにClaudeRippleをインストールし、ダッシュボードの**スマートフォン**画面でQRコードを
 一度スキャンするだけです。iPhone：[App Store](https://apps.apple.com/jp/app/id6823063731)。
-Android：Google Playのクローズドテスト中で、[Discord](https://discord.gg/R8ZgGSNHjw)で申請を
-受け付けています。Claudeアプリのセッション連携はmacOSで利用でき、コンピュータなしでも
+Android：[Google Play](https://play.google.com/store/apps/details?id=com.clauderipple.remote&hl=ja)。
+Claudeアプリのセッション連携はmacOSで利用でき、コンピュータなしでも
 アプリ内のデモですぐ試せます。
 
 ## インストール
@@ -425,7 +425,7 @@ Codex app / CLI ──/v1/responses──▶ ClaudeRipple ingress ──▶ Clau
 
 ## コミュニティ
 
-質問、不具合の報告、Ripple Remote Android 版ベータ（Google Play のクローズドテスト）への参加受付は Discord で行っています：[https://discord.gg/R8ZgGSNHjw](https://discord.gg/R8ZgGSNHjw)。Android 版ベータに参加するには、Google Play で使っている Gmail アドレスを @pbj_ripple にダイレクトメッセージで送ってください。誰でも読めるチャンネルには書き込まないでください。
+質問と不具合の報告は Discord で受け付けています：[https://discord.gg/R8ZgGSNHjw](https://discord.gg/R8ZgGSNHjw)。
 
 ## 提携関係について
 

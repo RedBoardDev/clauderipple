@@ -1,6 +1,6 @@
 {
   "name": "clauderipple",
-  "version": "0.12.7",
+  "version": "0.12.33",
   "description": "Use GPT (any ChatGPT plan with Codex), DeepSeek and 400+ other models in the Claude Desktop Code tab and Claude Code while staying signed in to your Claude subscription — no third-party gateway mode. Several ChatGPT accounts that take over when one runs out, in Codex too.",
   "license": "GPL-3.0-only",
   "workspaces": [
@@ -11,6 +11,7 @@
   },
   "scripts": {
     "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p packages/remote/tsconfig.web.json --noEmit && tsc -p packages/remote/relay/tsconfig.json --noEmit",
+    "check:mod": "node scripts/check-mod.mjs",
     "dist": "npm --workspace @clauderipple/app run dist",
     "release": "npm --workspace @clauderipple/app run release",
     "router": "node packages/router/src/index.ts",

@@ -29,6 +29,22 @@ test("runtime uses packaged Electron executable and bundled sources", { skip: ne
   }
 });
 
+test("the npm tray's Electron.app is not the packaged ClaudeRipple application", async () => {
+  process.execPath = "/Users/홍길동/.clauderipple/tray-runtime/node_modules/electron/dist/Electron.app/Contents/MacOS/Electron";
+  processWithResources.resourcesPath = "/Users/홍길동/.clauderipple/tray-runtime/node_modules/electron/dist/Electron.app/Contents/Resources";
+  try {
+    const { runtime } = await import("../src/runtime.ts");
+    const value = runtime();
+    assert.equal(value.packaged, false);
+    assert.ok(fs.existsSync(value.cli));
+    assert.ok(!value.cli.includes("Electron.app"));
+  } finally {
+    process.execPath = originalExecPath;
+    if (hadResourcesPath) processWithResources.resourcesPath = originalResourcesPath!;
+    else delete processWithResources.resourcesPath;
+  }
+});
+
 // Two unpackaged layouts run the same code: the checkout's TypeScript and the JavaScript an npm
 // install carries, one level down in the same shape. Node refuses to strip types under
 // node_modules, so the published package cannot be the .ts sources — and every path derived here

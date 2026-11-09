@@ -59,6 +59,25 @@ test("prefers a flat Desktop-cached CLI over a hashed one in the same version", 
     assert.equal(latestDesktopClaude(), flat);
   }));
 
+test("Windows discovers the new Desktop data root and refuses ambiguous profiles", { skip: process.platform !== "win32" }, () => {
+  withDesktopCache((_dir, place) => {
+    const parent = path.join(process.env.LOCALAPPDATA!, "Claude-Data");
+    const root = path.join(parent, "claude_test");
+    for (const name of ["config.json", "claude_desktop_config.json", "claude-code-sessions", path.join("Local Storage", "leveldb")]) {
+      const file = path.join(root, name);
+      fs.mkdirSync(name.endsWith(".json") ? path.dirname(file) : file, { recursive: true });
+      if (name.endsWith(".json")) fs.writeFileSync(file, "{}");
+    }
+    const binary = path.join(root, "claude-code", "2.1.304", "6f2711964649", "claude.exe");
+    fs.mkdirSync(path.dirname(binary), { recursive: true }); fs.writeFileSync(binary, "");
+    assert.equal(latestDesktopClaude(), binary);
+    place("9.9.9");
+    assert.equal(latestDesktopClaude(), binary, "the current profile wins over the legacy cache");
+    fs.cpSync(root, path.join(parent, "claude_other"), { recursive: true });
+    assert.equal(latestDesktopClaude(), null);
+  });
+});
+
 test("claude-login invokes PATH claude setup-token and saves only a 0600 credential file", () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "cr-claude-login-"));
   const bin = path.join(root, "bin");

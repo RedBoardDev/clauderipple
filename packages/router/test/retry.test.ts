@@ -38,6 +38,17 @@ test("a relay reporting a broken upstream is retried, and the turn is answered",
   } finally { await s.close(); }
 });
 
+test("regression: a relay's 402 endpoint failure is retried within the turn", async () => {
+  const relay = JSON.stringify({ error: { type: "server_error", message: "Upstream request failed: Endpoint is unavailable" } });
+  const s = await server([{ status: 402, body: relay }, { status: 200, body: '{"answer":"recovered"}' }]);
+  try {
+    const res = await fetchWithRetry(s.url, { method: "POST", body: "{}" }, opts);
+    assert.equal(res.status, 200);
+    assert.equal(await res.text(), '{"answer":"recovered"}');
+    assert.equal(s.calls(), 2);
+  } finally { await s.close(); }
+});
+
 test("a 5xx is retried, a connect failure is retried", async () => {
   const s = await server([{ status: 503 }, { status: 500 }, { status: 200 }]);
   try {
@@ -50,6 +61,17 @@ test("a 5xx is retried, a connect failure is retried", async () => {
   const url = dead.url;
   await dead.close();
   await assert.rejects(() => fetchWithRetry(url, { method: "POST", body: "{}" }, { log: noop, attempts: 2 }));
+});
+
+test("regression: a relay's 429 endpoint failure is retried within the turn", async () => {
+  const relay = JSON.stringify({ error: { type: "server_error", message: "Upstream request failed: [prefill_cap_refused] the cell is at capacity; retry shortly (after 5 s)" } });
+  const s = await server([{ status: 429, body: relay }, { status: 200, body: '{"answer":"recovered"}' }]);
+  try {
+    const res = await fetchWithRetry(s.url, { method: "POST", body: "{}" }, opts);
+    assert.equal(res.status, 200);
+    assert.equal(await res.text(), '{"answer":"recovered"}');
+    assert.equal(s.calls(), 2, "the relay's own 429 did not end the turn");
+  } finally { await s.close(); }
 });
 
 test("a 401, 429 or 400 is not retried — the same provider refuses the identical request every time", async () => {

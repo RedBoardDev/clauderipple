@@ -206,6 +206,83 @@ export function parseLevels(message: string): string[] {
 }
 
 /**
+ * Ollama's own API base for a provider that is Ollama, else null.
+ *
+ * Ollama serves its native API next to the OpenAI-compatible one (`/api/show` beside `/v1/models`),
+ * and only the native one states a model's thinking levels and context length: `/v1/models` reports
+ * ids alone, and a probe cannot see either — an unknown `reasoning_effort` field is simply ignored,
+ * which measured as "no effort" and saved every model with an empty ladder. The cloud endpoint
+ * (api key) and the local daemon's default port are the two shapes a provider records.
+ */
+export function ollamaApiBase(url: string | undefined, preset?: string): string | null {
+  let parsed: URL | null = null;
+  try {
+    parsed = url ? new URL(url) : null;
+  } catch {
+    parsed = null;
+  }
+  if (!parsed) return preset === "ollama" ? "http://127.0.0.1:11434" : null;
+  const host = parsed.hostname.toLowerCase();
+  if (host === "ollama.com" || host.endsWith(".ollama.com")) return `${parsed.protocol}//${parsed.host}`;
+  const loopback = host === "127.0.0.1" || host === "localhost" || host === "[::1]" || host === "::1";
+  if (loopback && parsed.port === "11434") return `${parsed.protocol}//${parsed.host}`;
+  return preset === "ollama" ? `${parsed.protocol}//${parsed.host}` : null;
+}
+
+/** What Ollama's own `/api/show` states about one model. */
+export type OllamaFacts = { effortLevels?: string[]; contextWindow?: number };
+
+/**
+ * Read `/api/show`'s answer. `thinking.values` is a list of levels for a model with steps, or
+ * booleans for an on/off switch — the latter is not a ladder and is left out rather than turned
+ * into levels nobody defined. The context length sits in `model_info` under a
+ * model-architecture key (`qwen3.context_length`), so the key is matched by suffix.
+ */
+export function parseOllamaShow(value: unknown): OllamaFacts {
+  const facts: OllamaFacts = {};
+  if (!value || typeof value !== "object") return facts;
+  const show = value as { thinking?: unknown; model_info?: unknown };
+  const values = show.thinking && typeof show.thinking === "object" ? (show.thinking as { values?: unknown }).values : undefined;
+  if (Array.isArray(values)) {
+    const levels = values.filter((level): level is string => typeof level === "string" && level.trim() !== "").map((level) => level.trim());
+    if (levels.length > 0) facts.effortLevels = levels;
+  }
+  if (show.model_info && typeof show.model_info === "object") {
+    for (const [key, raw] of Object.entries(show.model_info as Record<string, unknown>)) {
+      if (!key.endsWith(".context_length")) continue;
+      if (typeof raw === "number" && Number.isFinite(raw) && raw > 0) {
+        facts.contextWindow = Math.floor(raw);
+        break;
+      }
+    }
+  }
+  return facts;
+}
+
+/**
+ * Ask Ollama about one model. Undefined when the call or the answer says nothing usable, so a
+ * caller keeps whatever it knew rather than writing an empty answer over it.
+ */
+export async function ollamaModelFacts(base: string, id: string, deps: MeasureDeps): Promise<OllamaFacts | undefined> {
+  let response: Response;
+  try {
+    response = await deps.fetch(`${base.replace(/\/+$/, "")}/api/show`, {
+      method: "POST",
+      headers: requestHeaders({ wire: "chat", url: base }, deps),
+      body: JSON.stringify({ model: id }),
+    });
+  } catch {
+    return undefined;
+  }
+  if (!response.ok) return undefined;
+  try {
+    return parseOllamaShow(await response.json());
+  } catch {
+    return undefined;
+  }
+}
+
+/**
  * Which levels this model accepts, one at a time.
  *
  * Only an explicit refusal is a capability answer. A 429, a 5xx or a dropped connection says nothing

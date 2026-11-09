@@ -3,9 +3,21 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { ConfigStore, DEFAULTS, fastSwitches, providerFor, validate } from "../src/config.ts";
-import type { AnthropicCompatibleProvider, Config, GoogleProvider, OpenAiCompatibleProvider } from "../src/config.ts";
+import { ConfigStore, DEFAULTS, PROCESS_PRIORITIES, fastSwitches, providerFor, validate } from "../src/config.ts";
+import type { AnthropicCompatibleProvider, Config, GoogleProvider, OpenAiCompatibleProvider, ProcessPriority, Provider } from "../src/config.ts";
 import { Logger } from "../src/log.ts";
+
+test("validate accepts only the four process priority settings", () => {
+  assert.deepEqual(PROCESS_PRIORITIES, ["below-normal", "normal", "above-normal", "high"]);
+  for (const processPriority of PROCESS_PRIORITIES) {
+    assert.deepEqual(validate({ ...DEFAULTS, processPriority }), [], processPriority);
+  }
+  const message = 'processPriority must be "below-normal", "normal", "above-normal" or "high"';
+  for (const processPriority of ["realtime", "High", 1]) {
+    const config = { ...DEFAULTS, processPriority: processPriority as unknown as ProcessPriority };
+    assert.deepEqual(validate(config), [message]);
+  }
+});
 
 test("validate rejects an unusable Auto mode classifier target", () => {
   const providers = { p: { type: "chatgpt" as const } };
@@ -13,6 +25,30 @@ test("validate rejects an unusable Auto mode classifier target", () => {
   assert.ok(validate({ ...DEFAULTS, providers, autoModeClassifier: { provider: "missing", model: "gpt-6-luna" } }).some((e) => e.includes("unknown provider")));
   assert.ok(validate({ ...DEFAULTS, providers, autoModeClassifier: { provider: "p", model: "" } }).some((e) => e.includes("missing model")));
   assert.ok(validate({ ...DEFAULTS, providers: { p: { type: "anthropic", auth: "claude-code" } }, autoModeClassifier: { provider: "p", model: "claude-sonnet-5" } }).some((e) => e.includes("ingress-only")));
+});
+
+test("validate checks the Auto mode classifier's first-stage target like the main one", () => {
+  const providers = { p: { type: "chatgpt" as const }, cls: { type: "anthropic" as const, auth: "claude-code" as const, accountPool: true } };
+  const main = { provider: "p", model: "gpt-6-luna", effort: "high" };
+  const errors = (stage1: unknown) => validate({ ...DEFAULTS, providers, autoModeClassifier: { ...main, stage1: stage1 as { provider: string; model: string } } });
+  assert.deepEqual(errors({ provider: "cls", model: "claude-sonnet-5-5" }), []);
+  assert.deepEqual(errors({ provider: "missing", model: "claude-sonnet-5-5" }), ["autoModeClassifier.stage1: unknown provider"]);
+  assert.deepEqual(errors({ provider: "cls", model: " " }), ["autoModeClassifier.stage1: missing model"]);
+  assert.deepEqual(errors({ provider: "cls", model: "claude-sonnet-5-5", effort: 3 }), ["autoModeClassifier.stage1: effort must be a string"]);
+  assert.deepEqual(errors("claude-sonnet-5-5"), [`autoModeClassifier.stage1 must be an object or "native"`]);
+  assert.deepEqual(errors("native"), []);
+  const ingressOnly = { ...providers, cls: { type: "anthropic" as const, auth: "claude-code" as const } };
+  assert.deepEqual(validate({ ...DEFAULTS, providers: ingressOnly, autoModeClassifier: { ...main, stage1: { provider: "cls", model: "claude-sonnet-5-5" } } }), ["autoModeClassifier.stage1: provider is ingress-only"]);
+});
+
+test("validate lets either side of the Auto mode classifier stay on ordinary routing, but not both", () => {
+  const providers = { p: { type: "chatgpt" as const } };
+  const check = (settings: unknown) => validate({ ...DEFAULTS, providers, autoModeClassifier: settings as NonNullable<Config["autoModeClassifier"]> });
+  assert.deepEqual(check({ stage1: { provider: "p", model: "gpt-6-luna" } }), [], "the first stage alone");
+  assert.deepEqual(check({ provider: "p", model: "gpt-6-luna", stage1: "native" }), [], "the rest alone");
+  assert.deepEqual(check({}), ["autoModeClassifier names no target"]);
+  assert.deepEqual(check({ stage1: "native" }), ["autoModeClassifier names no target"]);
+  assert.deepEqual(check({ effort: "high", stage1: "native" }), ["autoModeClassifier: unknown provider", "autoModeClassifier: missing model"], "a half-written main target is an error, not a skip");
 });
 
 test("validate accepts a web search backend and rejects an unusable one", () => {
@@ -60,6 +96,28 @@ test("validate accepts native Anthropic providers and confines account pools to 
   assert.deepEqual(validate({ ...DEFAULTS, providers: { ok: { type: "anthropic", auth: "claude-code", limits: false } } }), []);
   assert.ok(validate({ ...DEFAULTS, providers: { bad: { type: "anthropic", auth: "claude-code", limits: "no" as unknown as boolean } } }).some((error) => error.includes("limits must be true or false")));
   assert.ok(validate({ ...DEFAULTS, providers: { bad: { type: "chatgpt", limits: 1 as unknown as boolean } } }).some((error) => error.includes("limits must be true or false")));
+});
+
+test("every provider kind takes a display label, and a blank or overlong one is refused", () => {
+  const providers: Record<string, Provider> = {
+    hive: { type: "anthropic-compatible", url: "https://api.example.test", label: "하이브" },
+    gpt: { type: "chatgpt", label: "Codex" },
+    openrouter: { type: "openai-compatible", url: "https://openrouter.ai/api/v1", label: "OpenRouter" },
+    gemini: { type: "google", auth: "api-key", label: "Gemini" },
+    claude: { type: "anthropic", auth: "api-key", label: "Claude" },
+    grok: { type: "grok", label: "Grok" },
+  };
+  assert.deepEqual(validate({ ...DEFAULTS, providers }), []);
+  for (const [name, p] of Object.entries(providers)) {
+    for (const label of ["", "   ", 7, "x".repeat(61)]) {
+      const errors = validate({ ...DEFAULTS, providers: { ...providers, [name]: { ...p, label: label as string } } });
+      assert.ok(errors.some((error) => error.includes(`provider ${name}: label must be a non-empty string of at most 60 characters`)), `${name} accepted ${JSON.stringify(label)}`);
+    }
+    // Exactly 60 characters, and no label at all, are both fine.
+    assert.deepEqual(validate({ ...DEFAULTS, providers: { ...providers, [name]: { ...p, label: "가".repeat(60) } } }), []);
+    const { label: _label, ...unlabelled } = p as Provider & { label?: string };
+    assert.deepEqual(validate({ ...DEFAULTS, providers: { ...providers, [name]: unlabelled as Provider } }), []);
+  }
 });
 
 test("validate accepts a chatgpt provider's Fast switches and refuses a fast that is not an object", () => {

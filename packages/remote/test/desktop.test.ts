@@ -7,12 +7,15 @@ import { agentEnded, BackgroundTasks, DesktopSessions, processHasSession, transc
 import { summarize, Sessions } from "../src/sessions.ts";
 import { PermissionQueue } from "../src/permissions.ts";
 import { FRAME_CAP } from "../src/protocol.ts";
+import { BackgroundActivity } from "../src/background-activity.ts";
 import { reduce } from "../web/timeline.ts";
-import { BridgeClient } from "../src/bridge-client.ts";
+import { BridgeClient, DESKTOP_BUSY } from "../src/bridge-client.ts";
 import { fileSymlinks } from "../../../test/capabilities.ts";
+import { signatureOf } from "./narration-signature.ts";
 
 const id = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
 const other = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
+const linked = "dddddddd-dddd-dddd-dddd-dddddddddddd";
 const line = (value: unknown): string => JSON.stringify(value) + "\n";
 const user = { type: "user", uuid: "u1", cwd: "/synthetic/project", timestamp: "2026-10-12T01:00:00Z", message: { content: "First prompt" } };
 const assistant = { type: "assistant", uuid: "a1", message: { id: "m1", model: "test-model", content: [{ type: "text", text: "Answer" }, { type: "tool_use", id: "t1", name: "Read", input: { file_path: "/synthetic/project/file.ts" } }] } };
@@ -36,9 +39,37 @@ test("background task list carries the launch description, command fallback and 
   tasks.accept(line({ type: "assistant", message: { content: [{ type: "tool_use", name: "Bash", id: "b", input: { command: "npm test", run_in_background: true } }] } }));
   tasks.accept(line({ type: "user", toolUseResult: { backgroundTaskId: "s1" }, message: { content: [{ type: "tool_result", tool_use_id: "b", content: "started" }] } }));
   assert.deepEqual(tasks.list, [
-    { id: "w1", kind: "agent", label: "Review diff", startedAt: Date.parse("2026-10-13T01:00:00.000Z") },
-    { id: "s1", kind: "shell", label: "npm test", startedAt: null },
+    { id: "w1", kind: "agent", label: "Review diff", startedAt: Date.parse("2026-10-13T01:00:00.000Z"), state: "running", sub: "sub-a" },
+    { id: "s1", kind: "shell", label: "npm test", command: "npm test", startedAt: null, state: "running" },
   ]);
+});
+
+test("the turn's task list follows update_plan as the app applies it, and the next message clears it", () => {
+  const tasks = new BackgroundTasks();
+  let n = 0;
+  const plan = (input: Record<string, unknown>, error = false) => {
+    const id = `p${++n}`;
+    tasks.accept(line({ type: "assistant", message: { content: [{ type: "tool_use", name: "mcp__ccd_turn__update_plan", id, input }] } }));
+    tasks.accept(line({ type: "user", message: { content: [{ type: "tool_result", tool_use_id: id, ...(error ? { is_error: true } : {}), content: "Plan shown" }] } }));
+  };
+  const statuses = () => tasks.plan.map(step => step.status[0]).join("");
+  assert.deepEqual(tasks.plan, []);
+  plan({ advance: true });
+  assert.deepEqual(tasks.plan, [], "an advance with no list changes nothing");
+  plan({ scope: "first_task", items: [{ content: " Read the code ", status: "in_progress" }, { content: "", status: "pending" }, { content: "Fix it", status: "bogus" }, { content: "Test it", status: "pending" }] });
+  assert.deepEqual(tasks.plan, [{ text: " Read the code ", status: "in_progress" }, { text: "Fix it", status: "pending" }, { text: "Test it", status: "pending" }]);
+  plan({ advance: true });
+  assert.equal(statuses(), "cip");
+  plan({ done: [2, 9], start: 3 }, true);
+  assert.equal(statuses(), "cip", "a refused call changes nothing");
+  plan({ done: [2], start: 3 });
+  assert.equal(statuses(), "cci");
+  plan({ advance: "true" });
+  assert.equal(statuses(), "ccc");
+  plan({ items: Array.from({ length: 15 }, (_, i) => ({ content: `step ${i}`, status: "pending" })), scope: "continuation" });
+  assert.equal(tasks.plan.length, 15);
+  tasks.accept(line({ type: "user", timestamp: "2026-10-23T01:00:00.000Z", origin: { kind: "human" }, message: { content: "next" } }));
+  assert.deepEqual(tasks.plan, []);
 });
 
 test("the main turn starts at the person's message, not a compaction summary or task notification", () => {
@@ -128,13 +159,16 @@ test("background tasks survive bounded summary tails and incremental partial rec
 });
 
 test("defensive transcript conversion preserves users, tools, failure and result", () => {
-  const lines = [line(user), "not json", "null", line({ type: "unknown" }), line({ ...user, isSidechain: true }), line({ type: "assistant", message: { content: [null, 5, { type: "thinking", thinking: "not shown" }] } }), line(assistant), line({ type: "user", message: { content: [{ type: "tool_result", tool_use_id: "t1", is_error: true, content: [{ type: "text", text: "failed" }] }] } }), line({ type: "result", subtype: "success", duration_ms: 23, num_turns: 1 })];
+  const lines = [line(user), "not json", "null", line({ type: "unknown" }), line({ ...user, isSidechain: true }), line({ type: "assistant", message: { content: [null, 5, { type: "thinking", thinking: "not shown" }, { type: "thinking", thinking: "Checking the tool output", signature: signatureOf("narration") }, { type: "thinking", thinking: "withheld", signature: signatureOf("thinking") }] } }), line(assistant), line({ type: "user", message: { content: [{ type: "tool_result", tool_use_id: "t1", is_error: true, content: [{ type: "text", text: "failed" }] }] } }), line({ type: "result", subtype: "success", duration_ms: 23, num_turns: 1 })];
   const bodies = lines.flatMap(l => transcriptEvents(l, user.cwd, summarize).bodies);
-  assert.deepEqual(bodies.map(b => b.kind), ["user", "thinking", "assistant", "tool_result", "result"]);
+  assert.deepEqual(bodies.map(b => b.kind), ["user", "thinking", "narration", "thinking", "assistant", "tool_result", "result"]);
   assert.deepEqual(bodies[1], { kind: "thinking", msg: "", block: 2, text: "not shown" });
-  const a = bodies[2];
+  // Only the block whose signature says narration is shown; the one that says thinking stays hidden.
+  assert.deepEqual(bodies[2], { kind: "narration", msg: "", block: 3, text: "Checking the tool output" });
+  assert.deepEqual(bodies[3], { kind: "thinking", msg: "", block: 4, text: "withheld" });
+  const a = bodies[4];
   assert.equal(a?.kind === "assistant" && a.tools[0]?.summary, "file.ts");
-  const result = bodies[3];
+  const result = bodies[5];
   assert.equal(result?.kind === "tool_result" && result.ok, false);
   assert.deepEqual(transcriptEvents(line({ type: "system", subtype: "turn_duration", durationMs: 99 }), "", summarize).bodies, [{ kind: "result", ok: true, ms: 99, turns: 1 }]);
   assert.equal(transcriptEvents(line({ ...user, isMeta: true }), "", summarize).bodies.length, 0);
@@ -213,7 +247,10 @@ test("only recent top-level UUID files, no symlinks, host transcripts or travers
   const outside = path.join(f.root, "outside.jsonl");
   fs.writeFileSync(outside, line(user));
   if (fileSymlinks) fs.symlinkSync(outside, path.join(f.project, "cccccccc-cccc-cccc-cccc-cccccccccccc.jsonl"));
-  fs.symlinkSync(f.project, path.join(f.projects, "linked-project"), "junction");
+  const linkedProject = path.join(f.root, "linked-project-target");
+  fs.mkdirSync(linkedProject);
+  fs.writeFileSync(path.join(linkedProject, `${linked}.jsonl`), line(user));
+  fs.symlinkSync(linkedProject, path.join(f.projects, "linked-project"), "junction");
   assert.deepEqual(f.desktop.list().map(s => s.id), [id]);
   assert.equal(f.desktop.has("../../outside"), false);
   assert.throws(() => f.desktop.log("../../outside"), /no such session/);
@@ -252,6 +289,19 @@ test("large timeline outputs are blobs and paged below the frame cap", t => {
     before = page.events[0]!.seq;
   }
   assert.equal(count, 22);
+});
+
+test("a fresh desktop process read bypasses the registry cache", { skip: process.platform !== "darwin" }, t => {
+  const f = fixture(t);
+  const registry = path.join(f.root, "sessions");
+  fs.mkdirSync(registry);
+  const file = path.join(registry, `${process.pid}.json`);
+  const write = (status: string) => fs.writeFileSync(file, JSON.stringify({ pid: process.pid, entrypoint: "claude-desktop", sessionId: id, status }));
+  write("idle");
+  assert.equal(f.desktop.liveProcess(id)?.status, "idle");
+  write("busy");
+  assert.equal(f.desktop.liveProcess(id)?.status, "idle", "the normal read uses the cached snapshot");
+  assert.equal(f.desktop.liveProcess(id, 0)?.status, "busy", "the fresh read observes the changed registry");
 });
 
 test("open detection matches exact session flags in fake ps output", () => {
@@ -344,7 +394,8 @@ for (const mode of ["resume", "process", "recent"] as const) test(`desktop conti
   assert.deepEqual(reduce(sessions.log(id).tail().events).items.map(item => item.type), ["user", "assistant"]);
   if (mode === "process") {
     await assert.rejects(sessions.setModel(id, "chosen-model", "high"), /Claude 앱/);
-    assert.throws(() => sessions.send(id, "first-phone", "continue"), /지금은 보낼 수 없습니다/);
+    assert.equal(sessions.send(id, "first-phone", "continue"), id);
+    assert.equal(sessions.summaryOf(id)?.queue?.[0]?.error, DESKTOP_BUSY, "an open process without registry status waits safely");
     assert.equal(options.length, 0);
     assert.equal(sessions.log(id).tail().events.some(e => e.kind === "user" && e.clientMsgId === "first-phone"), false);
     return;
@@ -453,10 +504,108 @@ test("a Mac session's worker status follows its result, its notification, a queu
   assert.deepEqual(run([toolUse("a"), launch("a")]), [["a", "running"]], "an async launch is not an end");
   assert.deepEqual(run([toolUse("a"), launch("a"), notice("a", "completed")]), [["a", "running"], ["a", "done"]]);
   assert.deepEqual(run([toolUse("b"), launch("b"), notice("b", "completed", true)]), [["b", "running"], ["b", "done"]], "a queued notification ends it");
-  assert.deepEqual(run([toolUse("c"), launch("c"), notice("c", "killed")]), [["c", "running"], ["c", "failed"]]);
+  assert.deepEqual(run([toolUse("c"), launch("c"), notice("c", "killed")]), [["c", "running"], ["c", "stopped"]]);
   const sync = (tid: string, error = false) => line({ type: "user", toolUseResult: { agentId: "w" }, message: { content: [{ type: "tool_result", tool_use_id: tid, is_error: error, content: "answer" }] } });
   assert.deepEqual(run([toolUse("d"), sync("d")]), [["d", "running"], ["d", "done"]], "a synchronous worker ends at its result");
   assert.deepEqual(run([toolUse("e"), sync("e", true)]), [["e", "running"], ["e", "failed"]]);
+});
+
+test("a running worker with a known model emits progress as only its own transcript grows", t => {
+  const f = fixture(t);
+  const worker = "toolu_progress";
+  subagent(f.project, "progress", { toolUseId: worker, model: "sol@high" }, [
+    assistantTurn("sol", "tool_use", [{ type: "tool_use", id: "read", name: "Read", input: {} }]),
+  ]);
+  const file = path.join(f.project, `${id}.jsonl`);
+  fs.writeFileSync(file, line(user) + line({ type: "assistant", message: { content: [{ type: "tool_use", id: worker, name: "Agent", input: { run_in_background: true } }] } }) +
+    line({ type: "user", toolUseResult: { isAsync: true, agentId: "progress" }, message: { content: [{ type: "tool_result", tool_use_id: worker, content: "launched asynchronously" }] } }));
+  f.desktop.list();
+  const events: import("../src/protocol.ts").EventBody[] = [];
+  const imported = f.desktop.importInto(id, path.join(f.root, "opened-timeline"), Date.now);
+  assert.equal(imported.tail().events.find(e => e.kind === "subagent")?.model, "sol");
+  imported.close();
+  const offset = fs.statSync(file).size;
+  const workerFile = path.join(f.project, id, "subagents", "agent-progress.jsonl");
+  fs.appendFileSync(workerFile, line({ isSidechain: true, type: "user", message: { content: [{ type: "tool_result", tool_use_id: "read", content: "read output" }] } }));
+  assert.equal(f.desktop.tail(id, offset, body => events.push(body)), offset, "the parent transcript did not grow");
+  assert.deepEqual(events.map(e => e.kind === "subagent" ? [e.model, e.steps, e.status] : e.kind), [["sol", 1, "running"]]);
+  events.length = 0;
+  f.desktop.tail(id, offset, body => events.push(body));
+  assert.equal(events.length, 0, "an unchanged worker emits nothing");
+  fs.appendFileSync(workerFile, assistantTurn("sol", "end_turn", [{ type: "text", text: "finished" }]));
+  f.desktop.tail(id, offset, body => events.push(body));
+  assert.deepEqual(events.map(e => e.kind === "subagent" ? [e.model, e.steps, e.status] : e.kind), [["sol", 2, "done"]]);
+  assert.equal(f.desktop.subLog(id, `sub-${worker}`)?.tail().events.at(-1)?.kind, "assistant");
+});
+
+for (const content of ["[Request interrupted by user]", [{ type: "text", text: "[Request interrupted by user for tool use]" }]]) {
+  test(`an interrupted worker closes without a notification (${typeof content}) on import, tail and reconnect`, t => {
+    const f = fixture(t);
+    const worker = "interrupted";
+    const file = path.join(f.project, `${id}.jsonl`);
+    const workerFile = path.join(f.project, id, "subagents", `agent-${worker}.jsonl`);
+    const launch = line({ type: "assistant", message: { content: [{ type: "tool_use", id: worker, name: "Agent", input: { run_in_background: true } }] } });
+    const launched = line({ type: "user", toolUseResult: { isAsync: true, agentId: worker }, message: { content: [{ type: "tool_result", tool_use_id: worker, content: "Async agent launched" }] } });
+    subagent(f.project, worker, { toolUseId: worker }, [assistantTurn("sol", "tool_use", [{ type: "tool_use", id: "read", name: "Read", input: {} }])]);
+    fs.writeFileSync(file, line(user) + launch + launched);
+    const before = f.desktop.log(id);
+    assert.equal(f.desktop.backgroundTasks(id), 1);
+    fs.appendFileSync(workerFile, line({ type: "user", isSidechain: true, message: { content } }));
+    assert.equal(agentEnded(workerFile), true);
+    const events: import("../src/protocol.ts").EventBody[] = [];
+    f.desktop.tail(id, fs.statSync(file).size, body => events.push(body));
+    assert.deepEqual(events.filter(e => e.kind === "subagent").map(e => e.status), ["stopped"]);
+    assert.equal(f.desktop.backgroundTasks(id), 0);
+    assert.equal(f.desktop.backgroundTaskHistory(id).find(task => task.id === worker)?.state, "stopped");
+    const after = f.desktop.log(id);
+    assert.notEqual(after, before, "worker-only changes invalidate the parent snapshot");
+    assert.equal(subagentEvents(after).at(-1)?.status, "stopped");
+    const replay = new BackgroundActivity();
+    for (const event of after.tail(1 << 20).events) replay.accept(event, text => typeof text === "string" ? text : after.blob(text.blob) ?? "");
+    assert.equal(replay.active.length, 0);
+    assert.equal(replay.history[0]?.state, "stopped");
+    const restarted = new DesktopSessions({ projects: f.projects, summarize, excluded: () => new Set(), processes: () => "" });
+    t.after(() => restarted.close());
+    assert.equal(subagentEvents(restarted.log(id)).at(-1)?.status, "stopped");
+    assert.equal(restarted.backgroundTasks(id), 0);
+  });
+}
+
+test("only an exact final interruption record stops a worker, never inactivity or the parent's interruption", t => {
+  const f = fixture(t);
+  const file = path.join(f.project, `${id}.jsonl`);
+  const launch = (tool: string) => line({ type: "assistant", message: { content: [{ type: "tool_use", id: tool, name: "Agent", input: {} }] } });
+  const running = assistantTurn("sol", "tool_use", [{ type: "tool_use", id: "read", name: "Read", input: {} }]);
+  const interrupted = line({ type: "user", isSidechain: true, message: { content: "[Request interrupted by user for tool use]" } });
+  const endings = [
+    running,
+    interrupted + running,
+    line({ type: "user", message: { content: "[Request interrupted by user] quoted instruction" } }),
+    line({ type: "assistant", message: { content: [{ type: "text", text: "[Request interrupted by user]" }] } }),
+    interrupted.slice(0, -1),
+    interrupted + '{"type":"assistant"',
+    line({ type: "user", message: { content: [{ type: "tool_result", content: "[Request interrupted by user]" }] } }),
+  ];
+  endings.forEach((ending, index) => subagent(f.project, `guard-${index}`, { toolUseId: `guard-${index}` }, [running, ending]));
+  fs.writeFileSync(file, line(user) + endings.map((_, index) => launch(`guard-${index}`)).join("") +
+    line({ type: "user", message: { content: "[Request interrupted by user]" } }));
+  f.advance();
+  assert.ok(subagentEvents(f.desktop.log(id)).every(e => e.status === "running"));
+  endings.forEach((_, index) => assert.equal(agentEnded(path.join(f.project, id, "subagents", `agent-guard-${index}.jsonl`)), false));
+});
+
+test("a nested worker's interruption refreshes its unchanged parent's cached worker log", t => {
+  const f = fixture(t);
+  subagent(f.project, "parent", { toolUseId: "parent" }, [assistantTurn("sol", "tool_use", [{ type: "tool_use", id: "child", name: "Agent", input: {} }])]);
+  subagent(f.project, "child", { toolUseId: "child" }, [assistantTurn("sol", "tool_use", [{ type: "tool_use", id: "read", name: "Read", input: {} }])]);
+  fs.writeFileSync(path.join(f.project, `${id}.jsonl`), line(user));
+  f.desktop.list();
+  const before = f.desktop.subLog(id, "sub-parent")!;
+  assert.equal(subagentEvents(before).at(-1)?.status, "running");
+  fs.appendFileSync(path.join(f.project, id, "subagents", "agent-child.jsonl"), line({ type: "user", isSidechain: true, message: { content: "[Request interrupted by user for tool use]" } }));
+  const after = f.desktop.subLog(id, "sub-parent")!;
+  assert.notEqual(after, before);
+  assert.equal(subagentEvents(after).at(-1)?.status, "stopped");
 });
 
 test("a Mac session's worker log is readable and grows with its transcript", t => {
@@ -477,12 +626,58 @@ test("a Mac session's worker log is readable and grows with its transcript", t =
   assert.equal(f.desktop.subLog(id, "sub-toolu_missing"), null, "an unknown worker has no log");
 });
 
-test("sidechain and nested records never open their own worker", () => {
+test("sidechain records open children only inside their own worker conversation", () => {
   const nested = line({ isSidechain: true, type: "assistant", message: { model: "sol", content: [{ type: "tool_use", id: "nested", name: "Agent", input: { description: "nested" } }] } });
-  const resolve = () => ({ model: "sol", steps: 1, description: "", ended: false });
+  const resolve = () => ({ model: "sol", steps: 1, description: "", terminal: null });
   // The parent pass skips sidechain records entirely.
   assert.deepEqual(transcriptEvents(nested, "/x", summarize).bodies, []);
-  // A subagent's own transcript reads sidechain records, but none of its Agent calls becomes a worker.
+  // Its own conversation exposes the child, retaining the launch call beside the lifecycle event.
   const own = transcriptEvents(nested, "/x", summarize, undefined, { allowSidechain: true, state: new Map(), resolve });
-  assert.deepEqual(own.bodies.map(b => b.kind), ["assistant"]);
+  assert.deepEqual(own.bodies.map(b => b.kind), ["subagent", "assistant"]);
+});
+
+test("desktop workers expose children and grandchildren without leaking them into the main conversation", t => {
+  const f = fixture(t);
+  const launch = (tool: string, prompt: string) => assistantTurn("sol", "tool_use", [{ type: "tool_use", id: tool, name: "Agent", input: { description: tool, prompt } }]);
+  const result = (tool: string, failed = false) => line({ type: "user", isSidechain: true, message: { content: [{ type: "tool_result", tool_use_id: tool, is_error: failed, content: "result" }] } });
+  subagent(f.project, "parent", { toolUseId: "parent" }, [launch("child", "Child instruction\nnot a summary")]);
+  subagent(f.project, "child", { toolUseId: "child" }, [launch("grandchild", "Grandchild instruction"), result("grandchild", true)]);
+  subagent(f.project, "grandchild", { toolUseId: "grandchild" }, [assistantTurn("sol", "end_turn", [{ type: "text", text: "Grandchild answer" }])]);
+  fs.writeFileSync(path.join(f.project, `${id}.jsonl`), line(user) + line({ type: "assistant", message: { content: [{ type: "tool_use", id: "parent", name: "Agent", input: { prompt: "Parent instruction" } }] } }));
+  const main = reduce(f.desktop.log(id).readAfter(0, 1 << 20).events);
+  assert.deepEqual(main.items.filter(i => i.type === "subagent").map(i => i.sub), ["sub-parent"]);
+  const parent = f.desktop.subLog(id, "sub-parent")!;
+  const parentView = reduce(parent.readAfter(0, 1 << 20).events);
+  assert.deepEqual(parentView.items.filter(i => i.type === "subagent").map(i => [i.sub, i.status]), [["sub-child", "running"]]);
+  const childView = reduce(f.desktop.subLog(id, "sub-child")!.readAfter(0, 1 << 20).events);
+  assert.deepEqual(childView.items.filter(i => i.type === "subagent").map(i => [i.sub, i.status]), [["sub-grandchild", "failed"]]);
+  assert.equal(f.desktop.subLog(id, "sub-grandchild")!.readAfter(0).events.find(e => e.kind === "assistant")?.text, "Grandchild answer");
+  fs.appendFileSync(path.join(f.project, id, "subagents", "agent-child.jsonl"), assistantTurn("sol", "end_turn", [{ type: "text", text: "Child done" }]));
+  const refreshed = f.desktop.subLog(id, "sub-parent")!;
+  assert.notEqual(refreshed, parent, "child progress invalidates a cached parent even when its own file is unchanged");
+  assert.equal(reduce(refreshed.readAfter(0, 1 << 20).events).items.find(i => i.type === "subagent")?.status, "done");
+  assert.equal(f.desktop.subLog(id, "sub-../../outside"), null);
+});
+
+test("a tail seeded from a handoff skips a later copy of a seeded worker launch (#126)", t => {
+  // An SDK handoff's log holds its events without transcript-line identities, so only the seed's own
+  // record can tell that a line after the offset is a copy of one before it.
+  const f = fixture(t);
+  const file = path.join(f.project, `${id}.jsonl`);
+  const launch = { type: "assistant", uuid: "launch", timestamp: "2026-11-05T01:00:02Z", message: { id: "lm", model: "model", content: [
+    { type: "tool_use", id: "worker-1", name: "Agent", input: { description: "worker", prompt: "go" } },
+  ] } };
+  const launched = { type: "user", uuid: "launched", timestamp: "2026-11-05T01:00:03Z", toolUseResult: { isAsync: true, agentId: "task-1" },
+    message: { content: [{ type: "tool_result", tool_use_id: "worker-1", content: "launched asynchronously" }] } };
+  fs.writeFileSync(file, line(user) + line(launch) + line(launched));
+  f.desktop.list();
+  const events: import("../src/protocol.ts").EventBody[] = [];
+  let offset = f.desktop.tail(id, fs.statSync(file).size, body => events.push(body));
+  fs.appendFileSync(file, line({ ...launch, cwd: "/moved/project" }));
+  offset = f.desktop.tail(id, offset, body => events.push(body));
+  assert.deepEqual(events.filter(e => e.kind === "assistant" || e.kind === "subagent"), [], "the copy emits nothing");
+  fs.appendFileSync(file, line({ type: "user", uuid: "notify", timestamp: "2026-11-05T01:00:04Z",
+    message: { content: "<task-notification><task-id>task-1</task-id><status>completed</status><result>done</result></task-notification>" } }));
+  f.desktop.tail(id, offset, body => events.push(body));
+  assert.deepEqual(events.filter(e => e.kind === "subagent").map(e => e.kind === "subagent" && [e.toolUseId, e.status]), [["worker-1", "done"]]);
 });

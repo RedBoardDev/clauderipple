@@ -35,7 +35,7 @@ const PROVIDERS: Config["providers"] = {
   anthropic: { type: "anthropic", auth: "claude-code", models: [{ id: "claude-opus-5" }] },
 };
 
-type Rig = { send: (model: string, path?: string) => Promise<{ status: number; body: string }>; records: () => RequestRecord[]; stop: () => void };
+type Rig = { send: (model: string, path?: string, prompt?: string) => Promise<{ status: number; body: string }>; records: () => RequestRecord[]; stop: () => void };
 
 async function rig(): Promise<Rig> {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "cr-refuse-"));
@@ -56,14 +56,14 @@ async function rig(): Promise<Rig> {
   });
   await proxy.listen();
 
-  const send = async (model: string, pathName = "/v1/messages"): Promise<{ status: number; body: string }> => {
+  const send = async (model: string, pathName = "/v1/messages", prompt = "hi"): Promise<{ status: number; body: string }> => {
     const sock = net.connect(proxyPort, "127.0.0.1");
     await new Promise<void>((r) => sock.once("connect", () => r()));
     sock.write("CONNECT api.anthropic.com:443 HTTP/1.1\r\nHost: api.anthropic.com:443\r\n\r\n");
     await new Promise<void>((r) => sock.once("data", () => r()));
     const secure = tls.connect({ socket: sock, servername: "api.anthropic.com", ca: ca.certPem });
     await new Promise<void>((r) => secure.once("secureConnect", () => r()));
-    const body = JSON.stringify({ model, max_tokens: 1, messages: [{ role: "user", content: "hi" }] });
+    const body = JSON.stringify({ model, max_tokens: 1, messages: [{ role: "user", content: prompt }] });
     secure.write(
       `POST ${pathName} HTTP/1.1\r\nHost: api.anthropic.com\r\ncontent-type: application/json\r\ncontent-length: ${Buffer.byteLength(body)}\r\n\r\n${body}`,
     );
@@ -106,6 +106,19 @@ test("an ambiguous model is refused 400 and names both providers", async () => {
   } finally {
     r.stop();
   }
+});
+
+test("an ambiguous marker on a native Claude request is refused locally with qualified alternatives", async () => {
+  const r = await rig();
+  try {
+    const { status, body } = await r.send("claude-opus-5", "/v1/messages", "[[ripple: deepseek-v4-pro@high]] task");
+    assert.equal(status, 400);
+    assert.match(body, /opencode-go:deepseek-v4-pro/);
+    assert.match(body, /deepseek:deepseek-v4-pro/);
+    const record = r.records().find(x => x.kind === "messages")!;
+    assert.equal(record.refusal, "unroutable");
+    assert.equal(record.upstreamCalled, false);
+  } finally { r.stop(); }
 });
 
 test("count_tokens on an unroutable non-claude model is refused the same way", async () => {

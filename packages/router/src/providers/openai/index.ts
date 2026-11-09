@@ -6,20 +6,28 @@ import http from "node:http";
 import type { OpenAiCompatibleProvider } from "../../config.ts";
 import type { Logger } from "../../log.ts";
 import type { RequestUsage } from "../../requestlog.ts";
-import { providerExhaustion, type ProviderExhaustion } from "../../health.ts";
-import { retryAfterMs } from "../../pool.ts";
+import { exhaustionHeaders, modelDeprecation, providerExhaustion, type ModelUnavailable, type ProviderExhaustion } from "../../health.ts";
+import { CLOUDFLARE_FINGERPRINT_BLOCK, retryAfterMs } from "../../pool.ts";
 import { credentialHeaderValues, redactErrorText } from "../../redact.ts";
 import { SseParser } from "../chatgpt/sse.ts";
 import { fetchWithRetry } from "../retry.ts";
+import { StartInputs } from "../start-input.ts";
 import { estimateTokens, formatSse, OpenAiStreamMapper, toOpenAiRequest, type ChatRequest, type ResponsesRequest } from "./translate.ts";
-import { refusesReplayedReasoning } from "../../reasoning.ts";
-import { PRESETS } from "../../presets.ts";
+import { refusesReplayedReasoning, requiresThinkingReplay } from "../../reasoning.ts";
+import { PRESETS, presetUserAgent, withDefaultUserAgent } from "../../presets.ts";
 import { conversationKey, serverToolNames, toolNameRestoreMap } from "../chatgpt/translate.ts";
 import type { AnthropicRequest } from "../chatgpt/translate.ts";
+import { promptAdditions } from "../../identity.ts";
+import type { RequestKind } from "../../routing.ts";
 
 const PING_MS = 15_000;
 
-export type OpenAiOutcome = { status: number; bytes: number; note?: string; usage?: RequestUsage; stopReason?: string; messageId?: string; servedTier?: string; exhaustion?: ProviderExhaustion | undefined };
+export type OpenAiCredential = {
+  headers: Record<string, string>;
+  next?: (status: number, retryAfterMs: number | undefined, body: string) => Record<string, string> | null;
+};
+
+export type OpenAiOutcome = { upstreamStatus?: number; retryAfterMs?: number | undefined; errorBody?: string; status: number; bytes: number; note?: string; usage?: RequestUsage; stopReason?: string; messageId?: string; servedTier?: string; exhaustion?: ProviderExhaustion | undefined; modelUnavailable?: ModelUnavailable | undefined };
 
 function anthropicError(status: number, type: string, message: string): { status: number; body: string } {
   return { status, body: JSON.stringify({ type: "error", error: { type, message } }) };
@@ -46,11 +54,24 @@ export function looksLikeAuth(text: string): boolean {
 }
 
 /**
+ * Cloudflare's own refusal of a request before the provider reads its key: `error code: 1010` in the
+ * body (issue #132). Cloudflare decides it from the request's fingerprint, so it says nothing about the key.
+ */
+export function isCloudflareFingerprintBlock(text: string): boolean {
+  return CLOUDFLARE_FINGERPRINT_BLOCK.test(text);
+}
+
+/** What the user reads for a fingerprint block. Says what it is not (the key) before what to check. */
+export const FINGERPRINT_BLOCK_HINT = "Cloudflare blocked the request before authentication (error 1010). This is about the request's fingerprint, not your API key. Check the User-Agent in this provider's headers.";
+
+/**
  * `label` names the provider in the message the user reads; `authHint`, when given, is appended to an
  * authentication error to say what to do about it — a credential the user can fix in another tool is
  * only fixable if the error names the tool.
  */
 export function mapHttpError(status: number, text: string, label = "OpenAI-compatible provider", authHint?: string, redact: (message: string) => string = (message) => message): { status: number; body: string } {
+  // Checked first: a Cloudflare block names no key, so nothing below may read it as a credential refusal.
+  if (status === 403 && isCloudflareFingerprintBlock(text)) return anthropicError(403, "permission_error", `${label}: ${FINGERPRINT_BLOCK_HINT}`);
   // Cleaned after decoding: a credential escaped inside the JSON (`\u0074ok…`) only reads as itself
   // once the string is parsed.
   const message = `${label}: ${redact(vendorMessage(text))}`;
@@ -67,6 +88,21 @@ export function mapHttpError(status: number, text: string, label = "OpenAI-compa
   if (status === 429) return anthropicError(429, "rate_limit_error", message);
   if (status >= 500) return anthropicError(529, "api_error", message);
   return anthropicError(400, "invalid_request_error", message);
+}
+
+/** Fixed block names only: even an unrecognised client-supplied type must not leak into the log. */
+function assistantTurnShapes(json: AnthropicRequest): { turn: number; blocks: Record<string, number> }[] {
+  const kinds = new Set(["text", "thinking", "redacted_thinking", "tool_use", "tool_result", "image", "document", "server_tool_use", "tool_addition", "tool_removal"]);
+  return json.messages.flatMap((message, turn) => {
+    if (message.role !== "assistant") return [];
+    const blocks: Record<string, number> = {};
+    if (typeof message.content === "string") blocks.text = 1;
+    else if (Array.isArray(message.content)) for (const block of message.content) {
+      const kind = kinds.has(block.type) ? block.type : "unknown";
+      blocks[kind] = (blocks[kind] ?? 0) + 1;
+    }
+    return [{ turn, blocks }];
+  });
 }
 
 function endpoint(base: string, wire: "chat" | "responses"): string {
@@ -112,7 +148,7 @@ export class OpenAiCompatibleAdapter {
   private readonly log: Logger;
   private readonly hooks: OpenAiAdapterHooks;
   private readonly tag: string;
-  private readonly lastInputByKey = new Map<string, number>();
+  private readonly startInputs = new StartInputs();
 
   constructor(name: string, cfg: OpenAiCompatibleProvider, log: Logger, hooks: OpenAiAdapterHooks = {}) {
     this.name = name;
@@ -122,15 +158,8 @@ export class OpenAiCompatibleAdapter {
     this.tag = hooks.logTag ?? "openai";
   }
 
-  private rememberInput(key: string, usage: { input_tokens: number; cache_read_input_tokens: number }): void {
-    const total = usage.input_tokens + usage.cache_read_input_tokens;
-    if (total <= 0) return;
-    this.lastInputByKey.set(key, total);
-    if (this.lastInputByKey.size > 500) this.lastInputByKey.delete(this.lastInputByKey.keys().next().value!);
-  }
-
   /** Handle a fully-read Messages request. Model/effort have already been resolved by routing. */
-  async handle(req: http.IncomingMessage, res: http.ServerResponse, path: string, json: AnthropicRequest, model: string, effort: string | undefined): Promise<OpenAiOutcome> {
+  async handle(req: http.IncomingMessage, res: http.ServerResponse, path: string, json: AnthropicRequest, model: string, effort: string | undefined, credential?: OpenAiCredential, options?: { kind?: RequestKind }): Promise<OpenAiOutcome> {
     if (path.startsWith("/v1/messages/count_tokens")) {
       const body = JSON.stringify({ input_tokens: estimateTokens(json) });
       res.writeHead(200, { "content-type": "application/json", "content-length": String(Buffer.byteLength(body)) }).end(body);
@@ -163,10 +192,10 @@ export class OpenAiCompatibleAdapter {
       replay,
       env: { p: this.name, m: model },
       ...(PRESETS.find((entry) => entry.id === this.cfg.preset)?.sealedReasoning ? { sealedReasoning: true } : {}),
+      ...(PRESETS.find((entry) => entry.id === this.cfg.preset)?.promptCacheKey ? { promptCacheKey: conversationKey(json) } : {}),
       carried,
       log: (line) => this.log.info(`${this.tag} ${this.name}: ${line} (${model})`),
-      ...(this.cfg.identity === undefined ? {} : { identity: this.cfg.identity }),
-      ...(this.cfg.instructionsAppend ? { instructionsAppend: this.cfg.instructionsAppend } : {}),
+      ...promptAdditions(options?.kind ?? "turn", this.cfg),
     });
     const upstreamRequest = translate();
     let requestBody = JSON.stringify(upstreamRequest);
@@ -177,13 +206,15 @@ export class OpenAiCompatibleAdapter {
       ? { [this.cfg.sessionHeader]: conversationKey(json) }
       : {};
     const label = this.hooks.label ?? "OpenAI-compatible provider";
-    const headersNow = async (): Promise<Record<string, string>> => ({
+    let credentialHeaders = credential?.headers;
+    // The preset's User-Agent is only a default: any User-Agent already set, configured or resolved, wins.
+    const headersNow = async (): Promise<Record<string, string>> => withDefaultUserAgent({
       "content-type": "application/json",
       accept: "text/event-stream",
       ...sessionHeader,
-      ...(this.cfg.headers ?? {}),
+      ...(credentialHeaders ?? this.cfg.headers ?? {}),
       ...(this.hooks.headers ? await this.hooks.headers(model) : {}),
-    });
+    }, presetUserAgent(this.cfg.preset));
     let upstreamHeaders: Record<string, string> = {};
     // Every credential sent on any attempt: after a 401 retry the vendor's error may still echo the
     // first one.
@@ -191,7 +222,7 @@ export class OpenAiCompatibleAdapter {
     const redact = (text: string): string => redactErrorText(text, [...upstreamSecrets], 2000);
     // Same input floor behavior as the ChatGPT adapter: the CLI snapshots message_start before usage arrives.
     const key = JSON.stringify({ model, wire, system: json.system ?? "", user: json.messages.find((message) => message.role === "user")?.content ?? "" });
-    const startInput = Math.max(estimateTokens(json), this.lastInputByKey.get(key) ?? 0);
+    const startInput = this.startInputs.start(key, estimateTokens(json));
     const controller = new AbortController();
     const onClose = (): void => controller.abort();
     res.on("close", onClose);
@@ -224,12 +255,21 @@ export class OpenAiCompatibleAdapter {
           upstream = new Response(refusal, { status: 401 });
         }
       }
+      while (!upstream.ok && !res.headersSent && !controller.signal.aborted && credential?.next) {
+        const text = await upstream.clone().text();
+        if (requiresThinkingReplay(upstream.status, text)) break;
+        const next = credential.next(upstream.status, retryAfterMs(Object.fromEntries(upstream.headers)), text);
+        if (!next) break;
+        await upstream.body?.cancel();
+        credentialHeaders = next;
+        upstream = await ask();
+      }
       // A 4xx that names reasoning is this vendor refusing the reasoning the conversation carried
       // back — a field it does not take, or a value from another model. The turn goes again without
       // it: replaying is an optimisation the user's turn must never depend on (reasoning.ts).
-      if (carried.replayed > 0 && refusesReplayedReasoning(upstream.status, await upstream.clone().text().catch(() => ""))) {
+      if (carried.replayed > 0 && upstream.status >= 400 && upstream.status < 500 && refusesReplayedReasoning(upstream.status, await upstream.clone().text().catch(() => ""))) {
         const refusal = await upstream.text().catch(() => "");
-        this.log.warn(`${this.tag} ${this.name}: upstream ${upstream.status} refused ${carried.replayed} replayed reasoning turn(s) for ${model}; asking again without them: ${refusal.replace(/\s+/g, " ").slice(0, 200)}`);
+        this.log.warn(`${this.tag} ${this.name}: upstream ${upstream.status} refused ${carried.replayed} replayed reasoning turn(s) for ${model}; asking again without them: ${redact(refusal).replace(/\s+/g, " ").slice(0, 200)}`);
         carried.replayed = 0;
         carried.undecodable = 0;
         requestBody = JSON.stringify(translate(false));
@@ -255,8 +295,12 @@ export class OpenAiCompatibleAdapter {
       const out = mapHttpError(upstream.status, text, label, this.hooks.authHint, redact);
       this.log.warn(`${this.tag} ${this.name}: upstream ${upstream.status} for ${model}: ${safeText.slice(0, 400)}`);
       res.off("close", onClose);
-      res.writeHead(out.status, { "content-type": "application/json", "content-length": String(Buffer.byteLength(out.body)) }).end(out.body);
-      return { status: out.status, bytes: Buffer.byteLength(out.body), note: `upstream ${upstream.status}`, exhaustion: providerExhaustion(upstream.status, text, retryAfterMs(Object.fromEntries(upstream.headers))) };
+      // A definite exhaustion is answered as such: the client must not retry it (#89).
+      const exhaustion = providerExhaustion(upstream.status, text, retryAfterMs(Object.fromEntries(upstream.headers)));
+      const missingThinking = requiresThinkingReplay(upstream.status, text);
+      if (missingThinking) this.log.warn(`${this.tag} ${this.name}: missing required thinking for ${model}; assistantTurns=${JSON.stringify(assistantTurnShapes(json))}`);
+      res.writeHead(out.status, { "content-type": "application/json", "content-length": String(Buffer.byteLength(out.body)), ...(exhaustion ? exhaustionHeaders(exhaustion) : {}), ...(missingThinking ? { "x-should-retry": "false" } : {}) }).end(out.body);
+      return { upstreamStatus: upstream.status, retryAfterMs: retryAfterMs(Object.fromEntries(upstream.headers)), errorBody: safeText, status: out.status, bytes: Buffer.byteLength(out.body), note: `upstream ${upstream.status}`, exhaustion, modelUnavailable: modelDeprecation(upstream.status, text) };
     }
 
     const wantStream = json.stream === true;
@@ -283,17 +327,23 @@ export class OpenAiCompatibleAdapter {
         if (done) break;
         for (const event of parser.feed(decoder.decode(value, { stream: true }))) {
           const output = mapper.feed(event, wire);
-          this.rememberInput(key, mapper.usage);
+          this.startInputs.note(key, mapper.usage);
           if (wantStream) for (const anthropic of output) bytes += write(res, formatSse(anthropic));
           if (mapper.isFinished) break;
         }
+        // Chat's finish_reason can precede a usage-only chunk. Only [DONE] ends reads;
+        // Responses finishes inside the mapper on its terminal event.
+        if (wire === "chat" && parser.sawDone && !mapper.isFinished) {
+          const tail = mapper.finish();
+          if (wantStream) for (const event of tail) bytes += write(res, formatSse(event));
+        }
         if (mapper.isFinished) break;
       }
-      if (!mapper.isFinished) {
+      if (!mapper.isFinished && !controller.signal.aborted) {
         // Only a vendor that said it was done is finished. A stream that just stopped — muse went
         // quiet for up to 300s and then closed, 2026-09-19 — is reported as overloaded so the
         // client asks again, instead of taking an empty turn as the model's final answer.
-        const tail = mapper.completed || parser.sawDone
+        const tail = mapper.completed || (wire === "chat" && parser.sawDone)
           ? mapper.finish()
           : mapper.fail(`${model}: upstream stream ended before the response completed`, "server_is_overloaded");
         if (wantStream) for (const event of tail) bytes += write(res, formatSse(event));
@@ -309,14 +359,20 @@ export class OpenAiCompatibleAdapter {
       try { await reader.cancel(); } catch { /* already closed */ }
     }
 
+    if (controller.signal.aborted) {
+      const usage = mapper.usage;
+      return { status: 0, bytes, note: "client closed", usage: { input: usage.input_tokens, cached: usage.cache_read_input_tokens, output: usage.output_tokens } };
+    }
+
     const failure = mapper.failure;
     const failedStatus = failureStatus(failure);
+    const exhaustion = failure ? providerExhaustion(429, `${failure.code ?? ""} ${failure.message}`, retryAfterMs(Object.fromEntries(upstream.headers))) : undefined;
     if (!wantStream) {
       // A failed turn is an error here too: answering it as a 200 with whatever content had
       // arrived is the same silent truncation the stream path used to commit.
       const body = failure ? anthropicError(failedStatus, failure.type, failure.message).body : JSON.stringify(mapper.message());
       bytes = Buffer.byteLength(body);
-      res.writeHead(failure ? failedStatus : 200, { "content-type": "application/json", "content-length": String(bytes) }).end(body);
+      res.writeHead(failure ? failedStatus : 200, { "content-type": "application/json", "content-length": String(bytes), ...(exhaustion && failedStatus === 429 ? exhaustionHeaders(exhaustion) : {}) }).end(body);
     } else if (!res.writableEnded) {
       res.end();
     }
@@ -324,7 +380,7 @@ export class OpenAiCompatibleAdapter {
     return {
       // A stream has already sent 200; the record still says the turn failed.
       status: failure ? failedStatus : 200,
-      exhaustion: failure ? providerExhaustion(429, `${failure.code ?? ""} ${failure.message}`, retryAfterMs(Object.fromEntries(upstream.headers))) : undefined,
+      exhaustion,
       bytes,
       note: failure
         ? `${wantStream ? "mid-stream " : ""}${failure.type}: ${failure.message} (in=${usage.input_tokens} cached=${usage.cache_read_input_tokens} out=${usage.output_tokens} replayed=${carried.replayed} reasoning=${mapper.reasoningCount})`

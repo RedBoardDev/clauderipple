@@ -1,6 +1,6 @@
 // The bands that take the dashboard's place when something wants a decision: cold cache, heavy
-// context, a hot plan limit, a judge that failed, the compact and handoff bars, and the cards that
-// report a compact or handoff in progress and done.
+// context, a hot plan limit, a judge that failed, the compact bar, and the cards that report a
+// compact or a handoff in progress and done.
 //
 // Each one is 리플이 telling you one thing: its face of the moment on the left, a short title that
 // says what, one line that says why, then at most one main action, the others quiet, and a way to
@@ -11,13 +11,12 @@
 import { t } from '../i18n'
 import type { RenderNode } from 'claude-code'
 
-import type { HandoffKind, Settings } from '../../types'
 import { CELL_PX, ROW_PX } from './art'
+import { DISPLAY, displayText } from './display'
 import { lookOf } from './look'
-import type { Sea, Tone } from './art'
-import { capsule, closeButton, pill, ripple, segmented as drawnSegmented, well } from './kit'
-import type { SegmentOption } from './kit'
-import { action, actions, canDraw, dismiss, segmented, speak } from './parts'
+import type { Sea } from './art'
+import { capsule, closeButton, pill, ripple, segmented, well } from './kit'
+import { action, actions, canDraw, dismiss, speak } from './parts'
 import type { Els } from './parts'
 import { FACE_TONE } from './ripple'
 import type { Face } from './ripple'
@@ -50,7 +49,6 @@ export function cardOf(frame: Frame, alert: AlertView, a: AlertActions): Card {
   const notNow: Choice = { key: 'dismiss', label: t(L, 'alerts.notNow'), hotkey: 'n', onPress: a.dismiss }
   const cancel: Choice = { key: 'dismiss', label: t(L, 'alerts.cancel'), hotkey: 'x', onPress: a.dismiss }
   const compact: Choice = { key: 'compact', label: t(L, 'band.compact'), hotkey: 'c', onPress: () => a.compact() }
-  const handoff: Choice = { key: 'handoff', label: t(L, 'band.handoff'), hotkey: 'h', onPress: a.handoff }
   switch (alert.kind) {
     case 'cold':
       return {
@@ -59,7 +57,6 @@ export function cardOf(frame: Frame, alert: AlertView, a: AlertActions): Card {
         title: t(L, 'alerts.coldTitle'),
         body: t(L, 'alerts.coldBody', { tokens: compactNumber(alert.tokens), minutes: alert.idleMinutes }),
         main: compact,
-        quiet: [handoff],
         close: notNow,
       }
     case 'kept':
@@ -78,7 +75,6 @@ export function cardOf(frame: Frame, alert: AlertView, a: AlertActions): Card {
         title: t(L, 'alerts.swampTitle', { percent: Math.round(alert.percent) }),
         body: t(L, 'alerts.swampBody', { tokens: compactNumber(alert.tokens) }),
         main: compact,
-        quiet: [handoff],
         close: notNow,
       }
     case 'hot': {
@@ -100,21 +96,25 @@ export function cardOf(frame: Frame, alert: AlertView, a: AlertActions): Card {
         key: 'judge',
         face: 'dazed',
         title: t(L, alert.network ? 'alerts.judgeNetworkTitle' : 'alerts.judgeTitle'),
-        body: t(L, 'alerts.judgeBody', { judge: t(L, JUDGE_NAME[alert.judge]), reason: alert.reason, fallback: t(L, alert.judge === 'haiku' ? 'alerts.keepEffort' : 'alerts.askHaiku') }),
+        body: t(L, 'alerts.judgeBody', { judge: t(L, JUDGE_NAME[alert.judge]), reason: displayText(alert.reason), fallback: t(L, alert.judge === 'haiku' ? 'alerts.keepEffort' : 'alerts.askHaiku') }),
         main: { key: 'settings', label: t(L, 'alerts.openSettings'), hotkey: 'o', onPress: a.openSettings },
         close: notNow,
       }
     case 'result':
       return resultCard(frame, alert, a)
-    case 'compactNote':
+    case 'compactNote': {
+      // The tidy-up is on unless the person turned it off; its switch sits quiet beside Compact.
+      const tidy: Choice = { key: 'tidy', label: t(L, 'alerts.tidyFirst', { state: t(L, alert.tidy ? 'band.on' : 'band.off') }), hotkey: 't', onPress: a.toggleTidy }
       return {
         key: 'note',
         face: 'asking',
         title: t(L, 'alerts.compactTitle'),
-        body: t(L, 'alerts.compactBody'),
+        body: t(L, 'alerts.compactBody') + (alert.pick === 'session' && alert.cold ? '\n' + t(L, 'alerts.compactCold') : ''),
+        quiet: [tidy],
         main: { ...compact, onPress: () => a.compact(alert.draft) },
         close: cancel,
       }
+    }
     case 'clear':
       return {
         key: 'clear',
@@ -122,15 +122,6 @@ export function cardOf(frame: Frame, alert: AlertView, a: AlertActions): Card {
         title: t(L, 'alerts.clearTitle'),
         body: t(L, 'alerts.clearBody'),
         main: { key: 'clear-go', label: t(L, 'alerts.clearGo'), hotkey: 'g', onPress: a.clear },
-        close: cancel,
-      }
-    case 'handoffChoice':
-      return {
-        key: 'handoff',
-        face: 'asking',
-        title: t(L, 'alerts.handoffTitle'),
-        body: alert.handoffKind === 'quick' ? t(L, 'alerts.quickBody') : t(L, 'alerts.fullBody'),
-        main: { key: 'go', label: t(L, 'alerts.go'), hotkey: 'g', onPress: a.go },
         close: cancel,
       }
   }
@@ -141,70 +132,37 @@ function resultCard(frame: Frame, alert: Extract<AlertView, { kind: 'result' }>,
   const close: Choice = { key: 'dismiss', label: t(L, 'alerts.dismiss'), hotkey: 'x', onPress: a.dismiss }
   switch (alert.stage) {
     case 'handingOff':
-      return { key: 'result', face: 'going', title: t(L, 'alerts.handingOff'), body: alert.detail ?? (alert.handoffKind === 'full' ? t(L, 'alerts.fullProgress') : t(L, 'alerts.quickProgress')) }
-    case 'handoffReady':
-      return {
-        key: 'result',
-        face: 'asking',
-        title: t(L, 'alerts.handoffReady'),
-        body: t(L, 'alerts.handoffReadyBody'),
-        main: { key: 'open-new', label: t(L, 'alerts.openNew'), hotkey: 'g', onPress: a.openNew },
-        quiet: [{ key: 'copy', label: t(L, 'alerts.copyText'), hotkey: 'y', onPress: a.copy }],
-        close: { key: 'dismiss', label: t(L, 'alerts.cancel'), hotkey: 'x', onPress: a.dismiss },
-      }
+      return { key: 'result', face: 'going', title: t(L, 'alerts.handingOff'), body: (alert.detail === undefined ? undefined : displayText(alert.detail)) ?? t(L, 'alerts.quickProgress') }
     case 'handoffDone':
-      return { key: 'result', face: 'pleased', title: t(L, 'alerts.handoffDone'), body: alert.detail ?? t(L, 'alerts.summaryReady'), quiet: [{ key: 'copy', label: t(L, 'alerts.copyAgain'), hotkey: 'y', onPress: a.copy }], close }
+      return { key: 'result', face: 'pleased', title: t(L, 'alerts.handoffDone'), body: (alert.detail === undefined ? undefined : displayText(alert.detail)) ?? t(L, 'alerts.summaryReady'), quiet: [{ key: 'copy', label: t(L, 'alerts.copyAgain'), hotkey: 'y', onPress: a.copy }], close }
+    case 'tidying':
+      // Put away while it runs: the turn is in the chat, and the compaction follows it either way.
+      return { key: 'result', face: 'working', title: t(L, 'alerts.tidying'), body: (alert.detail === undefined ? undefined : displayText(alert.detail)) ?? t(L, 'alerts.tidyingBody'), close }
     case 'compacting':
-      return { key: 'result', face: 'squeezing', title: t(L, 'alerts.compacting'), body: alert.detail ?? t(L, 'alerts.compactingBody') }
+      return { key: 'result', face: 'squeezing', title: t(L, 'alerts.compacting'), body: (alert.detail === undefined ? undefined : displayText(alert.detail)) ?? t(L, 'alerts.compactingBody') }
     case 'compacted':
-      return { key: 'result', face: 'pleased', title: t(L, 'alerts.compacted'), body: alert.detail ?? t(L, 'alerts.compactedBody'), close }
+      return { key: 'result', face: 'pleased', title: t(L, 'alerts.compacted'), body: (alert.detail === undefined ? undefined : displayText(alert.detail)) ?? t(L, 'alerts.compactedBody'), close }
     case 'failed':
-      return { key: 'result', face: 'sorry', title: t(L, 'alerts.failed'), body: alert.detail ?? t(L, 'alerts.unchanged'), close }
+      return { key: 'result', face: 'sorry', title: t(L, 'alerts.failed'), body: (alert.detail === undefined ? undefined : displayText(alert.detail)) ?? t(L, 'alerts.unchanged'), close }
   }
 }
 
 function extras(el: Els, frame: Frame, alert: AlertView, a: AlertActions): RenderNode[] {
-  const { Box, Text } = el
+  const { Box } = el
   if (alert.kind === 'compactNote' && 'Input' in el) {
     const Field = el.Input
     return [
+      ...('Select' in el && alert.models.length > 1 ? [<Box key="compact-model-row" flexDirection="row" alignItems="center" columnGap={2}><el.Text dimColor>{t(frame.lang, 'alerts.compactModel')}</el.Text><el.Select key="compact-model" options={alert.models} value={alert.pick} onSelect={(value: string) => a.pickCompactModel(value)} /></Box>] : []),
       <Field
         key="note"
         label={t(frame.lang, 'alerts.keep')}
         placeholder={t(frame.lang, 'alerts.keepPlaceholder')}
-        value={alert.draft}
+        value={displayText(alert.draft, DISPLAY.conversation)}
         submitLabel={t(frame.lang, 'alerts.compactSubmit')}
         autoFocus
         onInput={(text: string) => a.noteInput(text)}
         onSubmit={(text: string) => a.compact(text)}
       />,
-    ]
-  }
-  if (alert.kind === 'handoffChoice') {
-    const kinds: { value: HandoffKind; label: string; hotkey: string }[] = [
-      { value: 'quick', label: t(frame.lang, 'alerts.quick'), hotkey: 'q' },
-      { value: 'full', label: t(frame.lang, 'alerts.full'), hotkey: 'f' },
-    ]
-    const afters: { value: Settings['handoffAfter']; label: string; hotkey: string }[] = [
-      { value: 'continue', label: t(frame.lang, 'alerts.continue'), hotkey: '1' },
-      { value: 'confirm', label: t(frame.lang, 'alerts.confirm'), hotkey: '2' },
-      { value: 'copy', label: t(frame.lang, 'alerts.copy'), hotkey: '3' },
-    ]
-    // Two rows of options under one another, their names in a column of their own.
-    const line = (key: string, name: string, control: RenderNode) => (
-      <Box key={key} flexDirection="row" alignItems="center" columnGap={2}>
-        <Box width={8} flexShrink={0}>
-          <Text dimColor>{name.trim()}</Text>
-        </Box>
-        {control}
-      </Box>
-    )
-    return [
-      <Box key="choices" flexDirection="column">
-        {line('kind', t(frame.lang, 'alerts.kind'), segmented(el, frame, 'kind', kinds, alert.handoffKind, k => a.setHandoffKind(k)))}
-        {line('after', t(frame.lang, 'alerts.then'), segmented(el, frame, 'after', afters, alert.after, k => a.setHandoffAfter(k)))}
-        <Text dimColor wrap="wrap">{afterHint(frame, alert.after)}</Text>
-      </Box>,
     ]
   }
   return []
@@ -233,13 +191,11 @@ function seaOf(card: Card, alert: AlertView): Omit<Sea, 'at'> {
       return { tone: 'red', weather: 'static' }
     case 'note':
     case 'clear':
-    case 'handoff':
       return { tone: 'violet', weather: 'sparkles', ripples: 'calm' }
     default: {
       const stage = alert.kind === 'result' ? alert.stage : 'failed'
-      if (stage === 'handingOff' || stage === 'compacting') return { tone: 'violet', ripples: 'busy', current: true }
+      if (stage === 'handingOff' || stage === 'compacting' || stage === 'tidying') return { tone: 'violet', ripples: 'busy', current: true }
       if (stage === 'failed') return { tone: 'red', weather: 'static' }
-      if (stage === 'handoffReady') return { tone: 'violet', weather: 'sparkles', ripples: 'calm' }
       return { tone: 'green', tick: true, weather: 'sparkles' }
     }
   }
@@ -248,7 +204,7 @@ function seaOf(card: Card, alert: AlertView): Omit<Sea, 'at'> {
 /** 리플이 on a card, px: the full drawing (ripple.ts), brows and mouth and all. */
 const CARD_FACE = 34
 
-function drawnExtras(el: Els, frame: Frame, alert: AlertView, a: AlertActions, tone: Tone): RenderNode[] {
+function drawnExtras(el: Els, frame: Frame, alert: AlertView, a: AlertActions): RenderNode[] {
   const { Box, Text } = el
   const k = lookOf(frame)
   if (alert.kind === 'compactNote' && 'Input' in el) {
@@ -258,13 +214,16 @@ function drawnExtras(el: Els, frame: Frame, alert: AlertView, a: AlertActions, t
     // The field's own label would take the host's ink; its name is ours, beside its well.
     const cells = Math.max(20, frame.columns - Math.ceil(CARD_FACE / CELL_PX) - Math.ceil(chOf(name)) - 10)
     return [
+      // Drawn, as the settings' own pickers are: the host's Select takes the host's ink, which a light
+      // theme leaves dark on this dark card (2026-10-31). The dashboard keeps the choices to five.
+      ...(alert.models.length > 1 ? [<Box key="compact-model-row" flexDirection="row" alignItems="center" columnGap={2} flexWrap="wrap"><Text {...k.sub}>{t(frame.lang, 'alerts.compactModel')}</Text>{segmented(el, frame, 'compact-model', alert.models, alert.pick, value => a.pickCompactModel(value))}</Box>] : []),
       <Box key="note-row" flexDirection="row" alignItems="center" columnGap={2} width="100%" minWidth={0}>
         <Text {...k.sub}>{name}</Text>
         {well(el, frame, 'note', cells, (
           <Field
             key="note"
             placeholder={placeholder}
-            value={alert.draft}
+            value={displayText(alert.draft, DISPLAY.conversation)}
             submitLabel={t(frame.lang, 'alerts.compactSubmit')}
             autoFocus
             onInput={(text: string) => a.noteInput(text)}
@@ -274,40 +233,7 @@ function drawnExtras(el: Els, frame: Frame, alert: AlertView, a: AlertActions, t
       </Box>,
     ]
   }
-  if (alert.kind !== 'handoffChoice') return []
-  const kinds: SegmentOption<HandoffKind>[] = [
-    { value: 'quick', label: t(frame.lang, 'alerts.quick') },
-    { value: 'full', label: t(frame.lang, 'alerts.full') },
-  ]
-  const afters: SegmentOption<Settings['handoffAfter']>[] = [
-    { value: 'continue', label: t(frame.lang, 'alerts.continue') },
-    { value: 'confirm', label: t(frame.lang, 'alerts.confirm') },
-    { value: 'copy', label: t(frame.lang, 'alerts.copy') },
-  ]
-  const names = [t(frame.lang, 'alerts.kind'), t(frame.lang, 'alerts.then')].map(n => n.trim())
-  const nameCells = Math.ceil(Math.max(...names.map(chOf))) + 1
-  const line = (key: string, name: string, control: RenderNode) => (
-    <Box key={key} flexDirection="row" alignItems="center" columnGap={2}>
-      <Box width={nameCells} flexShrink={0}>
-        <Text {...k.mute}>{name}</Text>
-      </Box>
-      {control}
-    </Box>
-  )
-  return [
-    <Box key="choices" flexDirection="column" rowGap={1}>
-      {line('kind', names[0]!, drawnSegmented(el, frame, 'kind', kinds, alert.handoffKind, kind => a.setHandoffKind(kind), tone))}
-      {line('after', names[1]!, drawnSegmented(el, frame, 'after', afters, alert.after, after => a.setHandoffAfter(after), tone))}
-      <Box paddingLeft={nameCells + 2}>
-        <Text {...k.mute} wrap="wrap">{afterHint(frame, alert.after)}</Text>
-      </Box>
-    </Box>,
-  ]
-}
-
-/** What the chosen "then" does, in a line: the names alone were read the wrong way (2026-10-13). */
-export function afterHint(frame: Frame, after: Settings['handoffAfter']): string {
-  return t(frame.lang, after === 'continue' ? 'alerts.continueHint' : after === 'confirm' ? 'alerts.confirmHint' : 'alerts.copyHint')
+  return []
 }
 
 function drawnAlert(el: Els, frame: Frame, alert: AlertView, a: AlertActions): RenderNode {
@@ -320,7 +246,7 @@ function drawnAlert(el: Els, frame: Frame, alert: AlertView, a: AlertActions): R
   // The note's field has its own submit, which is the main action there.
   const fieldSubmits = alert.kind === 'compactNote' && 'Input' in el
   const main = card.main && !fieldSubmits ? card.main : undefined
-  const more = drawnExtras(el, frame, alert, a, tone)
+  const more = drawnExtras(el, frame, alert, a)
   // The actions' cells, as drawn (each pill its own whole cells, a cell between, the way out last).
   const actionCells = quiet.reduce((n, c) => n + k.art.pill(c.label, 'ghost', tone).cells + 1, 0) + (main ? k.art.pill(main.label, 'primary', tone).cells + 1 : 0) + (card.close ? 4 : 0)
   const faceCells = Math.ceil(CARD_FACE / CELL_PX) + 2
@@ -329,8 +255,8 @@ function drawnAlert(el: Els, frame: Frame, alert: AlertView, a: AlertActions): R
   // Too narrow to keep the actions beside the words: they go under them.
   const actionsBelow = !oneRow && room - faceCells - actionCells < 30
   // Beside a title and a why of two lines, the actions sit at the card's middle, not on the title's
-  // line (2026-10-13: they rode high). Beside the handoff's options they stay by the title, the ×
-  // where a way out is looked for.
+  // line (2026-10-13: they rode high). Beside the compact note's field they stay by the title, the
+  // × where a way out is looked for.
   const buttons = (
     <Box key="actions" flexDirection="row" alignItems="center" alignSelf={more.length ? 'flex-start' : 'center'} columnGap={1} flexShrink={0} flexWrap="wrap" rowGap={1}>
       {quiet.map(c => pill(el, frame, c.key, c.label, 'ghost', c.onPress, tone))}
@@ -363,7 +289,7 @@ function drawnAlert(el: Els, frame: Frame, alert: AlertView, a: AlertActions): R
       {actionsBelow ? null : buttons}
     </Box>
   )
-  const rows = oneRow ? 2 : 4 + (more.length ? 3.2 : 0) + (actionsBelow ? 2 : 0) + (frame.columns < 60 ? 3 : 0)
+  const rows = oneRow ? 2 : 4 + (more.length ? 3.2 + (more.length - 1) * 2 : 0) + (actionsBelow ? 2 : 0) + (frame.columns < 60 ? 3 : 0)
   return capsule(el, frame, {
     key: 'alert-' + card.key,
     // The light comes from 리플이: on the title's line in one row, at the card's middle beside more.
@@ -385,7 +311,7 @@ export function renderAlert(el: Els, frame: Frame, alert: AlertView, a: AlertAct
   const buttons = [card.main ? press(card.main, true) : '', ...(card.quiet ?? []).map(c => press(c)), rich ? '' : close]
   // The terminal has no face: a text mark says it instead (work going on, done, failed or broken,
   // a warning, a question).
-  const mark = card.face === 'squeezing' || card.face === 'going' ? '…' : tone === 'ok' ? '✓' : tone === 'bad' ? '✕' : tone === 'warn' ? '▲' : '◉'
+  const mark = card.face === 'squeezing' || card.face === 'going' || card.face === 'working' ? '…' : tone === 'ok' ? '✓' : tone === 'bad' ? '✕' : tone === 'warn' ? '▲' : '◉'
   return speak(el, frame, {
     key: 'alert-' + card.key,
     face: card.face,

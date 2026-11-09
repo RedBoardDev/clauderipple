@@ -184,11 +184,15 @@
       case 'Button':
         return button(node, t, scope, prefix)
       case 'Svg': {
+        // The app refuses an Svg whose alt is blank once trimmed and draws nothing in its place.
+        if (!String(p.alt ?? '').trim()) return document.createComment('Svg refused: blank alt')
         const img = document.createElement('img')
         img.src = 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(p.source)
         img.alt = p.alt
         apply(img, { display: 'block', flexShrink: 0 })
-        if (p.width) img.style.width = p.width + 'px'
+        // A picture fills the cells laid out for it, up to its own width (parts.tsx `filled` hands
+        // the host twice the drawn width, STRETCH, so it can fill a cell wider than CELL_PX).
+        if (p.width) { img.style.width = '100%'; img.style.maxWidth = p.width + 'px' }
         if (p.height) img.style.height = p.height + 'px'
         return img
       }

@@ -11,21 +11,31 @@ const WINDOW_KIND: Record<number, string> = { 300: 'five_hour', 10080: 'seven_da
 /** A router snapshot older than this is not shown as the plan's figure. */
 export const CLAUDE_USAGE_STALE_MS = 15 * 60_000
 
+const asRecord = (v: unknown): Record<string, unknown> => v && typeof v === 'object' && !Array.isArray(v) ? v as Record<string, unknown> : {}
+
 /**
- * The plan windows of the Claude login this session's requests pass through, from the router's
- * GET /api/status (`claude.accounts[id=current].quota`, packages/router/src/admin.ts
+ * The Claude account row the router serves with now: the one `inUse` marks, else the app login
+ * (a router before that flag marks none and only lists `current`).
+ */
+function claudeRow(status: unknown): Record<string, unknown> | undefined {
+  const accounts = asRecord(asRecord(status).claude).accounts
+  if (!Array.isArray(accounts)) return undefined
+  const rows = accounts.map(asRecord)
+  return rows.find(a => a.inUse === true) ?? rows.find(a => a.id === 'current')
+}
+
+/**
+ * The plan windows of the Claude account this session's requests pass through, from the router's
+ * GET /api/status (`claude.accounts[inUse=true].quota`, packages/router/src/admin.ts
  * claudeAccountUsage): for when the host leaves `rateLimits` empty though the requests carry them
  * (measured 2026-10-14: the router passes the `anthropic-ratelimit-unified-*` headers through).
  * Percent as the router reports it; a stale or unknown snapshot gives nothing.
  */
 export function claudeLimitsFrom(status: unknown, now: number): SessionRateLimit[] {
-  const object = (v: unknown): Record<string, unknown> => v && typeof v === 'object' && !Array.isArray(v) ? v as Record<string, unknown> : {}
-  const accounts = object(object(status).claude).accounts
-  const current = Array.isArray(accounts) ? accounts.map(object).find(a => a.id === 'current') : undefined
-  const quota = object(current?.quota)
+  const quota = asRecord(claudeRow(status)?.quota)
   if (typeof quota.at !== 'number' || now - quota.at > CLAUDE_USAGE_STALE_MS) return []
-  const limits = object(quota.rate_limits)
-  return [limits.primary, limits.secondary].map(object).flatMap(w => {
+  const limits = asRecord(quota.rate_limits)
+  return [limits.primary, limits.secondary].map(asRecord).flatMap(w => {
     const kind = typeof w.window_minutes === 'number' ? WINDOW_KIND[w.window_minutes] : undefined
     if (!kind || typeof w.used_percent !== 'number' || !Number.isFinite(w.used_percent)) return []
     const reset = typeof w.reset_at === 'number' ? w.reset_at * (w.reset_at < 1e12 ? 1000 : 1) : NaN
@@ -37,19 +47,17 @@ export function claudeLimitsFrom(status: unknown, now: number): SessionRateLimit
 export type ScopedLimit = { name: string; percent: number; resetsAt?: string }
 
 /**
- * The per-model weekly windows of the Claude login, from the router's GET /api/status
- * (`claude.accounts[id=current].quota.scoped`: `{name, used_percent, window_minutes, reset_at}`,
- * reset in epoch seconds or ms). A stale or unknown snapshot gives nothing, like claudeLimitsFrom.
+ * The per-model weekly windows of the Claude account the pool serves with now, from the router's
+ * GET /api/status (`claude.accounts[inUse=true].quota.scoped`: `{name, used_percent,
+ * window_minutes, reset_at}`, reset in epoch seconds or ms). A stale or unknown snapshot gives
+ * nothing, like claudeLimitsFrom.
  */
 export function claudeScopedFrom(status: unknown, now: number): ScopedLimit[] {
-  const object = (v: unknown): Record<string, unknown> => v && typeof v === 'object' && !Array.isArray(v) ? v as Record<string, unknown> : {}
-  const accounts = object(object(status).claude).accounts
-  const current = Array.isArray(accounts) ? accounts.map(object).find(a => a.id === 'current') : undefined
-  const quota = object(current?.quota)
+  const quota = asRecord(claudeRow(status)?.quota)
   if (typeof quota.at !== 'number' || now - quota.at > CLAUDE_USAGE_STALE_MS) return []
   const scoped = quota.scoped
   if (!Array.isArray(scoped)) return []
-  return scoped.map(object).flatMap(entry => {
+  return scoped.map(asRecord).flatMap(entry => {
     if (typeof entry.name !== 'string' || !entry.name || typeof entry.used_percent !== 'number' || !Number.isFinite(entry.used_percent)) return []
     const reset = typeof entry.reset_at === 'number' ? entry.reset_at * (entry.reset_at < 1e12 ? 1000 : 1) : NaN
     return [{ name: entry.name, percent: Math.round(entry.used_percent * 10) / 10, ...(Number.isFinite(reset) ? { resetsAt: new Date(reset).toISOString() } : {}) }]
@@ -59,8 +67,11 @@ export function claudeScopedFrom(status: unknown, now: number): ScopedLimit[] {
 const KINDS = ['five_hour', 'seven_day', 'scoped', 'window'] as const
 type LimitKind = (typeof KINDS)[number]
 
+/** What every window of one `GET /api/limits` account shares: its provider and the account itself. */
+type LimitOwner = Pick<LimitItem, 'provider' | 'type' | 'title' | 'account' | 'accountLabel' | 'inUse'>
+
 /** One window of `GET /api/limits` as a limits-row item, or null when it carries nothing to show. */
-function limitItemFromWindow(w: unknown, provider: string, type: string | undefined, title: string | undefined, account: number, now: number): LimitItem | null {
+function limitItemFromWindow(w: unknown, owner: LimitOwner, now: number): LimitItem | null {
   const o = w && typeof w === 'object' && !Array.isArray(w) ? w as Record<string, unknown> : {}
   const kind = o.kind
   if (typeof kind !== 'string' || !(KINDS as readonly string[]).includes(kind)) return null
@@ -72,13 +83,10 @@ function limitItemFromWindow(w: unknown, provider: string, type: string | undefi
   // reports, not gone. Dropped, Claude's five-hour window vanished from the row the minute it reset,
   // and the row read as one of Claude's figures cut off (2026-10-20).
   if (Number.isFinite(reset) && reset <= now) {
-    return { provider, ...(type ? { type } : {}), ...(title ? { title } : {}), account, kind: kind as LimitKind, label: typeof o.label === 'string' ? o.label : '', ...(minutes !== undefined ? { windowMinutes: minutes } : {}), percent: 0 }
+    return { ...owner, kind: kind as LimitKind, label: typeof o.label === 'string' ? o.label : '', ...(minutes !== undefined ? { windowMinutes: minutes } : {}), percent: 0 }
   }
   return {
-    provider,
-    ...(type ? { type } : {}),
-    ...(title ? { title } : {}),
-    account,
+    ...owner,
     kind: kind as LimitKind,
     label: typeof o.label === 'string' ? o.label : '',
     ...(minutes !== undefined ? { windowMinutes: minutes } : {}),
@@ -88,9 +96,10 @@ function limitItemFromWindow(w: unknown, provider: string, type: string | undefi
 }
 
 /**
- * Every provider's windows from the router's `GET /api/limits`: one shape for Claude, each ChatGPT
- * account and each Antigravity account (see `buildLimits` in packages/router/src/admin.ts). The
- * providers keep the router's order (Claude first), and each account's windows keep theirs.
+ * Every provider's windows from the router's `GET /api/limits`: one shape for each Claude, ChatGPT
+ * and Antigravity account (see `buildLimits` in packages/router/src/admin.ts), each window carrying
+ * its account's label and in-use mark. The providers keep the router's order (Claude first), and
+ * each account's windows keep theirs.
  */
 export function routerLimitItems(body: unknown, now: number): LimitItem[] {
   const object = (v: unknown): Record<string, unknown> => v && typeof v === 'object' && !Array.isArray(v) ? v as Record<string, unknown> : {}
@@ -107,11 +116,19 @@ export function routerLimitItems(body: unknown, now: number): LimitItem[] {
     if (!Array.isArray(accounts)) continue
     for (const a of accounts) {
       const account = object(a)
-      const index = typeof account.account === 'number' ? account.account : 0
       const windows = account.windows
       if (!Array.isArray(windows)) continue
+      // The account's label and in-use mark are newer (2026-11-04); an older router sends neither.
+      const owner: LimitOwner = {
+        provider,
+        ...(type ? { type } : {}),
+        ...(title ? { title } : {}),
+        account: typeof account.account === 'number' ? account.account : 0,
+        ...(typeof account.label === 'string' && account.label ? { accountLabel: account.label } : {}),
+        ...(account.inUse === true ? { inUse: true as const } : {}),
+      }
       for (const w of windows) {
-        const item = limitItemFromWindow(w, provider, type, title, index, now)
+        const item = limitItemFromWindow(w, owner, now)
         if (item) out.push(item)
       }
     }
@@ -138,11 +155,46 @@ export function saveUntil(hot: Hot | null, now: number): number {
   return Number.isFinite(reset) && reset > now ? reset : now + 5 * 3600000
 }
 
-/** The context percent when it is at or past `swampAt`, else null. */
-export function swamped(context: SessionContextUsage | null, swampAt: number): number | null {
+/** The context share at which the heavy band turns amber, and its alert opens (a fixed 80%). */
+export const HEAVY_PERCENT = 80
+
+/**
+ * The context percent when it is at or past `HEAVY_PERCENT`, else null. The context atom's percent
+ * is already measured against the compaction window (register.tsx `refreshUsage`).
+ */
+export function swamped(context: SessionContextUsage | null, at: number = HEAVY_PERCENT): number | null {
   if (!context || context.tokens === undefined) return null
   const percent = context.percent ?? (context.window > 0 ? context.tokens / context.window * 100 : undefined)
-  return percent !== undefined && percent >= swampAt ? percent : null
+  return percent !== undefined && percent >= at ? percent : null
+}
+
+/**
+ * The window the context share is measured against: Claude Code's own compaction point
+ * (`autoCompactWindow`) while it is below the model's window, else the model's window.
+ */
+export function contextWindow(window: number, compactAt: number | null | undefined, resolvedWindow?: number | null): number {
+  if (resolvedWindow !== null && resolvedWindow !== undefined && resolvedWindow > 0) return resolvedWindow
+  return compactAt !== null && compactAt !== undefined && compactAt > 0 && compactAt < window ? compactAt : window
+}
+
+/**
+ * Whether the token-count API counts this model's context: only Anthropic's own models. A routed
+ * model's count is ClaudeRipple's characters-over-four estimate, item by item (router
+ * `count_tokens`), so a "precise" count there is no more precise than the local estimate, and less
+ * so once the estimate's total is reconciled to the measured input (2026-10-30).
+ */
+export function countsPrecisely(model: string): boolean {
+  return /^claude-|^(?:opus|sonnet|haiku|fable|mythos)(?:[@[]|$)/.test(model)
+}
+
+/** Per-model effective window from the router; null also supports routers predating this field. */
+export function modelCompactWindow(body: unknown, model: string): number | null {
+  const object = (v: unknown): Record<string, unknown> => v && typeof v === 'object' && !Array.isArray(v) ? v as Record<string, unknown> : {}
+  const map = object(object(body).resolvedWindows)
+  const base = model.split('@')[0]!
+  const entry = object(map[model] ?? map[base] ?? map[base.replace(/-\d{8}$/, '')])
+  const value = entry.compactWindow
+  return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : null
 }
 
 export function coldAlert(memo: CacheMemo | null, contextTokens: number, now: number, hidden: boolean): boolean {
@@ -188,9 +240,9 @@ export function swampAlert(percent: number | null, hidden: number | null): boole
 
 /** Rendering consumes eligibility, keeping dismissal and idle decisions outside drawing code. */
 export function bandPriority(state: {
-  panel?: 'settings' | 'compact' | 'clear' | 'handoff' | 'setup' | null
+  panel?: 'settings' | 'compact' | 'clear' | 'setup' | null
   judgeDown?: boolean; hot?: boolean; result?: boolean; cold?: boolean; swamp?: boolean; kept?: boolean
-}): 'settings' | 'compact' | 'clear' | 'handoff' | 'setup' | 'judgeDown' | 'hot' | 'result' | 'cold' | 'swamp' | 'kept' | 'dashboard' {
+}): 'settings' | 'compact' | 'clear' | 'setup' | 'judgeDown' | 'hot' | 'result' | 'cold' | 'swamp' | 'kept' | 'dashboard' {
   if (state.panel) return state.panel
   for (const band of ['judgeDown', 'hot', 'result', 'cold', 'swamp', 'kept'] as const) if (state[band]) return band
   return 'dashboard'

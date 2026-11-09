@@ -51,7 +51,27 @@ jobs:
           grep -q "VERSION = \"$tag\"" packages/router/src/version.ts || { echo "::error::packages/router/src/version.ts is not $tag"; exit 1; }
 
       - run: npm run typecheck
+      - run: npm run check:mod
       - run: npm test
+
+      # What npm will publish, installed into an empty prefix and inspected: a tarball that is
+      # missing dist/ installs a command that cannot run, and the published package is the only
+      # artifact nobody can test by reading it afterwards (G-D13). Nothing here starts the CLI or
+      # touches an installation; the version-tag check above already ties the tarball to the tag.
+      - name: Packed tarball carries everything an install runs
+        run: |
+          set -euo pipefail
+          tmp="$(mktemp -d)"
+          trap 'rm -rf "$tmp"' EXIT
+          npm pack --silent
+          tgz="$(ls clauderipple-*.tgz | head -n 1)"
+          npm install --prefix "$tmp/lib" --no-audit --no-fund --ignore-scripts "./$tgz" >/dev/null
+          root="$tmp/lib/node_modules/clauderipple"
+          for file in bin/clauderipple.js dist/cli/src/index.js dist/router/src/index.js \
+                      dist/ui/index.html dist/mod/hooks/register.tsx dist/app/dist/main.js; do
+            [ -f "$root/$file" ] || { echo "::error::$file is missing from the published package"; exit 1; }
+          done
+          node -e "const p=require('$root/package.json'); if(p.bin?.clauderipple!=='bin/clauderipple.js') { console.error('::error::the package bin is not the CLI'); process.exit(1) }"
 
       - name: Publish
         if: github.event_name == 'push'

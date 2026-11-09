@@ -23,7 +23,8 @@ export type Runtime = {
 function appBundlePath(value: string | undefined): string | null {
   if (!value) return null;
   const match = value.match(/^(.*\.app)\/Contents(?:\/|$)/);
-  return match?.[1] ?? null;
+  // Electron.app belongs to the separately installed npm tray runtime, not our packaged app.
+  return match?.[1] && path.basename(match[1]) === "ClaudeRipple.app" ? match[1] : null;
 }
 
 export function runtime(): Runtime {

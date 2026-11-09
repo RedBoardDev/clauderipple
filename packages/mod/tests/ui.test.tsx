@@ -5,24 +5,28 @@
 // plugin's may not). The engine validates every tree against the surface's element table, and
 // presses reach the callbacks below, so these check both the trees and their wiring.
 
-import { expect, test } from 'claude-code/testing'
+import { expect, mock, test } from 'claude-code/testing'
 import type { Engine } from 'claude-code/testing'
 import type { On, RenderElement, RenderPropsOf } from 'claude-code'
 
-import type { AgentRec, Settings, Skin, StatusRequest } from '../types'
+import type { AgentRec, BgTask, Settings, Skin, StatusRequest } from '../types'
 import { STRINGS } from '../hooks/i18n'
 import { normalizeSettings } from '../hooks/settings'
-import { cardRows, renderAgents, talkOf, timeCells } from '../hooks/ui/agents'
+import { DONE_SHOWN, cardRows, renderAgents, talkOf, timeCells } from '../hooks/ui/agents'
 import { chOf, displayWidth } from '../hooks/ui/theme'
-import { commandLine, runSummary, shortPath, toolDetail } from '../hooks/ui/tools'
+import { commandLine, editLines, runDiff, runSummary, shortPath, toolDetail } from '../hooks/ui/tools'
 import { renderAlert } from '../hooks/ui/alerts'
-import { BAND_RIPPLE, CREST_CELLS, bandMood, besideBand, modeLabel, renderBand, renderFooter } from '../hooks/ui/band'
+import { BAND_RIPPLE, CREST_CELLS, bandMood, besideBand, modeLabel, renderBand, renderFooter, routeFact } from '../hooks/ui/band'
+import { renderLimits } from '../hooks/ui/limits'
+import { renderPhoneQueue } from '../hooks/ui/queue'
 import { rippleSource } from '../hooks/ui/parts'
+import { pic } from '../hooks/ui/kit'
+import { CELL_PX, SVG_MAX_PX, svg } from '../hooks/ui/art'
 import { renderLog } from '../hooks/ui/log'
 import { renderSettings } from '../hooks/ui/settings'
 import { renderSetup } from '../hooks/ui/setup'
 import { countdown, elapsed, minutesLeft, modelName, nextMinuteChange, resetsLabel, routeOf, seconds, targetOf, targetValue } from '../hooks/ui/view'
-import type { AgentEntry, AgentsActions, AlertView, DashboardView, Frame, JevState, SettingsActions, Surface } from '../hooks/ui/view'
+import type { AgentEntry, AgentsActions, AgentsView, AlertView, DashboardView, Frame, JevState, SettingsActions, Surface } from '../hooks/ui/view'
 
 const SURFACES = ['terminal', 'desktop'] as const
 const NOW = Date.parse('2026-10-10T13:20:00')
@@ -34,6 +38,11 @@ function paneProps(columns: number, rows = 30): RenderPropsOf['Pane'] {
 
 function frameOf(surface: Surface, columns = 140, maxRows = 12, skin: Skin = 'deep'): Frame {
   return { surface, columns, maxRows, now: NOW, appearance: 'auto', skin, lang: 'en' }
+}
+
+/** The drawn picture whose `alt` is `alt` (a query matches no `alt` of its own). */
+async function svgByAlt(ui: { findAll: (q: { type: string }) => Promise<{ props: Record<string, unknown> }[]> }, alt: string) {
+  return (await ui.findAll({ type: 'Svg' })).find(svg => svg.props.alt === alt)
 }
 
 /** Records which callback ran, with what. */
@@ -55,13 +64,11 @@ const DASH: DashboardView = {
   route: { model: 'gpt-6.1-sol', provider: 'chatgpt', ok: true, resent: false, status: '200', effort: 'high', cachePct: 96, seconds: 2.1 },
   notice: null,
   auto: true,
-  handoff: 'off',
   agents: { live: 0, total: 0 },
   compactions: 0,
   logOpen: false,
   agentsOpen: false,
   effortMenu: false,
-  swampAt: 50,
   hide: [],
   extras: ['context'],
   isWorking: false,
@@ -80,11 +87,7 @@ const SETTINGS: Settings = normalizeSettings({
   keepWarm: false,
   keepWarmHours: 2,
   keepWarmMinTokens: 30_000,
-  compactWith: 'haiku',
-  handoffSkill: '',
-  handoffAfter: 'continue',
-  handoffButton: 'advised',
-  swampAt: 50,
+  compactModel: 'claude-haiku-5-5',
   layout: 'dashboard',
   appearance: 'auto',
   language: 'auto',
@@ -101,7 +104,7 @@ function drawPane(on: On, id: string, draw: Draw) {
   on('ui.render', { component: 'Pane', requestId: id }, ($, e) => draw($.ui.resolve(e), e.surface) as RenderElement)
 }
 
-function mount($: Engine, id: string, surface: (typeof SURFACES)[number], columns = 140) {
+function mount<S extends Surface>($: Engine, id: string, surface: S, columns = 140) {
   return $.ui.mount({ plugin: PRESSER, surface, component: 'Pane', requestId: id, props: paneProps(columns), viewport: { columns, rows: 40 } })
 }
 
@@ -151,17 +154,18 @@ test('view helpers', () => {
 test('the band draws on both surfaces and its controls reach their callbacks', async ($, on) => {
   const { calls, fn } = recorder()
   const actions = {
-    toggleAuto: fn('auto'), toggleWarm: fn("warm"), compact: fn("compact"), clear: fn("clear"), handoff: fn("handoff"), toggleLog: fn('log'),
+    toggleAuto: fn('auto'), toggleWarm: fn("warm"), compact: fn("compact"), clear: fn("clear"), handoff: fn('handoff'), toggleLog: fn('log'),
     toggleAgents: fn('agents'), openSettings: fn('settings'), toggleEffortMenu: fn('menu'), pickEffort: fn('pick'),
   }
   drawPane(on, 'band', (el, surface) => renderBand(el, frameOf(surface), DASH, actions))
   drawPane(on, 'band-busy', (el, surface) =>
-    renderBand(el, frameOf(surface), { ...DASH, effort: { level: null, mode: 'deciding', since: NOW - 500 }, warm: { on: true, pings: 2, cost: 9000 }, limit: { kind: 'five_hour', percent: 86, resetsAt: '2026-10-10T15:40:00', save: true }, handoff: 'advised', agents: { live: 2, total: 3 }, effortMenu: true }, actions),
+    renderBand(el, frameOf(surface), { ...DASH, effort: { level: null, mode: 'deciding', since: NOW - 500 }, warm: { on: true, pings: 2, cost: 9000 }, limit: { kind: 'five_hour', percent: 86, resetsAt: '2026-10-10T15:40:00', save: true }, agents: { live: 2, total: 3 }, effortMenu: true }, actions),
   )
   for (const surface of SURFACES) {
     const ui = await mount($, 'band', surface)
     // Compact and clear are the desktop's icons; the terminal has no Log (the route is its own press)…
-    const keys = surface === 'terminal' ? ['auto', 'warm', 'log', 'agents', 'settings'] : ['auto', 'warm', 'agents', 'compact', 'clear', 'settings']
+    // Handoff shows on both, always (2026-10-24).
+    const keys = surface === 'terminal' ? ['handoff', 'auto', 'warm', 'log', 'agents', 'settings'] : ['handoff', 'auto', 'warm', 'agents', 'compact', 'clear', 'settings']
     // …but no Compact clear card here: the desktop's Compact opens the note bar from the band.
     if (surface === 'terminal') expect(await ui.find({ key: 'compact' })).toBeUndefined()
     for (const key of keys) {
@@ -194,8 +198,6 @@ test('the band draws on both surfaces and its controls reach their callbacks', a
     await ui.unmount()
 
     const busy = await mount($, 'band-busy', surface)
-    expect(await busy.find({ key: 'handoff' }), "busy { key: 'handoff' } " + surface).toBeDefined()
-    await busy.press({ key: 'handoff' })
     await busy.press({ key: 'pick-low' })
     if (surface === 'desktop') {
       expect(await busy.find({ type: 'Text', text: 'Deciding…' })).toBeDefined()
@@ -211,9 +213,9 @@ test('the band draws on both surfaces and its controls reach their callbacks', a
   expect(calls.filter(c => c === 'log').length).toBe(2)
   expect(calls.filter(c => c === 'compact').length).toBe(1)
   expect(calls.filter(c => c === 'clear').length).toBe(1)
+  expect(calls.filter(c => c === 'handoff').length).toBe(2)
   expect(calls.filter(c => c === 'menu').length).toBe(1)
   expect(calls.filter(c => c === 'pick:["low"]').length).toBe(2)
-  expect(calls.filter(c => c === 'handoff').length).toBe(2)
 })
 
 test('the band draws the same markup for the same view', async ($, on) => {
@@ -280,18 +282,18 @@ const ALERTS: AlertView[] = [
   { kind: 'swamp', percent: 63, tokens: 126_000 },
   { kind: 'hot', limitKind: 'five_hour', percent: 86, resetsAt: '2026-10-10T15:40:00', save: false },
   { kind: 'judgeDown', judge: 'jev', reason: 'key rejected (401)' },
-  { kind: 'result', stage: 'handingOff', handoffKind: 'quick' },
-  { kind: 'result', stage: 'handoffDone' },
+  { kind: 'result', stage: 'handingOff' },
+  { kind: 'result', stage: 'handoffDone', detail: 'A new session opened with the handoff filled in: press Enter there to go on.' },
+  { kind: 'result', stage: 'tidying' },
   { kind: 'result', stage: 'compacting' },
   { kind: 'result', stage: 'compacted' },
   { kind: 'result', stage: 'failed', detail: 'Haiku timed out' },
-  { kind: 'compactNote', draft: '' },
-  { kind: 'handoffChoice', handoffKind: 'quick', after: 'continue' },
+  { kind: 'compactNote', draft: '', tidy: true, pick: 'claude-haiku-5-5', models: [{ value: 'claude-haiku-5-5', label: 'Claude Haiku' }], cold: false },
 ]
 
 test('every alert draws on both surfaces', async ($, on) => {
   const noop = () => undefined
-  const actions = { compact: noop, clear: noop, handoff: noop, dismiss: noop, toggleSave: noop, openSettings: noop, noteInput: noop, setHandoffKind: noop, setHandoffAfter: noop, go: noop, copy: noop, openNew: noop }
+  const actions = { compact: noop, clear: noop, dismiss: noop, toggleSave: noop, openSettings: noop, noteInput: noop, toggleTidy: noop, pickCompactModel: noop, copy: noop }
   ALERTS.forEach((alert, i) => drawPane(on, 'alert-' + i, (el, surface) => renderAlert(el, frameOf(surface), alert, actions)))
   for (const surface of SURFACES) {
     for (let i = 0; i < ALERTS.length; i++) {
@@ -305,33 +307,38 @@ test('every alert draws on both surfaces', async ($, on) => {
 test('alert choices reach their callbacks', async ($, on) => {
   const { calls, fn } = recorder()
   const actions = {
-    compact: fn("compact"), clear: fn("clear"), handoff: fn("handoff"), dismiss: fn("dismiss"), toggleSave: fn('save'), openSettings: fn('settings'), noteInput: fn('note'),
-    setHandoffKind: fn('kind'), setHandoffAfter: fn('after'), go: fn('go'), copy: fn('copy'), openNew: fn('open-new'),
+    compact: fn("compact"), clear: fn("clear"), dismiss: fn("dismiss"), toggleSave: fn('save'), openSettings: fn('settings'), noteInput: fn('note'), toggleTidy: fn('tidy'), pickCompactModel: fn('model'), copy: fn('copy'),
   }
   drawPane(on, 'cold', (el, surface) => renderAlert(el, frameOf(surface), ALERTS[0]!, actions))
   drawPane(on, 'kept', (el, surface) => renderAlert(el, frameOf(surface), ALERTS[1]!, actions))
   drawPane(on, 'hot', (el, surface) => renderAlert(el, frameOf(surface), ALERTS[3]!, actions))
-  drawPane(on, 'note', (el, surface) => renderAlert(el, frameOf(surface), { kind: 'compactNote', draft: '' }, actions))
-  drawPane(on, 'choice', (el, surface) => renderAlert(el, frameOf(surface), ALERTS[11]!, actions))
+  drawPane(on, 'note', (el, surface) => renderAlert(el, frameOf(surface), { kind: 'compactNote', draft: '', tidy: true, pick: 'claude-haiku-5-5', models: [{ value: 'claude-haiku-5-5', label: 'Claude Haiku' }], cold: false }, actions))
+  drawPane(on, 'handed', (el, surface) => renderAlert(el, frameOf(surface), { kind: 'result', stage: 'handoffDone' }, actions))
   for (const surface of SURFACES) {
     const cold = await mount($, 'cold', surface)
     await cold.press({ key: 'compact' })
-    await cold.press({ key: 'handoff' })
     await cold.press({ key: 'dismiss' })
     const kept = await mount($, 'kept', surface)
     await kept.press({ key: 'dismiss' })
     const hot = await mount($, 'hot', surface)
     await hot.press({ key: 'save' })
     const note = await mount($, 'note', surface)
+    await note.press({ key: 'tidy' })
     await note.input({ key: 'note', text: 'keep the API decision' })
-    const choice = await mount($, 'choice', surface)
-    await choice.press({ key: 'kind-full' })
-    await choice.press({ key: 'after-copy' })
-    await choice.press({ key: 'go' })
+    const handed = await mount($, 'handed', surface)
+    await handed.press({ key: 'copy' })
   }
-  const once = ['compact', 'handoff', 'dismiss', 'dismiss', 'save', 'compact:["keep the API decision"]', 'kind:["full"]', 'after:["copy"]', 'go']
+  const once = ['compact', 'dismiss', 'dismiss', 'save', 'tidy', 'compact:["keep the API decision"]', 'copy']
   expect(calls).toEqual([...once, ...once])
 })
+
+/**
+ * The px a picture is drawn at: its document's own width. The Svg asks wider than that and fills
+ * the cells laid out for it (kit.tsx `filled`), so its `width` prop is not its size.
+ */
+function ownPx(picture: Drawn): number {
+  return Number(/^<svg\b[^>]*?\swidth="([\d.]+)"/.exec(String(picture.props?.source))?.[1])
+}
 
 /** The mascot pictures in a drawn tree: the Svgs on its 56 grid. */
 function mascots(tree: unknown): Drawn[] {
@@ -344,7 +351,7 @@ function mascots(tree: unknown): Drawn[] {
 
 test('each alert shows 리플이 with the face of its state, its gauge in 5% steps; the terminal keeps a text mark', async ($, on) => {
   const noop = () => undefined
-  const actions = { compact: noop, clear: noop, handoff: noop, dismiss: noop, toggleSave: noop, openSettings: noop, noteInput: noop, setHandoffKind: noop, setHandoffAfter: noop, go: noop, copy: noop, openNew: noop }
+  const actions = { compact: noop, clear: noop, dismiss: noop, toggleSave: noop, openSettings: noop, noteInput: noop, toggleTidy: noop, pickCompactModel: noop, copy: noop }
   const variants: [string, AlertView][] = [
     ['swamp-59', { kind: 'swamp', percent: 59, tokens: 118_000 }],
     ['swamp-61', { kind: 'swamp', percent: 61, tokens: 122_000 }],
@@ -360,7 +367,7 @@ test('each alert shows 리플이 with the face of its state, its gauge in 5% ste
     const found = mascots(await ui.drawn())
     expect(found.length, 'alert ' + i).toBe(1)
     // The full drawing (34 px up): brows and mouth say what the card is about.
-    expect(found[0]!.props?.width).toBe(34)
+    expect(ownPx(found[0]!)).toBe(34)
     // An image, not a frame: the desktop rebuilds a frame blank on each redraw.
     expect(found[0]!.props?.isInteractive, 'alert ' + i).toBeFalsy()
     sources.push(String(found[0]!.props?.source))
@@ -369,9 +376,8 @@ test('each alert shows 리플이 with the face of its state, its gauge in 5% ste
     expect(mascots(await terminal.drawn()).length).toBe(0)
     await terminal.unmount()
   }
-  // handoffDone, compacted and kept share the pleased face, compactNote and handoffChoice the
-  // asking one; every other state has its own.
-  expect(new Set(sources).size).toBe(ALERTS.length - 3)
+  // handoffDone, compacted and kept share the pleased face; every other state has its own.
+  expect(new Set(sources).size).toBe(ALERTS.length - 2)
   const source = async (id: string) => {
     const ui = await mount($, id, 'desktop')
     const s = String(mascots(await ui.drawn())[0]?.props?.source)
@@ -402,7 +408,7 @@ test('리플이 greets in setup and quick settings and waits in empty panes, nev
     const found = mascots(await ui.drawn())
     expect(found.length, id).toBe(count)
     if (tone) expect(String(found[0]!.props?.source).includes('stroke="' + tone + '"'), id).toBe(true)
-    if (size) expect(found[0]!.props?.width, id).toBe(size)
+    if (size) expect(ownPx(found[0]!), id).toBe(size)
     await ui.unmount()
     const terminal = await mount($, id, 'terminal', 64)
     expect(mascots(await terminal.drawn()).length, id).toBe(0)
@@ -490,12 +496,12 @@ const DEEP_INKS = ['#f2f0eb', '#cbc8bf', '#9c988e']
 test('every skin draws the band, the quick settings and a card on the desktop; flat paints the app\'s surface and its quiet words', async ($, on) => {
   const noop = () => undefined
   const bandActions = { toggleAuto: noop, toggleWarm: noop, compact: noop, clear: noop, handoff: noop, toggleLog: noop, toggleAgents: noop, openSettings: noop, toggleEffortMenu: noop, pickEffort: noop, hide: noop }
-  const alertActions = { compact: noop, clear: noop, handoff: noop, dismiss: noop, toggleSave: noop, openSettings: noop, noteInput: noop, setHandoffKind: noop, setHandoffAfter: noop, go: noop, copy: noop, openNew: noop }
-  const full: DashboardView = { ...DASH, extras: ['context', 'limits'], limit: { kind: 'five_hour', percent: 42, save: true }, handoff: 'advised', effortMenu: true, warm: { on: true, pings: 2, cost: 9000 }, agents: { live: 2, total: 3 }, mode: 'Burn GPT' }
+  const alertActions = { compact: noop, clear: noop, dismiss: noop, toggleSave: noop, openSettings: noop, noteInput: noop, toggleTidy: noop, pickCompactModel: noop, copy: noop }
+  const full: DashboardView = { ...DASH, extras: ['context', 'limits'], limit: { kind: 'five_hour', percent: 42, save: true }, effortMenu: true, warm: { on: true, pings: 2, cost: 9000 }, agents: { live: 2, total: 3 }, mode: 'Burn GPT' }
   for (const skin of SKINS) {
     drawPane(on, skin + '-band', el => renderBand(el, frameOf('desktop', 100, 12, skin), full, bandActions))
     drawPane(on, skin + '-quick', el => renderSettings(el, frameOf('desktop', 140, 12, skin), { settings: { ...SETTINGS, skin, jevSource: 'typesafe' }, jev: { source: null, test: { state: 'fail', message: 'no' } } }, QUICK_ACTIONS))
-    drawPane(on, skin + '-card', el => renderAlert(el, frameOf('desktop', 100, 12, skin), { kind: 'handoffChoice', handoffKind: 'quick', after: 'continue' }, alertActions))
+    drawPane(on, skin + '-card', el => renderAlert(el, frameOf('desktop', 100, 12, skin), { kind: 'compactNote', draft: '', tidy: true, pick: 'claude-haiku-5-5', models: [{ value: 'claude-haiku-5-5', label: 'Claude Haiku' }], cold: false }, alertActions))
     drawPane(on, skin + '-setup', el => renderSetup(el, frameOf('desktop', 100, 12, skin), { step: 1, draft: SETTINGS, jev: { source: null, test: { state: 'idle' } } }, { patch: noop, jevKey: noop, testJev: noop, openAllSettings: noop, back: noop, next: noop, finish: noop, skip: noop }))
   }
   for (const skin of SKINS) {
@@ -504,6 +510,8 @@ test('every skin draws the band, the quick settings and a card on the desktop; f
       const svgs = await ui.findAll({ type: 'Svg' })
       expect(svgs.length, skin + ' ' + what + ' pictures').toBeGreaterThan(3)
       for (const svg of svgs) expect(String(svg.props.source), skin + ' ' + what + ' ' + svg.props.alt).not.toMatch(/NaN|undefined/)
+      // The desktop draws nothing for a picture whose alt is blank.
+      for (const svg of svgs) expect(String(svg.props.alt ?? '').trim(), skin + ' ' + what + ' alt').not.toBe('')
       // The capsule's backdrop: a picture as wide as the frame (flat's is the app's own surface).
       const backdrop = svgs.some(svg => svg.props.alt === 'ClaudeRipple' && Number(svg.props.width) > 300)
       expect(backdrop, skin + ' ' + what + ' backdrop').toBe(true)
@@ -516,6 +524,33 @@ test('every skin draws the band, the quick settings and a card on the desktop; f
       }
       await ui.unmount()
     }
+  }
+})
+
+test('band, settings and log pictures stay within the SVG limit on every surface and theme', async ($, on) => {
+  const cases: { id: string; columns: number }[] = []
+  const logRows: StatusRequest[] = Array.from({ length: 40 }, (_, i) => ({ at: new Date(NOW - i * 1000).toISOString(), source: 'gpt-6.1-sol', target: 'gpt-6.1-sol', provider: 'chatgpt', status: 200, ok: true, ms: 100 }))
+  for (const skin of SKINS) for (const appearance of ['light', 'dark'] as const) for (const columns of [40, 600]) {
+    const frame = (surface: Surface): Frame => ({ ...frameOf(surface, columns, 12, skin), appearance })
+    const variants: [string, Draw][] = [
+      ['band', (el, surface) => renderBand(el, frame(surface), { ...DASH, effortMenu: true }, BAND_ACTIONS)],
+      ['settings', (el, surface) => renderSettings(el, frame(surface), { settings: SETTINGS, jev: { source: null, test: { state: 'idle' } } }, QUICK_ACTIONS)],
+      ['log', (el, surface) => renderLog(el, frame(surface), { rows: logRows, mineOnly: false }, { toggleScope: () => undefined })],
+    ]
+    for (const [name, draw] of variants) {
+      const id = [name, skin, appearance, columns].join('-')
+      drawPane(on, id, draw)
+      cases.push({ id, columns })
+    }
+  }
+  for (const { id, columns } of cases) for (const surface of ['terminal', 'desktop', 'vscode', 'mobile'] as const) {
+    const ui = await mount($, id, surface, columns)
+    expect((await ui.findAll({ type: 'Text' })).length > 0, id + ' ' + surface).toBe(true)
+    for (const picture of await ui.findAll({ type: 'Svg' })) {
+      expect(Number(picture.props.width) <= SVG_MAX_PX, id + ' width').toBe(true)
+      expect(Number(picture.props.height ?? 0) <= SVG_MAX_PX, id + ' height').toBe(true)
+    }
+    await ui.unmount()
   }
 })
 
@@ -623,15 +658,205 @@ test('the Agents pane draws live, finished and empty', async ($, on) => {
       expect(why, surface).toBeDefined()
       expect(why?.text).toContain('ui/')
     } else expect(why, surface).toBeUndefined()
-    // The API's own counts: 1200 + 38000 + 800 in, 95% of it from the cache, 5100 out, 12 tools.
-    if (surface === 'terminal') expect(await ui.find({ type: 'Text', text: 'in 40k · cache 95% · out 5.1k · tools 12' }), surface).toBeDefined()
-    else for (const value of ['40k', '95%', '5.1k', '12']) expect(await ui.find({ type: 'Text', text: value }), value).toBeDefined()
+    // The Claude app's count: the last prompt (1200 + 38000 + 800) plus the reply (5100), the cache's
+    // 95% share, and 12 tools.
+    if (surface === 'terminal') expect(await ui.find({ type: 'Text', text: 'tokens 45k · cache 95% · tools 12' }), surface).toBeDefined()
+    else for (const value of ['45k', '95%', '12']) expect(await ui.find({ type: 'Text', text: value }), value).toBeDefined()
     // Two agents finished: nothing hides behind "more".
     expect(await ui.find({ type: 'Button', key: 'done' }), surface).toBeUndefined()
     const empty = await mount($, 'agents-empty', surface, 64)
-    expect(await empty.find({ type: 'Text', text: 'No agents yet' }), "empty { type: 'Text', text: 'No agents yet' } " + surface).toBeDefined()
+    expect(await empty.find({ type: 'Text', text: 'No agents or background tasks yet' }), "empty { type: 'Text', text: 'No agents or background tasks yet' } " + surface).toBeDefined()
   }
   expect(calls).toEqual([])
+})
+
+test('the Agents pane draws forty agents at once, and a record missing its title or type', async ($, on) => {
+  // 2026-10-23: a session of dozens of workers left the pane on the engine's "Nothing to show yet":
+  // the list's capsule asked for a sea taller than the 4096 px an Svg may be, and the engine refused
+  // the whole tree. The store keeps the latest 40 finished; the list draws thirty cards of them.
+  const forty: AgentRec[] = Array.from({ length: 40 }, (_, i): AgentRec => ({ ...AGENTS[0]!, id: 'w' + i, description: 'cheongju:송수아 ' + i, ...(i < 31 ? {} : { state: 'done', endedAt: NOW - i * 1000, now: undefined, toolSince: undefined }) }))
+  // A record as an older mod or the engine may leave it: no description, no type, no model.
+  const bare: AgentRec = { id: 'bare', state: 'done', startedAt: NOW - 5000, endedAt: NOW - 1000, cost: 0 }
+  const cases: { id: string; columns: number }[] = []
+  for (const skin of SKINS) for (const appearance of ['light', 'dark'] as const) for (const columns of [40, 64]) {
+    const id = [skin, appearance, columns].join('-')
+    const frame = (surface: Surface) => ({ ...frameOf(surface, columns, 12, skin), appearance })
+    drawPane(on, 'forty-' + id, (el, surface) => renderAgents(el, frame(surface), { agents: forty, now: NOW, showDone: true }, AGENT_NOOP))
+    drawPane(on, 'bare-' + id, (el, surface) => renderAgents(el, frame(surface), { agents: [AGENTS[0]!, bare], now: NOW, showDone: true }, AGENT_NOOP))
+    cases.push({ id, columns })
+  }
+  for (const { id, columns } of cases) {
+    for (const surface of ['terminal', 'desktop', 'vscode', 'mobile'] as const) {
+      const ui = await mount($, 'forty-' + id, surface, columns)
+      // The title is the whole title on one line (the engine cuts it at the edge), so every card has it.
+      for (const i of [1, 30, 31, 34]) expect(await ui.find({ type: 'Text', text: 'cheongju:송수아 ' + i }), surface + ' ' + id + ' ' + i).toBeDefined()
+      // Thirty cards at most: the oldest running one and the finished past the room are counted.
+      for (const i of [0, 35]) expect(await ui.find({ type: 'Text', text: 'cheongju:송수아 ' + i }), surface + ' ' + id + ' ' + i).toBeUndefined()
+      for (const count of [1, 5]) expect(await ui.find({ type: 'Text', text: 'The ' + count + ' oldest are not listed' }), surface + ' ' + id + ' ' + count).toBeDefined()
+      const pictures = await ui.findAll({ type: 'Svg' })
+      if (surface === 'terminal' || surface === 'mobile') expect(pictures).toHaveLength(0)
+      else for (const picture of pictures) {
+        expect(Number(picture.props.width) <= SVG_MAX_PX).toBe(true)
+        expect(Number(picture.props.height ?? 0) <= SVG_MAX_PX).toBe(true)
+      }
+      await ui.unmount()
+      const one = await mount($, 'bare-' + id, surface, columns)
+      expect(await one.find({ type: 'Text', text: 'Port the request log renderer' }), surface + ' ' + id).toBeDefined()
+      expect(await one.find({ type: 'Text', text: 'bare' }), surface + ' ' + id).toBeDefined()
+      await one.unmount()
+    }
+  }
+})
+
+test('the Agents pane draws at most thirty cards, the latest running first, however many it holds', async ($, on) => {
+  // 2026-11-01: past about 70 cards the desktop left the pane on "Nothing to show yet", though the
+  // engine took the tree. Running records never age out of the store, so they can pile up.
+  const running: AgentRec[] = Array.from({ length: 120 }, (_, i): AgentRec => ({ ...AGENTS[0]!, id: 'run-' + i, description: 'run ' + i + ' end', startedAt: NOW - 200_000 + i }))
+  const done: AgentRec[] = Array.from({ length: 40 }, (_, i): AgentRec => ({ ...AGENTS[0]!, id: 'done-' + i, description: 'done ' + i + ' end', state: 'done', endedAt: NOW - i * 1000, now: undefined, toolSince: undefined }))
+  const tasks: BgTask[] = Array.from({ length: 40 }, (_, i): BgTask => ({ id: 'task-' + i, kind: 'shell', title: 'task ' + i + ' end', command: 'npm test', state: 'done', startedAt: NOW - 90_000, endedAt: NOW - 500_000 - i }))
+  const titles = [...running, ...done].map(a => a.description!).concat(tasks.map(t => t.title))
+  for (const showDone of [false, true]) drawPane(on, 'many-' + showDone, (el, surface) => renderAgents(el, frameOf(surface, 64), { agents: [...done, ...running], tasks, now: NOW, showDone }, AGENT_NOOP))
+  for (const showDone of [false, true]) for (const surface of ['desktop', 'terminal'] as const) {
+    const ui = await mount($, 'many-' + showDone, surface, 64)
+    let drawn = 0
+    for (const title of titles) if (await ui.find({ type: 'Text', text: title })) drawn++
+    expect(drawn, surface + ' ' + showDone).toBe(30 + DONE_SHOWN)
+    for (const title of ['run 90 end', 'run 119 end', 'done 0 end', 'done 3 end']) expect(await ui.find({ type: 'Text', text: title }), surface + ' ' + title).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: 'run 89 end' }), surface).toBeUndefined()
+    expect(await ui.find({ type: 'Text', text: '120 running' }), surface).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: 'The 90 oldest are not listed' }), surface).toBeDefined()
+    if (showDone) expect(await ui.find({ type: 'Text', text: 'The 76 oldest are not listed' }), surface).toBeDefined()
+    await ui.unmount()
+  }
+})
+
+test('the Agents pane draws forty mixed real-world records on every surface, skin and theme', async ($, on) => {
+  const by = ['marker', 'session', 'judge', 'haiku', 'jev', 'model', 'default', 'tier'] as const
+  const states = ['running', 'done', 'failed', 'killed'] as const
+  const mixed: AgentRec[] = Array.from({ length: 40 }, (_, i): AgentRec => ({
+    ...AGENTS[0]!, id: 'mixed-' + i, description: '에이전트 표시 오류 수정 ' + i,
+    state: states[i % states.length]!,
+    model: i % 3 === 0 ? 'gemini-3.8-flash@high' : i % 3 === 1 ? 'gpt-6.1-sol@medium' : undefined,
+    type: i % 3 === 0 ? 'ripple:auto' : i % 3 === 1 ? 'general-purpose' : undefined,
+    answeredBy: undefined, provider: i % 3 === 0 ? undefined : 'chatgpt', effort: i % 3 === 0 ? undefined : 'high',
+    pick: i % 3 === 0 ? undefined : { ...AGENTS[0]!.pick!, by: by[i % by.length]!, target: i % 2 ? { agent: 'general-purpose', model: 'opus' } : { agent: 'gpt-6-1-sol' }, fallbackReason: i % 5 === 0 ? '요청한 모델의 사용 한도를 초과했습니다.' : undefined },
+    now: 'Bash ' + '아주 긴 도구 실행 명령어 '.repeat(1000),
+    usage: { input: 1_234_567, cached: 9_876_543, cacheWrite: 100_000, output: 50_000 }, tools: 150,
+    endedAt: NOW - i * 1000,
+  }))
+  // Exercise the real register.tsx boundary too: text the engine's FINAL validation refuses must
+  // be caught before the tree leaves us, and an unreadable conversation must return to the list.
+  mock.clock(on, { now: NOW })
+  let broken: string | null = null
+  let selected: string | null = null
+  let closes = 0
+  const errors: string[] = []
+  on('state.get', { plugin: 'ripple', key: 'settings' }, () => ({ value: { value: SETTINGS, version: 0 } }))
+  on('state.get', { plugin: 'ripple', key: 'lang' }, () => ({ value: { value: 'ko', version: 0 } }))
+  on('state.get', { plugin: 'ripple', key: 'agents' }, () => ({ value: { value: broken === null ? mixed : [{ ...mixed[0]!, description: broken }, ...mixed.slice(1)], version: 0 } }))
+  on('state.get', { plugin: 'ripple', key: 'agentOpen' }, async ($, e, next) => {
+    const held = await next(e)
+    return { value: { value: selected, version: held.value?.version ?? 0 } }
+  })
+  on('state.set', { plugin: 'ripple', key: 'agentOpen' }, async ($, e, next) => { selected = typeof e.value === 'string' ? e.value : null; return next(e) })
+  on('session.messages', () => ({ value: { deny: '대화 기록을 읽을 수 없습니다.' } }))
+  on('ui.log', ($, e) => { errors.push(e.text); return { value: undefined } })
+  on('ui.close', () => { closes++; return { value: undefined } })
+  for (const skin of SKINS) for (const appearance of ['light', 'dark'] as const) {
+    const id = ['mixed', skin, appearance].join('-')
+    drawPane(on, id, (el, surface) => renderAgents(el, { ...frameOf(surface, 40, 12, skin), appearance, lang: 'ko' }, { agents: mixed, now: NOW, showDone: true }, AGENT_NOOP))
+  }
+  for (const skin of SKINS) for (const appearance of ['light', 'dark'] as const) {
+    const id = ['mixed', skin, appearance].join('-')
+    for (const surface of ['desktop', 'terminal', 'vscode', 'mobile'] as const) {
+      const ui = await mount($, id, surface, 40)
+      // The whole title is in the tree; the engine cuts it only as it draws.
+      // Ten running, then the twenty newest finished: the thirty cards the list draws.
+      for (const i of [0, 36, 26]) expect(await ui.find({ type: 'Text', text: '에이전트 표시 오류 수정 ' + i }), id + ' ' + surface + ' ' + i).toBeDefined()
+      expect(await ui.find({ type: 'Text', text: '에이전트 표시 오류 수정 ' + 27 }), id + ' ' + surface + ' 27').toBeUndefined()
+      await ui.unmount()
+    }
+  }
+  for (const surface of ['terminal', 'desktop', 'vscode', 'mobile'] as const) {
+    for (const description of ['표시 오류 \u001b[31m\u0085\u{10eeee}\u{2800}\u{0305}', '\u{0305}표시 오류', '\u{2800}\u{0305}표시 오류']) {
+      broken = description
+      selected = null
+      const fallback = await $.ui.mount({ plugin: 'ripple', surface, component: 'Pane', requestId: 'ripple-agents', props: paneProps(40), viewport: { columns: 40, rows: 40 } })
+      expect(await fallback.find({ type: 'Text', text: /제어 문자|결합 문자/ }), surface + ' validation reason').toBeDefined()
+      expect(await fallback.find({ type: 'Text', text: '에이전트 표시 오류 수정 39' }), surface + ' fallback list').toBeDefined()
+      expect(await fallback.findAll({ type: 'Svg' })).toHaveLength(0)
+      expect(await fallback.find({ key: 'back' })).toBeUndefined()
+      await fallback.press({ key: 'close' })
+      await fallback.unmount()
+    }
+    broken = null
+    selected = 'mixed-0'
+    const denied = await $.ui.mount({ plugin: 'ripple', surface, component: 'Pane', requestId: 'ripple-agents', props: paneProps(40), viewport: { columns: 40, rows: 40 } })
+    expect(await denied.find({ type: 'Text', text: '대화 기록을 읽을 수 없습니다.' }), surface + ' conversation reason').toBeDefined()
+    expect(await denied.find({ type: 'Text', text: '에이전트 표시 오류 수정 39' }), surface + ' returned to list').toBeDefined()
+    await denied.press({ key: 'back' })
+    expect(selected).toBe(null)
+    await denied.unmount()
+  }
+  expect(closes).toBe(12)
+  expect(errors.some(error => error.includes('결합 문자'))).toBe(true)
+})
+
+test('pictures tile at the SVG side limit without rescaling or restarting their artwork', async ($, on) => {
+  for (const size of [4095, 4096, 4097, 8200]) {
+    const source = svg(size, size, '<rect width="' + size + '" height="' + size + '" fill="#262523"/>')
+    drawPane(on, 'tiles-' + size, el => pic(el, 'tiles', source, 'whole', size, size))
+  }
+  for (const size of [4095, 4096, 4097, 8200]) {
+    const source = svg(size, size, '<rect width="' + size + '" height="' + size + '" fill="#262523"/>')
+    for (const surface of ['desktop', 'vscode', 'mobile'] as const) {
+      const ui = await mount($, 'tiles-' + size, surface)
+      const pictures = await ui.findAll({ type: 'Svg' })
+      const across = Math.ceil(size / SVG_MAX_PX)
+      expect(pictures).toHaveLength(across * across)
+      for (const [i, picture] of pictures.entries()) {
+        const x = (i % across) * SVG_MAX_PX
+        const y = Math.floor(i / across) * SVG_MAX_PX
+        const width = Math.min(SVG_MAX_PX, size - x)
+        const height = Math.min(SVG_MAX_PX, size - y)
+        // Each tile is its own size in its document and fills its cells as any picture does.
+        expect(ownPx(picture)).toBe(width)
+        expect(String(picture.props.source)).toMatch(new RegExp('^<svg\\b[^>]*\\sheight="' + height + '"'))
+        expect(Number(picture.props.width) >= width && picture.props.height === undefined).toBe(true)
+        expect(String(picture.props.source)).toContain('viewBox="' + [x, y, width, height].join(' ') + '"')
+        expect(String(picture.props.source).slice(String(picture.props.source).indexOf('><style>'))).toBe(source.slice(source.indexOf('><style>')))
+      }
+      await ui.unmount()
+    }
+  }
+})
+
+// The desktop's newer type (2026-10-25) set a cell at ~8.8 px, not the CELL_PX the pictures are
+// drawn for: pictures asked at their own px fell short of their cells, the band's sea ended before
+// its right edge and its icons sat in wide gaps.
+test('every picture fills the cells laid out for it, so it keeps its place whatever px a cell is', async ($, on) => {
+  const noop = () => undefined
+  const draws: [string, Draw][] = [
+    ['band', el => renderBand(el, frameOf('desktop', 100), DASH, BAND_ACTIONS)],
+    ['settings', el => renderSettings(el, frameOf('desktop', 100), { settings: SETTINGS, jev: { source: null, test: { state: 'idle' } } }, QUICK_ACTIONS)],
+    ['agents', el => renderAgents(el, frameOf('desktop', 64), { agents: AGENTS, now: NOW, showDone: true }, AGENT_NOOP)],
+    ['alert', el => renderAlert(el, frameOf('desktop', 100), ALERTS[0]!, { compact: noop, clear: noop, dismiss: noop, toggleSave: noop, openSettings: noop, noteInput: noop, toggleTidy: noop, pickCompactModel: noop, copy: noop })],
+  ]
+  for (const [id, draw] of draws) drawPane(on, 'cells-' + id, draw)
+  for (const [id] of draws) {
+    const ui = await mount($, 'cells-' + id, 'desktop', 100)
+    let pictures = 0
+    walk(await ui.drawn(), n => {
+      const only = n.type === 'Box' && n.children?.length === 1 ? n.children[0] as Drawn : null
+      if (only?.type !== 'Svg') return
+      pictures++
+      const key = id + ' ' + String(n.props?.key)
+      expect(Math.abs(Number(n.props?.width) * CELL_PX - ownPx(only)) < 0.5, key + ' cells').toBe(true)
+      expect(Number(only.props?.width) >= ownPx(only) && only.props?.height === undefined, key + ' fills').toBe(true)
+    })
+    expect(pictures > 0, id).toBe(true)
+    await ui.unmount()
+  }
 })
 
 test('the Agents pane shows the latest finished agents and the rest behind more; a card opens its conversation', async ($, on) => {
@@ -647,14 +872,18 @@ test('the Agents pane shows the latest finished agents and the rest behind more;
     for (const i of [2, 1, 0]) expect(await ui.find({ type: 'Text', text: 'Finished task ' + i }), surface + ' ' + i).toBeUndefined()
     expect(await ui.find({ type: 'Button', key: 'done' }), surface).toBeDefined()
     await ui.press({ key: 'done' })
-    // The desktop presses a card anywhere on it (a blank press a row); the terminal has a button.
-    await ui.press({ key: surface === 'terminal' ? 'open-a1' : 'open-a1-0' })
+    // A desktop row is one blank press under its title and facts, our own Text, so the host's button
+    // ink never paints them.
+    await ui.press({ key: 'open-a1' })
     const all = await mount($, 'agents-all', surface, 64)
     expect(await all.find({ type: 'Text', text: 'Finished task 0' }), surface).toBeDefined()
-    expect(await all.find({ type: 'Text', text: 'failed' }) ?? await all.find({ type: 'Text', text: /^✕/ }), surface).toBeDefined()
-    if (surface === 'desktop') expect(await all.find({ type: 'Button', key: 'open-d0-2' }), surface).toBeDefined()
+    expect(await all.find({ type: 'Text', text: /failed/ }) ?? await all.find({ type: 'Text', text: /^✕/ }), surface).toBeDefined()
+    if (surface === 'desktop') {
+      expect(await all.find({ type: 'Button', key: 'open-d0' }), surface).toBeDefined()
+      await all.press({ key: 'open-d0' })
+    }
   }
-  expect(calls).toEqual(['done', 'open:["a1"]', 'done', 'open:["a1"]'])
+  expect(calls).toEqual(['done', 'open:["a1"]', 'done', 'open:["a1"]', 'open:["d0"]'])
 })
 
 test('an agent\'s conversation reads in the pane: the task, its words, its tools, the answer, and a way back', async ($, on) => {
@@ -679,11 +908,14 @@ test('an agent\'s conversation reads in the pane: the task, its words, its tools
   for (const surface of SURFACES) {
     const live = await mount($, 'talk-live', surface, 64)
     expect(await live.find({ type: 'Text', text: 'Port the request log renderer' }), surface).toBeDefined()
-    expect(await live.find({ type: 'Text', text: 'Task' }), surface).toBeDefined()
-    // Its three calls fold into one line; the one it is in now still shows under it.
-    expect(await live.find({ type: surface === 'desktop' ? 'Text' : 'Button', text: /^Read 1 file, Ran 1 command, Edited 1 file/ }), surface).toBeDefined()
-    expect(await live.find({ type: 'Text', text: '1 failed' }), surface).toBeDefined()
-    expect(await live.find({ type: 'Text', text: /^Edit$/ }), surface).toBeDefined()
+    // The desktop sets the prompt in a card, as the Claude app does, with no label; the terminal labels it.
+    expect(await live.find({ type: 'Text', text: 'Task' }) !== undefined, surface).toBe(surface === 'terminal')
+    expect(await live.find({ key: 'task-body' }) !== undefined, surface).toBe(surface === 'desktop')
+    // Its three calls fold into one line. The terminal keeps the failure count and the call in
+    // flight under it; the desktop's line is the app's: its words alone, no mark, no count.
+    expect(await live.find({ type: surface === 'desktop' ? 'Text' : 'Button', text: /^Read a file, ran a command, edited a file/ }), surface).toBeDefined()
+    expect(await live.find({ type: 'Text', text: '1 failed' }) !== undefined, surface).toBe(surface === 'terminal')
+    expect(await live.find({ type: 'Text', text: /^Edit$/ }) !== undefined, surface).toBe(surface === 'terminal')
     for (const tool of ['Read', 'Bash']) expect(await live.find({ type: 'Text', text: new RegExp('^' + tool + '$') }), surface + ' ' + tool).toBeUndefined()
     // Its words as Markdown on the desktop, plain text on the terminal; no answer while it runs.
     if (surface === 'desktop') expect((await live.findAll({ type: 'Markdown' })).some(m => m.props.text === 'Reading the **current** renderer first.'), surface).toBe(true)
@@ -714,7 +946,7 @@ test('an agent\'s conversation reads in the pane: the task, its words, its tools
   expect(calls).toEqual(['back', 'back', 'back', 'back'])
 })
 
-test('scrolled down an open conversation, the way back floats at the window\'s top', async ($, on) => {
+test('an open conversation is headed by a chevron back and its title, which stay at the window\'s top on the pane\'s surface once scrolled', async ($, on) => {
   const { calls, fn } = recorder()
   const actions = { ...AGENT_NOOP, back: fn('back') }
   const talk: AgentEntry[] = [{ kind: 'prompt', text: 'Do it.' }, ...Array.from({ length: 20 }, (_, i): AgentEntry => ({ kind: 'text', text: 'words ' + i }))]
@@ -722,11 +954,71 @@ test('scrolled down an open conversation, the way back floats at the window\'s t
   drawPane(on, 'float-top', el => renderAgents(el, frameOf('desktop', 64), view, actions))
   drawPane(on, 'float-down', el => renderAgents(el, { ...frameOf('desktop', 64), offset: 12 }, view, actions))
   const top = await mount($, 'float-top', 'desktop', 64)
-  expect(await top.find({ key: 'float-back' })).toBeUndefined()
+  // The head: a drawn chevron under a blank press, then the title; no pill over the words.
+  const head = await top.find({ key: 'open-head' })
+  expect(head).toBeDefined()
+  expect(await svgByAlt(top, 'All agents')).toBeDefined()
+  expect(await top.find({ type: 'Text', text: 'Port the request log renderer' })).toBeDefined()
+  expect(await top.find({ key: 'float-head' })).toBeUndefined()
+  for (const key of ['pill-back', 'ghost-back', 'pill-back-float', 'ghost-back-float']) expect(await top.find({ key }), key).toBeUndefined()
+  // The card under the head names no title again: the head has it.
+  expect(await top.findAll({ type: 'Text', text: 'Port the request log renderer' })).toHaveLength(1)
+  await top.press({ key: 'back' })
+  // Scrolled, no copy of the head is redrawn at the window's top: the engine pins no row, and the
+  // copy trailed the words, landed mid-pane and flickered (2026-10-25).
   const down = await mount($, 'float-down', 'desktop', 64)
-  expect((await down.find({ key: 'float-back' }))?.props.top).toBe(12)
-  await down.press({ key: 'back-float' })
+  expect(await down.find({ key: 'float-head' })).toBeUndefined()
+  expect(await down.findAll({ key: 'open-head' })).toHaveLength(1)
+  for (const svg of await down.findAll({ type: 'Svg' })) expect(String(svg.props.alt ?? '').trim(), String(svg.props.source).slice(0, 80)).not.toBe('')
   expect(calls).toEqual(['back'])
+})
+
+test('a long prompt folds to its first lines under a fade, and Show more unfolds it', async ($, on) => {
+  const { calls, fn } = recorder()
+  const actions = { ...AGENT_NOOP, toggleRun: fn('run') }
+  const long = Array.from({ length: 12 }, (_, i) => 'Line ' + i + ' of a long delegated prompt that wraps across the pane.').join('\n')
+  const talk: AgentEntry[] = [{ kind: 'prompt', text: long }, { kind: 'text', text: 'On it.' }, { kind: 'prompt', text: 'Short follow-up.' }]
+  const draw = (runsOpen: string[]) => (el: Parameters<typeof renderBand>[0]) => renderAgents(el, frameOf('desktop', 64), { agents: AGENTS, now: NOW, showDone: false, open: { id: 'a1', talk: { entries: talk }, runsOpen } }, actions)
+  drawPane(on, 'fold-shut', draw([]))
+  drawPane(on, 'fold-open', draw(['prompt:first']))
+  const shut = await mount($, 'fold-shut', 'desktop', 64)
+  const body = await shut.find({ key: 'task-body' })
+  expect(body?.props.height).toBe(5)
+  expect(body?.props.overflow).toBe('hidden')
+  expect(await shut.find({ key: 'pic-task-fade' })).toBeDefined()
+  expect(await shut.find({ type: 'Text', text: 'Show more' })).toBeDefined()
+  // The short one does not fold, and has nothing to press.
+  expect(await shut.find({ key: 'prompt-2-body' })).toBeDefined()
+  expect(await shut.find({ key: 'prompt-2-more' })).toBeUndefined()
+  expect((await shut.find({ key: 'prompt-2-body' }))?.props.height).toBeUndefined()
+  await shut.press({ key: 'task-more' })
+  const open = await mount($, 'fold-open', 'desktop', 64)
+  expect((await open.find({ key: 'task-body' }))?.props.height).toBeUndefined()
+  expect(await open.find({ key: 'pic-task-fade' })).toBeUndefined()
+  expect(await open.find({ type: 'Text', text: 'Show less' })).toBeDefined()
+  await open.press({ key: 'task-more' })
+  expect(calls).toEqual(['run:["prompt:first"]', 'run:["prompt:first"]'])
+})
+
+test('while its agent works the conversation ends in Claude\'s spark, one picture that a redraw does not change', async ($, on) => {
+  const talk: AgentEntry[] = [{ kind: 'prompt', text: 'Do it.' }, { kind: 'text', text: 'On it.' }]
+  const done: AgentRec = { ...AGENTS[0]!, state: 'done', endedAt: NOW - 1000 }
+  drawPane(on, 'spark-live', el => renderAgents(el, frameOf('desktop', 64), { agents: AGENTS, now: NOW, showDone: false, open: { id: 'a1', talk: { entries: talk } } }, AGENT_NOOP))
+  drawPane(on, 'spark-later', el => renderAgents(el, frameOf('desktop', 64), { agents: [{ ...AGENTS[0]!, toolSince: NOW - 2000, now: 'Bash ls' }], now: NOW + 7000, showDone: false, open: { id: 'a1', talk: { entries: [...talk, { kind: 'text', text: 'More.' }] } } }, AGENT_NOOP))
+  drawPane(on, 'spark-done', el => renderAgents(el, frameOf('desktop', 64), { agents: [done], now: NOW, showDone: false, open: { id: 'a1', talk: { entries: talk } } }, AGENT_NOOP))
+  const live = await mount($, 'spark-live', 'desktop', 64)
+  const spark = await svgByAlt(live, 'Working')
+  expect(spark).toBeDefined()
+  expect(String(spark?.props.source)).toContain('#d97757')
+  expect(String(spark?.props.source)).toContain('@keyframes')
+  // No "thinking" line in its place.
+  expect(await live.find({ type: 'Text', text: 'thinking' })).toBeUndefined()
+  // Drawn again a tick and a step later, the same key and the same document.
+  const later = await mount($, 'spark-later', 'desktop', 64)
+  expect((await svgByAlt(later, 'Working'))?.props.source).toBe(spark?.props.source)
+  expect(await later.find({ key: 'pic-spark' })).toBeDefined()
+  const finished = await mount($, 'spark-done', 'desktop', 64)
+  expect(await svgByAlt(finished, 'Working')).toBeUndefined()
 })
 
 test('talkOf reads a conversation into prompts, words and tool calls that stand answered, failed or running', () => {
@@ -794,6 +1086,27 @@ test('the log pane keeps its content', async ($, on) => {
   expect(calls).toEqual(['scope', 'scope'])
 })
 
+test('a request made on the Fast tier shows FAST beside its effort, and no other request does (#97)', async ($, on) => {
+  const base = { source: 'gpt-6-1-sol@high', target: 'gpt-6.1-sol', provider: 'chatgpt', status: 200, ok: true, ms: 2140, effort: 'high', mine: true }
+  const rows: StatusRequest[] = [
+    { ...base, at: '2026-10-10T13:19:10', requestedTier: 'priority', servedTier: 'default' } as StatusRequest,
+    { ...base, at: '2026-10-10T13:18:55' },
+    { ...base, at: '2026-10-10T13:18:40', requestedTier: 'flex' },
+  ]
+  drawPane(on, 'log-fast', (el, surface) => renderLog(el, frameOf(surface, 64), { rows, mineOnly: true }, { toggleScope: () => undefined }))
+  drawPane(on, 'log-fast-none', (el, surface) => renderLog(el, frameOf(surface, 64), { rows: rows.slice(1), mineOnly: true }, { toggleScope: () => undefined }))
+  for (const surface of SURFACES) {
+    const ui = await mount($, 'log-fast', surface, 64)
+    // One badge for the one priority request, on the effort line (the line after the model's).
+    expect((await ui.findAll({ type: 'Text', text: 'FAST' })).length, surface).toBe(1)
+    const efforts: string[][] = []
+    walk(await ui.drawn(), n => { if (n.type === 'Box' && (n.children ?? []).some(c => (c as Drawn).type === 'Text' && ((c as Drawn).children ?? []).join('') === 'high')) efforts.push(((n.children ?? []) as Drawn[]).map(c => (c.children ?? []).join(''))) })
+    expect(efforts.map(line => line.includes('FAST')), surface).toEqual([true, false, false])
+    const none = await mount($, 'log-fast-none', surface, 64)
+    expect(await none.find({ type: 'Text', text: 'FAST' }), surface).toBeUndefined()
+  }
+})
+
 // ---- Nothing cut, nothing reloaded (2026-10-10) -------------------------------------------------
 
 type Drawn = { type?: string; props?: Record<string, unknown>; children?: unknown[] }
@@ -831,7 +1144,7 @@ test('every picture is a plain image, 리플이 the one face, and every blank pr
   // over it (kit.tsx), never from a blank button over nothing.
   const noop = () => undefined
   const setupActions = { patch: noop, jevKey: noop, testJev: noop, openAllSettings: noop, back: noop, next: noop, finish: noop, skip: noop }
-  const alertActions = { compact: noop, clear: noop, handoff: noop, dismiss: noop, toggleSave: noop, openSettings: noop, noteInput: noop, setHandoffKind: noop, setHandoffAfter: noop, go: noop, copy: noop, openNew: noop }
+  const alertActions = { compact: noop, clear: noop, dismiss: noop, toggleSave: noop, openSettings: noop, noteInput: noop, toggleTidy: noop, pickCompactModel: noop, copy: noop }
   const cases: [string, Draw][] = [
     ['one-quick', (el, surface) => renderSettings(el, frameOf(surface, 64, 30), { settings: { ...SETTINGS, jevSource: 'typesafe' }, jev: { source: null, test: { state: 'idle' } } }, QUICK_ACTIONS)],
     ...([1, 2, 3, 4] as const).map((step): [string, Draw] => ['one-setup-' + step, (el, surface) => renderSetup(el, frameOf(surface, 64, 30), { step, draft: SETTINGS, jev: { source: null, test: { state: 'idle' } } }, setupActions)]),
@@ -851,7 +1164,7 @@ test('every picture is a plain image, 리플이 the one face, and every blank pr
 
 test('a card says one thing: at most one main action, the others quiet, one way to let it go', async ($, on) => {
   const noop = () => undefined
-  const alertActions = { compact: noop, clear: noop, handoff: noop, dismiss: noop, toggleSave: noop, openSettings: noop, noteInput: noop, setHandoffKind: noop, setHandoffAfter: noop, go: noop, copy: noop, openNew: noop }
+  const alertActions = { compact: noop, clear: noop, dismiss: noop, toggleSave: noop, openSettings: noop, noteInput: noop, toggleTidy: noop, pickCompactModel: noop, copy: noop }
   const all: AlertView[] = [...ALERTS, { kind: 'hot', limitKind: 'five_hour', percent: 97, save: true }]
   all.forEach((alert, i) => drawPane(on, 'say-' + i, (el, surface) => renderAlert(el, frameOf(surface), alert, alertActions)))
   for (let i = 0; i < all.length; i++) {
@@ -880,15 +1193,15 @@ test('a card says one thing: at most one main action, the others quiet, one way 
   expect(await on_.find({ type: 'Button', key: 'dismiss' })).toBeDefined()
 })
 
-test('no drawing cuts its text: no truncating Text on any surface', async ($, on) => {
+test('no drawing cuts its text, but for the agent card\'s title and model name, which the app\'s proportional type cuts at the edge', async ($, on) => {
   const noop = () => undefined
+  // The engine's own ellipsis, on the two spots whose width the app's type decides: a character
+  // count there measured cells and cut too soon (2026-10-25).
   const settingsActions = QUICK_ACTIONS
   const cases: [string, Draw][] = [
     ['cut-quick', (el, surface) => renderSettings(el, frameOf(surface, 60, 30), { settings: SETTINGS, jev: { source: null, test: { state: 'fail', message: 'key rejected (401) '.repeat(4) } } }, settingsActions)],
-    ['cut-agents', (el, surface) => renderAgents(el, frameOf(surface, 40), { agents: AGENTS.map(a => ({ ...a, description: a.description + ' and a much longer tail of words that runs past any pane width', state: 'running' as const })), now: NOW, showDone: true }, { ...AGENT_NOOP, toggleDone: noop })],
-    ['cut-agents-done', (el, surface) => renderAgents(el, frameOf(surface, 40), { agents: AGENTS, now: NOW, showDone: true }, { ...AGENT_NOOP, toggleDone: noop })],
     ['cut-log', (el, surface) => renderLog(el, frameOf(surface, 40), { rows: [{ at: '2026-10-10T13:19:10', source: 'a-very-long-requested-model-name@high', target: 'another-very-long-routed-model-name', provider: 'opencode-go', status: 200, ok: true, ms: 2140 }], mineOnly: false }, { toggleScope: noop })],
-    ...ALERTS.map((alert, i): [string, Draw] => ['cut-alert-' + i, (el, surface) => renderAlert(el, frameOf(surface, 40), alert, { compact: noop, clear: noop, handoff: noop, dismiss: noop, toggleSave: noop, openSettings: noop, noteInput: noop, setHandoffKind: noop, setHandoffAfter: noop, go: noop, copy: noop, openNew: noop })]),
+    ...ALERTS.map((alert, i): [string, Draw] => ['cut-alert-' + i, (el, surface) => renderAlert(el, frameOf(surface, 40), alert, { compact: noop, clear: noop, dismiss: noop, toggleSave: noop, openSettings: noop, noteInput: noop, toggleTidy: noop, pickCompactModel: noop, copy: noop })]),
   ]
   for (const [id, draw] of cases) drawPane(on, id, draw)
   for (const surface of SURFACES) {
@@ -900,6 +1213,23 @@ test('no drawing cuts its text: no truncating Text on any surface', async ($, on
       await ui.unmount()
     }
   }
+})
+
+test('the agent card is the one drawing the engine cuts: its title and its model name alone', async ($, on) => {
+  // The app's type is proportional, so a character count cut too soon; these two take their row's
+  // free width and the engine ellipsis them at the edge (2026-10-25).
+  const agent: AgentRec = { ...AGENTS[0]!, description: 'Mobile / motion — a title long enough to reach the edge of any pane', model: 'gpt-6.1-sol@high' }
+  drawPane(on, 'cut-card', (el, surface) => renderAgents(el, frameOf(surface, 40), { agents: [agent], now: NOW, showDone: false }, AGENT_NOOP))
+  const cuts = async (surface: Surface): Promise<string[]> => {
+    const ui = await mount($, 'cut-card', surface, 40)
+    const cut: string[] = []
+    walk(await ui.drawn(), n => { if (n.type === 'Text' && String(n.props?.wrap ?? '').startsWith('truncate')) cut.push(String((n.children ?? []).join(''))) })
+    await ui.unmount()
+    return cut
+  }
+  expect(await cuts('desktop'), 'desktop').toEqual([agent.description, 'gpt-6.1-sol'])
+  // The terminal draws its own rows and wraps; the app's ellipsis is the desktop's.
+  expect(await cuts('terminal'), 'terminal').toEqual([])
 })
 
 // ---- The band holds still (2026-10-10) ----------------------------------------------------------
@@ -921,6 +1251,62 @@ test('within a minute the band draws the same tree; a minute on, only the countd
     expect(now).toContain('"42m"')
     expect(await drawn('later-' + surface)).toBe(now)
     expect((await drawn('minute-' + surface)).replace(/\b41m\b/g, '42m')).toBe(now)
+  }
+})
+
+test('while it works the current runs along the capsule\'s true bottom, in a picture of its own that a redraw keeps', async ($, on) => {
+  const working = (live: number, total: number, extra: Partial<DashboardView> = {}): DashboardView => ({ ...DASH, isWorking: true, agents: { live, total }, ...extra })
+  const busy = working(1, 1)
+  // The same band a moment on, with more requests out and every row it can add (the pin, the
+  // limits, the effort menu): nothing in the current depends on any of it.
+  const more = working(2, 3, { effortMenu: true, delegationPin: 'Opus', extras: ['limits'], limits: [{ provider: 'claude', account: 0, kind: 'five_hour', label: '', percent: 28 }] })
+  for (const skin of SKINS) {
+    drawPane(on, 'current-' + skin, el => renderBand(el, frameOf('desktop', 94, 12, skin), busy, BAND_ACTIONS))
+    drawPane(on, 'current-more-' + skin, el => renderBand(el, frameOf('desktop', 94, 12, skin), more, BAND_ACTIONS))
+    drawPane(on, 'current-idle-' + skin, el => renderBand(el, frameOf('desktop', 94, 12, skin), DASH, BAND_ACTIONS))
+  }
+  /** The pictures that carry `part` of a drawing (the current's class, the sea's glows). */
+  const pictures = async (ui: { findAll: (q: { type: string }) => Promise<{ props: Record<string, unknown> }[]> }, part: string) =>
+    (await ui.findAll({ type: 'Svg' })).map(picture => String(picture.props.source)).filter(source => source.includes(part))
+  for (const skin of SKINS) {
+    const ui = await mount($, 'current-' + skin, 'desktop', 94)
+    const later = await mount($, 'current-more-' + skin, 'desktop', 94)
+    const idle = await mount($, 'current-idle-' + skin, 'desktop', 94)
+    // Only the deep has water for a current to run in; a band at rest has none.
+    expect(await pictures(ui, 'class="cu"'), skin).toHaveLength(skin === 'deep' ? 1 : 0)
+    expect(await pictures(idle, 'class="cu"'), skin + ' at rest').toHaveLength(0)
+    const line = await ui.find({ key: 'band-current' })
+    if (skin === 'deep') {
+      // A separate placed node at the capsule's own bottom: no `top`, and no `height` of its own,
+      // which the host takes in whole rows and painted as a plate over the band.
+      expect(line?.props).toMatchObject({ position: 'absolute', bottom: 0, left: 0 })
+      expect(line?.props.top).toBeUndefined()
+      expect(line?.props.height).toBeUndefined()
+      expect(line?.props.backgroundColor).toBeUndefined()
+      // The line is its picture's own 2 px, so the picture, not the Box, sizes it.
+      expect((await pictures(ui, 'class="cu"'))[0]).toMatch(/\sheight="2"/)
+    } else expect(line).toBeUndefined()
+    // No wash over the band: nothing is painted in the colour of the plate that was there.
+    const plates: string[] = []
+    for (const mounted of [ui, later, idle]) walk(await mounted.drawn(), n => {
+      if (n.type === 'Box' && String(n.props?.backgroundColor ?? '').includes('103,232,249')) plates.push(String(n.props?.key ?? 'Box'))
+    })
+    expect(plates, skin).toEqual([])
+    // Not in the sea's picture: its height is only an estimate of the capsule's.
+    const seas = await pictures(ui, 'class="br"')
+    expect(seas, skin).toHaveLength(skin === 'deep' ? 1 : 0)
+    for (const source of seas) expect(source).not.toContain('class="cu"')
+    if (skin === 'deep') {
+      // Two frames that differ only in the requests out: the same key and the same document, so a
+      // host that keeps the picture keeps its motion; no negative delay to open it part way.
+      expect(await pictures(later, 'class="cu"')).toEqual(await pictures(ui, 'class="cu"'))
+      expect(await later.find({ key: 'band-current' })).toBeDefined()
+      expect(await later.find({ key: 'pic-band-current' })).toBeDefined()
+      expect((await pictures(ui, 'class="cu"'))[0]).not.toContain('animation-delay')
+    }
+    await ui.unmount()
+    await later.unmount()
+    await idle.unmount()
   }
 })
 
@@ -947,7 +1333,7 @@ test('리플이 acts out the band: thinking, working, drowsy, asleep or idle, on
     const tree = await ui.drawn()
     const found = mascots(tree)
     expect(found.length, id).toBe(1)
-    expect(found[0]!.props?.width, id).toBe(BAND_RIPPLE)
+    expect(ownPx(found[0]!), id).toBe(BAND_RIPPLE)
     expect(found[0]!.props?.isInteractive, id).toBeFalsy()
     sources[id] = String(found[0]!.props?.source)
     // Drawn for the capsule's dark water whatever the app's theme.
@@ -973,6 +1359,18 @@ function layoutOf(tree: unknown): Record<string, unknown> {
   return out
 }
 
+// The host sends what the phone queued when the turn ends; the Claude app never sees it, so a strip
+// over the band says it is there, on both surfaces, its first message on one line (2026-10-22).
+test('the phone queue strip draws on both surfaces with its count, first message and when', async ($, on) => {
+  for (const surface of SURFACES) drawPane(on, 'queue-' + surface, el => renderPhoneQueue(el, frameOf(surface), { count: 2, first: 'fix the\nheader' }))
+  for (const surface of SURFACES) {
+    const drawn = JSON.stringify(await (await mount($, 'queue-' + surface, surface)).drawn())
+    expect(drawn).toContain('Phone queue 2')
+    expect(drawn).toContain('fix the header')
+    expect(drawn).toContain('goes when this turn ends')
+  }
+})
+
 test('no value moves a neighbour: every slot keeps its width whatever it shows', async ($, on) => {
   const levels: DashboardView['effort'][] = [
     ...(['low', 'medium', 'high', 'xhigh', 'max'] as const).flatMap(level => [{ level, mode: 'auto' as const, why: 'w' }, { level, mode: 'manual' as const }]),
@@ -991,7 +1389,7 @@ test('no value moves a neighbour: every slot keeps its width whatever it shows',
     ...caches.map(cache => ({ ...DASH, cache })),
     ...routes.map(r => ({ ...DASH, ...r })),
     { ...DASH, agents: { live: 2, total: 3 }, agentsOpen: true, logOpen: true, auto: false, warm: { on: true, pings: 12, cost: 0, stopped: 'no cache' } },
-    { ...DASH, handoff: 'advised', context: { percent: 100, tokens: 200_000, window: 200_000 } },
+    { ...DASH, context: { percent: 100, tokens: 200_000, window: 200_000 } },
   ]
   const LANGS = ['en', 'ko', 'ja', 'es'] as const
   for (const lang of LANGS) {
@@ -1003,10 +1401,13 @@ test('no value moves a neighbour: every slot keeps its width whatever it shows',
   for (const lang of LANGS) {
     for (const surface of SURFACES) {
       const seen: Record<string, unknown> = {}
+      // The drawn band's effort and context take the value shown, and the agents icon its badge only
+      // while it has a count, tight (2026-10-25): what follows moves. Everything else keeps its width.
+      const tight = surface === 'desktop' ? ['fact-effort', 'fact-context', 'agents'] : []
       for (let i = 0; i < views.length; i++) {
         const ui = await mount($, lang + '-' + surface + '-' + i, surface, 110)
         for (const [key, value] of Object.entries(layoutOf(await ui.drawn()))) {
-          if (key in seen) expect(value, lang + ' ' + surface + ' view ' + i + ' ' + key).toEqual(seen[key])
+          if (key in seen && !tight.includes(key)) expect(value, lang + ' ' + surface + ' view ' + i + ' ' + key).toEqual(seen[key])
           else seen[key] = value
         }
         await ui.unmount()
@@ -1045,12 +1446,12 @@ test('the band names the mode that is on, cut to a slot of its own that keeps it
   }
 })
 
-test('Handoff advised, the desktop band keeps the route and every control in one row at 770 px (Chinese), 830 px (Korean, English, Japanese), 870 px (Spanish, Portuguese)', async ($, on) => {
+test('the desktop band keeps the route and every control in one row at 770 px (Chinese), 830 px (Korean, English, Japanese), 870 px (Spanish, Portuguese)', async ($, on) => {
   // The band counts every slot at a fixed width (never by value), drops the controls' words, then
   // the quietest facts, until the route and the controls fit; the reason takes what is left.
   // The Clear and Compact icons joined the row (2026-10-14), so the narrowest window grew by
   // about a control: Hangul labels are the widest, so Korean moved to 830.
-  const busy: DashboardView = { ...DASH, effort: { level: 'xhigh', mode: 'manual' }, handoff: 'advised', agents: { live: 2, total: 3 }, warm: { on: true, pings: 3, cost: 0 } }
+  const busy: DashboardView = { ...DASH, effort: { level: 'xhigh', mode: 'manual' }, agents: { live: 2, total: 3 }, warm: { on: true, pings: 3, cost: 0 } }
   const langs = Object.keys(STRINGS) as (keyof typeof STRINGS)[]
   // Cells counted at 8.8 px (the 14 px measure the band used before, 2026-10-10): a margin over
   // the host's 7.917 px for the site's padding and the band's own border.
@@ -1089,8 +1490,8 @@ test('the Auto word toggles on press and draws its state', async ($, on) => {
 
 // 2026-10-14: at the band's narrowest real width (94 columns) everything asked of the band holds:
 // the limit and the new icons stay; Handoff, Auto and the way out draw with them.
-test('at 94 columns with Handoff advised the limit is drawn beside the new controls', async ($, on) => {
-  const busy: DashboardView = { ...DASH, limit: { kind: 'seven_day', percent: 42, resetsAt: '2026-10-10T15:40:00', save: false }, handoff: 'advised', extras: ['context', 'limits'] }
+test('at 94 columns the limit is drawn beside the new controls', async ($, on) => {
+  const busy: DashboardView = { ...DASH, limit: { kind: 'seven_day', percent: 42, resetsAt: '2026-10-10T15:40:00', save: false }, extras: ['context', 'limits'] }
   drawPane(on, 'n94', el => renderBand(el, frameOf('desktop', 94), busy, { ...BAND_ACTIONS, hide: () => undefined }))
   const ui = await mount($, 'n94', 'desktop', 94)
   expect(await ui.find({ type: 'Box', key: 'fact-limit' }), 'limit at 94').toBeDefined()
@@ -1126,14 +1527,14 @@ function* walkText(node: unknown): Generator<string> {
 // Box drawn display "none" is refused as a hover scope) and reveals through the scope its fact or
 // control joins, so a control's tip shows in a full band.
 test('a control\'s tip is drawn in a full band, hidden and revealed by its scope', async ($, on) => {
-  const busy: DashboardView = { ...DASH, limit: { kind: 'seven_day', percent: 42, resetsAt: '2026-10-10T15:40:00', save: false }, handoff: 'advised', extras: ['context', 'limits'] }
+  const busy: DashboardView = { ...DASH, limit: { kind: 'seven_day', percent: 42, resetsAt: '2026-10-10T15:40:00', save: false }, extras: ['context', 'limits'] }
   drawPane(on, 'n100', el => renderBand(el, frameOf('desktop', 100), busy, { ...BAND_ACTIONS, hide: () => undefined }))
   const ui = await mount($, 'n100', 'desktop', 100)
   const tree = await ui.drawn()
   const tips = tipsOf(tree)
   // One tip per fact and control (the effort, the context, the cache, the limit, and every control
-  // but Handoff, which names itself in its pill) plus the way out — the row is full and all are
-  // drawn. The route has none: it lights as a button, and the log it opens is its card (028aee5).
+  // but Handoff, which names itself in its pill) plus the way out — the row is full and all are drawn. The route has none: it lights as a
+  // button, and the log it opens is its card (028aee5).
   expect(tips.length, 'tips: ' + tips.map(t => t.text.slice(0, 14)).join(' / ')).toBe(11)
   const words = (start: string) => tips.find(tip => tip.text.startsWith(start))
   expect(words('Last route')).toBeUndefined()
@@ -1172,20 +1573,272 @@ test('with the limits row drawn, save mode\'s word follows Claude\'s windows', a
 })
 
 
+// 2026-10-25: the owner moved the reset times off the band into a pane the row opens. 2026-10-29:
+// that pane was a bare table of "4시간 뒤" and "수 15:35"; it now says each reset's exact local date
+// and time to the minute and the time left, both, under its provider account's head, with the
+// window closest to its cap first, a passed reset and a missing one said plainly, and save mode's
+// end. NOW is Saturday 10 October 2026, 13:20 local.
+test('the limits pane names each window\'s exact reset and the time left', async ($, on) => {
+  const limits = [
+    { provider: 'claude', type: 'anthropic', title: 'Claude', account: 0, kind: 'five_hour' as const, label: '', percent: 28, resetsAt: new Date(NOW + 2 * 3_600_000 + 12 * 60_000).toISOString() },
+    { provider: 'claude', type: 'anthropic', title: 'Claude', account: 0, kind: 'seven_day' as const, label: '', percent: 8, resetsAt: new Date(NOW + 3 * 86_400_000).toISOString() },
+    { provider: 'chatgpt', type: 'chatgpt', title: 'GPT', account: 0, kind: 'five_hour' as const, label: '', windowMinutes: 300, percent: 12, resetsAt: new Date(NOW + 45 * 60_000).toISOString() },
+    { provider: 'chatgpt', type: 'chatgpt', title: 'GPT', account: 1, kind: 'five_hour' as const, label: '', windowMinutes: 300, percent: 64, resetsAt: new Date(NOW - 15 * 60_000).toISOString() },
+    { provider: 'chatgpt', type: 'chatgpt', title: 'GPT', account: 1, kind: 'seven_day' as const, label: '', windowMinutes: 10080, percent: 97 },
+  ]
+  const { calls, fn } = recorder()
+  const actions = { close: fn('close') }
+  const view = { items: limits, saveUntil: NOW + 2 * 3_600_000 }
+  // Every pane answered before the first mount: the hooks beneath the plugins register first.
+  for (const surface of SURFACES) {
+    drawPane(on, 'limits-' + surface, el => renderLimits(el, { ...frameOf(surface, 80), lang: 'ko' }, view, actions))
+    drawPane(on, 'limits-none-' + surface, el => renderLimits(el, { ...frameOf(surface, 80), lang: 'ko' }, { items: [] }, actions))
+  }
+  drawPane(on, 'limits-en', el => renderLimits(el, frameOf('desktop', 80), view, actions))
+  for (const surface of SURFACES) {
+    const ui = await mount($, 'limits-' + surface, surface, 80)
+    const said = (await ui.findAll({ type: 'Text' })).map(text => text.text).join('\n')
+    for (const text of [
+      '플랜 한도',
+      // One head per provider account, numbered when a provider has several.
+      'Claude', 'GPT 1', 'GPT 2',
+      // Every share, and how many windows are at 80% or more.
+      '28%', '8%', '12%', '64%', '97%', '사용률이 80% 이상인 한도가 1개 있습니다.',
+      // Each reset to the minute in local time, and the time left.
+      '10월 10일 (토) 오후 3:32 초기화', '2시간 12분 남음',
+      '10월 13일 (화) 오후 1:20 초기화', '3일 남음',
+      '10월 10일 (토) 오후 2:05 초기화', '45분 남음',
+      // A reset already passed says so; a window without one says that.
+      '초기화 시간(10월 10일 (토) 오후 1:05)이 지났습니다.', '표시된 사용률은 초기화 전 값일 수 있습니다.',
+      '이 한도는 초기화 시간을 확인할 수 없습니다.',
+      // Save mode, under Claude's own windows, until when it holds.
+      '절약 모드가 켜져 있습니다. 10월 10일 (토) 오후 3:20까지 자동 추론 강도를 중간 이하로 유지합니다.',
+    ]) expect(said, surface + ' ' + text).toContain(text)
+    // Save mode is Claude's alone.
+    expect(said.split('절약 모드가 켜져 있습니다.').length - 1, surface).toBe(1)
+    await ui.press({ key: 'limits-close' })
+    await ui.unmount()
+    const none = await mount($, 'limits-none-' + surface, surface, 80)
+    expect(await none.find({ type: 'Text', text: '아직 한도 사용량을 확인할 수 없습니다.' }), surface).toBeDefined()
+    await none.unmount()
+  }
+  expect(calls).toEqual(['close', 'close'])
+  // The desktop heads the pane with the window closest to its cap, as a dial and in words, and draws
+  // each share as a bar.
+  const desktop = await mount($, 'limits-desktop', 'desktop', 80)
+  expect(await desktop.find({ type: 'Text', text: '최고 사용률' })).toBeDefined()
+  expect(await desktop.find({ type: 'Text', text: 'GPT 2 주간 97%' })).toBeDefined()
+  expect(await svgByAlt(desktop, '최고 사용률 GPT 2 주간 97%')).toBeDefined()
+  for (const alt of ['5시간 28%', '주간 8%', '5시간 12%', '5시간 64%', '주간 97%']) expect(await svgByAlt(desktop, alt), alt).toBeDefined()
+  await desktop.unmount()
+  const en = await mount($, 'limits-en', 'desktop', 80)
+  const english = (await en.findAll({ type: 'Text' })).map(text => text.text).join('\n')
+  for (const text of ['Plan limits', 'Resets Sat, Oct 10, 3:32 PM', '2h 12m left', 'Resets Tue, Oct 13, 1:20 PM', '3d left', 'Its reset time (Sat, Oct 10, 1:05 PM) has passed.', 'One window is at 80% or more.']) expect(english, text).toContain(text)
+  await en.unmount()
+})
+
+// 2026-11-04: the pane lists every Claude account the owner added, numbered, each with its label
+// and the one in use marked; save mode's sentence stands once, under the account in use. The band's
+// row keeps to that account alone, unnumbered.
+test('the limits pane lists every account, labelled and the one in use marked; the row keeps to it', async ($, on) => {
+  const at = (h: number) => new Date(NOW + h * 3_600_000).toISOString()
+  const limits = [
+    { provider: 'anthropic', type: 'anthropic', title: 'Claude', account: 0, kind: 'five_hour' as const, label: '', percent: 81, resetsAt: at(2) },
+    { provider: 'anthropic', type: 'anthropic', title: 'Claude', account: 1, accountLabel: 'work@example.com', inUse: true as const, kind: 'five_hour' as const, label: '', percent: 15, resetsAt: at(3) },
+    { provider: 'chatgpt', type: 'chatgpt', title: 'GPT', account: 0, accountLabel: 'me@example.com', kind: 'seven_day' as const, label: '', windowMinutes: 10080, percent: 23, resetsAt: at(50) },
+    { provider: 'chatgpt', type: 'chatgpt', title: 'GPT', account: 1, accountLabel: 'design-team-shared-account@example.com', inUse: true as const, kind: 'seven_day' as const, label: '', windowMinutes: 10080, percent: 64, resetsAt: at(60) },
+  ]
+  const view = { items: limits, saveUntil: NOW + 3_600_000 }
+  for (const surface of SURFACES) drawPane(on, 'accounts-' + surface, el => renderLimits(el, { ...frameOf(surface, 80), lang: 'ko' }, view, { close: () => {} }))
+  drawPane(on, 'accounts-narrow', el => renderLimits(el, { ...frameOf('desktop', 44), lang: 'ko' }, view, { close: () => {} }))
+  drawPane(on, 'accounts-row', el => renderBand(el, { ...frameOf('desktop', 94), lang: 'ko' }, { ...DASH, extras: ['limits'], limits }, BAND_ACTIONS))
+  // "사용 중" right after the number, set apart from the account's name: a badge on the desktop,
+  // in brackets on the terminal; never one more "·" run at the end of the name.
+  const tagged = { desktop: ['work', 'design-team-shared-acco…'], terminal: ['(사용 중)', '· work', '· design-team-shared-acco…'] }
+  for (const surface of SURFACES) {
+    const ui = await mount($, 'accounts-' + surface, surface, 80)
+    const texts = (await ui.findAll({ type: 'Text' })).map(text => text.text)
+    for (const text of ['Claude 1', 'Claude 2', 'GPT 1', 'GPT 2', '81%', '15%', ...tagged[surface]]) expect(texts, surface + ' ' + text).toContain(text)
+    const said = texts.join('\n')
+    expect(said.includes('· 사용 중'), surface).toBe(false)
+    expect(said.split('절약 모드가 켜져 있습니다.').length - 1, surface).toBe(1)
+    // The sentence stands under the account in use: after its head, before the next tile's.
+    expect(said.indexOf('절약 모드가 켜져 있습니다.') > said.indexOf('Claude 2'), surface).toBe(true)
+    if (surface === 'terminal') expect(said.split('(사용 중)').length - 1).toBe(2)
+    else {
+      expect(said.includes('사용 중'), 'the desktop draws the tag, not a Text').toBe(false)
+      expect((await ui.findAll({ type: 'Svg' })).filter(svg => svg.props.alt === '사용 중').length).toBe(2)
+    }
+    await ui.unmount()
+  }
+  // Narrow, the long name gives way; both tags stay.
+  const narrow = await mount($, 'accounts-narrow', 'desktop', 44)
+  expect((await narrow.findAll({ type: 'Svg' })).filter(svg => svg.props.alt === '사용 중').length).toBe(2)
+  await narrow.unmount()
+  const row = await mount($, 'accounts-row', 'desktop', 94)
+  const shown = (await row.findAll({ type: 'Text' })).map(text => text.text)
+  expect(shown).toContain('Claude')
+  expect(shown).toContain('15%')
+  expect(shown).not.toContain('81%')
+  expect(shown).not.toContain('Claude 2')
+  // Every provider keeps to its account in use, unnumbered as Claude is (e827192, 2026-11-05).
+  expect(shown).toContain('GPT')
+  expect(shown).toContain('64%')
+  expect(shown).not.toContain('23%')
+  expect(shown).not.toContain('GPT 2')
+  await row.unmount()
+})
+
+// 2026-10-25: the row itself is the way in. It lights under the pointer and says what pressing it
+// shows; the reset times are no longer written on it.
+// 2026-11-07: the route says the last answer's tok/s, but never cuts the model's name for it.
+test('the terminal route keeps its output rate only beside the whole model name', () => {
+  const route = { model: 'deepseek-v4.1-flash', provider: 'opencode-go', ok: true, resent: false, status: '200', seconds: 1, rate: 200 }
+  const view: DashboardView = { ...DASH, notice: null, route }
+  const texts = (room: number) => {
+    const fact = routeFact(frameOf('terminal', 100), view, room, () => {})
+    return fact ? [fact.value.text, ...(fact.tail ?? []).map(run => run.text)] : []
+  }
+  expect(texts(24)).toEqual(['deepseek-v4.1-flash'])
+  expect(texts(40)).toEqual(['deepseek-v4.1-flash', '200 tok/s'])
+  const failed = routeFact(frameOf('terminal', 100), { ...view, route: { ...route, ok: false, status: '529' } }, 40, () => {})
+  expect((failed?.tail ?? []).map(run => run.text)).not.toContain('200 tok/s')
+})
+
+test('the desktop limits row is a button that opens the limits pane', async ($, on) => {
+  const { calls, fn } = recorder()
+  const actions = { ...BAND_ACTIONS, toggleLimits: fn('limits') }
+  const limits: DashboardView['limits'] = [
+    { provider: 'claude', type: 'anthropic', title: 'Claude', account: 0, kind: 'five_hour', label: '', percent: 28, resetsAt: new Date(NOW + 2 * 3_600_000).toISOString() },
+    { provider: 'claude', type: 'anthropic', title: 'Claude', account: 0, kind: 'seven_day', label: '', percent: 8, resetsAt: new Date(NOW + 3 * 86_400_000).toISOString() },
+  ]
+  drawPane(on, 'limits-row', el => renderBand(el, { ...frameOf('desktop', 94), lang: 'ko' }, { ...DASH, extras: ['limits'], limits }, actions))
+  const ui = await mount($, 'limits-row', 'desktop', 94)
+  expect(await ui.find({ type: 'Button', key: 'limits-open' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: '눌러서 기간별 사용률과 초기화 시간 보기' })).toBeDefined()
+  // The shares are on the row; the reset times are the pane's.
+  for (const figure of ['28%', '8%']) expect(await ui.find({ type: 'Text', text: figure }), figure).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /뒤$/ })).toBeUndefined()
+  await ui.press({ key: 'limits-open' })
+  expect(calls).toEqual(['limits'])
+  await ui.unmount()
+})
+
+// 2026-10-29: the row's light sat in an empty absolute Box laid over it, which the app never drew:
+// every other button on the band showed a box under the pointer and the limits row none. The row
+// now carries the same light as the effort chip, in flow, with no vertical air, and gives back the
+// light's round edge from the air above it so the band keeps its height and the figures their place.
+test('the pressable limits row lights as the band\'s other buttons do, at the same height', async ($, on) => {
+  const limits: DashboardView['limits'] = [
+    { provider: 'claude', account: 0, kind: 'five_hour', label: '', percent: 28 },
+    { provider: 'chatgpt', account: 0, kind: 'seven_day', label: '', percent: 8 },
+  ]
+  for (const skin of SKINS) for (const columns of [94, 200]) for (const active of [false, true]) {
+    const id = ['limits-height', skin, columns, active].join('-')
+    drawPane(on, id, el => renderBand(el, frameOf('desktop', columns, 12, skin), { ...DASH, extras: ['limits'], limits }, { ...BAND_ACTIONS, ...(active ? { toggleLimits: () => undefined } : {}) }))
+  }
+  for (const skin of SKINS) for (const columns of [94, 200]) {
+    const at: { left: number; top: number }[] = []
+    for (const active of [false, true]) {
+      const ui = await mount($, ['limits-height', skin, columns, active].join('-'), 'desktop', columns)
+      // A drawn node carries its hover beside its props.
+      const nodes = new Map<string, Drawn & { hover?: Record<string, unknown> }>()
+      walk(await ui.drawn(), n => { if (typeof n.props?.key === 'string') nodes.set(n.props.key, n) })
+      const outer = nodes.get('band-limits')!.props!
+      const rowNode = nodes.get('limits-row')!
+      const row = rowNode.props!
+      expect(nodes.has('limits-light')).toBe(false)
+      if (active) {
+        // The effort chip's light, in the same skin: its edge at rest and under the pointer.
+        const effortNode = nodes.get('fact-effort')!
+        expect(row.borderStyle, skin).toBe(effortNode.props!.borderStyle)
+        expect(row.borderColor, skin).toBe(effortNode.props!.borderColor)
+        const { scope: _effortScope, ...effortHover } = effortNode.hover!
+        const { scope, ...rowHover } = rowNode.hover!
+        expect(rowHover, skin).toEqual(effortHover)
+        expect(scope).toBe('ripple-tip-limits-open')
+        // No host air above or below the figures; a fact's air either side.
+        expect(row.paddingY).toBe(0)
+        expect(row.paddingX).toBe(0.5)
+        expect(await ui.find({ type: 'Button', key: 'limits-open' })).toBeDefined()
+      } else expect(row.borderStyle).toBeUndefined()
+      at.push({ left: (outer.paddingLeft as number) + ((row.paddingX as number | undefined) ?? 0), top: (outer.paddingTop as number) + (active ? 2 / (19 / 2) : 0) })
+      await ui.unmount()
+    }
+    // The figures start where they did, and the row with its edge is as tall as it was.
+    expect(Math.abs(at[1]!.left - at[0]!.left) < 1e-9, skin + ' ' + columns + ' left').toBe(true)
+    expect(Math.abs(at[1]!.top - at[0]!.top) < 1e-9, skin + ' ' + columns + ' top').toBe(true)
+  }
+})
+
 // ---- Tool runs (2026-10-20: a worker's commands read as a wall, each wrapped over lines) ------------
 
 test('a run of tool calls is headed in one line as the Claude app heads it', () => {
   const call = (id: string, tool: string, detail: string, state: 'ok' | 'error' | 'running' = 'ok') => ({ id, tool, detail, state })
   const run = [call('1', 'Bash', 'npm test'), call('2', 'Read', 'a.ts'), call('3', 'Read', 'a.ts'), call('4', 'Bash', 'ls', 'error'), call('5', 'Edit', 'a.ts')]
   // A file read twice counts once; a read and an edit of one file count in each kind.
-  expect(runSummary(run, 'ko')).toEqual({ text: '명령어 2개 실행함, 파일 1개 읽음, 파일 1개를 편집함', failed: 1 })
-  expect(runSummary(run.slice(0, 2), 'en')).toEqual({ text: 'Ran 1 command, Read 1 file', failed: 0 })
+  // The Claude app's own Korean (2026-10-24): "실행됨 명령 20개, 읽음 파일 15개".
+  expect(runSummary(run, 'ko')).toEqual({ text: '실행됨 명령 2개, 읽음 파일 1개, 편집함 파일 1개', failed: 1 })
+  // The app's English: the first word capitalised, the rest as written.
+  expect(runSummary(run.slice(0, 2), 'en')).toEqual({ text: 'Ran a command, read a file', failed: 0 })
   expect(runSummary([call('1', 'Bash', 'a'), call('2', 'Bash', 'b')], 'es').text).toBe('2 comandos ejecutados')
   expect(runSummary([call('1', 'Bash', 'a')], 'es').text).toBe('1 comando ejecutado')
-  // Five kinds or more: the first three, the rest counted.
-  const kinds = [call('1', 'Bash', 'x'), call('2', 'Read', 'a'), call('3', 'Edit', 'b'), call('4', 'Grep', 'c'), call('5', 'WebFetch', 'd'), call('6', 'WebFetch', 'e')]
-  expect(runSummary(kinds, 'ko').text).toBe('명령어 1개 실행함, 파일 1개 읽음, 파일 1개를 편집함, 그 외 작업 3개')
-  expect(runSummary(kinds, 'en').text).toBe('Ran 1 command, Read 1 file, Edited 1 file, and 3 more actions')
+  // Every kind shown, in the order they came, but the tools the app has no kind for last
+  // (2026-10-24: ours led with "사용함 도구 2개" where the app's view beside it ended with it).
+  // A search, a lookup and a browse name no count; a page fetched twice counts once.
+  const kinds = [call('0', 'ToolSearch', 'q'), call('1', 'Bash', 'x'), call('2', 'Read', 'a'), call('3', 'Write', 'b'), call('4', 'Grep', 'c'), call('5', 'WebFetch', 'd'), call('6', 'WebFetch', 'd'), call('7', 'Skill', 's'), call('8', 'Glob', 'g'), call('9', 'Agent', 'w')]
+  expect(runSummary(kinds, 'ko').text).toBe('실행됨 명령 1개, 읽음 파일 1개, 생성됨 파일 1개, 검색함 코드, 가져옴 페이지 1개, 찾음 파일, 실행됨 에이전트 1개, 사용함 도구 2개')
+  expect(runSummary(kinds, 'en').text).toBe('Ran a command, read a file, created a file, searched code, fetched a page, found files, ran an agent, used 2 tools')
+})
+
+test('an edit counts the lines it adds and removes from what the model sent, and a run sums its answered edits', () => {
+  expect(editLines('Edit', { old_string: 'a\nb\nc\nd', new_string: 'a\nB\nc\nd\ne' })).toEqual({ added: 2, removed: 1 })
+  expect(editLines('Edit', { old_string: 'x\n', new_string: 'x\n' })).toEqual({ added: 0, removed: 0 })
+  // A Write's every line is added; a MultiEdit sums its pairs; other tools count nothing.
+  expect(editLines('Write', { content: 'one\ntwo\nthree\n' })).toEqual({ added: 3, removed: 0 })
+  expect(editLines('MultiEdit', { edits: [{ old_string: 'a', new_string: 'b' }, { old_string: 'c\nd', new_string: '' }] })).toEqual({ added: 1, removed: 3 })
+  expect(editLines('Bash', { command: 'ls' })).toBeUndefined()
+  const call = (id: string, state: 'ok' | 'error' | 'running', added: number, removed: number) => ({ id, tool: 'Edit', detail: 'a.ts', state, added, removed })
+  expect(runDiff([call('1', 'ok', 40, 300), call('2', 'ok', 12, 80), call('3', 'error', 5, 5), call('4', 'running', 7, 7)])).toEqual({ added: 52, removed: 380 })
+  expect(runDiff([{ id: '1', tool: 'Bash', detail: 'ls', state: 'ok' }])).toBeUndefined()
+  // talkOf carries the counts on the edit's entry, and nothing on any other call.
+  expect(talkOf([{ role: 'assistant', text: '', toolUses: [
+    { tool_use_id: 'e', tool: 'Edit', input: { file_path: '/a.ts', old_string: 'a', new_string: 'b\nc' }, text: 'ok' },
+    { tool_use_id: 'r', tool: 'Read', input: { file_path: '/a.ts' }, text: 'ok' },
+  ] }])).toEqual([
+    { kind: 'tool', id: 'e', tool: 'Edit', detail: '/a.ts', state: 'ok', added: 2, removed: 1 },
+    { kind: 'tool', id: 'r', tool: 'Read', detail: '/a.ts', state: 'ok' },
+  ])
+})
+
+test('a run is one quiet line in the app\'s words, its edits\' lines in a chip after it, with no mark and no failure count', async ($, on) => {
+  const talk: AgentEntry[] = [
+    { kind: 'prompt', text: 'Remove the feature.' },
+    ...Array.from({ length: 7 }, (_, i): AgentEntry => ({ kind: 'tool', id: 'c' + i, tool: 'Bash', detail: 'grep -rn x', state: i === 2 ? 'error' : 'ok' })),
+    ...Array.from({ length: 9 }, (_, i): AgentEntry => ({ kind: 'tool', id: 'd' + i, tool: 'Edit', detail: 'f' + i + '.ts', state: 'ok', added: i === 0 ? 4 : 6, removed: i === 0 ? 44 : 42 })),
+    ...Array.from({ length: 3 }, (_, i): AgentEntry => ({ kind: 'tool', id: 'e' + i, tool: 'Read', detail: 'r' + i + '.ts', state: 'ok' })),
+  ]
+  const done: AgentRec = { ...AGENTS[0]!, state: 'done', endedAt: NOW - 1000 }
+  drawPane(on, 'chip-ko', el => renderAgents(el, { ...frameOf('desktop', 64), lang: 'ko' }, { agents: [done], now: NOW, showDone: false, open: { id: 'a1', talk: { entries: talk } } }, AGENT_NOOP))
+  drawPane(on, 'chip-open', el => renderAgents(el, { ...frameOf('desktop', 64), lang: 'ko' }, { agents: [done], now: NOW, showDone: false, open: { id: 'a1', talk: { entries: talk }, runsOpen: ['c0'] } }, AGENT_NOOP))
+  const ui = await mount($, 'chip-ko', 'desktop', 64)
+  expect(await ui.find({ type: 'Text', text: '실행됨 명령 7개, 편집함 파일 9개, 읽음 파일 3개' })).toBeDefined()
+  // The words carry no hover of their own: lit words and the press's light fought under a still
+  // pointer and the line flickered (2026-10-25). The press over the line is its one hover.
+  const lit: unknown[] = []
+  walk(await ui.drawn(), n => { if (n.type === 'Text' && (n.children ?? []).join('') === '실행됨 명령 7개, 편집함 파일 9개, 읽음 파일 3개') lit.push((n as { hover?: unknown }).hover) })
+  expect(lit).toEqual([undefined])
+  const chip = await svgByAlt(ui, '52줄 추가, 380줄 삭제')
+  expect(chip).toBeDefined()
+  expect(String(chip?.props.source)).toContain('+52')
+  expect(String(chip?.props.source)).toContain('−380')
+  expect(await ui.find({ type: 'Text', text: '1개 실패' })).toBeUndefined()
+  // The agent's own card keeps its ✓; nothing marks the run.
+  expect(await ui.find({ type: 'Text', text: '✕' })).toBeUndefined()
+  expect(await ui.find({ type: 'Button', key: 'run-c0' })).toBeDefined()
+  // Unfolded, the failed call is still told apart in red.
+  const open = await mount($, 'chip-open', 'desktop', 64)
+  expect(await open.findAll({ type: 'Text', text: '✕' })).toHaveLength(1)
 })
 
 test('a call reads as one short line: no leading cd, paths short, a command\'s description first', () => {
@@ -1207,7 +1860,7 @@ test('a call reads as one short line: no leading cd, paths short, a command\'s d
     .toEqual([{ kind: 'tool', id: 'u1', tool: 'Read', detail: 'a.kt', state: 'ok' }])
 })
 
-test('a run of calls folds into its head, unfolds call by call when pressed, and a single call stays one line', async ($, on) => {
+test('a run of calls folds into its head, unfolds call by call when pressed; a single call stays one line on the terminal and is a run of one on the desktop', async ($, on) => {
   const { calls, fn } = recorder()
   const actions = { ...AGENT_NOOP, toggleRun: fn('run') }
   const bash = (i: number, state: 'ok' | 'error' = 'ok'): AgentEntry => ({ kind: 'tool', id: 'b' + i, tool: 'Bash', detail: commandLine('cd /Users/pbj/Documents/tabripple/android && ./gradlew :core:test --tests "*Parser*" -q 2>&1 | grep -vE "^(w:|warning)" | tail -40 # run ' + i), state })
@@ -1224,15 +1877,18 @@ test('a run of calls folds into its head, unfolds call by call when pressed, and
   drawPane(on, 'runs-open', (el, surface) => renderAgents(el, frameOf(surface, 64), { agents: [done], now: NOW, showDone: false, open: { id: 'a9', talk: { entries: talk }, runsOpen: ['b0'] } }, actions))
   for (const surface of SURFACES) {
     const folded = await mount($, 'runs-folded', surface, 64)
-    expect(await folded.find({ type: surface === 'desktop' ? 'Text' : 'Button', text: /^Ran 8 commands, Edited 1 file/ }), surface).toBeDefined()
-    expect(await folded.find({ type: 'Text', text: '1 failed' }), surface).toBeDefined()
-    // Folded, none of its calls show; the single call after the words is its own line, no head.
-    expect(await folded.findAll({ type: 'Text', text: /^Bash$/ }), surface).toHaveLength(1)
-    expect(await folded.find({ type: 'Text', text: 'git status' }), surface).toBeDefined()
-    expect(await folded.find({ type: 'Button', key: 'run-solo' }), surface).toBeUndefined()
+    expect(await folded.find({ type: surface === 'desktop' ? 'Text' : 'Button', text: /^Ran 8 commands, edited a file/ }), surface).toBeDefined()
+    expect(await folded.find({ type: 'Text', text: '1 failed' }) !== undefined, surface).toBe(surface === 'terminal')
+    // Folded, none of its calls show. The single call after the words: on the terminal its own
+    // line, no head; on the desktop a run of one, as the Claude app draws it.
+    const desktop = surface === 'desktop'
+    expect(await folded.findAll({ type: 'Text', text: /^Bash$/ }), surface).toHaveLength(desktop ? 0 : 1)
+    expect(await folded.find({ type: 'Text', text: 'git status' }) !== undefined, surface).toBe(!desktop)
+    expect(await folded.find({ type: 'Button', key: 'run-solo' }) !== undefined, surface).toBe(desktop)
+    if (desktop) expect(await folded.find({ type: 'Text', text: 'Ran a command' }), surface).toBeDefined()
     await folded.press({ key: 'run-b0' })
     const open = await mount($, 'runs-open', surface, 64)
-    expect(await open.findAll({ type: 'Text', text: /^Bash$/ }), surface).toHaveLength(9)
+    expect(await open.findAll({ type: 'Text', text: /^Bash$/ }), surface).toHaveLength(desktop ? 8 : 9)
     expect(await open.find({ type: 'Text', text: /^Edit$/ }), surface).toBeDefined()
     // Each call one line, its cd gone, cut with an ellipsis before the pane's edge.
     const details = (await open.findAll({ type: 'Text', text: /gradlew/ })).map(d => d.text)
@@ -1257,26 +1913,31 @@ const STILL_PAIRS: [number, number][] = [[192_000, 193_000], [59_000, 60_000], [
 /** Pane widths: ~560 px, ~360 px, ~260 px. */
 const STILL_COLUMNS = [68, 44, 33]
 const STILL_LANGS = ['en', 'ko', 'es'] as const
-const stillId = (lang: string, columns: number, i: number, side: string) => ['still', lang, columns, i, side].join('-')
+const stillId = (lang: string, columns: number, i: number, side: string, page: string) => ['still', page, lang, columns, i, side].join('-')
+/** The list's row, and the open conversation's card that carries the figures (2026-10-24). */
+const STILL_PAGES = ['list', 'open'] as const
+const stillView = (page: string, rec: AgentRec, now: number): AgentsView => ({ agents: [rec], now, showDone: false, ...(page === 'open' ? { open: { id: rec.id, talk: { entries: [] } } } : {}) })
 
-test('a running card draws the same tree a tick on and across 59s → 1m 00s and 9m 59s → 10m 00s, but for its time, wide and narrow', async ($, on) => {
-  for (const lang of STILL_LANGS) {
-    for (const columns of STILL_COLUMNS) {
-      for (const [i, [before, after]] of STILL_PAIRS.entries()) {
-        const agent: AgentRec = { ...STILL_AGENT, startedAt: NOW - before }
-        // A step on, the agent is in another tool: the card must not show it.
-        const later: AgentRec = { ...agent, now: 'Edit hooks/ui/log.tsx', toolSince: NOW + 500 }
-        for (const [side, ms, rec] of [['a', 0, agent], ['b', after - before, later]] as const) {
-          drawPane(on, stillId(lang, columns, i, side), el => renderAgents(el, { ...frameOf('desktop', columns), lang, now: NOW + ms }, { agents: [rec], now: NOW + ms, showDone: false }, AGENT_NOOP))
+test('a running row and card draw the same tree a tick on and across 59s → 1m 00s and 9m 59s → 10m 00s, but for its time, wide and narrow', async ($, on) => {
+  for (const page of STILL_PAGES) {
+    for (const lang of STILL_LANGS) {
+      for (const columns of STILL_COLUMNS) {
+        for (const [i, [before, after]] of STILL_PAIRS.entries()) {
+          const agent: AgentRec = { ...STILL_AGENT, startedAt: NOW - before }
+          // A step on, the agent is in another tool: neither the row nor the card may show it.
+          const later: AgentRec = { ...agent, now: 'Edit hooks/ui/log.tsx', toolSince: NOW + 500 }
+          for (const [side, ms, rec] of [['a', 0, agent], ['b', after - before, later]] as const) {
+            drawPane(on, stillId(lang, columns, i, side, page), el => renderAgents(el, { ...frameOf('desktop', columns), lang, now: NOW + ms }, stillView(page, rec, NOW + ms), AGENT_NOOP))
+          }
         }
       }
     }
   }
-  drawPane(on, 'still-fresh', el => renderAgents(el, frameOf('desktop', 68), { agents: [{ ...STILL_AGENT, id: 'a0', usage: undefined, tools: undefined, now: undefined, toolSince: undefined }], now: NOW, showDone: false }, AGENT_NOOP))
-  for (const lang of STILL_LANGS) {
+  drawPane(on, 'still-fresh', el => renderAgents(el, frameOf('desktop', 68), stillView('open', { ...STILL_AGENT, id: 'a0', usage: undefined, tools: undefined, now: undefined, toolSince: undefined }, NOW), AGENT_NOOP))
+  for (const page of STILL_PAGES) for (const lang of STILL_LANGS) {
     for (const columns of STILL_COLUMNS) {
       for (const [i, [before, after]] of STILL_PAIRS.entries()) {
-        const at = (s: string) => stillId(lang, columns, i, s)
+        const at = (s: string) => stillId(lang, columns, i, s, page)
         const times = [elapsed(before, lang), elapsed(after, lang)]
         expect(times[0], at('')).not.toBe(times[1])
         const masked = async (side: string) => {
@@ -1289,9 +1950,9 @@ test('a running card draws the same tree a tick on and across 59s → 1m 00s and
       }
     }
   }
-  // The numbers rows are there from the start, a dash for each figure not yet reported.
+  // The open card's second row is there from the start, a dash for each figure not yet reported.
   const fresh = await mount($, 'still-fresh', 'desktop', 68)
-  expect(await fresh.findAll({ type: 'Text', text: /^–$/ })).toHaveLength(3)
+  expect(await fresh.findAll({ type: 'Text', text: /^–$/ })).toHaveLength(2)
   expect(await fresh.find({ type: 'Text', text: /^0$/ })).toBeDefined()
   for (const lang of ['en', 'ko', 'zh', 'ja', 'es', 'pt'] as const) {
     for (const columns of STILL_COLUMNS) {
@@ -1304,28 +1965,36 @@ test('a running card draws the same tree a tick on and across 59s → 1m 00s and
   }
 })
 
-test('a narrow card keeps its model on one line without the vendor path, and its numbers in two fixed rows', async ($, on) => {
+test('a narrow card keeps its model on one line without the vendor path, and the same two body rows as a wide one', async ($, on) => {
   const why = 'session model · General / Standard'
   const agent: AgentRec = { ...STILL_AGENT, pick: { ...STILL_AGENT.pick!, why, by: 'session' } }
-  drawPane(on, 'narrow-card', el => renderAgents(el, { ...frameOf('desktop', 33), lang: 'ko' }, { agents: [agent], now: NOW, showDone: false }, AGENT_NOOP))
-  drawPane(on, 'wide-card', el => renderAgents(el, { ...frameOf('desktop', 68), lang: 'ko' }, { agents: [agent], now: NOW, showDone: false }, AGENT_NOOP))
+  // The card heads an open conversation; the title is the page's head row there.
+  drawPane(on, 'narrow-card', el => renderAgents(el, { ...frameOf('desktop', 33), lang: 'ko' }, stillView('open', agent, NOW), AGENT_NOOP))
+  drawPane(on, 'wide-card', el => renderAgents(el, { ...frameOf('desktop', 68), lang: 'ko' }, stillView('open', agent, NOW), AGENT_NOOP))
   const narrow = await mount($, 'narrow-card', 'desktop', 33)
   const wide = await mount($, 'wide-card', 'desktop', 68)
-  for (const ui of [narrow, wide]) {
+  for (const [side, ui] of [['narrow', narrow], ['wide', wide]] as const) {
     // No vendor path, and no pick line.
-    expect(await ui.find({ type: 'Text', text: /deepseek-ai\// })).toBeUndefined()
-    expect(await ui.find({ type: 'Text', text: /^deepseek-v/ })).toBeDefined()
-    expect(await ui.find({ type: 'Text', text: /표준/ })).toBeUndefined()
-    expect(await ui.find({ type: 'Text', text: why })).toBeUndefined()
+    expect(await ui.find({ type: 'Text', text: /deepseek-ai\// }), side + ' vendor').toBeUndefined()
+    expect(await ui.find({ type: 'Text', text: /^deep/ }), side + ' model').toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /표준/ }), side + ' level').toBeUndefined()
+    expect(await ui.find({ type: 'Text', text: why }), side + ' why').toBeUndefined()
   }
-  // Narrow: the name is cut to fit beside the effort; the numbers take two rows, the time ends one.
-  expect((await narrow.find({ type: 'Text', text: /^deepseek-v/ }))!.text.endsWith('…')).toBe(true)
-  expect(await narrow.find({ key: 'nums-1' })).toBeDefined()
-  expect(await wide.find({ key: 'nums-1' })).toBeUndefined()
-  expect(await narrow.find({ type: 'Text', text: '3m 12s' }) ?? await narrow.find({ type: 'Text', text: '3분 12초' })).toBeDefined()
-  // The time never takes a row of its own, and a long title is cut to two lines.
+  // Neither width pre-cuts the name: the whole string is drawn and the engine ellipsis it at the
+  // edge when its row is short, since the app's type is proportional.
+  for (const [side, ui] of [['narrow', narrow], ['wide', wide]] as const) {
+    const model = await ui.find({ type: 'Text', text: 'deepseek-v4.1-flash-1017' })
+    expect(model?.props.wrap, side + ' model cut').toBe('truncate-end')
+  }
+  for (const [side, ui] of [['narrow', narrow], ['wide', wide]] as const) {
+    expect(await ui.find({ key: 'model-row' }), side + ' model row').toBeDefined()
+    expect(await ui.find({ key: 'nums' }), side + ' numbers row').toBeDefined()
+    expect(await ui.find({ key: 'nums-1' }), side + ' no second numbers row').toBeUndefined()
+    expect(await ui.find({ key: 'open-head-end' }), side + ' time in the head').toBeDefined()
+  }
+  expect(await narrow.find({ type: 'Text', text: '3분 12초' }), 'time').toBeDefined()
+  // The time never takes a row of its own, and the title is the whole string, one line the engine cuts.
   for (const ui of [narrow, wide]) expect(await ui.find({ key: 'time-row' })).toBeUndefined()
-  const title = (await narrow.find({ type: 'Text', text: /^Port the/ }))!.text
-  expect(title.endsWith('…')).toBe(true)
-  expect(chOf(title) <= 2 * 33).toBe(true)
+  const title = await narrow.find({ type: 'Text', text: STILL_TITLE })
+  expect(title?.props.wrap, 'title cut').toBe('truncate-end')
 })

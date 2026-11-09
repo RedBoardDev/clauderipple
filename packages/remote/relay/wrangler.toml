@@ -8,10 +8,11 @@ compatibility_date = "2026-09-20"
 [assets]
 directory = "./dist"
 binding = "ASSETS"
-# Only the sockets run the worker. The PWA is plain static assets — free and unlimited on Cloudflare
-# (developers.cloudflare.com/workers/static-assets/billing-and-limitations, 2026-04-23) — with
-# their headers from dist/_headers.
-run_worker_first = ["/ws/*"]
+# Only the sockets and the two app-link files run the worker. The PWA is plain static assets — free
+# and unlimited on Cloudflare (developers.cloudflare.com/workers/static-assets/billing-and-limitations,
+# 2026-04-23) — with their headers from dist/_headers. The app-link paths must reach the worker, not
+# the asset store: only the worker can answer them with the right content type and variable.
+run_worker_first = ["/ws/*", "/.well-known/apple-app-site-association", "/.well-known/assetlinks.json"]
 html_handling = "auto-trailing-slash"
 not_found_handling = "none"
 
@@ -26,3 +27,12 @@ new_sqlite_classes = ["RelayRoom"]
 
 [observability]
 enabled = false
+
+[vars]
+# Android App Links: the SHA-256 fingerprint of the certificate Google Play signs the app with.
+# It is not in the repo — read it from Play Console → App integrity → App signing key certificate →
+# SHA-256 certificate fingerprint, and paste it here (comma-separated with a debug build's own
+# fingerprint, if you add one). While this is empty the relay answers
+# /.well-known/assetlinks.json with 404, so Android keeps opening the link in a browser.
+# Read 2026-10-23 from the Play Developer API (generatedApks, versionCode 9 and 10).
+ANDROID_CERT_SHA256 = "0A:F1:50:F9:36:13:5E:EC:59:D4:5A:4F:1D:55:EE:AE:E7:35:49:63:5C:0D:73:64:EF:B7:AF:95:EB:04:AC:F9"

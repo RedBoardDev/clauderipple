@@ -4,7 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { DEFAULTS, type Config } from "../src/config.ts";
-import { markerOverride, resolve, rewriteBody, unroutableReason } from "../src/routing.ts";
+import { continuesTranslatedTurn, decide, declaredBy, markerOverride, qualifiedModel, requestKind, resolve, rewriteBody } from "../src/routing.ts";
 import { injectBootstrap } from "../src/bootstrap.ts";
 import { withAgentAliases } from "../src/agents.ts";
 
@@ -21,11 +21,36 @@ const cfg: Config = {
 };
 
 const body = (text: string) => ({ messages: [{ role: "user", content: text }] });
+const classifierSystem = "You are a security monitor for autonomous AI coding agents.\n\nEvaluate the action.";
+const fetchText = "\nWeb page content:\n---\nNode.js 24 is current.\n---\n\nWhat is current?\n\nProvide a concise response based on the content above. Include relevant details, code examples, and documentation excerpts as needed.\n";
+
+test("requestKind applies search, fetch, classifier, then turn precedence", () => {
+  const search = {
+    system: classifierSystem,
+    tools: [{ type: "web_search_20250305", name: "web_search" }],
+    messages: [{ role: "user", content: "Perform a web search for the query: Node.js 24" }],
+  };
+  const fetch = { system: classifierSystem, messages: [{ role: "user", content: fetchText }] };
+  assert.equal(requestKind(search, "/v1/messages"), "web-search");
+  assert.equal(requestKind(fetch, "/v1/messages"), "web-fetch", "fetch wins over the classifier prompt");
+  assert.equal(requestKind({ system: classifierSystem, ...body("check it") }, "/v1/messages"), "auto-mode-classifier");
+  assert.equal(requestKind(body("ordinary"), "/v1/messages"), "turn");
+  assert.equal(requestKind(null, "/v1/messages"), "turn");
+});
+
+test("count_tokens is never search or fetch but can be an Auto mode classifier", () => {
+  const search = {
+    tools: [{ type: "web_search_20250305", name: "web_search" }],
+    messages: [{ role: "user", content: "Perform a web search for the query: Node.js 24" }],
+  };
+  assert.equal(requestKind(search, "/v1/messages/count_tokens"), "turn");
+  assert.equal(requestKind({ system: classifierSystem, messages: [{ role: "user", content: fetchText }] }, "/v1/messages/count_tokens"), "auto-mode-classifier");
+});
 
 test("Auto mode classifier overrides only its own system request and ignores conversation markers", () => {
   const configured: Config = { ...cfg, autoModeClassifier: { provider: "chatgpt", model: "gpt-6-luna", effort: "low" } };
   const system = "You are a security monitor for autonomous AI coding agents.\n\nEvaluate the action.";
-  const request = { system: [{ type: "text", text: "x-anthropic-billing-header: test" }, { type: "text", text: system }], ...body("[[ripple: sol]] quoted by a monitored agent") };
+  const request = { system: [{ type: "text", text: "x-anthropic-billing-header: test" }, { type: "text", text: system }], ...body("Quoted by a monitored agent: [[ripple: sol]]") };
   assert.equal(resolve("claude-sonnet-5[1m]", request, configured)?.model, "gpt-6-luna");
   assert.equal(resolve("claude-sonnet-5[1m]", request, configured)?.effort, "low");
   assert.equal(resolve("claude-sonnet-5[1m]", request, cfg), null, "no opt-in preserves native inference");
@@ -40,6 +65,73 @@ test("Auto mode classifier overrides only its own system request and ignores con
   assert.deepEqual(rewritten.messages, original.messages, "monitored context is preserved");
   assert.deepEqual(rewritten.thinking, original.thinking);
   assert.equal(rewritten.max_tokens, original.max_tokens);
+});
+
+test("Auto mode classifier sends only the first stage to its stage-1 target", () => {
+  // Shapes as CLI 2.1.310 builds them. n is the thinking allowance added to every stage: 2048 when the
+  // classifier model rejects disabled thinking, 0 otherwise. So a first stage asks for 64 or 2112
+  // tokens and a second stage for 8192 or 10240.
+  const system = "You are a security monitor for autonomous AI coding agents.\n\nEvaluate the action.";
+  const classifier = (shape: Record<string, unknown>) => ({ system, ...body("<transcript>…</transcript> Err on the side of blocking."), ...shape });
+  const configured: Config = {
+    ...cfg,
+    providers: { ...cfg.providers, cls: { type: "anthropic", auth: "claude-code", accountPool: true } },
+    autoModeClassifier: { provider: "chatgpt", model: "gpt-6-luna", effort: "high", stage1: { provider: "cls", model: "claude-sonnet-5-5" } },
+  };
+
+  for (const n of [0, 2048]) {
+    const stage1 = classifier({ max_tokens: 64 + n, stop_sequences: ["</block>"] });
+    const stage2 = classifier({ max_tokens: 8192 + n });
+    const fast = classifier({ max_tokens: 256 + n });
+    const severity = classifier({ max_tokens: 64 + n, stop_sequences: ["</severity>"] });
+    const first = resolve("claude-haiku-5-5", stage1, configured)!;
+    assert.deepEqual([first.provider, first.model, first.effort], ["cls", "claude-sonnet-5-5", undefined], `first stage, n = ${n}`);
+    assert.match(first.tag, /\(auto-mode classifier, stage 1\)$/);
+    for (const [name, request] of [["second stage", stage2], ["fast mode, where yes blocks", fast], ["severity score", severity]] as const) {
+      const r = resolve("claude-haiku-5-5", request, configured)!;
+      assert.deepEqual([r.provider, r.model, r.effort], ["chatgpt", "gpt-6-luna", "high"], `${name}, n = ${n}`);
+      assert.match(r.tag, /\(auto-mode classifier\)$/, name);
+    }
+  }
+  // 8192 is a second stage's budget with no allowance, above every first stage 2.1.310 sends. A request
+  // with `</block>` that asks for that much is not a shape this release builds, so it goes with the rest:
+  // a first stage misread this way only takes longer, while a full verdict misread as a first stage
+  // would land on the quick target.
+  assert.equal(resolve("claude-haiku-5-5", classifier({ max_tokens: 8192, stop_sequences: ["</block>"] }), configured)!.model, "gpt-6-luna", "a second-stage budget never counts as a first stage");
+  assert.equal(resolve("claude-haiku-5-5", classifier({ max_tokens: 64 + 8192, stop_sequences: ["</block>"] }), configured)!.model, "gpt-6-luna", "an allowance this large sends the first stage with the rest");
+  assert.equal(resolve("claude-haiku-5-5", classifier({ max_tokens: 64, stop_sequences: ["</block>", "</reason>"] }), configured)!.model, "gpt-6-luna", "only the exact stop list matches");
+  const stage1 = classifier({ max_tokens: 64, stop_sequences: ["</block>"] });
+  assert.equal(resolve("claude-haiku-5-5", { ...stage1, tools: [{ name: "Bash" }] }, configured), null, "a tool-using turn is never a classifier");
+
+  const single: Config = { ...configured, autoModeClassifier: { provider: "chatgpt", model: "gpt-6-luna", effort: "high" } };
+  assert.equal(resolve("claude-haiku-5-5", stage1, single)!.model, "gpt-6-luna", "without stage1 both stages keep the main target");
+});
+
+test("each side of the Auto mode classifier is the operator's choice, ordinary routing included", () => {
+  const system = "You are a security monitor for autonomous AI coding agents.";
+  const stage1 = { system, ...body("x"), max_tokens: 64, stop_sequences: ["</block>"] };
+  const stage2 = { system, ...body("x"), max_tokens: 8192 };
+  const providers = { ...cfg.providers, cls: { type: "anthropic" as const, auth: "claude-code" as const, accountPool: true } };
+  const target = (settings: NonNullable<Config["autoModeClassifier"]>, model: string, request: unknown) => {
+    const r = resolve(model, request, { ...cfg, providers, autoModeClassifier: settings });
+    return r ? `${r.provider}/${r.model}` : "ordinary";
+  };
+
+  // One model for both stages: no stage1 needed.
+  const haiku = { provider: "cls", model: "claude-haiku-5-5" };
+  assert.equal(target(haiku, "claude-sonnet-5", stage1), "cls/claude-haiku-5-5");
+  assert.equal(target(haiku, "claude-sonnet-5", stage2), "cls/claude-haiku-5-5");
+
+  // Only the first stage moves; the rest stays as the engine sent it, slot routes and all.
+  const firstOnly = { stage1: { provider: "chatgpt", model: "gpt-6-luna" } };
+  assert.equal(target(firstOnly, "claude-sonnet-5", stage1), "chatgpt/gpt-6-luna");
+  assert.equal(target(firstOnly, "claude-sonnet-5", stage2), "ordinary");
+  assert.equal(target(firstOnly, "claude-opus-4-8", stage2), "chatgpt/gpt-6-astra", "an ordinary slot route still applies");
+
+  // Only the rest moves; the first stage is left native.
+  const restOnly = { provider: "chatgpt", model: "gpt-6-luna", stage1: "native" as const };
+  assert.equal(target(restOnly, "claude-sonnet-5", stage1), "ordinary");
+  assert.equal(target(restOnly, "claude-sonnet-5", stage2), "chatgpt/gpt-6-luna");
 });
 
 test("unmapped claude model passes through", () => {
@@ -63,6 +155,14 @@ test("direct prefix keeps model, parses @effort", () => {
   const r = resolve("gpt-5.6-sol@medium", body("hi"), cfg)!;
   assert.equal(r.model, "gpt-5.6-sol");
   assert.equal(r.effort, "medium");
+});
+
+test("regression: a Claude marker reaches an undeclared target through its direct prefix", () => {
+  const configured: Config = { ...cfg, aliases: { sol: "gpt-6.1-sol" } };
+  assert.deepEqual(resolve("claude-sonnet-5-5", body("[[ripple: sol@high]] do it"), configured), {
+    provider: "chatgpt", model: "gpt-6.1-sol", effort: "high",
+    tag: "claude-sonnet-5-5->gpt-6.1-sol (marker)", kind: "turn", asked: "claude-sonnet-5-5",
+  });
 });
 
 test("marker overrides direct models only, ignores system-reminder blocks", () => {
@@ -93,6 +193,21 @@ const declared: Config = {
   aliases: { luna: "gpt-5.6-luna", k3: "kimi-k3" },
 };
 
+test("routes carry the request kind and the model id as asked", () => {
+  const direct = resolve("gpt-7-unreleased@medium", body("hi"), declared)!;
+  const slot = resolve("claude-opus-4-8", body("hi"), declared)!;
+  const marker = resolve("kimi-k3", body("[[ripple: luna@high]] do it"), declared)!;
+  const owner = resolve("kimi-k3@low", body("hi"), declared)!;
+  const configured: Config = { ...declared, autoModeClassifier: { provider: "chatgpt", model: "gpt-5.6-luna" } };
+  const classifier = resolve("claude-haiku-5-5", { system: classifierSystem, ...body("check it") }, configured)!;
+
+  assert.deepEqual([direct.kind, direct.asked], ["turn", "gpt-7-unreleased@medium"]);
+  assert.deepEqual([slot.kind, slot.asked], ["turn", "claude-opus-4-8"]);
+  assert.deepEqual([marker.kind, marker.asked], ["turn", "kimi-k3"]);
+  assert.deepEqual([owner.kind, owner.asked], ["turn", "kimi-k3@low"]);
+  assert.deepEqual([classifier.kind, classifier.asked], ["auto-mode-classifier", "claude-haiku-5-5"]);
+});
+
 test("a model only one provider carries routes there without a rule", () => {
   const r = resolve("kimi-k3", body("hi"), declared)!;
   assert.equal(r.provider, "opencode-go");
@@ -118,6 +233,32 @@ test("the native anthropic provider's models are not a routing target until its 
   };
   assert.equal(resolve("claude-opus-5", body("hi"), pooled)?.provider, "anthropic");
   assert.equal(resolve("claude-haiku-4-5-20251001", body("hi"), pooled)?.provider, "anthropic");
+});
+
+test("a Claude API key serves only what names it, never a bare Claude id", () => {
+  const keyed: Config = {
+    ...declared,
+    providers: {
+      ...declared.providers,
+      api: { type: "anthropic", auth: "api-key", apiKey: "k", models: [{ id: "claude-opus-5" }] },
+    },
+  };
+  assert.equal(resolve("claude-opus-5", body("hi"), keyed), null, "the bare id stays on the app's own sign-in");
+  const named = resolve("api:claude-opus-5", body("hi"), keyed)!;
+  assert.equal(named.provider, "api");
+  assert.equal(named.model, "claude-opus-5");
+  const both: Config = { ...keyed, providers: { ...keyed.providers, anthropic: { type: "anthropic", auth: "claude-code", accountPool: true, models: [{ id: "claude-opus-5" }] } } };
+  assert.equal(resolve("claude-opus-5", body("hi"), both)?.provider, "anthropic", "beside the account pool, the pool keeps the bare id");
+});
+
+test("the OpenAI API stands back from a model the ChatGPT plan also declares", () => {
+  const openai: Config["providers"][string] = { type: "openai-compatible", url: "https://api.openai.com/v1", preset: "openai", wire: "responses", models: [{ id: "gpt-6.1-sol" }] };
+  const plan: Config["providers"][string] = { type: "chatgpt", models: [{ id: "gpt-6.1-sol" }] };
+  const base: Config = { ...DEFAULTS, routes: {}, direct: [], aliases: {}, providers: { chatgpt: plan, openai } };
+  assert.equal(resolve("gpt-6.1-sol", body("hi"), base)?.provider, "chatgpt", "the plan keeps the bare id: the key would bill it");
+  assert.equal(resolve("openai:gpt-6.1-sol", body("hi"), base)?.provider, "openai");
+  const alone: Config = { ...base, providers: { openai } };
+  assert.equal(resolve("gpt-6.1-sol", body("hi"), alone)?.provider, "openai", "with no plan declaring it, the key owns the bare id");
 });
 
 test("rules still win over what a provider declares", () => {
@@ -148,8 +289,52 @@ test("rewriteBody sets model, effort and clamps ultra", () => {
   const j = rewriteBody({ model: "claude-opus-4-8", output_config: { effort: "ultra" } }, resolve("claude-opus-4-8", body("hi"), cfg)!, cfg.effortClamp);
   assert.equal(j.model, "gpt-6-astra");
   assert.deepEqual(j.output_config, { effort: "max" });
-  const k = rewriteBody({ model: "x" }, { provider: "chatgpt", model: "m", effort: undefined, tag: "" }, cfg.effortClamp);
+  const k = rewriteBody({ model: "x" }, { provider: "chatgpt", model: "m", effort: undefined, tag: "", kind: "turn", asked: "x" }, cfg.effortClamp);
   assert.equal("output_config" in k, false);
+});
+
+// A pinned worker's model id names a stored Claude account on its provider half. Routing must strip
+// it before anything is sent, and the request body must otherwise match an unpinned turn byte for byte.
+test("a pinned account id routes to its provider and forwards the bare model", () => {
+  const pinned: Config = {
+    ...DEFAULTS,
+    providers: { anthropic: { type: "anthropic", auth: "claude-code", accountPool: true, models: [{ id: "claude-opus-5-5", name: "Claude Opus 5.5" }] } },
+    routes: {}, direct: [], aliases: {},
+  };
+  const r = resolve("anthropic#3f2a9c1b:claude-opus-5-5@high", {}, pinned)!;
+  assert.deepEqual([r.provider, r.model, r.effort, r.accountPin], ["anthropic", "claude-opus-5-5", "high", "3f2a9c1b"]);
+  assert.deepEqual(qualifiedModel("anthropic#3f2a9c1b:claude-opus-5-5", pinned), { provider: "anthropic", model: "claude-opus-5-5", accountPin: "3f2a9c1b" });
+  assert.deepEqual(declaredBy("anthropic#3f2a9c1b:claude-opus-5-5", pinned), ["anthropic"]);
+  const before = { model: "anthropic#3f2a9c1b:claude-opus-5-5", max_tokens: 8, messages: [{ role: "user", content: "hi" }] };
+  const forwarded = JSON.parse(JSON.stringify({ ...before, model: "anthropic#3f2a9c1b:claude-opus-5-5@high" })) as Record<string, unknown>;
+  rewriteBody(forwarded, r, pinned.effortClamp);
+  const unpinned = JSON.parse(JSON.stringify({ ...before, model: "claude-opus-5-5@high" })) as Record<string, unknown>;
+  rewriteBody(unpinned, resolve("claude-opus-5-5@high", {}, pinned)!, pinned.effortClamp);
+  assert.equal(forwarded.model, "claude-opus-5-5", "the upstream sees the bare id");
+  assert.deepEqual(forwarded, unpinned, "the forwarded body matches an unpinned turn byte for byte");
+  // An unknown pin still routes: the account is looked up at send time and falls back there.
+  assert.equal(resolve("anthropic#nosuch00:claude-opus-5-5", {}, pinned)?.accountPin, "nosuch00");
+  assert.equal(resolve("anthropic#3f2a9c1b:claude-unknown", {}, pinned), null, "a provider that does not declare the model is no pin");
+  // A marker naming the pinned worker resolves through its agent alias, pin included.
+  const aliased: Config = { ...pinned, aliases: { "claude-opus-5-5-mambo20211": "anthropic#3f2a9c1b:claude-opus-5-5" } };
+  const viaMarker = resolve("claude-opus-5-5", body("[[ripple: claude-opus-5-5-mambo20211@max]] task"), aliased)!;
+  assert.deepEqual([viaMarker.provider, viaMarker.model, viaMarker.effort, viaMarker.accountPin], ["anthropic", "claude-opus-5-5", "max", "3f2a9c1b"]);
+});
+
+test("bootstrap advertises a pinned agent's model id so the CLI runs it", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cr-pinned-bootstrap-"));
+  try {
+    fs.writeFileSync(path.join(dir, "opus-mambo.md"), "---\nname: opus-mambo\nmodel: anthropic#3f2a9c1b:claude-opus-5-5@high\n---\n");
+    const pinned: Config = {
+      ...DEFAULTS,
+      providers: { anthropic: { type: "anthropic", auth: "claude-code", accountPool: true, models: [{ id: "claude-opus-5-5" }] } },
+      routes: {}, direct: [], aliases: {}, cli: { ...DEFAULTS.cli, extraModels: [] },
+    };
+    const out = JSON.parse(injectBootstrap(Buffer.from("{}"), pinned, [dir]).toString()) as { additional_model_options: { model: string }[] };
+    assert.deepEqual(out.additional_model_options.map((m) => m.model), ["anthropic#3f2a9c1b:claude-opus-5-5@high"]);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test("bootstrap injection adds CLI models and compaction windows", () => {
@@ -160,6 +345,30 @@ test("bootstrap injection adds CLI models and compaction windows", () => {
   assert.equal(out.auto_compact_windows.a, 1);
   const raw = Buffer.from("not json");
   assert.equal(injectBootstrap(raw, cfg), raw);
+});
+
+test("bootstrap supplies missing descriptions without changing existing options or config", () => {
+  const configured: Config = {
+    ...cfg,
+    cli: {
+      extraModels: [
+        { model: "gpt-default", name: "Default description", contextWindow: 400_000 },
+        { model: "gpt-described", name: "Display name", description: "Explicit description" },
+        { model: "gpt-empty", name: "Empty description", description: "" },
+      ],
+    },
+  };
+  const before = structuredClone(configured);
+  const existing = [{ model: "native", name: "Native", description: "Upstream description", disabled_reason: "Unavailable" }];
+  const out = JSON.parse(injectBootstrap(Buffer.from(JSON.stringify({ additional_model_options: existing })), configured, []).toString());
+  assert.deepEqual(out.additional_model_options, [
+    ...existing,
+    { model: "gpt-default", name: "Default description", contextWindow: 400_000, description: "Default description" },
+    { model: "gpt-described", name: "Display name", description: "Explicit description" },
+    { model: "gpt-empty", name: "Empty description", description: "" },
+  ]);
+  assert.equal(out.auto_compact_windows["gpt-default"], 400_000);
+  assert.deepEqual(configured, before, "bootstrap normalization does not mutate the config");
 });
 
 test("each routed model and slot keeps its own compaction window; the global value is only the fallback", () => {
@@ -175,7 +384,7 @@ test("each routed model and slot keeps its own compaction window; the global val
   assert.equal(out.auto_compact_windows["gpt-5.6-terra@high"], 400_000);
   assert.equal(out.auto_compact_windows["gpt-6-astra@high"], 258400, "no own window → global fallback");
   assert.equal(out.auto_compact_windows["claude-opus-4-8"], 1_000_000, "slot carries its own");
-  assert.equal(out.auto_compact_windows["claude-opus-4-6"], 258400);
+  assert.equal(out.auto_compact_windows["claude-opus-4-6"], 400_000, "slot follows its target's known window before the global fallback");
 });
 
 test("a picker model with no window of its own takes its provider's before the global fallback", () => {
@@ -221,9 +430,10 @@ test("bootstrap injects agent-file model ids (with @effort) when their base is r
   fs.writeFileSync(path.join(dir, "gpt.md"), "---\nname: gpt\nmodel: gpt-5.6-terra@high\n---\n");
   fs.writeFileSync(path.join(dir, "other.md"), "---\nname: o\nmodel: sonnet\n---\n");
   const cfg = { ...DEFAULTS, providers: {}, routes: {}, aliases: {}, direct: [{ prefix: "gpt-", provider: "chatgpt" }], cli: { extraModels: [{ model: "gpt-5.6-terra", name: "GPT-5.6 Terra" }] } } as unknown as Config;
-  const out = JSON.parse(injectBootstrap(Buffer.from("{}"), cfg, [dir]).toString()) as { additional_model_options: { model: string; name: string }[] };
+  const out = JSON.parse(injectBootstrap(Buffer.from("{}"), cfg, [dir]).toString()) as { additional_model_options: { model: string; name: string; description: string }[] };
   assert.deepEqual(out.additional_model_options.map((m) => m.model), ["gpt-5.6-terra", "gpt-5.6-terra@high"]);
   assert.equal(out.additional_model_options[1]!.name, "GPT-5.6 Terra · high");
+  assert.deepEqual(out.additional_model_options.map((m) => m.description), ["GPT-5.6 Terra", "GPT-5.6 Terra · high"]);
 });
 
 test("a dated model id matches its undated mapping", () => {
@@ -270,8 +480,8 @@ test("a marker naming an agent file resolves through the derived alias", () => {
 
   // The marker now resolves to a real id. `deepseek-v4-pro` is offered by two providers in
   // `declared`, so it is still ambiguous — the alias resolves, and the ambiguity is what stops it.
-  const reason = unroutableReason("vendor-model", body("[[ripple: deepseek@high]] do it"), cfg);
-  assert.equal(reason, '"deepseek-v4-pro" is declared by two providers (opencode-go, deepseek); add a route or direct rule');
+  const reason = decide("vendor-model", body("[[ripple: deepseek@high]] do it"), cfg, "turn").refusal;
+  assert.equal(reason, '"deepseek-v4-pro" is declared by two providers (opencode-go, deepseek); use "opencode-go:deepseek-v4-pro" or "deepseek:deepseek-v4-pro", or add a route or direct rule');
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
@@ -285,50 +495,50 @@ test("a marker naming an agent file routes when exactly one provider declares it
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
-test("unroutableReason: marker alias that resolves to an undeclared model", () => {
+test("decide: marker alias that resolves to an undeclared model", () => {
   const cfg: Config = { ...declared, aliases: { ...declared.aliases, deepseek: "deepseek-v4-pro" } };
   // Two providers declare it → the ambiguity message, not the "undeclared" one.
-  assert.equal(unroutableReason("whatever", body("[[ripple: deepseek@high]]"), cfg),
-    '"deepseek-v4-pro" is declared by two providers (opencode-go, deepseek); add a route or direct rule');
+  assert.equal(decide("whatever", body("[[ripple: deepseek@high]]"), cfg, "turn").refusal,
+    '"deepseek-v4-pro" is declared by two providers (opencode-go, deepseek); use "opencode-go:deepseek-v4-pro" or "deepseek:deepseek-v4-pro", or add a route or direct rule');
   // An alias pointing at a model nobody has.
   const ghost: Config = { ...declared, aliases: { ...declared.aliases, ghost: "no-such-model" } };
-  assert.equal(unroutableReason("whatever", body("[[ripple: ghost]]"), ghost),
+  assert.equal(decide("whatever", body("[[ripple: ghost]]"), ghost, "turn").refusal,
     'marker alias "ghost" resolves to "no-such-model", which no provider declares');
 });
 
-test("unroutableReason: a marker name that is neither alias nor agent", () => {
-  assert.equal(unroutableReason("whatever", body("[[ripple: nobody@high]]"), declared),
+test("decide: a marker name that is neither alias nor agent", () => {
+  assert.equal(decide("whatever", body("[[ripple: nobody@high]]"), declared, "turn").refusal,
     'marker alias "nobody" is not an alias and not an agent name');
 });
 
-test("unroutableReason: two providers declare the named model", () => {
-  assert.equal(unroutableReason("deepseek-v4-pro", body("hi"), declared),
-    '"deepseek-v4-pro" is declared by two providers (opencode-go, deepseek); add a route or direct rule');
+test("decide: two providers declare the named model", () => {
+  assert.equal(decide("deepseek-v4-pro", body("hi"), declared, "turn").refusal,
+    '"deepseek-v4-pro" is declared by two providers (opencode-go, deepseek); use "opencode-go:deepseek-v4-pro" or "deepseek:deepseek-v4-pro", or add a route or direct rule');
 });
 
-test("unroutableReason: no provider declares it, and an ingress-only provider is named", () => {
-  assert.equal(unroutableReason("some-model-nobody-has", body("hi"), declared), 'no provider declares "some-model-nobody-has"');
+test("decide: no provider declares it, and an ingress-only provider is named", () => {
+  assert.equal(decide("some-model-nobody-has", body("hi"), declared, "turn").refusal, 'no provider declares "some-model-nobody-has"');
   // A model only the native anthropic provider lists: the provider is named, not the model.
   const onlyNative: Config = {
     ...DEFAULTS,
     providers: { anthropic: { type: "anthropic", auth: "claude-code", models: [{ id: "claude-haiku-4-5" }] } },
     routes: {}, direct: [], aliases: {},
   };
-  assert.equal(unroutableReason("claude-haiku-4-5", body("hi"), onlyNative), null, "a claude-* id is never a refusal");
+  assert.equal(decide("claude-haiku-4-5", body("hi"), onlyNative, "turn").refusal, null, "a claude-* id is never a refusal");
   const nonClaudeNative: Config = {
     ...DEFAULTS,
     providers: { anthropic: { type: "anthropic", auth: "claude-code", models: [{ id: "vendor-model" }] } },
     routes: {}, direct: [], aliases: {},
   };
-  assert.equal(unroutableReason("vendor-model", body("hi"), nonClaudeNative), 'provider "anthropic" is ingress-only');
+  assert.equal(decide("vendor-model", body("hi"), nonClaudeNative, "turn").refusal, 'provider "anthropic" is ingress-only');
 });
 
-test("unroutableReason is null for a routable model, a rule, and every claude-* id", () => {
-  assert.equal(unroutableReason("kimi-k3", body("hi"), declared), null, "routable");
-  assert.equal(unroutableReason("gpt-7-unreleased", body("hi"), declared), null, "a direct rule decides");
-  assert.equal(unroutableReason("claude-opus-5", body("hi"), declared), null);
+test("decide refusal is null for a routable model, a rule, and every claude-* id", () => {
+  assert.equal(decide("kimi-k3", body("hi"), declared, "turn").refusal, null, "routable");
+  assert.equal(decide("gpt-7-unreleased", body("hi"), declared, "turn").refusal, null, "a direct rule decides");
+  assert.equal(decide("claude-opus-5", body("hi"), declared, "turn").refusal, null);
   assert.equal(resolve("claude-opus-5", body("hi"), declared), null, "and resolve agrees it is unrouted");
-  assert.equal(unroutableReason(undefined, body("hi"), declared), null);
+  assert.equal(decide(undefined, body("hi"), declared, "turn").refusal, null);
 });
 
 // 2026-09-20: a GPT-6 Astra session (prefix rule → chatgpt) delegated to `muse`; the marker changed
@@ -354,10 +564,25 @@ test("a marker's model takes its own provider, even under a prefix rule on the s
   assert.equal(resolve("gpt-6-astra", body("[[ripple: gpt-5.6-sol@low]] x"), cfg2)!.provider, "chatgpt");
   // A marker to a model nobody declares is a refusal, with the reason, not a 400 from ChatGPT.
   assert.equal(resolve("gpt-6-astra", body("[[ripple: ghost@high]] x"), cfg2), null);
-  assert.equal(unroutableReason("gpt-6-astra", body("[[ripple: ghost@high]] x"), cfg2),
+  assert.equal(decide("gpt-6-astra", body("[[ripple: ghost@high]] x"), cfg2, "turn").refusal,
     'marker alias "ghost" is not an alias and not an agent name');
   // …but without a marker a prefix rule is never second-guessed here.
-  assert.equal(unroutableReason("gpt-6-astra", body("x"), cfg2), null);
+  assert.equal(decide("gpt-6-astra", body("x"), cfg2, "turn").refusal, null);
+});
+
+test("an ignored prefix rule still explains a marker that nothing can take", () => {
+  // A prefix rule naming an ingress-only provider is ignored, and the request passes through. A marker
+  // naming another model, with no prefix rule of its own, is refused by name when no provider takes
+  // it, as it was before the rules and their reasons became one pass.
+  const native: Config = {
+    ...cfg,
+    providers: { anthropic: { type: "anthropic", auth: "claude-code" }, chatgpt: { type: "anthropic-compatible", url: "http://127.0.0.1:8787", models: [{ id: "kimi-k3" }] } },
+    direct: [{ prefix: "vendor-", provider: "anthropic" }],
+  };
+  assert.equal(decide("vendor-model", body("x"), native, "turn").refusal, null, "no marker: pass through");
+  assert.equal(decide("vendor-model", body("[[ripple: ghost]] x"), native, "turn").refusal, 'marker alias "ghost" is not an alias and not an agent name');
+  assert.equal(decide("vendor-model", body("[[ripple: kimi-k3]] x"), native, "turn").refusal, null, "a declared marker model is not refused");
+  assert.equal(decide("vendor-model", body("[[ripple: vendor-other]] x"), native, "turn").refusal, null, "a marker model under a prefix rule is not second-guessed");
 });
 
 test("a marker counts only at the top of a user message; a quoted one is prose", () => {
@@ -367,4 +592,27 @@ test("a marker counts only at the top of a user message; a quoted one is prose",
   assert.equal(resolve("gpt-6-astra", body(summary), cfg)!.model, "gpt-6-astra");
   assert.equal(markerOverride(body("  \n[[ripple: luna@low]]\n\ntask"), cfg.aliases)?.model, "gpt-5.6-luna", "leading whitespace is fine");
   assert.equal(markerOverride(body("<system-reminder>x</system-reminder>[[ripple: luna]] task"), cfg.aliases)?.model, "gpt-5.6-luna", "a stripped reminder does not push it off the top");
+});
+
+// The frame as CLI 2.1.308 sent it to a Workflow agent on 2026-10-22 (relayed request shortened).
+test("a Workflow agent's marker is the top of the script's text, under the harness frame", () => {
+  const request = "[Workflow harness — user request] The harness relays, verbatim and indented below, the user request that triggered this workflow run. …\n  병렬로 여러개 돌려서 나눠서 시켜";
+  const task = "[Workflow harness — computed task] The task text below was computed at runtime by a workflow script. … The computed task text follows:\n  [[ripple: luna@high]]\n  역할: 한국어 교정자.";
+  const two = { messages: [{ role: "user", content: request }, { role: "user", content: task }] };
+  assert.deepEqual(markerOverride(two, cfg.aliases), { model: "gpt-5.6-luna", effort: "high" });
+  const merged = { messages: [{ role: "user", content: [{ type: "text", text: request }, { type: "text", text: task }] }] };
+  assert.deepEqual(markerOverride(merged, cfg.aliases), { model: "gpt-5.6-luna", effort: "high" }, "the two turns sent as one message");
+  assert.equal(resolve("claude-opus-5-5", two, declared)?.model, "gpt-5.6-luna");
+  const quoted = task.replace("[[ripple: luna@high]]\n  역할", "역할: [[ripple: luna@high]]");
+  assert.equal(markerOverride(body(quoted), cfg.aliases), null, "inside the script's text, below its top, it is prose");
+  assert.equal(markerOverride(body(`Summary: …\n${task}`), cfg.aliases), null, "a frame quoted below the top is not a frame");
+});
+
+// A workflow worker's continue carries no marker; when the turn before it was translated, Anthropic
+// has no such thread (404 on every turn, 2026-10-23), so it is recognised by the id we minted.
+test("a continue of a turn this router minted is recognised; Anthropic's own ids and creates are not", () => {
+  assert.equal(continuesTranslatedTurn({ thread: { type: "continue", previous_message_id: "msg_8f46eee3c1a01d63c54f683e" } }), true);
+  assert.equal(continuesTranslatedTurn({ thread: { type: "continue", previous_message_id: "msg_011CgJN1qQSD73cvPhge2Cri" } }), false);
+  assert.equal(continuesTranslatedTurn({ thread: { type: "create" } }), false);
+  assert.equal(continuesTranslatedTurn({}), false);
 });

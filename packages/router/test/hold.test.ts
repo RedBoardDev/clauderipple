@@ -23,6 +23,8 @@ import { RequestLog } from "../src/requestlog.ts";
 import { DISASSOCIATE_JS, SCAN_KNOWN_JS, TetherController } from "../src/tether.ts";
 import { createCa } from "../src/x509.ts";
 
+const noClaudeCodeCredentialReaders = { keychain: () => null, credentialsFile: () => null };
+
 // ---- The gate alone -----------------------------------------------------------------------------
 
 /** Timers the test fires by hand. */
@@ -183,7 +185,7 @@ test("postponed → hold engaged after the grace period → the held call waits,
       if (file === "/usr/bin/osascript" && args[3] === SCAN_KNOWN_JS) {
         assert.equal(hold.engaged, false, "visibility is established before the hold gate engages");
         assert.deepEqual(JSON.parse(args[5]!), ["Home"]);
-        return { code: 0, stdout: "visible\n", stderr: "" };
+        return { code: 0, stdout: JSON.stringify({ freshMs: 9_500, nets: [{ ssid: "Home", rssi: -40 }], found: [{ name: "Home", rssi: -40 }] }), stderr: "" };
       }
       if (file === "/usr/bin/osascript" && args[3] === DISASSOCIATE_JS) {
         events.push(`leave (held ${hold.waiting}, provider saw ${r.up.seen.join(",")})`);
@@ -286,7 +288,7 @@ test("the OpenAI ingress holds a model call the same way, and never holds anythi
     aliases: {},
   };
   const hold = new HoldGate();
-  const ingress = new OpenAiIngress({ config: () => config, log: new Logger(path.join(root, "router.log"), 1e6, 1, false), requests: new RequestLog(path.join(root, "requests.jsonl")), hold });
+  const ingress = new OpenAiIngress({ config: () => config, log: new Logger(path.join(root, "router.log"), 1e6, 1, false), requests: new RequestLog(path.join(root, "requests.jsonl")), claudeCodeCredentialReaders: noClaudeCodeCredentialReaders, hold });
   const port = await ingress.listen();
   const call = (pathname: string, body?: unknown) => {
     let firstByteAt: number | null = null;

@@ -29,7 +29,7 @@ const MIME: Record<string, string> = {
   ".ico": "image/x-icon",
 };
 
-/** Quick enough that a dead router reads as dead, long enough for a login or a provider probe. */
+/** Bound connection setup separately from waiting for approval, a login or a provider probe. */
 const CONNECT_TIMEOUT_MS = 4_000;
 const IDLE_TIMEOUT_MS = 180_000;
 
@@ -64,8 +64,6 @@ async function forward(request: Request, admin: URL): Promise<Response> {
       // pooled socket those timers piled up (MaxListenersExceededWarning, measured here).
       { host: admin.hostname, port: admin.port, method: request.method, path: `${url.pathname}${url.search}`, headers, agent: false },
       (res) => {
-        clearTimeout(connectTimer);
-        res.socket?.setTimeout(IDLE_TIMEOUT_MS, () => res.destroy());
         const out = new Headers();
         for (const name of ["content-type", "cache-control", "content-disposition"]) {
           const value = res.headers[name];
@@ -81,6 +79,14 @@ async function forward(request: Request, admin: URL): Promise<Response> {
       req.destroy();
       done(routerDownResponse());
     }, CONNECT_TIMEOUT_MS);
+    req.once("socket", (socket) => {
+      if (socket.connecting) socket.once("connect", () => clearTimeout(connectTimer));
+      else clearTimeout(connectTimer);
+    });
+    // ClientRequest starts the socket idle timeout after connecting, including the wait for
+    // response headers. Certificate approval can legitimately take more than four seconds.
+    req.setTimeout(IDLE_TIMEOUT_MS, () => req.destroy());
+    req.once("close", () => clearTimeout(connectTimer));
     req.on("error", () => {
       clearTimeout(connectTimer);
       done(routerDownResponse());

@@ -39,6 +39,23 @@ for (const platform of ["darwin", "linux"] as const) test(`${platform} snapshot 
     return ` PID COMMAND\n 42 claude --resume=${id}\n garbage\n`;
   }), [{ pid: 42, command: `claude --resume=${id}` }]);
 });
+test("macOS snapshot runs a blocking ps once, then refreshes in the background", async () => {
+  let now = 0, sync = 0, async = 0;
+  const snapshot = new ProcessSnapshot({
+    platform: "darwin", ttlMs: 5000, now: () => now,
+    exec: () => { sync++; return ` PID COMMAND\n 42 claude --resume=${id}\n`; },
+    execAsync: async () => { async++; return ` PID COMMAND\n 43 claude\n`; },
+  });
+  // Sessions.list asks once per closed Claude app session: dozens of reads inside one list.
+  for (let i = 0; i < 50; i++) assert.equal(snapshot.current()[0]?.pid, 42);
+  assert.deepEqual([sync, async], [1, 0]);
+  now = 5000;
+  assert.equal(snapshot.current()[0]?.pid, 42, "a stale snapshot is served while the new one is read");
+  snapshot.current();
+  await delay(0);
+  assert.deepEqual([sync, async], [1, 1]);
+  assert.equal(snapshot.current()[0]?.pid, 43);
+});
 test("desktop registry liveness is off on Linux and reads the Windows registry", t => {
   assert.equal(liveDesktopProcesses("/not/a/registry", 0, "linux").size, 0);
   // Windows reads the registry now: the process snapshot behind it decides who is live.
@@ -165,8 +182,8 @@ test("an update restarts only the phone host this installation registered, and n
   assert.equal(refreshPlan({ installed: true, definition: "<string>/Users/me/src/clauderipple/packages/remote/src/main.ts</string>", script, busy: false }), "foreign");
   assert.equal(refreshPlan({ installed: true, definition: ours, script, busy: true }), "busy");
   assert.equal(refreshPlan({ installed: true, definition: ours, script, busy: false }), "restart");
-  // A host from before the busy field, or one not answering, is restarted.
-  assert.equal(refreshPlan({ installed: true, definition: ours, script, busy: undefined }), "restart");
+  // A host from before the busy field, or one not answering, must stay pending.
+  assert.equal(refreshPlan({ installed: true, definition: ours, script, busy: undefined }), "busy");
   // The plist escapes XML; the Windows launcher doubles single quotes.
   const odd = "/Users/a&b/cr's/main.js";
   assert.equal(refreshPlan({ installed: true, definition: "<string>/Users/a&amp;b/cr's/main.js</string>", script: odd, busy: false }), "restart");

@@ -1,32 +1,38 @@
-import type { Billing, Domain, Effort, LadderChoice, LadderOptions, Level, ModelScore, RouterModel, Rule, Rung, Settings, TierTarget, WorkerCandidate, WorkerPick, WorkerVerdict } from '../types'
-import { CLAUDE_WORKERS, DOMAINS, EFFORTS, LEVELS, candidateKey, isAllowed } from './settings'
-import { MARKER } from './worker'
+import type { Billing, Domain, Effort, LadderChoice, LadderOptions, ModelScore, ProviderAvailability, RouterModel, Rule, Rung, Settings, TierTarget, WorkerCandidate, WorkerPick, WorkerVerdict } from '../types'
+import { CLAUDE_WORKERS, EFFORTS, candidateKey, isAllowed } from './settings'
+import { MARKER, providerModelId } from './worker'
 import { t } from './i18n'
 import type { Lang } from './i18n'
-import { kindOf, parseEffortVerdict, verdictObject } from './judge'
 import { claudeChoices, rungAbove, rungOf, tickedChoices } from './ladder'
 
-/** The one agent the main chat delegates to; the judge picks the worker (docs/specs/2026-10-12-worker-tiers.md). */
+/** The one agent the main chat delegates to (docs/specs/2026-10-12-worker-tiers.md). */
 // The description line: a chat that had seen other workers' "Sol·high · " titles wrote one here
 // too, and the app's running-agent row showed "Sol·high" while Sonnet ran (2026-10-22). The row
 // shows the call as written; only the task list gets the mod's corrected title.
-export const AUTO_DESCRIPTION = 'Delegate any task here; ClaudeRipple picks the model. If a worker fails or returns nothing usable, delegate again here once and say the earlier attempt failed. ' +
-  'Write the Agent description as the task alone, with no model or effort in front: ClaudeRipple puts the model it picks there. ' +
-  'If you know how hard the task is, put [[ripple: light]], [[ripple: standard]], [[ripple: hard]] or [[ripple: max]] on the prompt\'s first line: ' +
-  'light = lookups, mechanical edits, one small fix; standard = carry out a designed change (even across several files), research, summarize, read-only review; ' +
-  'hard = subtle debugging, security review, or work where a wrong call is costly; max = planning, design or architecture where the deliverable is the decision itself. ' +
-  'Size, file count or the brief\'s warnings do not by themselves make a task hard. Leave the marker out when unsure, and ClaudeRipple judges it. ' +
-  'To run one particular model instead (the user asked for it, or a comparison needs it), name it on the first line: [[ripple: opus@high]] for a Claude model (opus, sonnet, haiku), or [[ripple: <worker agent name>@<effort>]]. ' +
-  'It runs as named, past every ClaudeRipple rule, and still shows in the agents panel; never start a model another way, such as claude -p, to get around the rules. ' +
+//
+// Who names the worker's model changed three times in two days (4000c3f, 28ae836, e9876fc). The
+// session guessed models from earlier tasks; then the worker judge, reading a few messages, gave a
+// render step's "딥시크" to the translation before it and could not see the written rule that
+// translation runs on Opus (2026-10-24). Now the session, which sees the whole conversation, names
+// the domain and rung; the owner's ladder names the model; a model is named only with its source,
+// which the mod checks but never re-reads as language. A wrong call is fixed in the criteria or the
+// review, not by moving the decision again.
+export const AUTO_DESCRIPTION = 'Delegate tasks here. Put the tier, and a domain word when it applies, on the prompt\'s first line: ' +
+  '[[ripple: light]], [[ripple: standard]], [[ripple: hard]] or [[ripple: max]]; light = lookups, mechanical edits, one small fix; ' +
+  'standard = carry out a designed change (even across several files), research, summarize, read-only review; ' +
+  'hard = subtle debugging, security review, or work where a wrong call is costly; max = planning or architecture where the deliverable is the decision itself. ' +
+  'Size, file count or the brief\'s warnings do not by themselves make a task hard. Add ui only when the work needs visual judgment: visual design, a new screen\'s layout, or UX decisions, as in [[ripple: standard ui]]; ' +
+  'restoring, porting, wiring or translating existing UI code takes no domain word. Add backend for server, API or database work. ' +
+  'Add review when the task is a read-only adversarial review (red team) of finished work that reports defects, as in [[ripple: hard review]]. ' +
+  'With no marker the task runs as general standard. The owner\'s ladder picks the model for the tier. ' +
+  'Name a model instead only when the user asked for it for this task, or a written rule (CLAUDE.md, a memory file) assigns it to this step: ' +
+  'put [[ripple: <worker agent name or opus/sonnet/haiku>@<effort>]] on the first line and on the second line "Model reason: user \\"<the user\'s exact words>\\"" or "Model reason: rule <file> — <the rule>". ' +
+  'A model without a reason, or a quote the user did not say, is refused; never carry a model over from an earlier task. A standing pin the user set ("앞으로 솔로") is applied for you. ' +
+  'Write the Agent description as the task alone, with no model or effort in front. If an attempt failed, say so when delegating again. ' +
   'A brief states the scope, what must not be touched, the done criteria and how to verify them. Read the report for whether it did what was asked before using it. ' +
-  'Continue a worker with SendMessage only within 5 minutes of its last reply; later its cache has lapsed, so start a new one with a summary of what is done and what is left.'
+  'Continue a worker with SendMessage only within 5 minutes of its last reply; later start a new one with a summary of what is done and what is left.'
 
-/**
- * The tier markers the main chat may write on a ripple:auto prompt, as the judge's verdict they
- * stand for (`rungOf` gives light, standard, hard, plan). The main chat knows the whole
- * conversation, the judge one brief: re-judging 62 delegations (2026-10-15), the judge sent 32 to
- * hard, Opus under this description 18. Not model names, so never routed as one.
- */
+/** The tier markers the session writes on a ripple:auto prompt, as the verdict they stand for (`rungOf` gives the rung). */
 export const TIER_MARKERS: Readonly<Record<string, Pick<WorkerVerdict, 'level' | 'kind'>>> = {
   light: { level: 'light', kind: 'do' },
   standard: { level: 'standard', kind: 'do' },
@@ -38,28 +44,60 @@ export function tierOf(marker: { name: string } | null): string | null {
   return marker && Object.hasOwn(TIER_MARKERS, marker.name) ? marker.name : null
 }
 
-export const WORKER_JUDGE_SYSTEM = `Choose a domain, capability level, kind of work and the cheapest effort that still does this delegated task well. Evaluate actual scope and risk, not prompt length.
-Domains: design (visual taste, composition, brand), frontend (UI implementation), backend (APIs and server logic), infra (deployment and operations), data (queries and processing), test (verification), docs (writing), research (investigation), general (other or cross-domain).
-Levels are independent of domain: light (chores, repeated edits, simple lookups, one small fix), standard (carry out a designed change, even across several files; research, summarize, read-only review), deep (subtle debugging, security review, or architecture where a wrong call is costly; size, file count, or warnings and prohibitions in the brief do not by themselves make work deep). A task that says an earlier attempt failed is one level higher than it would otherwise be.
-Kind is determined by the deliverable, not preparatory steps. plan = pure planning: the deliverable is a decision, design, specification, or review verdict, NOT implemented code. do = carry out work: implement, fix, run, look up, write. Any task whose deliverable includes implemented code, files, builds or fixes is do, even if it says "read the spec/design first" or requires architecture/design reasoning before implementation. Writing a design/spec document alone remains plan; producing implementation files is do. Examples: "implement host listing of sessions" => do; "build an iOS app" => do; "read the spec first, then implement it" => do; "decide the session-listing architecture; do not implement" => plan. If planning and implementation are mixed, choose do. Deep plan is the hardest work, which runs on the strongest model, reserved for pure architecture, system design or consequential design decisions.
-Effort choices are low, medium, high, xhigh, max; reserve the last two for exceptionally hard work. Return only JSON {"domain":"design|frontend|backend|infra|data|test|docs|research|general","level":"light|standard|deep","kind":"plan|do","effort":"low|medium|high|xhigh|max","sure":0.0,"why":"brief reason"}. Confidence is zero to one and is about the level; explain in the user's language in at most six words.`
+export function readMarker(prompt: string): { name: string; level?: string; domain?: string } | null {
+  const marker = MARKER.exec(prompt)
+  return marker ? { name: marker[1]!.toLowerCase(), ...(marker[2] ? { level: marker[2].toLowerCase() } : {}), ...(marker[3] ? { domain: marker[3].toLowerCase() } : {}) } : null
+}
 
-export function workerJudgeInput(input: { description: string; prompt: string }): string {
-  return `Task: ${input.description}\n\nInstructions:\n${input.prompt.slice(0, 3000)}`
+/** The line that says where a named model comes from: the user's words for this task, or a written rule. */
+const REASON = /^[ \t]*model reason[ \t]*:[ \t]*(user|rule)\b[ \t]*(.*)$/im
+export type ModelReason = { source: 'user' | 'rule'; text: string; quote?: string }
+export function modelReason(prompt: string): ModelReason | null {
+  const line = REASON.exec(prompt)
+  if (!line) return null
+  const text = line[2]!.trim()
+  const pair = /"([^"]+)"|“([^”]+)”|「([^」]+)」|『([^』]+)』/.exec(text)
+  const quote = pair?.slice(1).find(Boolean)?.trim()
+  return { source: line[1]!.toLowerCase() as ModelReason['source'], text, ...(quote ? { quote } : {}) }
 }
 /**
- * A kind the judge leaves out or garbles reads as do: the verdict's level still stands, and losing
- * it over the kind would send the task to the default instead.
+ * A rule reason's minimal form: a concrete file identifier first and a non-empty rule after it
+ * ("memory/translation.md — draft translations run on Opus"). It reads the line's shape only —
+ * never whether the file exists or what it says. An empty "Model reason: rule" used to pass and
+ * named a model with no source at all (2026-10-25).
  */
-export function parseWorkerVerdict(text: string): WorkerVerdict | undefined {
-  const verdict = parseEffortVerdict(text)
-  const raw = verdictObject(text)
-  if (!verdict || !DOMAINS.includes(raw?.domain as Domain) || !LEVELS.includes(raw?.level as Level)) return undefined
-  return { ...verdict, domain: raw!.domain as Domain, level: raw!.level as Level, kind: kindOf(raw!.kind) ?? 'do' }
+export function ruleReason(text: string): boolean {
+  const trimmed = text.trim()
+  const at = trimmed.search(/\s/)
+  if (at <= 0) return false
+  const file = trimmed.slice(0, at).replace(/[,;]+$/, '')
+  // A path segment or an extension: "memory/x.md", "docs/specs/a.md", "C:\rules\x.md".
+  if (!/[/\\]|\.[A-Za-z0-9]{1,8}$/.test(file)) return false
+  // " — ", " - ", ": " or a plain space; the rule itself must hold something.
+  return trimmed.slice(at).replace(/^\s*[—–:,-]\s*/, '').trim().length > 0
 }
-export function readMarker(prompt: string): { name: string; level?: string } | null {
-  const marker = MARKER.exec(prompt)
-  return marker ? { name: marker[1]!.toLowerCase(), ...(marker[2] ? { level: marker[2].toLowerCase() } : {}) } : null
+/** A prompt without its model-reason line, which is for the mod only. */
+export function withoutReason(prompt: string): string {
+  return prompt.replace(new RegExp(REASON.source + '\\n?', 'gim'), '').replace(/^\s*\n/, '')
+}
+/** The prompt a routed worker reads: no routing marker, no model-reason line. */
+export function withoutRouting(prompt: string): string {
+  return withoutReason(prompt.replace(new RegExp(MARKER.source, 'gi'), ''))
+}
+/**
+ * Whether the user said these words: whitespace and case aside, inside one of their own messages.
+ * A check of the session's claim, not a reading of what the user meant; a word or two ("솔") could
+ * be found anywhere, so a quote is at least three letters.
+ */
+export function userSaid(quote: string, words: readonly string[]): boolean {
+  const flat = (text: string) => text.replace(/\s+/g, ' ').trim().toLowerCase()
+  const wanted = flat(quote)
+  return wanted.replace(/ /g, '').length >= 3 && words.some(text => flat(text).includes(wanted))
+}
+
+/** The domain a tier marker names, as the verdict domain its ladder reads. No word: general. */
+export function markerDomain(word: string | undefined): Domain {
+  return word === 'ui' || word === 'frontend' ? 'frontend' : word === 'design' ? 'design' : word === 'backend' || word === 'server' ? 'backend' : word === 'review' || word === 'redteam' || word === 'red-team' ? 'review' : 'general'
 }
 export function agentProvider(agentFileText: string): string | undefined {
   const head = /^---\r?\n([\s\S]*?)\r?\n---/.exec(agentFileText)?.[1]
@@ -95,7 +133,9 @@ export function routerModelOptions(config: unknown): RouterModel[] {
       if (typeof id === 'string' && id) out.push({ value: id, label: `${id} · ${provider}`, provider, ...(typeof name === 'string' && name.trim() ? { name } : {}) })
     }
   }
-  return out
+  const counts = new Map<string, number>()
+  for (const model of out) counts.set(model.value, (counts.get(model.value) ?? 0) + 1)
+  return out.map(model => counts.get(model.value)! > 1 ? { ...model, value: `${model.provider}:${model.value}` } : model)
 }
 export function zenJev(config: unknown): { authorization?: string; model: string } {
   const provider = record(record(record(config).providers)['opencode-zen'])
@@ -139,12 +179,14 @@ export function ladderOptionsFrom(raw: unknown, until: number, allow: readonly s
   const root = record(raw)
   const efforts = (value: unknown): Effort[] => list(value).filter((e): e is Effort => EFFORTS.includes(e as Effort))
   const usable = new Set(list(root.providers).flatMap(p => { const v = record(p); return typeof v.name === 'string' && v.usable !== false ? [v.name] : [] }))
+  const modelsOut = new Map(list(root.providers).flatMap(p => { const v = record(p); return typeof v.name === 'string' ? [[v.name, unavailableModels(v.models)] as const] : [] }))
   const catalogue = list(root.providers).length > 0
   const scores = scoreModels(root.scores)
   const choices: LadderChoice[] = list(root.agents).flatMap(value => {
     const a = record(value)
     if (typeof a.name !== 'string' || !a.name || typeof a.model !== 'string' || typeof a.provider !== 'string') return []
     if (catalogue && !usable.has(a.provider)) return []
+    if (modelsOut.get(a.provider)?.[baseModel(a.model)]) return []
     const costs = (scores.find(s => s.model === a.model && s.provider === a.provider)?.variants ?? []).flatMap(v => v.costPerTask === null ? [] : [v.costPerTask])
     const billing = BILLINGS.includes(a.billing as Billing) ? a.billing as Billing : 'payg'
     return [{ target: { agent: a.name }, model: a.model, provider: a.provider, billing, efforts: efforts(a.efforts), ...(costs.length ? { cost: Math.min(...costs) } : {}) }]
@@ -152,21 +194,50 @@ export function ladderOptionsFrom(raw: unknown, until: number, allow: readonly s
   const providers = Object.fromEntries(list(root.providers).flatMap(value => {
     const p = record(value)
     if (typeof p.name !== 'string' || typeof p.usable !== 'boolean') return []
-    return [[p.name, { usable: p.usable, ...(typeof p.reason === 'string' ? { reason: p.reason } : {}), ...(typeof p.exhaustedUntil === 'number' ? { exhaustedUntil: p.exhaustedUntil } : {}) }]]
+    const models = unavailableModels(p.models)
+    return [[p.name, { usable: p.usable, ...(typeof p.reason === 'string' ? { reason: p.reason } : {}), ...(typeof p.exhaustedUntil === 'number' ? { exhaustedUntil: p.exhaustedUntil } : {}), ...(Object.keys(models).length ? { models } : {}) }]]
   }))
   return { until, choices: tickedChoices([...choices, ...claudeChoices(efforts(root.claudeEfforts))], allow, allowKnown), providers }
 }
+/**
+ * A provider's models that are out while it answers others (GET /api/mod-options `models`): a spent
+ * Antigravity quota group takes its own models out, not the provider's other ones.
+ */
+function unavailableModels(value: unknown): NonNullable<ProviderAvailability['models']> {
+  return Object.fromEntries(Object.entries(record(value)).flatMap(([model, entry]) => {
+    const e = record(entry)
+    if (!model || entry === null || typeof entry !== 'object') return []
+    return [[model, { ...(typeof e.reason === 'string' ? { reason: e.reason } : {}), ...(typeof e.exhaustedUntil === 'number' ? { exhaustedUntil: e.exhaustedUntil } : {}) }]]
+  }))
+}
+/** Drop availability entries whose stated reset has passed: a cached catalogue must not outlive them. */
+export function liveProviders(providers: NonNullable<LadderOptions['providers']>, now: number): NonNullable<LadderOptions['providers']> {
+  return Object.fromEntries(Object.entries(providers).flatMap(([name, p]) => {
+    const models = Object.fromEntries(Object.entries(p.models ?? {}).filter(([, m]) => m.exhaustedUntil === undefined || m.exhaustedUntil > now))
+    const expired = p.exhaustedUntil !== undefined && p.exhaustedUntil <= now
+    // A provider-wide exhaustion that has reset drops the provider entry, but not a model still out.
+    if (expired && !Object.keys(models).length) return []
+    const { models: _, ...rest } = p
+    const base: ProviderAvailability = expired ? { usable: true } : rest
+    return [[name, Object.keys(models).length ? { ...base, models } : base]]
+  }))
+}
+/** A model out while its provider answers others (a spent quota group), by its id without `@effort`. */
+function modelOut(candidate: WorkerCandidate, providers: NonNullable<LadderOptions['providers']>): boolean {
+  return !!providers[candidate.provider]?.models?.[providerModelId(candidate.model, candidate.provider)]
+}
 export function candidateUsable(candidate: WorkerCandidate, settings: Settings, chatgpt: boolean, providers: NonNullable<LadderOptions['providers']> = {}): boolean {
   const live = providers[candidate.provider]
+  if (modelOut(candidate, providers)) return false
   return settings.providers[candidate.provider] !== false && (live ? live.usable : candidate.provider !== 'chatgpt' || chatgpt)
 }
-function unavailableReason(provider: string, providers: NonNullable<LadderOptions['providers']>, lang: Lang): string {
-  const reason = providers[provider]?.reason
+function unavailableReason(provider: string, providers: NonNullable<LadderOptions['providers']>, lang: Lang, model?: string): string {
+  const reason = model ? providers[provider]?.models?.[providerModelId(model, provider)]?.reason : providers[provider]?.reason
   if (!reason && provider === 'chatgpt') return t(lang, 'toasts.providerQuota')
   const labels: Record<string, string> = lang === 'ko'
     ? { insufficient_balance: '잔액 부족', billing_exhausted: '결제 한도 소진', quota_exhausted: '사용량 한도 소진' }
     : { insufficient_balance: 'insufficient balance', billing_exhausted: 'billing exhausted', quota_exhausted: 'quota exhausted' }
-  return `${provider}: ${reason && labels[reason] || (lang === 'ko' ? '현재 사용 불가' : 'currently unavailable')}`
+  return `${provider}: ${reason === 'model_deprecated' ? reason : reason && labels[reason] || (lang === 'ko' ? '현재 사용 불가' : 'currently unavailable')}`
 }
 function sameTarget(a: TierTarget, b: TierTarget): boolean { return a.agent === b.agent && a.model === b.model }
 function candidateOf(target: TierTarget, candidates: readonly WorkerCandidate[]): WorkerCandidate | undefined {
@@ -174,33 +245,17 @@ function candidateOf(target: TierTarget, candidates: readonly WorkerCandidate[])
 }
 /** Domain overrides belong to the effective worker set; a missing override uses its general ladder. */
 export function workerRule(domain: Domain, settings: Settings): { rule: WorkerPick['rule']; ladder: Rule } {
-  const key = domain === 'design' || domain === 'frontend' ? 'ui' : domain === 'backend' ? 'backend' : 'general'
+  const key = domain === 'design' || domain === 'frontend' ? 'ui' : domain === 'backend' ? 'backend' : domain === 'review' ? 'review' : 'general'
   const ladder = key === 'general' ? undefined : settings.domainRules?.[key]
   return ladder ? { rule: key, ladder } : { rule: 'general', ladder: settings.rules.general }
 }
 
-/**
- * Visual design depends on the model's taste, not on how hard the task is (2026-10-21: a store
- * screenshot redesign judged "design, standard" ran on the light pair). Under the ui ladder a design
- * verdict on the light or standard rung is raised to the hard rung; frontend, other ladders and
- * verdicts already on hard or plan are untouched.
- */
-export function domainVerdict(verdict: WorkerVerdict, rule: WorkerPick['rule']): { verdict: WorkerVerdict; raised?: 'design' } {
-  if (rule !== 'ui' || verdict.domain !== 'design') return { verdict }
-  const rung = rungOf(verdict)
-  if (rung !== 'light' && rung !== 'standard') return { verdict }
-  const { sure: _sure, ...rest } = verdict
-  return { verdict: { ...rest, ...TIER_MARKERS.hard! }, raised: 'design' }
-}
-
 export type Resolution = { target?: TierTarget; effort: Effort; rung?: Rung; position?: number; skipped?: { rung: Rung; position: number; model: string; reason: string }[]; fallbackReason?: string }
 
-/** Claude Code's own agent with no model: the subagent runs on the session's model. */
-export const SESSION_MODEL: TierTarget = { agent: 'general-purpose' }
-
 /**
- * The ladder: the verdict's rung, else one rung up, else the session model, never down. Whatever
- * ran instead says why (the fallback toast).
+ * The ladder: the verdict's rung, else one rung up, never down. Whatever ran instead says why (the
+ * fallback toast). With nothing on either rung usable there is no target: the session's own model
+ * used to run it, an Opus the owner had put on no rung and was there to save (2026-10-24).
  */
 export function ladderPick(verdict: WorkerVerdict, rule: Rule, settings: Settings, candidates: readonly WorkerCandidate[], chatgpt: boolean, lang: Lang, allow: readonly string[] = [], providers: NonNullable<LadderOptions['providers']> = {}, known: readonly string[] = []): Resolution {
   const wanted = rungOf(verdict)
@@ -217,20 +272,36 @@ export function ladderPick(verdict: WorkerVerdict, rule: Rule, settings: Setting
       if (candidate && candidateUsable(candidate, settings, chatgpt, providers) && ticked) {
         return { target: { ...target }, effort: step.effort, rung, position: index + 1, skipped, ...(reasons.length ? { fallbackReason: reasons.join('; ') } : {}) }
       }
-      const reason = !candidate ? t(lang, 'toasts.workerMissing', { name: target.agent }) : settings.providers[candidate.provider] === false ? t(lang, 'workers.disabled', { provider: candidate.provider }) : !ticked ? t(lang, 'workers.notCandidate', { name: candidate.model }) : providers[candidate.provider]?.usable === false ? unavailableReason(candidate.provider, providers, lang) : t(lang, 'toasts.providerQuota')
+      const reason = !candidate ? t(lang, 'toasts.workerMissing', { name: target.agent }) : settings.providers[candidate.provider] === false ? t(lang, 'workers.disabled', { provider: candidate.provider }) : !ticked ? t(lang, 'workers.notCandidate', { name: candidate.model }) : providers[candidate.provider]?.usable === false ? unavailableReason(candidate.provider, providers, lang) : modelOut(candidate, providers) ? unavailableReason(candidate.provider, providers, lang, candidate.model) : t(lang, 'toasts.providerQuota')
       const model = candidate?.model ?? target.model ?? target.agent
       skipped.push({ rung, position: index + 1, model, reason })
       reasons.push(`${model}: ${reason}`)
     }
   }
   const effort = rule.rungs[wanted]?.[0]?.effort ?? verdict.effort
-  // The session's model is Claude's: with Anthropic switched off nothing is left to run it.
-  if (settings.providers.anthropic === false) return { effort, rung: wanted, skipped, fallbackReason: t(lang, 'workers.none') }
-  return { target: { ...SESSION_MODEL }, effort, rung: wanted, skipped, fallbackReason: reasons.join('; ') || t(lang, 'workers.none') }
+  return { effort, rung: wanted, skipped, fallbackReason: reasons.join('; ') || t(lang, 'workers.none') }
+}
+
+/** Only allowed, installed entries after this pick in the same tier. Availability is rechecked by the router. */
+export function ladderFallbackModels(rule: Rule, pick: Resolution, candidates: readonly WorkerCandidate[], settings: Settings): string[] {
+  if (!pick.rung || !pick.position) return []
+  return (rule.rungs[pick.rung] ?? []).slice(pick.position).flatMap(step => {
+    const candidate = candidateOf(step.target, candidates)
+    if (!candidate || settings.providers[candidate.provider] === false || !allowed(candidate, settings.allow, settings.allowKnown)) return []
+    return [`${baseModel(candidate.model)}@${step.effort}`]
+  })
+}
+
+/** Resolve only native family aliases; explicit versions, custom ids and inheritance stay intact. */
+export function resolveClaudeModel(model: string | undefined): string | undefined {
+  if (!model) return model
+  const alias = baseModel(model).replace(/\[1m\]$/, '')
+  const worker = CLAUDE_WORKERS.find(w => w.target.model === alias)
+  return worker ? worker.model + model.slice(alias.length) : model
 }
 
 export function spawnModel(target: TierTarget, effort: Effort, fileModel?: string): string | undefined {
-  return fileModel && target.agent !== 'general-purpose' ? `${baseModel(fileModel)}@${effort}` : target.model
+  return resolveClaudeModel(fileModel && target.agent !== 'general-purpose' ? `${baseModel(fileModel)}@${effort}` : target.model)
 }
 /** A prefix this mod (or the retired agent-title hook) put on a title: "Sol·high · ". */
 const TITLE_PREFIX = /^[^\s·]+(?:·[a-z]+)? · /
@@ -267,7 +338,12 @@ export function bareTitle(description: string): string {
   return bare.trim() ? bare : description
 }
 
+/** Claude Code owns these agents and their read-only/tool constraints (2026-10-24). */
+export const NATIVE_AGENTS: readonly string[] = ['statusline-setup', 'claude-code-guide', 'Explore', 'Plan']
+
 export function takesOver(spawn: { subagentType: string; model?: string; fork: boolean }, settings: Settings): boolean {
   if (spawn.fork || settings.agentAuto === 'off') return false
-  return ['ripple:auto', 'auto'].includes(spawn.subagentType) || (settings.agentAuto === 'all' && spawn.subagentType === 'general-purpose' && spawn.model === undefined)
+  if (['ripple:auto', 'auto'].includes(spawn.subagentType)) return true
+  // A project agent's pinned model must not bypass the ladder either (2026-10-24, opus-xhigh).
+  return settings.agentAuto === 'all' && !spawn.subagentType.includes(':') && !NATIVE_AGENTS.includes(spawn.subagentType)
 }

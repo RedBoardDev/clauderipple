@@ -13,4 +13,22 @@ export function launcherOptions(binary: string | undefined, platform = process.p
     cwd: options.cwd, env: options.env, signal: options.signal, shell: true, windowsHide: true, stdio: ["pipe", "pipe", "pipe"],
   }) };
 }
-export const sdkQuery: typeof query = input => query({ ...input, options: { ...input.options, ...launcherOptions(input.options?.pathToClaudeCodeExecutable) } });
+/** The SDK's close() initiates graceful shutdown but does not await process exit.
+ * Handoff must wait for the actual writer, not just the SDK's message iterator. */
+export const sdkQuery = (input: Parameters<typeof query>[0]): ReturnType<typeof query> & { processExited: Promise<void> } => {
+  const exited = Promise.withResolvers<void>();
+  const custom = input.options?.spawnClaudeCodeProcess ?? launcherOptions(input.options?.pathToClaudeCodeExecutable).spawnClaudeCodeProcess;
+  const result = query({ ...input, options: { ...input.options, spawnClaudeCodeProcess: options => {
+    const child = custom ? custom(options) : spawn(options.command, options.args, {
+      cwd: options.cwd, env: options.env, signal: options.signal, windowsHide: true, stdio: ["pipe", "pipe", "pipe"],
+    });
+    if ("stderr" in child && child.stderr) child.stderr.on("data", (chunk: Buffer) => input.options?.stderr?.(chunk.toString()));
+    child.once("exit", () => exited.resolve());
+    child.once("error", error => {
+      // A failed spawn has no writer; an abort/error on a running child still needs its exit.
+      if ((error as NodeJS.ErrnoException).syscall?.startsWith("spawn")) exited.resolve();
+    });
+    return child;
+  } } });
+  return Object.assign(result, { processExited: exited.promise });
+};

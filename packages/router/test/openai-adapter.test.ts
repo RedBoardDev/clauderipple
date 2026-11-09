@@ -2,13 +2,14 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import http from "node:http";
-import { mapHttpError, OpenAiCompatibleAdapter } from "../src/providers/openai/index.ts";
+import { isCloudflareFingerprintBlock, mapHttpError, OpenAiCompatibleAdapter, type OpenAiCredential } from "../src/providers/openai/index.ts";
 import { Logger } from "../src/log.ts";
 import { decodeEnvelope, encodeEnvelope } from "../src/reasoning.ts";
 import type { AnthropicRequest } from "../src/providers/chatgpt/translate.ts";
+import { requestKind } from "../src/routing.ts";
 
 const seen: { path: string; headers: http.IncomingHttpHeaders; body: Record<string, unknown> }[] = [];
-let mode: "chat" | "responses" | "error" | "cut-responses" | "cut-chat" | "done-chat" | "refuse-reasoning" | "refuse-chat" | "sealed" | "sealed-chat" = "chat";
+let mode: "chat" | "responses" | "error" | "cloudflare" | "cut-responses" | "cut-chat" | "done-chat" | "refuse-reasoning" | "refuse-chat" | "sealed" | "sealed-chat" | "missing-thinking" = "chat";
 const sse = (records: Record<string, unknown>[]) => records.map((record) => `data: ${JSON.stringify(record)}\n\n`).join("");
 
 const upstream = http.createServer((req, res) => {
@@ -16,8 +17,21 @@ const upstream = http.createServer((req, res) => {
   req.on("data", (chunk: Buffer) => chunks.push(chunk));
   req.on("end", () => {
     seen.push({ path: req.url ?? "", headers: req.headers, body: JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string, unknown> });
+    if (req.headers.authorization === "Bearer hop-first") {
+      res.writeHead(429, { "retry-after": "123" }).end('{"error":{"message":"hop-first limited"}}');
+      return;
+    }
+    if (mode === "missing-thinking") {
+      res.writeHead(400, { "content-type": "application/json" }).end(JSON.stringify({ error: { message: "Upstream request failed: The `content[].thinking` in the thinking mode must be passed back to the API. (reasoning signature required)" } }));
+      return;
+    }
     if (mode === "error") {
       res.writeHead(401, { "content-type": "application/json" }).end(JSON.stringify({ error: { message: "missing key" } }));
+      return;
+    }
+    // Cloudflare refusing the request's fingerprint before the provider reads the key (issue #132).
+    if (mode === "cloudflare") {
+      res.writeHead(403, { "content-type": "text/plain" }).end("error code: 1010");
       return;
     }
     // A vendor that refuses the reasoning carried back in the request it was given.
@@ -95,12 +109,14 @@ const upstreamPort = await listen(upstream);
 const log = new Logger(null, 1_000_000, 1, false);
 let adapter: OpenAiCompatibleAdapter;
 let configuredEffort = "high";
+let credential: OpenAiCredential | undefined;
 const front = http.createServer((req, res) => {
   const chunks: Buffer[] = [];
   req.on("data", (chunk: Buffer) => chunks.push(chunk));
   req.on("end", () => {
     const json = JSON.parse(Buffer.concat(chunks).toString("utf8")) as AnthropicRequest;
-    void adapter.handle(req, res, req.url ?? "/v1/messages", json, "vendor-model", configuredEffort);
+    const requestPath = (req.url ?? "/v1/messages").split("?")[0] ?? "/v1/messages";
+    void adapter.handle(req, res, req.url ?? "/v1/messages", json, "vendor-model", configuredEffort, credential, { kind: requestKind(json, requestPath) });
   });
 });
 const frontPort = await listen(front);
@@ -177,6 +193,33 @@ test("adapter translates stateless Responses wire and supports non-streaming out
   assert.equal(JSON.parse(response.text).content[0].text, "Hi");
 });
 
+test("an Auto mode classifier's system text reaches the upstream exactly as sent, on both wires", async () => {
+  const system = "You are a security monitor for autonomous AI coding agents.\n\nJudge this action.";
+  const addendum = "Be brief.";
+  const classifier: AnthropicRequest = { model: "claude-haiku-5-5", stream: true, system, messages: [{ role: "user", content: "check" }] };
+  const ordinarySystem = "Judge this action.";
+
+  for (const wire of ["chat", "responses"] as const) {
+    mode = wire;
+    adapter = new OpenAiCompatibleAdapter("fake", { type: "openai-compatible", url: `http://127.0.0.1:${upstreamPort}/v1`, wire, instructionsAppend: addendum }, log);
+    const classifierResponse = await call(classifier);
+    assert.equal(classifierResponse.status, 200);
+    const classifierBody = seen.at(-1)!.body;
+    const classifierSystem = wire === "chat"
+      ? (classifierBody.messages as { content: unknown }[])[0]!.content
+      : classifierBody.instructions;
+    assert.equal(classifierSystem, system);
+
+    const turnResponse = await call({ ...classifier, system: ordinarySystem });
+    assert.equal(turnResponse.status, 200);
+    const turnBody = seen.at(-1)!.body;
+    const turnSystem = wire === "chat"
+      ? (turnBody.messages as { content: unknown }[])[0]!.content
+      : turnBody.instructions;
+    assert.equal(turnSystem, `You are vendor-model, answering through Claude Code, a terminal-based coding agent.\n\n${ordinarySystem}\n\n${addendum}`);
+  }
+});
+
 test("adapter maps a vendor 401 to Anthropic authentication_error", async () => {
   mode = "error";
   adapter = new OpenAiCompatibleAdapter("fake", { type: "openai-compatible", url: `http://127.0.0.1:${upstreamPort}/v1` }, log);
@@ -226,6 +269,56 @@ test("no session header is sent unless the provider asks for one", async () => {
   }, log);
   await call(request);
   assert.equal(seen.at(-1)!.headers["x-opencode-session"], undefined);
+});
+
+// OpenCode's edge answers Cloudflare `error code: 1010` to a request whose User-Agent is missing or
+// Node's default `node` (issue #132). The preset declares the User-Agent it is let through with.
+test("the OpenCode Go preset sends its User-Agent on Chat and Responses, and a configured one wins", async () => {
+  for (const wire of ["chat", "responses"] as const) {
+    mode = wire;
+    adapter = new OpenAiCompatibleAdapter("fake", { type: "openai-compatible", url: `http://127.0.0.1:${upstreamPort}/v1`, wire, headers: { authorization: "Bearer secret" }, sessionHeader: "x-opencode-session", preset: "opencode-go" }, log);
+    const response = await call(request);
+    assert.equal(response.status, 200);
+    assert.equal(seen.at(-1)!.headers["user-agent"], "opencode/2.2.6", `${wire}: the preset's User-Agent went out, and only one value`);
+  }
+
+  mode = "chat";
+  adapter = new OpenAiCompatibleAdapter("fake", { type: "openai-compatible", url: `http://127.0.0.1:${upstreamPort}/v1`, headers: { authorization: "Bearer secret", "User-Agent": "my-client/1" }, preset: "opencode-go" }, log);
+  await call(request);
+  assert.equal(seen.at(-1)!.headers["user-agent"], "my-client/1", "a User-Agent the provider configures wins, in any case, and is not joined to the default");
+});
+
+test("another OpenAI-compatible preset does not send the OpenCode Go User-Agent", async () => {
+  mode = "chat";
+  adapter = new OpenAiCompatibleAdapter("fake", { type: "openai-compatible", url: `http://127.0.0.1:${upstreamPort}/v1`, headers: { authorization: "Bearer secret" }, preset: "groq" }, log);
+  const response = await call(request);
+  assert.equal(response.status, 200);
+  assert.notEqual(seen.at(-1)!.headers["user-agent"], "opencode/2.2.6");
+});
+
+test("a Cloudflare 1010 refusal reaches the client as a fingerprint block, not a credential refusal", async () => {
+  mode = "cloudflare";
+  adapter = new OpenAiCompatibleAdapter("fake", { type: "openai-compatible", url: `http://127.0.0.1:${upstreamPort}/v1`, headers: { authorization: "Bearer secret" }, preset: "opencode-go" }, log);
+  const before = seen.length;
+  const response = await call({ ...request, stream: false });
+  assert.equal(response.status, 403);
+  const body = JSON.parse(response.text) as { error: { type: string; message: string } };
+  assert.equal(body.error.type, "permission_error");
+  assert.match(body.error.message, /1010/);
+  assert.match(body.error.message, /not your API key/, "the key is named as not the cause");
+  assert.equal(seen.length - before, 1, "not asked again: the same fingerprint would be refused again");
+  mode = "chat";
+});
+
+test("a Cloudflare 1010 body is recognised on its own and only on 403", () => {
+  assert.equal(isCloudflareFingerprintBlock("error code: 1010"), true);
+  assert.equal(isCloudflareFingerprintBlock("<title>Access denied</title> Error 1010"), true);
+  assert.equal(isCloudflareFingerprintBlock("error code: 1020"), false);
+  assert.equal(isCloudflareFingerprintBlock('{"error":{"message":"Invalid API key 1010"}}'), false);
+  assert.match(mapHttpError(403, "error code: 1010").body, /1010/);
+  // Anything else on a 403 keeps its existing reading.
+  assert.match(mapHttpError(403, JSON.stringify({ error: { message: "Invalid API key" } })).body, /authentication_error/);
+  assert.equal(mapHttpError(401, "error code: 1010").status, 401, "a 401 is not a fingerprint block");
 });
 
 // A stream that closes before the vendor says it is done was cut off. Finishing it as end_turn gave
@@ -372,6 +465,211 @@ test("a Chat vendor's refusal of reasoning_content is retried once without it", 
   assert.equal(response.status, 200, "the retry answered, the refusal did not reach the user");
   const attempts = seen.slice(-2).map((s) => JSON.stringify((s.body as { messages?: unknown }).messages ?? []).includes('"reasoning_content"'));
   assert.deepEqual(attempts, [true, false], "the second ask carried no reasoning");
+});
+
+test("per-call credential wins over session and configured headers; reasoning retry survives a hop", async () => {
+  mode = "refuse-chat";
+  adapter = new OpenAiCompatibleAdapter("fake", {
+    type: "openai-compatible", url: `http://127.0.0.1:${upstreamPort}/v1`, wire: "chat",
+    sessionHeader: "authorization", headers: { authorization: "Bearer config" },
+  }, log);
+  const before = seen.length;
+  const refusals: [number, number | undefined, string][] = [];
+  credential = {
+    headers: { authorization: "Bearer hop-first" },
+    next: (status, retry, body) => {
+      refusals.push([status, retry, body]);
+      return status === 429 ? { authorization: "Bearer hop-second" } : null;
+    },
+  };
+  try {
+    const response = await call({
+      ...request, stream: false,
+      messages: [
+        { role: "user", content: "read a" },
+        { role: "assistant", content: [{ type: "thinking", thinking: "thought", signature: encodeEnvelope({ w: "chat", p: "fake", m: "vendor-model", f: "reasoning_content" }) }] },
+        { role: "user", content: "continue" },
+      ],
+    });
+    assert.equal(response.status, 200);
+    const attempts = seen.slice(before);
+    assert.deepEqual(attempts.map((a) => a.headers.authorization), ["Bearer hop-first", "Bearer hop-second", "Bearer hop-second"]);
+    assert.deepEqual(attempts.map((a) => JSON.stringify(a.body).includes('"reasoning_content"')), [true, true, false]);
+    assert.equal(refusals[0]![0], 429);
+    assert.equal(refusals[0]![1], 123000);
+    assert.match(refusals[0]![2], /hop-first limited/);
+    assert.equal(refusals[1]![0], 400);
+  } finally { credential = undefined; }
+});
+
+test("replayed reasoning does not buffer a successful stream until upstream EOF", async (t) => {
+  let pending: http.ServerResponse | undefined;
+  let sent: { messages: { reasoning_content?: string }[] } | undefined;
+  const slow = http.createServer((req, res) => {
+    const chunks: Buffer[] = [];
+    req.on("data", (chunk: Buffer) => chunks.push(chunk));
+    req.on("end", () => {
+      sent = JSON.parse(Buffer.concat(chunks).toString("utf8")) as { messages: { reasoning_content?: string }[] };
+      pending = res;
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      res.write(sse([{ choices: [{ delta: { content: "first chunk" }, finish_reason: null }] }]));
+      // The test releases EOF only after the client has received the text.
+    });
+  });
+  const port = await listen(slow);
+  const streaming = new OpenAiCompatibleAdapter("fake", { type: "openai-compatible", url: `http://127.0.0.1:${port}/v1` }, log);
+  const gateway = http.createServer((req, res) => {
+    req.resume();
+    req.on("end", () => {
+      void streaming.handle(req, res, "/v1/messages", {
+        ...request,
+        messages: [
+          { role: "user", content: "question" },
+          { role: "assistant", content: [{ type: "thinking", thinking: "thought", signature: encodeEnvelope({ w: "chat", p: "fake", m: "vendor-model", f: "reasoning_content" }) }] },
+          { role: "user", content: "continue" },
+        ],
+      }, "vendor-model", undefined);
+    });
+  });
+  t.after(() => {
+    pending?.end();
+    gateway.closeAllConnections();
+    slow.closeAllConnections();
+    gateway.close();
+    slow.close();
+  });
+  const gatewayPort = await listen(gateway);
+  const response = await fetch(`http://127.0.0.1:${gatewayPort}/v1/messages`, { method: "POST", body: "{}", signal: AbortSignal.timeout(2000) });
+  assert.equal(response.status, 200);
+  const reader = response.body!.getReader();
+  let text = "";
+  while (!text.includes('"text":"first chunk"')) {
+    const chunk = await reader.read();
+    assert.equal(chunk.done, false);
+    text += new TextDecoder().decode(chunk.value);
+  }
+  assert.ok(pending);
+  assert.equal(pending.writableEnded, false);
+  assert.ok(sent?.messages.some((message) => message.reasoning_content === "thought"), "the successful request really carried replayed reasoning");
+  pending.end(sse([{ choices: [{ delta: {}, finish_reason: "stop" }] }]));
+  while (true) {
+    const chunk = await reader.read();
+    if (chunk.done) break;
+    text += new TextDecoder().decode(chunk.value);
+  }
+  assert.match(text, /message_stop/);
+});
+
+for (const wire of ["chat", "responses"] as const) {
+  for (const stream of [true, false]) {
+    for (const afterTerminal of ["open", "reset", "error"] as const) {
+      test(`${wire} terminal completes stream=${stream} without waiting for EOF (${afterTerminal})`, { timeout: 3000 }, async (t) => {
+        const closed = Promise.withResolvers<void>();
+        let reset: NodeJS.Timeout | undefined;
+        const backend = http.createServer((req, res) => {
+          req.resume();
+          req.on("end", () => {
+            res.on("close", () => closed.resolve());
+            res.writeHead(200, { "content-type": "text/event-stream" });
+            res.write(sse(wire === "chat" ? [
+              { choices: [{ delta: { content: "answer" }, finish_reason: "stop" }] },
+            ] : [
+              { type: "response.output_item.added", item: { type: "message", id: "msg_1" } },
+              { type: "response.output_text.delta", item_id: "msg_1", delta: "answer" },
+              { type: "response.output_item.done", item: { type: "message", id: "msg_1" } },
+            ]));
+            // Usage arrives after finish_reason, in a later write. It must not be lost.
+            setImmediate(() => {
+              const terminal = wire === "chat"
+                ? sse([{ choices: [], usage: { prompt_tokens: 40, prompt_tokens_details: { cached_tokens: 30 }, completion_tokens: 5 } }]) + "data: [DONE]\n\n"
+                : sse([{ type: "response.completed", response: { usage: { input_tokens: 40, input_tokens_details: { cached_tokens: 30 }, output_tokens: 5 } } }]);
+              const lateError = sse([{ error: { message: "too late", code: "server_is_overloaded" } }]);
+              res.write(terminal + (afterTerminal === "error" ? lateError : ""));
+              if (afterTerminal === "reset") reset = setTimeout(() => res.destroy(), 50);
+              // No EOF, even after the terminal marker: the adapter owns cleanup.
+            });
+          });
+        });
+        const port = await listen(backend);
+        const local = new OpenAiCompatibleAdapter("fake", { type: "openai-compatible", wire, url: `http://127.0.0.1:${port}` }, log);
+        const outcome = Promise.withResolvers<Awaited<ReturnType<OpenAiCompatibleAdapter["handle"]>>>();
+        const gateway = http.createServer((req, res) => {
+          req.resume();
+          req.on("end", () => {
+            local.handle(req, res, "/v1/messages", { ...request, stream }, "vendor-model", undefined).then(outcome.resolve, outcome.reject);
+          });
+        });
+        t.after(() => {
+          if (reset) clearTimeout(reset);
+          gateway.closeAllConnections(); backend.closeAllConnections();
+          gateway.close(); backend.close();
+        });
+        const gatewayPort = await listen(gateway);
+        const response = await fetch(`http://127.0.0.1:${gatewayPort}`, { method: "POST", body: "{}", signal: AbortSignal.timeout(1000) });
+        const text = await response.text();
+        const result = await outcome.promise;
+        assert.equal(result.status, 200);
+        assert.deepEqual(result.usage, { input: 10, cached: 30, output: 5 });
+        assert.equal(result.stopReason, "end_turn");
+        if (stream) {
+          const events = text.split("\n\n").filter(Boolean).map((event) => JSON.parse(event.split("\ndata: ")[1]!) as { type: string; usage?: unknown });
+          assert.equal(events.filter((event) => event.type === "message_stop").length, 1);
+          assert.equal(events.some((event) => event.type === "error"), false);
+          assert.deepEqual(events.find((event) => event.type === "message_delta")?.usage, { input_tokens: 10, cache_read_input_tokens: 30, cache_creation_input_tokens: 0, output_tokens: 5 });
+        } else {
+          assert.equal(response.status, 200);
+          assert.equal(JSON.parse(text).content[0].text, "answer");
+        }
+        await closed.promise;
+      });
+    }
+  }
+}
+
+test("missing thinking 400 logs assistant shapes only and never retries (#109)", async () => {
+  mode = "missing-thinking";
+  const warnings: string[] = [];
+  class CaptureLogger extends Logger {
+    override warn(line: string): void { warnings.push(line); }
+  }
+  adapter = new OpenAiCompatibleAdapter("opencode-go", { type: "openai-compatible", url: `http://127.0.0.1:${upstreamPort}/v1`, wire: "responses" }, new CaptureLogger(null, 1000000, 1, false));
+  const before = seen.length;
+  let hops = 0;
+  credential = { headers: {}, next: () => { hops++; return null; } };
+  try {
+    const response = await call({ ...request, messages: [
+      { role: "user", content: "PRIVATE_USER" },
+      { role: "assistant", content: [
+        { type: "thinking", thinking: "PRIVATE_THOUGHT", signature: encodeEnvelope({ w: "responses", p: "opencode-go", m: "vendor-model", r: { type: "reasoning", encrypted_content: "PRIVATE_BLOB" } }) },
+        { type: "tool_use", id: "PRIVATE_ID", name: "PRIVATE_TOOL", input: { secret: "PRIVATE_ARGUMENT" } },
+        { type: "tool_use", id: "b", name: "Read", input: {} },
+      ] },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: "PRIVATE_ID", content: "PRIVATE_RESULT" }] },
+      { role: "assistant", content: "PRIVATE_TEXT" },
+      { role: "assistant", content: [] },
+      { role: "assistant", content: [{ type: "PRIVATE_TYPE", text: "PRIVATE_UNKNOWN" }] },
+    ] });
+    assert.equal(response.status, 400);
+    assert.equal(response.headers["x-should-retry"], "false");
+    assert.equal(seen.length - before, 1);
+    assert.equal(hops, 0);
+    const diagnostic = warnings.find((line) => line.includes("assistantTurns="));
+    assert.ok(diagnostic, "shape diagnostic is emitted at WARN");
+    const turns = JSON.parse(diagnostic.split("assistantTurns=")[1]!) as unknown;
+    assert.deepEqual(turns, [
+      { turn: 1, blocks: { thinking: 1, tool_use: 2 } },
+      { turn: 3, blocks: { text: 1 } },
+      { turn: 4, blocks: {} },
+      { turn: 5, blocks: { unknown: 1 } },
+    ]);
+    assert.doesNotMatch(warnings.join("\n"), /PRIVATE_/);
+    const noCarriers = await call(request);
+    assert.equal(noCarriers.status, 400);
+    assert.equal(noCarriers.headers["x-should-retry"], "false");
+    assert.equal(seen.length - before, 2, "replayed=0 also makes exactly one attempt");
+    assert.equal(hops, 0);
+    assert.ok(warnings.some((line) => line.endsWith("assistantTurns=[]")));
+  } finally { credential = undefined; }
 });
 
 test("cleanup", () => {

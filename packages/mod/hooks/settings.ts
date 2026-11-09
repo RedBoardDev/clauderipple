@@ -1,7 +1,10 @@
 import type { Calibration, Domain, DomainRules, Effort, Level, Mode, Rule, Rung, Settings, SettingsChange, Skin, Step, TierTarget } from '../types/index.d.ts'
 
-/** Bump whenever a writer's normalization can lose another format's fields. */
-export const MOD_SETTINGS_SCHEMA_VERSION = 1
+/**
+ * Bump whenever a writer's normalization can lose another format's fields. 2: `domainRules.review`,
+ * which a version-1 mod drops on its next save.
+ */
+export const MOD_SETTINGS_SCHEMA_VERSION = 2
 
 export const DOMAINS: readonly Domain[] = ['general', 'design', 'frontend', 'backend', 'infra', 'data', 'test', 'docs', 'research']
 export const LEVELS: readonly Level[] = ['light', 'standard', 'deep']
@@ -30,8 +33,8 @@ export const DEFAULTS: Settings = {
   providers: {},
   fallback: { agent: 'general-purpose', model: 'sonnet' },
   keepWarm: false, keepWarmHours: 2, keepWarmMinTokens: 30000,
-  compactWith: 'haiku', handoffSkill: '', handoffAfter: 'continue', handoffButton: 'advised',
-  swampAt: 50, swampAlert: false, layout: 'dashboard', appearance: 'auto', skin: 'deep', language: 'auto', hide: ['reason'], extras: [], setupDone: false,
+  compactModel: 'claude-haiku-5-5', compactModels: [],
+  swampAlert: false, layout: 'dashboard', appearance: 'auto', skin: 'deep', language: 'auto', hide: ['reason'], extras: [], setupDone: false,
 }
 
 /** The desktop's skins, in the order the panel offers them. */
@@ -135,14 +138,19 @@ function ladderRungs(raw: unknown): Rule['rungs'] {
   return rungs
 }
 /**
- * A domain ladder folded into two levels: light and standard hold one list, hard and plan another.
- * The upper rung of each pair wins (standard's list for the light pair, plan's for the heavy one);
- * an empty upper rung falls back to the lower. The general ladder keeps its four rungs.
+ * A domain ladder folded into two levels: light work is the light and standard rungs, heavy work
+ * hard and plan, by difficulty as the owner sets the two rows (2026-10-24). From 2026-10-22 to
+ * 10-24 standard sat in the heavy row, because the worker judge read ordinary design as standard
+ * and the owner wanted design on Opus; the judge is gone, and design now names Opus itself with a
+ * written rule (memory design-work-opus-only), so a standard UI or backend task no longer runs on
+ * the heavy model. Light reads its own rung, else standard's; heavy reads plan, else hard, else
+ * standard, else light, so one filled row still runs everything and a ladder stored by the old
+ * split reads right. The general ladder keeps its four rungs.
  */
 export function twoLevelRungs(rungs: Rule['rungs']): Rule['rungs'] {
   const out: Rule['rungs'] = {}
-  const light = rungs.standard?.length ? rungs.standard : rungs.light
-  const heavy = rungs.plan?.length ? rungs.plan : rungs.hard
+  const light = rungs.light?.length ? rungs.light : rungs.standard
+  const heavy = [rungs.plan, rungs.hard, rungs.standard, rungs.light].find(list => list?.length)
   if (light?.length) { out.light = copy(light); out.standard = copy(light) }
   if (heavy?.length) { out.hard = copy(heavy); out.plan = copy(heavy) }
   return out
@@ -169,7 +177,7 @@ function generalRule(raw: unknown): Rule {
 function domainRules(raw: unknown): DomainRules | undefined {
   const source = object(raw)
   const out: DomainRules = {}
-  for (const key of ['ui', 'backend'] as const) {
+  for (const key of ['ui', 'backend', 'review'] as const) {
     // A domain ladder has two levels, so its four rungs are folded on the way in.
     if (object(source[key]).mode === 'ladder') out[key] = { mode: 'ladder', rungs: twoLevelRungs(generalRule(source[key]).rungs) }
   }
@@ -301,15 +309,18 @@ export function normalizeSettings(raw: unknown, workers?: readonly Worker[]): Se
   const choices = {
     judge: ['haiku', 'jev', 'model'], jevSource: ['typesafe', 'zen'], bias: [-2, -1, 0, 1, 2], floor: EFFORTS,
     delegation: ['normal', 'eager'],
-    ceiling: EFFORTS, agentAuto: ['off', 'auto', 'all'], keepWarmHours: [1, 2, 4, 8], compactWith: ['haiku', 'session'],
-    handoffAfter: ['continue', 'confirm', 'copy'], handoffButton: ['advised', 'always'], layout: ['dashboard', 'minimal'],
+    ceiling: EFFORTS, agentAuto: ['off', 'auto', 'all'], keepWarmHours: [1, 2, 4, 8],
+    layout: ['dashboard', 'minimal'],
     appearance: ['auto', 'dark', 'light'], skin: SKINS, language: ['auto', 'ko', 'en', 'zh', 'ja', 'es', 'pt'],
   } as const
   for (const key of Object.keys(choices) as (keyof typeof choices)[]) if ((choices[key] as readonly unknown[]).includes(value[key])) Object.assign(result, { [key]: value[key] })
   if (typeof value.judgeModel === 'string' && value.judgeModel.trim()) result.judgeModel = value.judgeModel.trim()
-  if (typeof value.handoffSkill === 'string') result.handoffSkill = value.handoffSkill.trim().replace(/^\//, '')
   if (typeof value.keepWarmMinTokens === 'number' && Number.isFinite(value.keepWarmMinTokens) && value.keepWarmMinTokens >= 0) result.keepWarmMinTokens = value.keepWarmMinTokens
-  if (typeof value.swampAt === 'number' && Number.isFinite(value.swampAt) && value.swampAt >= 0 && value.swampAt <= 100) result.swampAt = value.swampAt
+  // `compactWith: 'haiku' | 'session'` was the whole choice. A stored model id wins; otherwise the
+  // old choice (or anything unknown) reads as Haiku, the default it always meant.
+  if (typeof value.compactModel === 'string' && value.compactModel.trim()) result.compactModel = value.compactModel.trim()
+  else if (value.compactWith === 'session') result.compactModel = 'session'
+  result.compactModels = names(value.compactModels).slice(0, 4)
   if (Array.isArray(value.hide)) result.hide = [...new Set(value.hide.filter((part): part is string => typeof part === 'string' && ['timer', 'reason', 'route', 'limits'].includes(part)))]
   result.fallback = target(value.fallback, DEFAULTS.fallback)!
   const domains = domainRules(value.domainRules)

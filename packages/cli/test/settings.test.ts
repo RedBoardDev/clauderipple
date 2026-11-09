@@ -7,6 +7,34 @@ import path from "node:path";
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cr-settings-"));
 process.env.CLAUDE_SETTINGS_PATH = path.join(dir, "settings.json");
 const { applyProxyEnv, checkProxyEnv, removeProxyEnv, currentProxyEnv, syncModelSlots } = await import("../src/settings.ts");
+process.on("exit", () => fs.rmSync(dir, { recursive: true, force: true }));
+
+test("uninstall removes only model values recorded as ours, preserving user changes", () => {
+  const file = process.env.CLAUDE_SETTINGS_PATH!;
+  fs.writeFileSync(file, JSON.stringify({ env: { ANTHROPIC_MODEL: "user-main" } }));
+  applyProxyEnv({ proxyUrl: "http://127.0.0.1:8791", caPath: path.join(dir, "ca.pem"), force: false, models: { main: "user-main", smallFast: "ours", subagent: "ours-worker" } });
+  const settings = JSON.parse(fs.readFileSync(file, "utf8"));
+  settings.env.CLAUDE_CODE_SUBAGENT_MODEL = "user-worker";
+  fs.writeFileSync(file, JSON.stringify(settings));
+  removeProxyEnv({ proxyUrl: "http://127.0.0.1:8791", caPath: path.join(dir, "ca.pem") });
+  assert.deepEqual(JSON.parse(fs.readFileSync(file, "utf8")).env, { ANTHROPIC_MODEL: "user-main", CLAUDE_CODE_SUBAGENT_MODEL: "user-worker" });
+});
+
+test("install/update preserves direct.json and does not rewrite settings", () => {
+  const file = process.env.CLAUDE_SETTINGS_PATH!;
+  const original = JSON.stringify({ env: { KEEP: "1" } });
+  fs.writeFileSync(file, original);
+  const saved = path.join(dir, "direct.json");
+  fs.writeFileSync(saved, JSON.stringify({ at: "now", cli: {}, desktop: null }));
+  try {
+    const edit = applyProxyEnv({ proxyUrl: "http://127.0.0.1:8791", caPath: path.join(dir, "ca.pem"), force: false, models: { main: "routed" }, respectDirect: true });
+    assert.equal(edit.changed, false);
+    assert.equal(fs.readFileSync(file, "utf8"), original);
+    assert.ok(fs.existsSync(saved));
+  } finally {
+    fs.rmSync(saved);
+  }
+});
 
 test("applyProxyEnv adds keys, backs up, preserves other settings; remove restores", () => {
   const file = process.env.CLAUDE_SETTINGS_PATH!;
@@ -129,4 +157,34 @@ test("a GUI save writes the slots, and a slot it does not name is left alone", (
   // Another proxy owns HTTPS_PROXY: refuse rather than quietly retargeting it.
   fs.writeFileSync(file, JSON.stringify({ env: { HTTPS_PROXY: "http://corp:3128" } }));
   assert.throws(() => syncModelSlots({ ...base, models: { smallFast: "deepseek-v4.1-flash" } }), /already/);
+});
+
+// install writes CLAUDE_CODE_MAX_CONTEXT_TOKENS as part of its own setup, so uninstall takes back
+// exactly that value; a cap set by hand is not evidence and stays (G-D16).
+test("install's context cap is taken back, a hand-set one stays", () => {
+  const file = process.env.CLAUDE_SETTINGS_PATH!;
+  const proxy = { proxyUrl: "http://127.0.0.1:8790", caPath: "/x/ca.pem", force: false };
+  fs.writeFileSync(file, JSON.stringify({ env: { FOO: "1" } }));
+  applyProxyEnv({ ...proxy, maxContextTokens: 500000 });
+  assert.equal(JSON.parse(fs.readFileSync(file, "utf8")).env.CLAUDE_CODE_MAX_CONTEXT_TOKENS, "500000");
+  removeProxyEnv({ proxyUrl: proxy.proxyUrl, caPath: proxy.caPath });
+  assert.deepEqual(JSON.parse(fs.readFileSync(file, "utf8")).env, { FOO: "1" });
+
+  fs.writeFileSync(file, JSON.stringify({ env: { CLAUDE_CODE_MAX_CONTEXT_TOKENS: "700000" } }));
+  applyProxyEnv({ ...proxy, maxContextTokens: 700000 });
+  const edit = removeProxyEnv({ proxyUrl: proxy.proxyUrl, caPath: proxy.caPath });
+  assert.equal(JSON.parse(fs.readFileSync(file, "utf8")).env.CLAUDE_CODE_MAX_CONTEXT_TOKENS, "700000", "the user's own cap is not ours to delete");
+  assert.ok(edit.notes.some((note) => /no record/.test(note)), edit.notes.join("\n"));
+});
+
+// G-D04: settings.json is shared with the CLI itself and with every installation. A file that is
+// not a JSON object must stop the edit, not be spread into a new object that loses its contents.
+test("a settings file that is not an object is refused, never rewritten", () => {
+  const file = process.env.CLAUDE_SETTINGS_PATH!;
+  for (const content of ["[]", "null", '"a string"', "42"]) {
+    fs.writeFileSync(file, content);
+    assert.throws(() => applyProxyEnv({ proxyUrl: "http://127.0.0.1:8790", caPath: "/x/ca.pem", force: true }), /not a JSON object/);
+    assert.throws(() => removeProxyEnv({ proxyUrl: "http://127.0.0.1:8790", caPath: "/x/ca.pem" }), /not a JSON object/);
+    assert.equal(fs.readFileSync(file, "utf8"), content);
+  }
 });

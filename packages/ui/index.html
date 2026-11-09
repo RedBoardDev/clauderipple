@@ -36,6 +36,15 @@
       <div class="section-head"><h2 class="section-title" data-i18n="health.providers">Providers</h2></div>
       <div class="group" id="health-providers"></div>
     </section>
+    <!-- What is in the way and what to do about it; drawn only when the router reports something. -->
+    <section class="section" id="health-diagnostics-section" hidden>
+      <div class="section-head">
+        <h2 class="section-title" data-i18n="health.diagnostics">Diagnostics</h2>
+        <button class="btn secondary compact" id="diagnostics-copy" type="button" data-i18n="health.copyDiagnostics">Copy diagnostics</button>
+      </div>
+      <div class="group" id="health-diagnostics"></div>
+      <p class="group-footer" data-i18n="health.diagnosticsHelp"></p>
+    </section>
     <section class="section">
       <div class="section-head"><h2 class="section-title" data-i18n="health.requestCount">Request count</h2></div>
       <div class="group" id="health-requests"></div>
@@ -90,11 +99,23 @@
       <div class="group"><div class="model-checklist" id="client-picker-models"></div></div>
       <p class="group-footer" data-i18n="slots.pickerModelsHelp"></p>
     </section>
+    <section class="section" id="client-picker-order-card" hidden>
+      <div class="section-head"><h2 class="section-title" data-i18n="slots.pickerOrder">Order in the picker</h2></div>
+      <div class="group"><ol class="picker-order" id="client-picker-order"></ol></div>
+      <p class="group-footer" data-i18n="slots.pickerOrderHelp"></p>
+    </section>
 
     <section class="section">
       <div class="section-head"><h2 class="section-title" data-i18n="slots.modelSlots">Claude Code's own model slots</h2></div>
       <div class="group" id="client-model-slots"></div>
       <p class="group-footer" data-i18n="slots.modelSlotsHelp"></p>
+    </section>
+
+    <section class="section">
+      <div class="section-head"><h2 class="section-title" data-i18n="classifier.title">Auto mode classifier</h2></div>
+      <div class="group" id="client-auto-classifier"></div>
+      <p class="group-footer" data-i18n="classifier.help"></p>
+      <p class="group-footer" id="client-auto-classifier-note" data-i18n="classifier.claudeNeedsPool" hidden></p>
     </section>
 
     <section class="section">
@@ -161,11 +182,11 @@
     <header class="page-header">
       <div><h1 data-i18n="logs.title">Logs</h1></div>
       <div class="logs-tabs" role="tablist">
-        <button class="logs-tab active" id="logs-requests-tab" type="button" role="tab" aria-selected="true" data-i18n="logs.requests">Requests</button>
-        <button class="logs-tab" id="logs-raw-tab" type="button" role="tab" aria-selected="false" data-i18n="logs.raw">Raw logs</button>
+        <button class="logs-tab active" id="logs-requests-tab" type="button" role="tab" aria-selected="true" aria-controls="logs-requests-panel" data-i18n="logs.requests">Requests</button>
+        <button class="logs-tab" id="logs-raw-tab" type="button" role="tab" aria-selected="false" aria-controls="logs-raw-panel" data-i18n="logs.raw">Raw logs</button>
       </div>
     </header>
-    <div id="logs-requests-panel" role="tabpanel">
+    <div id="logs-requests-panel" role="tabpanel" aria-labelledby="logs-requests-tab">
       <section class="section">
         <div class="logs-header-row">
           <div><h2 class="section-title" data-i18n="logs.usage">Usage</h2><span class="small" id="logs-range-caption"></span></div>
@@ -192,7 +213,7 @@
         <div class="group empty-card" id="requests-empty" hidden data-i18n="logs.empty">No requests yet.</div>
       </section>
     </div>
-    <div id="logs-raw-panel" role="tabpanel" hidden>
+    <div id="logs-raw-panel" role="tabpanel" aria-labelledby="logs-raw-tab" hidden>
       <div class="raw-toolbar"><span class="small" data-i18n="logs.rawPolling">Updates every 3s · last 200 lines</span><label class="check"><input type="checkbox" id="logs-autoscroll" checked /><span data-i18n="logs.autoscroll">Auto-scroll</span></label></div>
       <div class="group"><pre id="logbox"></pre></div>
     </div>

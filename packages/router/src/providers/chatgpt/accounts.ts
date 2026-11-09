@@ -41,6 +41,7 @@ export type ChatGptAccount = {
   needsReauth?: boolean;
   /** Left out of rotation by the user. */
   paused?: boolean;
+  preferred?: boolean;
 };
 
 export type ChatGptAccountSummary = {
@@ -51,6 +52,7 @@ export type ChatGptAccountSummary = {
   expiresAt: number;
   needsReauth: boolean;
   paused: boolean;
+  preferred: boolean;
   /** "codex" for the Codex CLI's own login, which we only read. */
   source: "own" | "codex";
 };
@@ -75,7 +77,8 @@ function validAccount(value: unknown): value is ChatGptAccount {
     && (a.email === undefined || typeof a.email === "string")
     && (a.planType === undefined || typeof a.planType === "string")
     && (a.needsReauth === undefined || typeof a.needsReauth === "boolean")
-    && (a.paused === undefined || typeof a.paused === "boolean");
+    && (a.paused === undefined || typeof a.paused === "boolean")
+    && (a.preferred === undefined || typeof a.preferred === "boolean");
 }
 
 /** The file's accounts; [] when absent, null when unreadable (so a mutation refuses to overwrite it). */
@@ -172,6 +175,7 @@ export function saveChatGptAccount(home: string, grant: ChatGptGrant, now = new 
       createdAt: previous?.createdAt ?? now,
       updatedAt: now,
       ...(previous?.paused ? { paused: true } : {}),
+      ...(previous?.preferred ? { preferred: true } : {}),
     };
     const next = [...accounts];
     if (index >= 0) next[index] = account;
@@ -213,15 +217,16 @@ export function markChatGptNeedsReauth(home: string, id: string, expectedAccessT
   });
 }
 
-export function updateChatGptAccount(home: string, id: string, change: { label?: string; paused?: boolean }): boolean {
+export function updateChatGptAccount(home: string, id: string, change: { label?: string; paused?: boolean; preferred?: boolean }): boolean {
   const label = change.label?.replace(/[\x00-\x1f\x7f]/g, "").trim().slice(0, 80);
   if (change.label !== undefined && !label) return false;
   return mutate(home, (accounts) => {
     const index = accounts.findIndex((account) => account.id === id);
     if (index < 0) return { result: false };
-    const next = [...accounts];
-    const { paused: _paused, ...rest } = next[index]!;
-    next[index] = { ...rest, ...(label ? { label } : {}), ...((change.paused ?? next[index]!.paused) ? { paused: true } : {}), updatedAt: new Date().toISOString() };
+    const next = accounts.map((account) => change.preferred === true ? { ...account, preferred: false } : { ...account });
+    next[index] = { ...next[index]!, ...(label ? { label } : {}), paused: change.paused ?? accounts[index]!.paused ?? false, preferred: change.preferred ?? accounts[index]!.preferred ?? false, updatedAt: new Date().toISOString() };
+    if (!next[index]!.paused) delete next[index]!.paused;
+    if (!next[index]!.preferred) delete next[index]!.preferred;
     return { accounts: next, result: true };
   });
 }
@@ -252,6 +257,7 @@ export function summarize(account: ChatGptAccount): ChatGptAccountSummary {
     expiresAt: account.expiresAt,
     needsReauth: account.needsReauth === true,
     paused: account.paused === true,
+    preferred: account.preferred === true,
     source: "own",
   };
 }
@@ -392,7 +398,7 @@ export class ChatGptAccountPool {
     const out: ChatGptCredential[] = [];
     for (const account of this.ownAccounts()) {
       if (account.paused || account.needsReauth || this.now() >= account.expiresAt) continue;
-      out.push(credentialOf(account.id, account.label, account.accessToken, account.accountId));
+      out.push({ ...credentialOf(account.id, account.label, account.accessToken, account.accountId), preferred: account.preferred === true });
     }
     const codex = this.codexLogin();
     if (codex && this.now() < codex.expiresAt) out.push(credentialOf(CODEX_LOGIN_ID, identityFromTokens(codex).email ?? "Codex CLI login", codex.accessToken, codex.accountId));
@@ -477,6 +483,7 @@ export class ChatGptAccountPool {
         expiresAt: codex.expiresAt,
         needsReauth: this.now() >= codex.expiresAt,
         paused: false,
+        preferred: false,
         source: "codex",
       });
     }

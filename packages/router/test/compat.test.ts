@@ -56,6 +56,22 @@ test("sanitizeForCompatible drops adaptive thinking and effort under strict defa
   assert.deepEqual(result.changes, ["thinking", "effort xhigh→removed"]);
 });
 
+test("a provider that takes adaptive thinking keeps it, without the Claude-only fields, and keeps its effort", () => {
+  const caps = { ...STRICT_COMPAT_CAPS, thinking: "adaptive" as const, effortLevels: ["low", "medium", "high", "xhigh", "max"] };
+  const result = sanitizeForCompatible({
+    thinking: { type: "adaptive", display: "omitted", block_binding: { type: "enabled" } },
+    output_config: { effort: "high" },
+  }, caps);
+  assert.deepEqual(result.json.thinking, { type: "adaptive" });
+  assert.deepEqual(result.json.output_config, { effort: "high" });
+  assert.deepEqual(result.changes, ["thinking"]);
+});
+
+test("the MiniMax preset passes adaptive thinking on", () => {
+  assert.equal(resolveCompatibleCaps({ thinking: "adaptive" }).thinking, "adaptive");
+  assert.equal(resolveCompatibleCaps({ thinking: "adaptive" }, { thinking: "enabled" }).thinking, "enabled", "a config override still wins");
+});
+
 test("sanitizeForCompatible strips non-adaptive thinking decorations and cache_control only when disabled", () => {
   const result = sanitizeForCompatible({
     thinking: { type: "enabled", budget_tokens: 100, display: "updates", block_binding: {} },
@@ -207,4 +223,151 @@ test("the per-turn billing header is dropped, and a system that was only the hea
   }, STRICT_COMPAT_CAPS);
   assert.deepEqual(midText.json.system, [{ type: "text", text: "see x-anthropic-billing-header: later" }]);
   assert.equal(midText.changes.some((c) => c.startsWith("billing_header")), false);
+});
+
+// Issue #92: Claude Code 2.1.308+ puts SessionStart hook context and deferred-tool deltas in
+// mid-conversation system messages, carrying `tool_addition`/`tool_removal` blocks a vendor's
+// Anthropic skin refuses (400 `Invalid Anthropic Messages API request`) for the whole request.
+const addition = (name: string, extra: Record<string, unknown> = {}) => ({
+  type: "tool_addition",
+  tool: { type: "tool_definition", definition: { name, description: `${name} tool`, input_schema: { type: "object" }, ...extra } },
+});
+
+test("mid-conversation system messages become user turns and their deferred tools join tools", () => {
+  const hookText = "SessionStart hook additional context: ripple";
+  const input = {
+    model: "m",
+    tools: [{ type: "custom", name: "Read", input_schema: { type: "object" } }],
+    messages: [
+      { role: "user", content: [{ type: "text", text: "hi" }] },
+      {
+        role: "system",
+        content: [{ type: "text", text: hookText }, addition("mcp__ripple__status", { eager_input_streaming: true })],
+      },
+      { role: "developer", content: [{ type: "text", text: "also context" }] },
+      { role: "assistant", content: [{ type: "text", text: "ok" }] },
+    ],
+  };
+  const snapshot = structuredClone(input);
+  const result = sanitizeForCompatible(input, STRICT_COMPAT_CAPS);
+  const messages = result.json.messages as { role: string; content: unknown }[];
+  assert.deepEqual(messages.map((message) => message.role), ["user", "user", "user", "assistant"]);
+  assert.equal(messages.length, 4, "a folded turn is not merged into the user message before it");
+  assert.deepEqual(messages[1]?.content, [{ type: "text", text: hookText }], "the text goes out byte for byte, with no prefix");
+  assert.deepEqual(result.json.tools, [
+    { type: "custom", name: "Read", input_schema: { type: "object" } },
+    { name: "mcp__ripple__status", description: "mcp__ripple__status tool", input_schema: { type: "object" } },
+  ], "the lifted definition is appended after the caller's tools, without eager_input_streaming");
+  assert.deepEqual(result.changes, ["system_role×2", "tool_addition×1"]);
+  assert.deepEqual(input, snapshot, "input remains pure");
+});
+
+test("a lifted tool is added once, never beside a declared one, in the order the messages named it", () => {
+  const input = {
+    model: "m",
+    tools: [{ type: "custom", name: "declared" }],
+    messages: [
+      { role: "system", content: [{ type: "text", text: "a" }, addition("one"), addition("declared")] },
+      { role: "system", content: [{ type: "text", text: "b" }, addition("two"), addition("one")] },
+    ],
+  };
+  const result = sanitizeForCompatible(input, STRICT_COMPAT_CAPS);
+  assert.deepEqual((result.json.tools as { name: string }[]).map((tool) => tool.name), ["declared", "one", "two"]);
+  // `tool_addition` counts the blocks folded out of the messages, as `billing_header` does: the
+  // blocks are the change, whether or not the tool was one the request had already declared.
+  assert.deepEqual(result.changes, ["system_role×2", "tool_addition×4"]);
+});
+
+test("a message that held only an extension block goes whole; the changes count what went out", () => {
+  const result = sanitizeForCompatible({
+    model: "m",
+    messages: [
+      { role: "user", content: [{ type: "text", text: "hi" }] },
+      { role: "system", content: [addition("late")] },
+      { role: "system", content: [{ type: "tool_removal", tool: { type: "tool_reference", name: "Read" } }] },
+    ],
+  }, STRICT_COMPAT_CAPS);
+  assert.deepEqual(result.json.messages, [{ role: "user", content: [{ type: "text", text: "hi" }] }]);
+  assert.deepEqual((result.json.tools as { name: string }[]).map((tool) => tool.name), ["late"]);
+  // Both emptied messages are dropped rather than turned into user turns, so no `system_role`.
+  assert.deepEqual(result.changes, ["tool_addition×1", "tool_removal×1"]);
+});
+
+test("a lifted tool's schema is scrubbed like any other", () => {
+  const result = sanitizeForCompatible({
+    model: "m",
+    messages: [{
+      role: "system",
+      content: [{
+        type: "text",
+        text: "ctx",
+      }, addition("Artifact", {
+        input_schema: {
+          type: "object",
+          properties: {
+            paths: { type: "array", items: { type: "string", pattern: "^[^\\0]*$" } },
+            slug: { type: "string", pattern: "^[a-z]+$" },
+          },
+        },
+      })],
+    }],
+  }, STRICT_COMPAT_CAPS);
+  type Props = { paths: { items: { pattern?: string } }; slug: { pattern?: string } };
+  const [tool] = result.json.tools as { input_schema: { properties: Props } }[];
+  assert.equal(tool?.input_schema.properties.paths.items.pattern, undefined);
+  assert.equal(tool?.input_schema.properties.slug.pattern, "^[a-z]+$");
+  assert.ok(result.changes.includes("pattern×1"));
+});
+
+test("a provider without server tools drops a lifted server tool and withdraws its instructions", () => {
+  const request = () => ({
+    model: "m",
+    messages: [{
+      role: "system",
+      content: [{ type: "text", text: "ctx" }, addition("web_search", { type: "web_search_20250305" })],
+    }],
+    tool_choice: { type: "tool", name: "web_search" },
+  });
+
+  const dropped = sanitizeForCompatible(request(), STRICT_COMPAT_CAPS);
+  assert.equal("tools" in dropped.json, false, "nothing left to declare: no empty tools array either");
+  assert.equal("tool_choice" in dropped.json, false);
+  assert.ok(dropped.changes.includes("server_tools×1"));
+  assert.ok(dropped.changes.includes("server_tool_note"));
+  assert.match(String(dropped.json.system), /^Not available in this session: `web_search`\./);
+
+  // A provider that runs server tools keeps the lifted definition, and gets no note.
+  const kept = sanitizeForCompatible(request(), { ...STRICT_COMPAT_CAPS, serverTools: true });
+  assert.deepEqual((kept.json.tools as { name: string }[]).map((tool) => tool.name), ["web_search"]);
+  assert.equal("tool_choice" in kept.json, true);
+  assert.equal("system" in kept.json, false);
+});
+
+test("tool_removal blocks leave their message and leave the declared tools alone", () => {
+  const tools = [{ type: "custom", name: "Read" }];
+  const input = {
+    model: "m",
+    tools,
+    messages: [
+      { role: "user", content: [{ type: "text", text: "hi" }] },
+      { role: "system", content: [{ type: "text", text: "withdrawn" }, { type: "tool_removal", tool: { type: "tool_reference", name: "Read" } }] },
+    ],
+  };
+  const result = sanitizeForCompatible(input, STRICT_COMPAT_CAPS);
+  assert.equal(result.json.tools, tools, "a removal changes no declaration");
+  assert.deepEqual(result.json.messages, [
+    { role: "user", content: [{ type: "text", text: "hi" }] },
+    { role: "user", content: [{ type: "text", text: "withdrawn" }] },
+  ]);
+  assert.deepEqual(result.changes, ["system_role×1", "tool_removal×1"]);
+  assert.equal(input.messages[1]?.content.length, 2, "input remains pure");
+});
+
+test("a request with no extensions keeps the caller's own arrays", () => {
+  const messages = [{ role: "user", content: [{ type: "text", text: "hi" }] }];
+  const tools = [{ type: "custom", name: "Read" }];
+  const result = sanitizeForCompatible({ model: "m", messages, tools }, STRICT_COMPAT_CAPS);
+  assert.equal(result.json.messages, messages);
+  assert.equal(result.json.tools, tools);
+  assert.deepEqual(result.changes, []);
 });

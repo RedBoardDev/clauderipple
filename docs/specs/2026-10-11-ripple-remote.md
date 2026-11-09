@@ -39,7 +39,7 @@ the base URL cannot be changed inside the app's sessions, but a process we spawn
 | omnara-ai/omnara | 2.9k | Apache-2.0 | pivoted to a managed agent platform |
 
 Nobody mixes workers inside one Claude session with cache kept, and nobody shows the mod's
-figures (effort judge, cache keep-warm, context/limit gauges, handoff/compact) remotely. The
+figures (effort judge, cache keep-warm, context/limit gauges, compact) remotely. The
 complaints in Paseo's 1,170 and Happy's 1,061 open issues cluster on four failures, which become
 our requirements below.
 
@@ -97,6 +97,10 @@ Every issue cited here was re-read with `gh api` on 2026-10-11 and is **open**: 
   sessions not open in the app. *Not measured.*
 - **Transport:** outbound WSS to our relay (Cloudflare Worker + Durable Object), plus direct
   LAN/Tailscale. Same liveness numbers as Paseo (10 s / 30 s / 8 s, capped backoff, never stop).
+  Through the relay the phone also sends the relay's plain `ping` every 10 s, which the runtime's
+  auto-response answers without waking the room; once host and phone both advertise it, the
+  end-to-end check and presence drop to 60 s (`SLOW_PING_MS`) so an idle phone lets the room
+  hibernate (2026-11-04).
 - **E2EE:** X25519 + XSalsa20-Poly1305 (`tweetnacl`, our own framing). Host key 0600 under
   `~/.clauderipple/`. Pairing by QR from the tray app and the dashboard.
 - **Sync:** per-session event log with `seq`/`epoch`, persisted (append-only JSONL, rotated). The

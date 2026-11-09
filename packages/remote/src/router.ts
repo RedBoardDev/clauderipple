@@ -1,6 +1,6 @@
 // The host reads the router's admin API like any client: models and effort ladders for the
 // picker, the proxy settings a spawned CLI needs, and per-session request records for the
-// mod's figures. Read-only; the host never writes router state.
+// mod's figures. It writes one thing, and only when the phone asks: the mod's host-wide effortAuto.
 import type { Effort, Figures, ProviderGroup, RippleLimit, RippleStatus } from "./protocol.ts";
 
 const EFFORTS: readonly Effort[] = ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"];
@@ -24,8 +24,10 @@ interface RequestRecord { source?: string; target?: string; provider?: string; e
 interface Window { used_percent?: number; window_minutes?: number; reset_at?: number }
 
 export interface RouterStatus { ok: boolean; problem?: string; proxyEnv: Record<string, string> }
+/** The router's `GET`/409 body for mod settings: the settings and the revision they were read at. */
+interface ModSettingsBody { settings?: unknown; revision?: number }
 
-export type Fetch = (url: string, init?: { signal?: AbortSignal }) => Promise<{ ok: boolean; status: number; json(): Promise<unknown> }>;
+export type Fetch = (url: string, init?: { signal?: AbortSignal; method?: string; headers?: Record<string, string>; body?: string }) => Promise<{ ok: boolean; status: number; json(): Promise<unknown> }>;
 
 const toEffort = (s: string | undefined): Effort | null => (s && (EFFORTS as readonly string[]).includes(s) ? (s as Effort) : null);
 const base = (id: string): string => id.split("@")[0]!.replace(/-\d{8}$/, "");
@@ -45,6 +47,16 @@ export class RouterClient {
     return (await res.json()) as T;
   }
 
+  private async put<T>(path: string, body: unknown): Promise<{ ok: boolean; status: number; data: T }> {
+    const res = await this.fetch(this.adminUrl + path, {
+      method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify(body), signal: AbortSignal.timeout(4000),
+    });
+    let data: T;
+    // A 409 carries the snapshot to retry with; anything else may carry a plain-text body.
+    try { data = (await res.json()) as T; } catch { data = undefined as T; }
+    return { ok: res.ok, status: res.status, data };
+  }
+
   /** Every chat model the router routes, grouped by provider, judge-only models left out (ARCHITECTURE §3b). */
   async models(): Promise<ProviderGroup[]> {
     const [opts, levels] = await Promise.all([this.get<ModOptions>("/api/mod-options"), this.get<EffortLevels>("/api/effort-levels")]);
@@ -56,6 +68,34 @@ export class RouterClient {
 
   /** The router's own `GET /api/mod-settings` body, unvalidated: `rippleStatus` reads it at the boundary. */
   async modSettings(): Promise<unknown> { return this.get<unknown>("/api/mod-settings"); }
+
+  /**
+   * Turn the mod's host-wide automatic effort on or off. The dashboard's own save is the model:
+   * read the settings and their revision, then write the whole setting set back with only
+   * `effortAuto` replaced. A save that raced another writer gets the current snapshot with a 409,
+   * and that body is the next attempt's base — never a blind overwrite. Three attempts, then fail.
+   * Answers the value the router now stores.
+   */
+  async setEffortAuto(on: boolean): Promise<boolean> {
+    let snapshot: ModSettingsBody | undefined = await this.get<ModSettingsBody>("/api/mod-settings");
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const settings = obj(snapshot?.settings);
+      if (!Object.keys(settings).length) throw new Error("router has no mod settings");
+      const revision: number | undefined = snapshot?.revision;
+      const written: { ok: boolean; status: number; data: ModSettingsBody } = await this.put<ModSettingsBody>("/api/mod-settings", {
+        schemaVersion: 2,
+        settings: { ...settings, effortAuto: on },
+        ...(typeof revision === "number" ? { revision } : {}),
+      });
+      if (written.ok) {
+        const stored = obj(obj(written.data).settings).effortAuto;
+        return typeof stored === "boolean" ? stored : on;
+      }
+      if (written.status !== 409) throw new Error(`router /api/mod-settings: HTTP ${written.status}`);
+      snapshot = written.data && typeof written.data === "object" ? written.data : undefined;
+    }
+    throw new Error("router /api/mod-settings: revision changed too often");
+  }
 
   /** What a spawned CLI needs to go through the router: the same two keys `~/.claude/settings.json` carries (ARCHITECTURE §1). */
   async status(): Promise<RouterStatus> {
@@ -75,38 +115,41 @@ export class RouterClient {
 
   /** The mod's figures for one Claude Code session, from the router's own request records. */
   async figures(sessionId: string, mainModel: string, contextWindow: number | null): Promise<Figures> {
-    const [reqs, status, window] = await Promise.all([
+    const [reqs, status, windows] = await Promise.all([
       this.get<{ requests: RequestRecord[] }>(`/api/requests?kind=messages&n=400&session=${encodeURIComponent(sessionId)}`).catch(() => ({ requests: [] })),
-      this.get<{ claude?: { accounts?: { quota?: { rate_limits?: { primary?: Window; secondary?: Window } } }[] } }>("/api/status").catch(() => ({})),
-      contextWindow ?? this.catalogWindow(mainModel),
+      this.get<{ claude?: { accounts?: { inUse?: boolean; quota?: { rate_limits?: { primary?: Window; secondary?: Window } } }[] } }>("/api/status").catch(() => ({})),
+      // Sessions already throttle figures. Do not keep a second model-only cache: the same id
+      // can be rerouted, or its catalogue window can change, without changing the session model.
+      this.get<unknown>("/api/context-windows").catch(() => null),
     ]);
-    return computeFigures(reqs.requests, mainModel, window, status, Date.now());
+    return computeFigures(reqs.requests, mainModel, (route, source) => figureWindow(windows, source, route, contextWindow), status, Date.now());
   }
+}
 
-  private windows: { at: number; map: Record<string, number> } | null = null;
-
-  /**
-   * The router's catalogue window for a model (`GET /api/context-windows`), for a session whose CLI
-   * never told us one: a Claude app session. Read at most every 10 minutes; unknown or an older
-   * router without the endpoint is null.
-   */
-  private async catalogWindow(model: string): Promise<number | null> {
-    // Claude Code's own suffix: "[1m]" is the million-token variant of the same model.
-    if (/\[1m\]$/i.test(model)) return 1_000_000;
-    if (!this.windows || Date.now() - this.windows.at > 10 * 60_000) {
-      const body = await this.get<{ windows?: unknown }>("/api/context-windows").catch(() => null);
-      const raw = body?.windows && typeof body.windows === "object" ? body.windows as Record<string, unknown> : null;
-      // A failed read is not cached: the next refresh asks again.
-      if (raw) {
-        const map: Record<string, number> = {};
-        for (const [id, value] of Object.entries(raw)) if (typeof value === "number" && value > 0) map[id] = value;
-        this.windows = { at: Date.now(), map };
-      }
+/** Resolve usage against the model that actually served it, never the native alias's SDK cap. */
+function figureWindow(body: unknown, mainModel: string, route: Figures["route"], sdkWindow: number | null): number | null {
+  const data = obj(body);
+  const lookup = (map: Record<string, unknown>, model: string): unknown => map[model] ?? map[model.split("@")[0]!] ?? map[base(model)];
+  const positive = (value: unknown): number | null => typeof value === "number" && Number.isFinite(value) && value > 0 ? value : null;
+  const target = route?.model ?? mainModel;
+  if (data.resolvedWindows && typeof data.resolvedWindows === "object") {
+    const map = obj(data.resolvedWindows);
+    // The source entry preserves an explicit route override, but only while that route still
+    // names the provider/target recorded on this request. A fallback uses its own target entry.
+    for (const id of [mainModel, target]) {
+      const entry = obj(lookup(map, id));
+      if (typeof entry.model !== "string") continue;
+      if (route && (base(entry.model) !== base(target) || (entry.provider ?? "anthropic") !== route.provider)) continue;
+      return positive("compactWindow" in entry ? entry.compactWindow : entry.contextWindow); // never fall through to a stale SDK capacity
     }
-    const map = this.windows?.map ?? {};
-    const id = model.replace(/\[[^\]]*\]$/, "");
-    return map[model] ?? map[id] ?? map[base(id)] ?? null;
+    return null;
   }
+  // Older routers lack provider-bound resolutions. Only the actual target's exact map entry is
+  // usable; do not strip [1m] or infer a window from a model's name.
+  const known = positive(lookup(obj(data.windows), target));
+  if (known !== null) return known;
+  return route?.provider === "anthropic" && base(target) === base(mainModel) && target.startsWith("claude-")
+    ? positive(sdkWindow) : null;
 }
 
 export function groupModels(opts: ModOptions, levels: EffortLevels): ProviderGroup[] {
@@ -134,16 +177,17 @@ export function groupModels(opts: ModOptions, levels: EffortLevels): ProviderGro
 
 /**
  * Cache % is read over all input of the session's main-model requests; context % is the latest
- * main request's input over the window the CLI reported for the model. Unknown stays null.
+ * main request's input over its resolved model window (or the caller's measured window). Unknown stays null.
  * `route` is where that same latest request went (the router's target, not the model asked for).
  */
-export function computeFigures(records: RequestRecord[], mainModel: string, contextWindow: number | null, status: { claude?: { accounts?: { quota?: { rate_limits?: { primary?: Window; secondary?: Window } } }[] } }, now: number): Figures {
+export function computeFigures(records: RequestRecord[], mainModel: string, window: number | null | ((route: Figures["route"], source: string) => number | null), status: { claude?: { accounts?: { inUse?: boolean; quota?: { rate_limits?: { primary?: Window; secondary?: Window } } }[] } }, now: number): Figures {
   const main = base(mainModel);
   let read = 0, all = 0;
   let effort: Effort | null = null;
   let latest = -Infinity;
   let lastInput: number | null = null;
   let route: Figures["route"] = null;
+  let source = mainModel;
   const workers = new Map<string, { model: string; provider: string; requests: number }>();
   for (const r of records) {
     const target = r.target ?? r.source ?? "";
@@ -156,6 +200,7 @@ export function computeFigures(records: RequestRecord[], mainModel: string, cont
       // A request still streaming has no usage yet; it would read as an empty context (measured: 0% mid-turn).
       if (at > latest && input > 0) {
         latest = at; effort = toEffort(r.effort) ?? effort; lastInput = input;
+        source = r.source ?? mainModel;
         route = { model: target.replace(/@[^@]*$/, ""), provider: r.provider ?? "", ok: r.ok === true, status: typeof r.status === "number" ? r.status : null };
       }
     } else if (target) {
@@ -165,7 +210,11 @@ export function computeFigures(records: RequestRecord[], mainModel: string, cont
       workers.set(key, w);
     }
   }
-  const windows = status.claude?.accounts?.[0]?.quota?.rate_limits;
+  const value = typeof window === "function" ? window(route, source) : window;
+  const contextWindow = typeof value === "number" && Number.isFinite(value) && value > 0 ? value : null;
+  // The account the router serves with now; a router without the flag lists the login first.
+  const accounts = status.claude?.accounts ?? [];
+  const windows = (accounts.find((account) => account.inUse === true) ?? accounts[0])?.quota?.rate_limits;
   const five = [windows?.primary, windows?.secondary].find((w) => w?.window_minutes === 300);
   return {
     effort,
@@ -208,7 +257,10 @@ export function rippleStatus(limitsJson: unknown, modSettingsJson: unknown, now:
     const provider = typeof p.provider === "string" ? p.provider : "";
     if (!provider || !Array.isArray(p.accounts)) continue;
     const title = typeof p.title === "string" && p.title ? p.title : LABELS[provider] ?? provider;
-    const accounts = p.accounts.map(obj).filter((a) => Array.isArray(a.windows));
+    const listed = p.accounts.map(obj).filter((a) => Array.isArray(a.windows));
+    // The router lists every Claude account (2026-11-04); the band's row, and so this, shows only the
+    // one in use (the first when none is marked), unnumbered, as it did when that was all it listed.
+    const accounts = p.type === "anthropic" && listed.length > 1 ? [listed.find((a) => a.inUse === true) ?? listed[0]!] : listed;
     const into = p.type === "anthropic" ? claude : limits;
     accounts.forEach((a, index) => {
       for (const w of (a.windows as unknown[]).map(obj)) {

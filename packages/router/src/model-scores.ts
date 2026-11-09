@@ -3,7 +3,8 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import type { Dataset, Effort, Model } from "../../../scripts/aa-dataset-lib.mjs";
 import { homeDir, type Config } from "./config.ts";
-import { declaredBy, resolve } from "./routing.ts";
+import { declaredBy, qualifiedModel, resolve } from "./routing.ts";
+import { isTargetProvider } from "./targets.ts";
 import { isJudgeOnlyModel } from "./model-policy.ts";
 
 export const AA_DATA_URL = "https://raw.githubusercontent.com/PBJ-2/clauderipple/data/aa-models.json";
@@ -111,21 +112,21 @@ export class ModelScoreCatalog {
  * explicit routes/direct precedence and ambiguous owners behave exactly like inference. Native
  * Anthropic declarations remain visible (they are routable via OpenAI ingress, not Messages).
  * Marker aliases contribute their target ids; a slot contributes its resolved target, not the
- * Claude source label. Deduplicate by (provider, model); ambiguous declarations without an
- * explicit rule are not routable and are excluded.
+ * Claude source label. Deduplicate by (provider, model); duplicate declarations use qualified
+ * candidates, so both offerings are scored without guessing a bare id's owner.
  */
 export function buildModelScores(cfg: Config, dataset: ScoreDataset | null): ModelScores {
   const targets = new Map<string, { model: string; provider: string }>();
   const add = (model: string, provider: string): void => {
     if (cfg.providers[provider] && !isJudgeOnlyModel(model)) targets.set(`${provider}\0${model}`, { model, provider });
   };
-  const declared = new Set(Object.values(cfg.providers).flatMap(p => (p.models ?? []).map(m => m.id)));
+  const declared = new Set(Object.entries(cfg.providers).flatMap(([provider, p]) => (p.models ?? []).map(m => declaredBy(m.id, cfg).length > 1 ? `${provider}:${m.id}` : m.id)));
   const candidates = new Set([...declared, ...Object.values(cfg.aliases), ...cfg.cli.extraModels.map(m => m.model), ...Object.values(cfg.cli.models ?? {}), ...Object.keys(cfg.routes)]);
   // Fallbacks are explicit provider/model targets even when they are absent from declared lists.
   for (const route of Object.values(cfg.routes)) {
     for (const fallback of route.fallbacks ?? []) {
       const provider = cfg.providers[fallback.provider];
-      if (provider && (provider.type !== "anthropic" || provider.accountPool)) add(fallback.model, fallback.provider);
+      if (isTargetProvider(provider)) add(fallback.model, fallback.provider);
     }
   }
   for (const candidate of candidates) {
@@ -133,7 +134,8 @@ export function buildModelScores(cfg: Config, dataset: ScoreDataset | null): Mod
     if (result) { add(result.model, result.provider); continue; }
     // Native ingress has a separate resolver; do not pretend ambiguous translated models route.
     const owners = declaredBy(candidate, cfg);
-    if (owners.length === 1 && cfg.providers[owners[0]!]!.type === "anthropic") add(candidate.replace(/@[a-z]+$/, ""), owners[0]!);
+    // Deliberately include an ingress-only sole owner because the OpenAI ingress can still serve it.
+    if (owners.length === 1 && cfg.providers[owners[0]!]!.type === "anthropic") add(qualifiedModel(candidate, cfg)?.model ?? candidate.replace(/@[a-z]+$/, ""), owners[0]!);
   }
   const groups = new Map<string, ScoreModel[]>();
   for (const variant of dataset?.models ?? []) {

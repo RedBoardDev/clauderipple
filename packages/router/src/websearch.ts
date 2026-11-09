@@ -22,6 +22,7 @@
 // field wrong and a search that really ran is reported as zero.
 
 import crypto from "node:crypto";
+import type { RequestUsage } from "./requestlog.ts";
 
 /** What the side request asked for. `allowedDomains`/`blockedDomains` ride on the tool definition. */
 export type WebSearchQuery = {
@@ -38,7 +39,37 @@ export type SearchOutcome = {
   hits: SearchHit[];
   /** Optional prose to accompany the hits, for backends that produce one. */
   text?: string;
+  /**
+   * Tokens the backend billed for the search, when it reports any. The side request spends real
+   * quota on the user's own account, so the request log records it like any other request's.
+   */
+  usage?: RequestUsage;
 };
+
+const positive = (value: unknown): number | undefined =>
+  typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : undefined;
+
+/** Token counts out of an OpenAI-shaped reply (`prompt_tokens` includes the cached part). */
+function openAiUsage(value: unknown): RequestUsage | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const u = value as { prompt_tokens?: unknown; completion_tokens?: unknown; prompt_tokens_details?: { cached_tokens?: unknown } };
+  const prompt = positive(u.prompt_tokens);
+  const output = positive(u.completion_tokens);
+  if (prompt === undefined && output === undefined) return undefined;
+  const cached = positive(u.prompt_tokens_details?.cached_tokens) ?? 0;
+  return { input: Math.max(0, (prompt ?? 0) - cached), cached, output: output ?? 0 };
+}
+
+/** Token counts out of an Anthropic-shaped reply (`input_tokens` excludes the cached part). */
+function anthropicUsage(value: unknown): RequestUsage | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const u = value as { input_tokens?: unknown; output_tokens?: unknown; cache_read_input_tokens?: unknown; cache_creation_input_tokens?: unknown };
+  const input = positive(u.input_tokens);
+  const output = positive(u.output_tokens);
+  if (input === undefined && output === undefined) return undefined;
+  const cacheWrite = positive(u.cache_creation_input_tokens);
+  return { input: input ?? 0, cached: positive(u.cache_read_input_tokens) ?? 0, ...(cacheWrite !== undefined ? { cacheWrite } : {}), output: output ?? 0 };
+}
 
 /**
  * A source of search results — in practice a provider's own hosted search, billed to the account the
@@ -258,12 +289,13 @@ export function webPluginBackend(opts: {
         ...(signal ? { signal } : {}),
       });
       if (!res.ok) throw new Error(`${opts.name} web search: HTTP ${res.status}`);
-      const json = await res.json() as { choices?: { message?: unknown }[] };
+      const json = await res.json() as { choices?: { message?: unknown }[]; usage?: unknown };
       const outcome = hitsFromAnnotations(json.choices?.[0]?.message);
       // No citations means the plugin did not run. Say so rather than handing back a confident
       // summary with nothing behind it.
       if (outcome.hits.length === 0) throw new Error(`${opts.name} web search: no citations returned`);
-      return outcome;
+      const usage = openAiUsage(json.usage);
+      return usage ? { ...outcome, usage } : outcome;
     },
   };
 }
@@ -322,7 +354,7 @@ export function anthropicServerToolBackend(opts: {
         ...(signal ? { signal } : {}),
       });
       if (!res.ok) throw new Error(`${opts.name} web search: HTTP ${res.status}`);
-      const json = await res.json() as { content?: unknown };
+      const json = await res.json() as { content?: unknown; usage?: unknown };
       const hits: SearchHit[] = [];
       const prose: string[] = [];
       for (const block of Array.isArray(json.content) ? json.content : []) {
@@ -339,7 +371,12 @@ export function anthropicServerToolBackend(opts: {
       const deduped = dedupeHits(hits).slice(0, opts.maxResults ?? 10);
       if (deduped.length === 0) throw new Error(`${opts.name} web search: no results returned`);
       const text = prose.join("").trim();
-      return text ? { hits: deduped, text } : { hits: deduped };
+      const usage = anthropicUsage(json.usage);
+      return {
+        hits: deduped,
+        ...(text ? { text } : {}),
+        ...(usage ? { usage } : {}),
+      };
     },
   };
 }

@@ -13,6 +13,7 @@ Everything below is backed by a document, a file, or a measured log. Items marke
 
 CLI: CONNECT api.anthropic.com  → ClaudeRipple terminates TLS (leaf cert signed by ca.pem)
      per request, in order:
+       qualified declaration  → select the named declaring provider, strip only its qualifier
        direct rule (prefix)   → send to that provider, model unchanged (+effort)
        slot alias (routes)    → rewrite model (+effort), send to provider adapter
        exactly one provider's
@@ -21,6 +22,22 @@ CLI: CONNECT api.anthropic.com  → ClaudeRipple terminates TLS (leaf cert signe
        otherwise              → forward byte-for-byte to api.anthropic.com over real TLS
 CLI: CONNECT anything else      → blind tunnel
 ```
+
+Before those rules run, `requestKind` (routing.ts) decides once what the request is
+(a web search, a web fetch, an Auto mode classifier request, or an ordinary turn),
+and `decide` returns the route, carrying that `kind` and the model the client
+`asked` for, or the reason to refuse it, in one pass over the rules above. The
+adapters read `kind` through `promptAdditions` (identity.ts) to know what they may
+add to the system prompt.
+
+What a provider can do is answered in one module, `targets.ts`: whether it can take
+routed requests at all (`isTargetProvider`, `ingressOnly`), who declares a model id
+(`declaredBy`, `qualifiedModel`), which efforts it takes (`effortLevels`), and
+whether it runs web search (`runsServerTools`, `answersWebSearch`). The router's
+callers (routing, validation, the proxy, agent files, model scores, the admin
+status) ask it instead of spelling the rule themselves. The dashboard keeps one
+copy of `isTargetProvider` for providers not saved yet, and `ui-targets.test.ts`
+holds that copy to the router's.
 
 Why this path is stable:
 
@@ -96,8 +113,17 @@ this setting, native routing remains unchanged. For example:
 The named provider must exist and support outbound inference. Detection uses the
 security-monitor system prompt, never user messages or routing markers. The
 original security prompt, context, output format and native decision logic remain
-intact. Configure this field in the JSON config; the settings GUI has no control
-for it yet. Removing the field restores ordinary routing.
+intact. The dashboard's Clients page sets it (see the first-stage section below),
+or edit the JSON config. Removing the field restores ordinary routing.
+
+"Intact" covers the system prompt on every provider: `promptAdditions` gives a
+request of kind `auto-mode-classifier` no identity line, no `instructionsAppend`
+and no image hint. Until 2026-10-24 it did not hold. The request's kind never
+reached the adapters, so the ChatGPT path put `You are gpt-6-luna (reasoning
+effort: high), answering through Claude Code, a terminal-based coding agent.` in
+front of the security prompt and the image-generation hint after it, and the
+OpenAI-compatible, Google, Grok and Anthropic-compatible paths added the identity
+line and the addendum (docs/reviews/2026-10-24-architecture-review.md, candidate 1).
 
 This request is Auto mode's safety check: it decides whether an action the agent
 wants to take runs without asking. A target that judges worse than the model
@@ -111,6 +137,106 @@ Verified with Desktop's Claude Code 2.1.284: both classification stages used the
 configured target; an authorized temporary-file write proceeded and an explicitly
 forbidden deletion was denied. The registered `CLAUDE_CODE_AUTO_MODE_MODEL`
 environment variable did not change the actual native classifier requests.
+
+#### A separate first-stage target (CLI 2.1.310, 2026-10-24)
+
+The two stages, as the 2.1.310 binary builds them (`classifierStage` `xml_s1` /
+`xml_s2`; `n` is the thinking allowance added to every stage, 2048 when the
+classifier model rejects disabled thinking and 0 otherwise):
+
+- Stage 1: `max_tokens: 64 + n`, `stop_sequences: ["</block>"]`, the last user
+  text ending in an instruction to err on the side of blocking. `<block>no` allows
+  the action at once; `<block>yes` sends it to stage 2.
+- Stage 2: `max_tokens: 8192 + n`, no stop sequence, `<thinking>` then `<block>`.
+  Its verdict is final.
+- The server can set `tengu_auto_mode_config.twoStageClassifier` to `"fast"`
+  (stage 1 alone, `256 + n`, no stop sequence, and its `yes` blocks) or
+  `"thinking"` (stage 2 alone). A severity-score site stops at `</severity>`.
+
+In 2.1.310 `CLAUDE_CODE_AUTO_MODE_MODEL` does steer the native classifier (unlike
+2.1.284 above), but a server-configured classifier model takes priority, and the
+variable is refused for `claude-sonnet-5-5`, `claude-opus-5-5` and `claude-opus-5`
+(list `nH`, check `c4o`) with the warning that "the API's safeguards refuse the
+classifier's escalated check on it". `ANTHROPIC_DEFAULT_SONNET_MODEL` naming a
+5.5 model is refused as the classifier the same way.
+
+Measured 2026-10-24 by sending both stages to `claude-sonnet-5-5` through an
+`accountPool` provider: six first stages answered in 0.8–2.2 s with 8–9 output
+tokens (`stop_sequence`); both second stages came back `stop_reason: "refusal"`
+with 0 output tokens in about 1 s. The engine turns a stage-2 refusal into a block
+that keeps the stage-1 verdict ("Blocked by fast classifier"), and its refusal
+fallback model is empty in the external build, so nothing retries it. GPT-6 Luna at
+`high` effort took 4–20 s per call on both stages.
+
+So the setting can be split by stage, and which model answers each side is the
+operator's choice. A first stage is the exact shape above: one stop sequence,
+`</block>`, and `max_tokens < 8192`. Every other classifier request (stage 2, fast
+mode, the severity score, any shape not recognised) is "the rest". The bound lies
+between the largest first stage 2.1.310 sends (2112) and the smallest second stage
+(8192). If a later release grew the allowance past it, its first stages would go
+with the rest, which costs time; the opposite mistake would hand a full verdict to
+the quick target.
+
+| Setting | First stage | The rest |
+|---|---|---|
+| `{provider, model, effort}` | that target | that target |
+| `{provider, model, effort, stage1: {…}}` | `stage1` | the top-level target |
+| `{stage1: {…}}` | `stage1` | ordinary routing |
+| `{provider, model, effort, stage1: "native"}` | ordinary routing | the top-level target |
+
+Ordinary routing is what the request gets without the setting: passthrough, or a
+slot route for its model. A setting that leaves both sides to it is a config error,
+not a silent no-op. The router log tags the first stage `(auto-mode classifier,
+stage 1)`; `requests.jsonl` keeps `purpose: "auto-mode-classifier"` and names the
+target.
+
+Two settings this allows. One Claude model on both stages:
+
+```json
+"providers": {"claude-classifier": {"type": "anthropic", "auth": "claude-code", "accountPool": true, "limits": false}},
+"autoModeClassifier": {"provider": "claude-classifier", "model": "claude-haiku-5-5"}
+```
+
+Sonnet 5.5 on the first stage, which it answers, and a GPT model on the rest (this
+machine's setting since 2026-10-24):
+
+```json
+"autoModeClassifier": {"provider": "chatgpt", "model": "gpt-6-luna", "effort": "high",
+                       "stage1": {"provider": "claude-classifier", "model": "claude-sonnet-5-5"}}
+```
+
+An `accountPool` provider with no `models` list is a target only where a setting
+names it, so no other Claude request moves to it. It signs in as the observed
+Claude Code login, and every request it answers counts against that subscription.
+
+The dashboard's Clients page has an "Auto mode classifier" section with one row per
+side, each a provider and model or Claude Code's own choice, plus an effort. An
+empty effort saves none, and the request keeps the effort Claude Code gave it. The
+rows and the config are translated only by `classifierRowsOf` and
+`classifierSettingOf` in `packages/ui/app.js`; one model on both rows is saved
+without `stage1`. A Claude `accountPool` provider without a model list is offered
+with the Claude catalogue, and the models the engine refuses for stage 2 are
+labelled in the second row. A choice is read when it is made and saves run one at
+a time, so the last choice is the one stored. Removing a provider clears each row
+that named it on its own: that row goes back to Claude Code's choice and the other
+row stays.
+
+Why splitting the stages does not loosen the check by itself:
+
+- A first-stage `no` allows the action without stage 2, as it does natively; only
+  who answers changes. That makes the first-stage target the one that decides
+  which actions are never looked at twice, so the warning above applies to it
+  most: a target that says `no` where the native model says `yes` lets the action
+  through unseen.
+- A first-stage `yes` always reaches the full second stage on the other side.
+- A first stage that fails (a refusal, an HTTP error, no usable Claude account) is
+  a block in the engine, never an allow.
+- Fast mode belongs to the rest: its single stage is final, so it goes where final
+  verdicts go.
+
+Also considered: answering every first stage `<block>yes` in the router so that
+every action gets the full second stage. That is stricter than native, but every
+action, including a plain file write, then waits for a whole second stage.
 
 Verified in `app.asar` (`.vite/build/index.chunk-C0sgyfNn.js`, `-2CuMdv3h.js`):
 
@@ -186,6 +312,17 @@ chat is out of reach for every approach, ours included.
   entry now keeps only the template options whose id the model's ladder holds,
   recommends high (or the nearest), and drops `thinking` when none remain. The
   real bootstrap's option fields beyond `id`/`recommended` were not captured.
+- **The order is the array's.** The Code tab lists a surface's `section: "main"`
+  entries in `model_selector_config` order, unsorted; other natives sit in a
+  "More models" submenu (the bundled `ion-dist` filters `main` and sorts only
+  `overflow`; measured on the live claude.ai Code tab, Desktop 4.4212, Windows,
+  2026-11-03: Opus 5.5, Fable 5.1, Sonnet 5.5, Haiku 5.5, then the eight injected
+  models exactly in `cli.extraModels` order). Injection appends after the natives
+  and skips an id the app already lists, so a Claude id in `extraModels` keeps
+  Claude's own place, and the dashboard's order list leaves it out. The picker
+  snapshot (`picker.last`) records per surface the ids it `injected`;
+  `/api/claude-models` drops exactly those, not every `extraModels` id, which hid
+  a ticked Claude model from the mapping sources.
 - **Windows uses the same mechanism** (measured end to end in a Windows 11 VM,
   2026-09-14: picker listed the GPT models, a call routed, the model answered).
   Two things differ and nothing else does:
@@ -227,6 +364,12 @@ request went, and a `Pane` holds the request log.
   `model: "sonnet"` plus the marker on the second line reached the router as
   `deepseek-v4.1-flash@low`, effort low. Without the mod, the first-line rule
   and the no-`model` rule stand as before.
+- **Native Claude worker versions** come from `CLAUDE_WORKERS` in
+  `hooks/settings.ts`. The mod resolves family aliases (`haiku`, `sonnet`, `opus`,
+  `fable`) to that table's concrete IDs before dispatch, so the advertised worker
+  and the requested model agree even when the CLI's alias defaults differ.
+  Explicit versioned IDs and inherited models stay unchanged. This does not
+  change Claude Code's separate Auto mode security classifier.
 - **Where it can draw.** The desktop app's header icons (terminal, diff,
   browser) are the app's own; the mod API (CLI 2.1.286 types) has no place for
   a plugin's button there. Its sites are the band, the status line, panes,
@@ -264,9 +407,22 @@ request went, and a `Pane` holds the request log.
 
 The router is the single source of the mod's settings, persisted in
 `<homeDir()>/mod-settings.json`. `GET /api/mod-settings` returns
-`{settings:<full normalized Settings>, revision, stored:boolean}`. Before the first
-write it returns normalized defaults, revision 0 and `stored:false`, without creating
-storage. `PUT` accepts `{settings, revision?}`, normalizes with the mod's own pure
+`{settings:<full normalized Settings>, revision, stored:boolean, compactAt:number|null}`.
+`compactAt` is Claude Code's own compaction point, read from `autoCompactWindow`
+in `~/.claude/settings.json` (`CLAUDE_SETTINGS_PATH` overrides the path): the
+top-level key, else the one **user-owned** value `/autocompact <n>` saved under
+`modelSettings.<model>`; generated values never masquerade as a global preference.
+Null means no single user preference can be reported. A dashboard save changes only
+the global key and preserves user per-model preferences (2026-10-28); it also reconciles
+the router-owned values described in §4. The band's model-specific fallback comes from
+`GET /api/context-windows`, not this global dashboard field. Compaction fires about 33k tokens before the window
+(20k output reserve + 13k buffer), not at it. Before the first write it returns normalized defaults, revision 0 and
+`stored:false`, without creating storage. `PUT` accepts `{settings, revision?,
+compactAt?}`: a `compactAt` writes or removes that settings.json key directly
+(100k–1M tokens, previous bytes backed up, atomic replace, every other key
+kept), so the dashboard and a session's `/autocompact` always agree; a
+`compactAt`-only save returns the same read snapshot instead of touching the
+mod's revision. `settings` is normalized with the mod's own pure
 `hooks/settings.ts:normalizeSettings` (type-only imports, no `claude-code` runtime),
 increments the revision under the account stores' `withFileLock` and `writeJsonAtomic`
 helpers (0600), and returns `{settings, revision, stored:true}`. A stale supplied
@@ -280,10 +436,11 @@ Corrupt storage is an error, never an empty store to overwrite.
 
 The mod reads this endpoint at `session.start` and every 3-second router poll, even
 when its band is hidden. A changed revision replaces the settings atom and redraws
-readers. Only when `stored:false` does it read legacy plugin-store `settings` and
+readers; every read also refreshes `compactAt`, which `/autocompact` changes without
+a revision, and the band measures its context share against it. Only when `stored:false` does it read legacy plugin-store `settings` and
 `setupDone` and migrate them with a revision-checked PUT; a racing first writer wins
 instead of being overwritten. Afterwards settings are never read from or saved to the
-plugin store; unrelated keys such as picks, band visibility and handoff choices remain.
+plugin store; unrelated keys such as picks and band visibility remain.
 Panel/setup saves PUT the last seen revision. On 409 the mod takes the server copy,
 reapplies only the user's changed paths (including sibling rule/provider fields), and
 retries once. A panel keeps its opening baseline so a poll while it is open cannot
@@ -326,6 +483,67 @@ aliases, generated agents, AA auto-worker score candidates, OpenAI model lists a
 Codex catalogs exclude them; the next enabled agent sync removes previously
 owned Jev files, never hand-written ones. Provider configuration and mod options keep
 them available as judge candidates. Tests: `test/admin.test.ts`, `test/model-policy.test.ts`.
+
+### 3c. Native compaction, with only its answering model selected (2026-10-31)
+
+The mod always calls `next(e)` for `session.compact`, including workers and
+`precompute`. Claude Code alone builds the summary prompt, chooses the recent
+messages to keep, and reattaches files. There is no mod-side summarizer or
+transcript serialization. The optional card tidy-up is unchanged; it happens
+before invoking core's compactor, not instead of it.
+
+Measured in CLI **2.1.309**: a compaction appends a final user instruction containing
+`Your task is to create a detailed summary of the conversation so far,` or
+`Your task is to create a detailed summary of this conversation.`. The same CLI
+names each request's class in `x-claude-code-request-class` (`main`, `subagent`,
+`workflow`, `compaction`, `auxiliary`, `side_reply`; `compaction` when the query
+source is `compact`). It sends that header with its gateway hint headers, which
+`CLAUDE_CODE_GATEWAY_HINT_HEADERS` forces and a first-party login turns on by
+default. When the header is present it alone decides, so a person who quotes the
+compaction prompt in a main turn keeps their model. Only a request with no class
+header falls back to the prompt text: `routing.ts` then recognizes the common
+prefix only in the last user message's direct text. Either way only a POST on
+`/v1/messages` can select another compaction model. Unrecognized requests retain
+ordinary routing. A measured core compaction on 2026-10-30 at
+02:49:39 (session `55197cef…`, Opus 5.5) was one Messages call: input 2,057,
+cache read 565,652, cache write 458, output 8,694, `end_turn`. It reused the
+conversation prefix. Haiku 5.5's reported window is 1M, whereas GPT's effective
+475k may be too small for that conversation; a refused target falls back below.
+
+`POST /api/compact-pick {session, model}` registers a RAM-only pick for ten minutes,
+consumed by the first matching main-conversation compaction. The store is bounded
+to 10,000 sessions. The existing admin Host/Origin checks apply. A card press
+registers its exact model, including `session` (which overrides the default with
+no swap). Typed and automatic compactions register nothing. Without a pick the
+router reads the saved mod `compactModel`; absent or `session` means no swap.
+The normalized UI default is not treated as an explicitly stored choice. Failed
+registration is reported by the mod but never prevents core compaction.
+
+Workers are excluded by `x-claude-code-agent-id`, the existing CLI subagent signal
+(§4a); they neither consume main's pick nor inherit its compaction default.
+Session identity is the same on both sides: the 2.1.309 binary's `session.id`
+handler calls `Rpe(...).id`, whose definition returns `String(V())`; the request
+header builder also sets `X-Claude-Code-Session-Id` from `V()`. The generated API
+types call this the transcript file's name (§3a's captured header measurement).
+Precompute is allowed through unchanged and, when it issues the recognized API
+request, follows the same router selection. A core-reused precomputed summary has
+no new API request to intercept, so the mod clears its pick (`model: null`) once
+core's compaction settles, used or not; otherwise it would wait up to ten minutes
+for the next compaction. The router does not invalidate core's precompute or
+change its behavior.
+
+Selected ids go through ordinary route resolution, without scanning historical
+routing markers to override the selection. Native Claude ids keep caller auth;
+declared/routed ids use their ordinary adapters, effort and compatibility rules.
+Compaction gains no identity, appended instructions or image hints. On non-2xx or
+connect/dispatch failure **before response commitment**, the existing deferred
+error-response boundary restores the original body and re-resolves its original
+model, exactly once. A started response is never replaced. The original destination
+still returns its own failure if it also fails. Both compaction attempts are kept
+in `requests.jsonl` (`purpose: compaction`, `compact→<model>` and fallback/error
+notes); router.log names the failed override and final completion. The failed
+attempt's upstream error excerpt is redacted by the existing logging rules (§5).
+Tests: `packages/router/test/compaction.test.ts` and the mod's engine tests.
 
 ## 4. Provider adapters
 
@@ -400,6 +618,16 @@ must preserve **Data: Artificial Analysis (artificialanalysis.ai)** attribution.
   a whole session without anyone writing a rule. An ingress-only owner still counts
   as an owner, so a third party also offering `claude-opus-5` reads as an ambiguity
   to ask about rather than a silent redirection of Claude traffic.
+  **Provider-qualified ids (2026-10-26, issue #94).** `<provider>:<modelId>` selects
+  that provider only when the prefix is a key in `providers` and its declared models
+  include the remaining id (dated/undated forms match). Otherwise the whole string
+  stays a model id, so Ollama's `qwen3:8b` is unchanged. Qualification takes precedence
+  over a prefix rule; the upstream receives only `modelId`, with `@effort` handled as
+  before. Ingress-only declarations still cannot be outbound targets. Marker aliases,
+  including those derived from agent files, may name qualified ids. A bare duplicate
+  remains ambiguous: the refusal names the qualified alternatives rather than guessing
+  a provider or leaking the request to Anthropic. Effort ladders, windows and scores
+  follow the selected provider; usage records keep provider and original model id apart.
   Prefix rules stay useful for what no provider declares yet (`gpt-` catches a model
   released today). A model reaching a provider this way carries no per-model context
   window unless it is also in `cli.extraModels` or a slot — the same as a direct rule.
@@ -412,11 +640,29 @@ must preserve **Data: Artificial Analysis (artificialanalysis.ai)** attribution.
     resolved anywhere different**. Picker exposure stays what the operator ticked; it is
     routing that stopped needing to be said twice.
 - **Worker definitions derive from the same list (2026-09-20).** A ticked model is
-  also a subagent the operator can name: for every id exactly one non-ingress
-  provider declares, the router writes `~/.claude/agents/<name>.md` (`agents.ts`;
-  `name` = the id with anything outside `[a-z0-9-]` folded to `-`, frontmatter
+  also a subagent the operator can name: for every non-ingress provider's declared
+  id, the router writes `~/.claude/agents/<name>.md` (`agents.ts`;
+  `name` = the id lower-cased, then anything outside `[a-z0-9-]` folded to `-`, runs
+  of `-` collapsed to one and the ends trimmed, frontmatter
   `model:` = the exact id, `@high` when the provider offers any effort level —
-  `@medium` until 2026-10-02). It
+  `@medium` until 2026-10-02). Without the lower-casing step a hosted id lost its
+  model name to dashes (`deepseek-ai/DeepSeek-V4.1-Flash-1017` →
+  `deepseek-ai--eep-eek--4-1--lash-1017`, fixed after 0.12.18, #111). A name the
+  0.12.18 algorithm gave a worker that now differs stays resolvable as a marker
+  alias, rungs and allow-list entries saved under it are renamed when the mod's
+  settings are read (admin.ts), and its file is removed like any stale generated
+  file — by the manifest, or, when that record is lost, by the generated mark and
+  the same `model:` line. For a duplicate id, the first outbound provider in
+  config key order keeps that name; later providers use `<name>-<provider>` (the
+  same filename sanitisation applies). **All** duplicate workers carry a qualified
+  `model:` (`google-gemini:gemini-4-argon@high`), including the one keeping its old
+  name; single-owner files stay byte-identical. This preserves existing ladder names
+  when a second provider adds the model, instead of deleting both workers (#94).
+  Name collisions and hand-written files retain their existing priority. Generated
+  worker metadata reports each actual provider with the original model id, and the
+  mod checks quota by that pair, so a spent Google API worker can fall through to
+  the OpenCode Go worker for the same model. The dashboard's existing provider groups
+  distinguish them without a second display convention. The router
   records what it wrote in `<home>/generated-agents.json` and touches **only**
   those files: a hand-written agent of the same name wins and is left alone, an
   unticked model removes its generated file and nothing else, identical content is
@@ -453,6 +699,25 @@ must preserve **Data: Artificial Analysis (artificialanalysis.ai)** attribution.
   provider header to overwrite the caller's by name covers one of the two at
   best. An un-routed request keeps its headers — that one really is going to
   Anthropic. Enforced by `packages/router/test/proxy-headers.test.ts`.
+  - **Anthropic-only blocks inside `messages` (issue #92, 2026-10-26).** CLI 2.1.308+
+    carries SessionStart hook context and deferred-tool deltas in mid-conversation
+    messages with `role: "system"` (and `"developer"`), and their content holds block
+    types only Anthropic defines: `tool_addition` (whose `tool.definition` is a whole
+    tool definition, `eager_input_streaming` included) and `tool_removal` (whose
+    `tool.type` is `tool_reference`). Anthropic reads them; a vendor's Anthropic skin
+    validates the content union and answers 400 `Invalid Anthropic Messages API
+    request` for the whole request, so from the first turn with a SessionStart hook or
+    a deferred MCP tool every request failed on OpenRouter (deepseek-v4.1-flash,
+    kimi-k3.1-pro). `sanitizeForCompatible` folds such a message to `user` with its
+    text byte-for-byte and does not merge it into a neighbouring user turn — a merge
+    rewrites bytes the vendor may have cached — lifts each `tool_addition` definition
+    into the same rules the declared `tools` get (server-tool filter, `defer_loading`,
+    `scrubSchema`, `tool_choice`, the withdrawal note) with `eager_input_streaming`
+    dropped, appends lifted tools after the caller's list in the order the messages
+    named them so the cached tool prefix does not move, and drops a `tool_removal`
+    block while leaving `tools` alone. A message left with no content goes whole. The
+    log line counts what happened: `system_role×N`, `tool_addition×N`,
+    `tool_removal×N`. Tests: `packages/router/test/compat.test.ts`.
 - **ChatGPT subscription (Codex backend):** needs a translation layer,
   Anthropic Messages ⇄ OpenAI Responses, plus OAuth (PKCE) login against
   `chatgpt.com/backend-api/codex`. The upstream endpoint is unofficial and may
@@ -512,6 +777,78 @@ must preserve **Data: Artificial Analysis (artificialanalysis.ai)** attribution.
     unknown to the backend answer `400 "… model is not supported when using
     Codex with a ChatGPT account"` before any quota check, so a `429` for
     gpt-6-sol/luna that day confirmed the ids without spending quota.
+  - **Windows follow the live catalogue (2026-10-23).** A model's `context_window`
+    is not the window Codex runs with: Codex multiplies it by the entry's
+    `effective_context_window_percent`, and gpt-6.1-sol measured
+    `500000 × 95% = 475000` while `config.json` still said 272000 (and compacted
+    at 258400). The backend itself leaves the percent out (same day, asked as
+    0.163.0 and 0.164.0: `context_window: 500000` alone, which ClaudeRipple then
+    reported as 500000); Codex's own `models_cache.json` records 95 for every
+    model, so Codex supplies it, and a missing percent is taken as 95 here too.
+    `parseCodexCatalog` therefore records the effective window, the
+    adapter publishes the last-read list process-wide (`providers/chatgpt/
+    windows.ts`), and one resolver (`chatgptModelWindow`) hands it to bootstrap's
+    `auto_compact_windows`, the picker's `context_window_by_model` and
+    `providerModelWindow` — ahead of any stored `contextWindow` (except a picker entry's own
+    override, below) and of `cli.autoCompactWindow`, for models served by a `chatgpt` provider (by
+    id, alias, prefix rule or as a route's target). An explicit
+    `route.contextWindow` still wins; every non-chatgpt provider keeps the old
+    fallback. The catalogue is now read at router start and every two hours, not
+    only when the dashboard asks.
+  - **A picker entry's own window wins over the catalogue (2026-10-30).** The catalogue
+    figure stays the default for a model the dashboard has no override for, but the
+    window field is the operator's: `cli.extraModels[].contextWindow` now beats
+    `chatgptModelWindow` in `resolvedModelWindow`, `chatPickerModels`,
+    bootstrap's agent-file entries and the `GET /api/context-windows` snapshot;
+    an explicit `route.contextWindow` still beats both. Ticking a model copies the
+    provider's declared window onto the entry (`applyPickerSelections`), so an entry
+    equal to that declaration is not an override (`pickerWindowOverride`) — today's
+    configs carry 6.1 Sol's stale 272000 that way and must keep following the
+    catalogue. `catalogWindows` now carries every catalogue-backed id's own figure,
+    also while an override is in effect, so the editor prefills it as the default and
+    shows its note only while `windows` (the resolved value) equals it. The field is
+    editable for catalogue models too; an empty or catalogue-equal value saves no
+    override. Tests: `router/test/chatgpt-windows.test.ts`,
+    `chatgpt-windows-api.test.ts`, `ui-picker-selection.test.ts`.
+  - **Effective compaction windows (2026-10-28, Claude Code 2.1.308).** The owner's
+    measured `/context` reported `30.7k / 600k` on `claude-opus-4-7` routed to Sol
+    (475000 capacity), despite bootstrap and `autoCompactWindowsCache` carrying 475000.
+    Bootstrap is only client-data defaults: the user's global `autoCompactWindow`
+    overrides it. A `--settings` model-specific 475000 changed that model to `/ 475k`
+    while native Opus 5.5 stayed `/ 600k` (owner-supplied measurement). Reproduced in
+    this change with generated temporary settings and an isolated `CLAUDE_CONFIG_DIR`,
+    `--setting-sources '' --no-session-persistence`, Desktop's 2.1.308 binary:
+    Opus 4.7 `31.8k / 475k`, native Opus 5.5 `16.7k / 600k`; `/context` only,
+    no inference turn and no operational settings/router changes.
+    `picker.ts:resolvedModelWindow` now supplies the capacity for bootstrap and the
+    context API; `bootstrapWindows` supplies their shared advertised key set, including
+    slot aliases, extra models and agent `@effort` ids. `effectiveCompactWindow` in
+    `cli/src/compact-windows.ts` computes `min(capacity, user model setting ?? user global
+    setting ?? capacity)`. Generated settings are excluded from user preferences, so a
+    lowered global setting can later rise again. Routed CLI windows are capped at
+    `CLI_WINDOW_MAX`; a result below the CLI's 100K minimum fails visibly, never rounds
+    above the model's capacity.
+    The router writes only routed, non-native `modelSettings[id].autoCompactWindow`:
+    on startup/config reload, immediately on GUI config/compact-setting saves, and every
+    15 seconds (also picks up settings, catalogue and agent-file changes). Unchanged
+    settings are not rewritten. Native Anthropic settings are never generated.
+    Exact generated values live in the existing settings-adjacent ownership store's
+    `homes[installation].compactWindows`; settings lock + atomic JSON replacement are
+    shared with CLI writers. Hand-written or user-edited values and other installations'
+    claims are preserved. A removed route or uninstall removes only unchanged owned
+    fields and keeps sibling keys. A user writing the exact generated value cannot be
+    distinguished from leaving it untouched. Explicit user model overrides above the
+    capacity are preserved, not silently corrected.
+    `GET /api/context-windows` keeps the real `contextWindow` and adds `compactWindow`
+    per provider-bound resolution, including native Claude catalogue models; unknown
+    capacity remains null. The remote host's figures prefer `compactWindow` even over
+    SDK `modelUsage` capacities, retaining old behavior when the field is absent. The
+    mod polls the same API; its fallback uses that model's effective window, while a
+    `/context` breakdown's `rawMaxTokens` always wins as the running CLI's actual value.
+    Higher-priority project/local/managed/command-line settings are outside this user-file
+    policy; an already-running CLI may retain its own window until it reloads settings.
+    Tests: `router/test/context-windows.test.ts`, `chatgpt-windows-api.test.ts`,
+    `remote/test/compact-windows.test.ts`, `test/mod/session.test.ts`.
   - Model self-introduction is not evidence of routing. Verify by upstream
     usage records.
   - **Implemented 2026-09-11** in `packages/router/src/providers/chatgpt/`.
@@ -751,6 +1088,28 @@ must preserve **Data: Artificial Analysis (artificialanalysis.ai)** attribution.
       prose. This was found the hard way: a stale `ANTHROPIC_SMALL_FAST_MODEL` left in a running
       session kept sending searches to a provider that could not run them, and the session reported
       the search tool as unresponsive with nothing in any log to say why.
+    - **Claude is the last resort for Claude Code's own side requests (2026-11-08).** Observed on
+      the live router: `webSearch` and the `smallFast` slot both pointed at Luna on `chatgpt`, the
+      account's weekly quota ran out, the backend answered 429 `usage_limit_reached`, the route
+      resolved to the same provider, and the guard above refused the search — while a signed-in
+      Claude pool could have run Anthropic's own `web_search`. Now, in order:
+      1. A configured backend (or a route's own search) whose provider `targetUsable` already reports
+         spent is **not called**; one that is usable is tried as before.
+      2. If neither answered, the search goes to the first usable native Claude provider (`type:
+         "anthropic"`, a signed-in pool; a per-token API key is `namedOnly` and never used unasked)
+         with `CLAUDE_SMALL_MODEL` (`claude-haiku-5-5`, targets.ts). Body and `web_search` tool are
+         untouched; only `model` is rewritten. Only with no usable Claude is the search refused,
+         exactly as in the previous bullet.
+      3. Other `smallFast` side requests (`isSmallFastSideRequest`, routing.ts: the slot's model, never
+         a subagent, a compaction or a main-session turn; a title is recognised by class
+         `auxiliary`, or without the header by having no tools and one message) get the same
+         Claude providers appended as a last fallback, which `chooseTarget` takes only when the
+         primary is unusable. The route's own fallbacks (and a Google turn's unwritten fallback)
+         are not changed; the primary's effort is not carried to Claude.
+      4. `WebFetch`'s reader override (`cfg.webSearch`) whose provider is unusable goes to Claude the
+         same way instead of back to the slot's route.
+      Every such fallback logs a line and leaves the record note `fallback to Claude (<provider>
+      unusable|failed)`. Tests: `packages/router/test/proxy-claude-last-resort.test.ts`.
     - **The backend is chosen by how the provider is spoken to, not by vendor.**
       `anthropic-compatible` → server tool, `openai-compatible` → web plugin. Anything else refuses
       and leaves the request alone.
@@ -903,14 +1262,89 @@ from, to}` at hour granularity — buckets whose hour start is in `[from, to)`. 
   ("No tool call found"), so such results are sent as user text.
 - **Usage snapshots.** The CLI snapshots `message.usage` per streamed content block,
   before `message_delta`; `message_start` therefore announces an input estimate
-  (char/4, floored by the last measured total for the conversation) so the app's
-  token counter and the CLI's context accounting are not zero.
+  so the app's token counter and the CLI's context accounting are not zero. Once
+  the conversation has been measured, its char/4 estimate is scaled by the last
+  measurement's tokens-over-estimate (`providers/start-input.ts`); plain char/4
+  stands only before the first measurement. Char/4 alone must not come back, on a
+  smaller request either: /context reconciles its Messages row to this figure
+  while a response streams, and the compaction that follows records it as the
+  tokens it dropped. A GPT-6.1 Sol chat measured at 281k read 648k (136% of its
+  475k window) on every streaming response; at 355k measured, a request the CLI
+  had trimmed came back to char/4 and announced 1.22M, which the manual compaction
+  then reported as 1.2M saved (2026-10-30).
+
+- **Retired models (2026-10-29, #94).** Explicit `ModelDeprecated`, `model_deprecated`,
+  or "Model … has been deprecated" on HTTP 404/410 records
+  `model_deprecated` by provider and exact upstream model id in `ModelHealth`.
+  A generic endpoint/thread 404/410 does not. `/api/status.providers[name].models[id]`
+  exposes `{usable:false, reason, at}`; `/api/mod-options` supplies the same exclusion
+  to the existing ladder's per-model skip path. Sibling models remain usable.
+  Retirement has **no TTL**: a 2xx model response on the same provider and exact model,
+  a change to that provider's configuration (URL, models, credentials or wire), or a router
+  restart clears it. A successful sibling or unrelated config save cannot revive it.
+  This is process-memory advisory state, not a persisted blacklist.
+
+- **Running worker ladder fallback (2026-10-29, #89).** A model id such as `x@high`
+  does not identify a tier: several modes/domain ladders can select it concurrently,
+  and `worker-picks.jsonl` originally had no request-side join. The mod now snapshots
+  the selected tier's remaining installed, allowed entries (including each effort)
+  in an encoded `clauderipple-ladder` comment at the task's top. Its pick id and
+  fallback ids also go into the existing pick log. Explicit model/pin choices that
+  did not use the ladder get no snapshot. No tier is inferred from the model id.
+  Only a request with the subagent header consumes it, from the first user message's
+  first text block (or string content), at its start after any leading engine reminders;
+  later messages, quoted metadata and later blocks are never scanned. It must match the original
+  requested model and resolved provider/model/effort. The router binds the snapshot
+  to session + agent (bounded to 10,000 entries), so later compacted requests retain
+  it without sharing another worker's tier. Restart loses this binding; a request
+  still carrying the task comment can recreate it. Already-running workers created
+  by an older mod, or compacted ones whose binding was lost/evicted, do not acquire
+  a guessed ladder. Every fallback, including a bound snapshot's, must still match a rung's
+  provider/model/effort in the CURRENT saved effective ladder (active mode and domain rules
+  included), with provider and allow-list switches respected. Missing/unreadable settings mean
+  no ladder reroute. The snapshot preserves spawn order but never authorizes a removed rung.
+  Before sending upstream, definite provider exhaustion, model retirement, or an
+  OAuth adapter with no usable account/quota group permits the existing `chooseTarget`
+  path to select the first usable remaining entry. Ordinary API-key rate limits do
+  not trigger this worker preflight. The first request that *discovers* exhaustion
+  still returns the existing non-retryable error; the next request skips it.
+  Fallback ids must still resolve through current config: ambiguous, removed, and
+  ingress-only native Claude targets are not invented as outbound providers (§5).
+  With no usable fallback the original provider keeps its existing refusal contract.
+  A `LADDER` line and the request note name pick/from/to/reason. All adapters, cache
+  identity, thread replay, and Google's one-unwritten-fallback cap remain on the
+  existing path; a started response is never replaced. Translators scope reasoning
+  to their own provider/model as before. An Anthropic-compatible worker fallback
+  additionally runs `dropForeignThinking`; when the provider changes, each signed thinking
+  or redacted-thinking block is retained only if its signature/data digest was observed in
+  a response from the TARGET provider. The side-band JSON/SSE response observer records
+  provenance in a process-local, globally bounded 100,000-entry digest map, never rewriting
+  response bytes or retaining reasoning text. On a reroute, unknown/evicted origins (including
+  after a restart) are foreign and dropped. This per-block decision preserves the fallback's own
+  replayed prefix across tool turns instead of stripping it again on every reroute.
+  Configured route FAILOVER uses this same cross-provider filter (including native Claude
+  account-pool targets); same-provider reroutes retain their existing behavior. After recovery,
+  ordinary native/compatible requests (including Anthropic passthrough) also drop blocks whose
+  known owners do NOT include the target. Unknown/evicted origins are kept on these requests;
+  a digest observed from both providers belongs to both. The decision is per block, so repeated
+  recovery turns keep the same history prefix, and switching back to the fallback keeps its own
+  blocks. A constant-space process-local summary of observed providers gates this recovery scan:
+  before any other provider has minted a block, no history is inspected or hashed. No body is
+  reserialized solely for this check unless a block was removed. Existing unsigned/envelope
+  cleanup on native Anthropic remains unchanged. Translated adapters still scope their own envelopes. A changed provider's
+  credentials clear its exhaustion advisory on config reload. An explicitly configured key
+  pool with a ready credential also overrides that advisory at preflight; otherwise the
+  existing 30-minute/default or stated Retry-After exhaustion lifetime is unchanged.
+  These fake-upstream tests verify routing and cached-prefix preservation, not a live
+  vendor cache-hit percentage. The engine's `turn.complete` error has no API detail;
+  terminal worker outcome records still say `reason:error` (proposal 3 is deferred).
 
 - **Credential pools (`providers.<name>.credentials`, 2026-09-17).** A provider may hold several
   credentials, each a complete header set. The conversation keeps the one it is on while that one
   is healthy — moving it moves the prompt cache with it, and ≥90% cache hit is an acceptance metric
-  — and only a failure moves it, including back to one that has recovered rather than to the head
-  of the list. A 401 quarantines a credential, because rejected credentials do not heal; a 429
+  — and only a failure, or the operator changing which credential is preferred (below), moves it,
+  including back to one that has recovered rather than to the head of the list. A 401 quarantines a
+  credential, because rejected credentials do not heal; a 429
   cools it until the vendor's stated reset (`retry-after`, seconds or HTTP-date, or the Codex reset
   header), clamped to six hours; a 402 cools it for half an hour; a 5xx or a connect failure for
   ten seconds. **A 4xx that is the request's own fault is charged to nobody** — retrying a bad body
@@ -923,6 +1357,65 @@ from, to}` at hour granularity — buckets whose hour start is in `[from, to)`. 
   The narrowly classified Antigravity prompt refusal (§4d-ii) additionally permits one same-turn
   route fallback after the upstream rejects the request but **before any response reaches the
   client**; it does not mark a usable account as exhausted.
+  - **OpenAI-compatible pools (2026-10-23).** `openai-compatible` shares the same CredentialPool,
+    conversation stickiness and in-turn failover as `anthropic-compatible`, before any response is
+    written. One key stays in `headers`; several use complete `credentials` entries with `headers`
+    mirroring the first, retaining id `default` when converting a single key. OpenCode Go usage is
+    fetched and cached separately per credential and exposed in configured order, with optional labels.
+  - **MiniMax M Plan quota (2026-11-08).** A `minimax` preset provider (or any Anthropic-compatible
+    one on `api.minimax.io` / `api.minimaxi.com`) reads its plan's remaining quota from
+    `GET {provider origin}/v1/api/openplatform/coding_plan/remains` with the plan's own key as
+    `Authorization: Bearer <key>` — the same key the Anthropic wire sends as `x-api-key`, so the
+    endpoint is undocumented by MiniMax and the shape below is what it answered:
+    `{"model_remains":[{"model_name":"general","current_interval_remaining_percent":91,
+    "current_weekly_remaining_percent":99,"end_time":1794126007151,"weekly_end_time":1794712807151,
+    "current_interval_total_count":0,"current_weekly_total_count":0,...}],
+    "base_resp":{"status_code":0,"status_msg":"success"}}`. The plan counts **time, not calls**, so
+    the `*_count` fields are 0 and the share used is `100 - *_remaining_percent`; the resets are
+    `end_time` (the five-hour window) and `weekly_end_time` (the week) in epoch milliseconds, read as
+    seconds. The "general" entry answers for the plan; without one the first entry answers. A
+    `base_resp.status_code` other than 0, no `model_remains` or no finite share reads as null, so a
+    pay-as-you-go key that is on no plan shows no row at all. `GET /api/limits` lists it as its own
+    provider (`type: "minimax"`, title "MiniMax"), one account per credential, and a spent window
+    takes the provider out of the ladder until it resets (the #95 rule, as for OpenCode Go).
+    Source: `providers/minimax-usage.ts`, measured 2026-11-08 with a real M Plan key.
+  - **Google api-key pools (2026-10-29, #112).** The `google` wire's `api-key` mode uses the same
+    pool, stickiness and in-turn failover. Its keys are complete header sets like the compatible
+    adapters', except each key goes out on `x-goog-api-key` (moved from `authorization`/`x-api-key`
+    when the model is a relay's Gemini endpoint folded by `providerFor`), and `apiKey` mirrors the
+    first entry. Skips exhausted/paused keys, rests a 429's key until its stated reset, and records
+    and logs the key that answered. Antigravity rotates its own accounts (§4d-ii) and is unchanged.
+  - **Shared operator controls (2026-10-23).** ChatGPT, Claude OAuth, Google CCA and compatible
+    API-key pools share `preferred`, `paused`, `clearCooldown` and `inUse`. At most one stored
+    account/key is preferred. Changing which one is preferred migrates that provider's held
+    conversations: the pool notices the new preferred owner in `pick()` and drops its affinity
+    entries, so each re-picks it on its next turn and pays one cold prompt cache (a `continue`
+    meeting a thread the new account never produced answers 404 `thread_not_found`; the CLI replays
+    full history and re-claims there). New conversations try the preferred account first while
+    usable, and return to it after its cooldown resets. A preferred account merely recovering from
+    cooldown does **not** move a held conversation, and neither does removing the preference;
+    choosing the same account again after a removal is a change. A retry's list that leaves out the
+    tried preferred account is not a removal.
+    Paused entries are excluded even from the compatible adapters' all-cooling
+    first-key fallback; all paused means no upstream request. `inUse` identifies the next usable
+    account for a new conversation (one or none), not `active`, which remains the last responder.
+    The Claude pool's in-use account is also the row `GET /api/status` marks `inUse: true` in
+    `claude.accounts`, so the status mod follows a preferred stored account rather than always the
+    login; a router that marks no row keeps the mod on the login. `GET /api/limits` lists every
+    Claude account whose usage is known as its own entry under the one Claude provider: the app
+    login as `account: 0`, then the stored accounts in saved order (`account` 1…, kept while
+    another's usage comes and goes), each stored one with its `label`, and `inUse: true` on the
+    pool's in-use account (none marked while that account's usage is unknown, so no reader shows
+    another account's figures as it). ChatGPT and Antigravity entries carry `label` and `inUse` the
+    same way. The mod's limits pane draws every account; its band row and the remote's status keep
+    to the in-use Claude account (the first when none is marked).
+    Login account PATCH bodies accept boolean `preferred`/`paused` and `clearCooldown: true`;
+    Claude's existing PUT preference API remains supported. External Codex/current-Claude logins
+    retain their existing ownership restrictions. Compatible credentials persist boolean flags on
+    their `config.json` entries via PUT `/api/config` (validated, at most one preferred per provider);
+    `/api/status.credentials[name]` reports each entry's flags and selection, including a declared
+    single key. POST `/api/credentials/clear-cooldown` with `{provider, id}` clears one key's runtime
+    health. Cooldown clearing also works while an entry is paused, without resuming it.
   - Four things an independent review found, each of which had made it past the unit tests because
     each lived in the wiring rather than the state machine: the pool never heard about the ChatGPT
     or openai-compatible adapters, so those providers looked healthy forever and a slot pointing at
@@ -936,9 +1429,23 @@ from, to}` at hour granularity — buckets whose hour start is in `[from, to)`. 
     notices is the worse mistake. Only 401 parks.
   - An answer lifts a quarantine but does not cancel a live cooldown: requests overlap, and a 200
     arriving after a concurrent 429 does not mean the limit lifted.
-  - The conversation key is `conversationKey`, the same one the prompt cache uses. `metadata.user_id`
-    alone is one value for every conversation a user has, so using it raw dragged all of them onto
-    one credential at once — the opposite of what stickiness is for.
+  - **Pool affinity (2026-10-28, issue #101)** uses `requestConversationKey` captured before routing:
+    agent + session when available, otherwise session/user identity + the full first user message
+    (cache-control markers excluded). `conversationKey` truncates at 4000 characters, so workers
+    sharing injected instructions had shared one user's affinity indefinitely. New conversations
+    try the preferred/first usable configured key; a healthy existing affinity never moves merely
+    because an earlier key recovered (a preference change does move it — "Shared operator controls").
+    A successful native pool answer's `messageId` is remembered with the conversation that produced
+    it (60-minute TTL, bounded), so a later `continue` — which carries only the new messages and can
+    be keyed by none of them — asks for that conversation's account instead of seeding a new
+    affinity. Provider cache/session keys remain unchanged. Metadata-less
+    one-message side requests without an agent keep their shared `conversationKey` class below.
+    Request records expose `credential` (configured label or 1-based ordinal, never runtime id/token);
+    `router.log` also records selection reason and candidate health, plus every same-turn retry.
+    The measured JSON `server_error` / `Upstream request failed: This Go model requires Global regions`
+    400 rests the workspace's key for 60s (or Retry-After) and permits another key before the first
+    response byte. Other 400s still neither penalise keys nor retry the pool. Tests: `pool.test.ts`
+    and `proxy-failover.test.ts`.
   - The same key has a second branch, because not every request is a conversation. What the CLI
     sends *beside* one — the web-search side request, a title, a summary — carries no `metadata` at
     all and one lone user message that is different every time, so seeding on that message minted a
@@ -1040,6 +1547,16 @@ from, to}` at hour granularity — buckets whose hour start is in `[from, to)`. 
   reads are cached for 60 seconds; ClaudeRipple **never refreshes or writes**
   Claude Code's own credential. Expiry becomes OpenAI-style 401 `Claude Code
   login expired — open Claude Code once to refresh`.
+- Headers ClaudeRipple manufactures itself (no observation, e.g. the Codex
+  ingress on a machine whose Code tab never passed through the router) name the
+  newest CLI this machine can vouch for, not a pinned one
+  (`providers/claude-cli-version.ts`): the `claude-cli/<version>` of a recent
+  observation, else the newest CLI the Desktop app has cached (version
+  directory names, cached 5 minutes, no child process), else the release's
+  constant. Issue #103: the pinned `claude-cli/2.1.266` made Opus 5.5 answer
+  `Claude Code 2.1.266 does not support this model; version 2.1.280 or newer is
+  required`. The version is a client fingerprint only; the model list and wire
+  shape are unaffected.
 - `clauderipple claude-login` (0.1.2) is ClaudeRipple's own browser sign-in:
   the OAuth authorization-code flow with PKCE (S256) against Claude Code's
   public client, exactly as Claude Code 2.1.271 does (read from its binary,
@@ -1067,11 +1584,30 @@ from, to}` at hour granularity — buckets whose hour start is in `[from, to)`. 
   Wire facts are behaviorally measured (the reference implementations do the
   same flow); they are not an Anthropic guarantee, and reuse of one or multiple
   subscriptions is subject to Anthropic's terms and possible account restrictions.
-- A native `anthropic` provider remains OpenAI-ingress-only unless it explicitly
-  sets `accountPool: true`. With that flag and `auth: "claude-code"`, Claude
+- **Metered keys serve what names them (2026-10-30).** A native `anthropic`
+  provider on an API key (`auth: "api-key"`, no `accountPool`) and the `openai`
+  preset (the OpenAI API) bill per token for models the person also reaches on a
+  plan. They are targets, but `bareOwners` (targets.ts) drops them from a bare
+  id's owners: a Claude API key never owns a bare id, since the app's own sign-in
+  always answers one; the OpenAI API owns one only where no plan declares it. Their
+  workers are always `<model>-<provider>` on a qualified id (`claude-api:claude-opus-5-5`),
+  and the dashboard keeps a Claude API key out of the mapping and picker lists, where
+  a bare id would run on the sign-in. The key goes as `x-api-key`; the caller's
+  `authorization` and the `oauth-*` beta are dropped. Asked for 2026-10-30: only
+  whoever turns a key on uses it, and through API workers.
+- A native `anthropic` login remains OpenAI-ingress-only unless it explicitly
+  sets `accountPool: true` with `auth: "claude-code"` (`isTargetProvider`). The
+  config refuses one as a fallback or a classifier target; as a primary route or a
+  direct rule it is accepted, ignored at routing time (the request passes through),
+  and reported: the config save answers with a warning per such rule, and the
+  router logs it when it reads the config (`targetWarnings`). With the pool, Claude
   Desktop/Code Messages requests stay unmodified except for the routed model and
   selected identity. The runtime pool is ordered current observed/env/Claude Code
-  login first, then ClaudeRipple-owned accounts. A conversation is sticky to the
+  login first, then ClaudeRipple-owned accounts. When none of them is usable, a
+  turn that carries the client's own `Bearer` goes out on it unchanged, as a
+  passthrough would; only a turn without one is refused with 401 (#88,
+  2026-10-24: the observed login aged out unseen behind the pool, and one revoked
+  stored account stopped every main-chat turn). A conversation is sticky to the
   account that answered so its prompt-cache prefix survives, including across that
   account's token refresh. Before response headers reach the client, 401, 429, 402
   and retryable HTTP failures such as 5xx may retry the same request on an untried
@@ -1079,13 +1615,57 @@ from, to}` at hour granularity — buckets whose hour start is in `[from, to)`. 
   response starts. A 401 permanently marks only that stored token generation as
   needing re-login; 429 and transient failures cool down without deleting it. Refresh
   is per-account process-wide single-flight and persisted with compare-and-swap so a
-  stale refresh or rejection cannot overwrite a newer sign-in. Credential health uses
-  a token-generation runtime id while affinity and admin APIs use the durable local
-  account id, so a fresh login cannot inherit an old quarantine or lose its cache claim.
+  stale refresh or rejection cannot overwrite a newer sign-in. A rest (cooldown, failure
+  count, quota scope) counts against the durable local account id, so a token refresh keeps
+  a spent account resting, while a quarantine belongs to the token-generation runtime id so a
+  fresh login cannot inherit an old one; affinity and admin APIs use the durable account id.
   Retry replaces every previous identity header, and every sent
   secret is added to error redaction. The OpenAI ingress for Codex uses the same
   ordered projection only to choose one available credential; it deliberately does
   not rotate accounts or retry a turn.
+- **Pinned account workers (2026-11-05).** Every provider that keeps stored
+  accounts of its own — a Claude `accountPool` provider, ChatGPT (`own`/`auto`;
+  never `borrow-codex`), and Google Antigravity — gets one generated worker per
+  declared model × stored account, named `<model's worker name>-<pin8>` where
+  `pin8` is the first 8 characters of the durable local account id — never the
+  label, so relabelling an account or removing one of two same-label accounts
+  cannot make an existing name resolve to another account and silently move a
+  saved ladder rung, workflow or marker. The label appears only in the
+  description, the title prefix and the dashboard list; a hand-written file
+  already holding the pinned name wins and that account gets no worker, with a
+  warning like any other generated-name clash. `storedAccountsFor`
+  (`pinned-accounts.ts`) is the one place that maps a provider kind to its store;
+  the CLI/Desktop login and the borrowed Codex login are in none of them, so they
+  never get pinned workers. A worker's frontmatter model id is
+  `<provider>#<account-pin>:<model>@<effort>`: the pin is the stable local account
+  id prefix, never the label, and it rides on the provider half so
+  `qualifiedModel` (targets.ts) still selects one declaration while
+  `Resolved.model` stays the bare upstream id — the forwarded body is otherwise
+  byte-identical, so prompt caching is unaffected. Routing succeeds even when the
+  pin names no account that is present now. Each provider's own account pick
+  honours it through `pool.pinnedCredential`: the Claude native path, ChatGPT
+  `pick` and Antigravity `pickAccount` use the pinned credential when it is
+  present and usable (not paused, cooling, quarantined or resting in that quota
+  scope) and otherwise take the ordinary pick, logging
+  `account-pin fallback <pin> → <chosen>` once for that turn. An in-turn retry
+  keeps the pin first and then falls back the same way, and neither a pinned pick
+  nor its fallback writes another conversation's sticky claim or changes
+  `preferred`. Files are generated and removed through the normal manifest, so an
+  account removed from the store loses its workers at the next sync. One
+  `PinnedAgentSync` (agents.ts) owns the regeneration and remembers the account
+  signature (`storedAccountsSignature`: the configured providers' account ids and
+  labels, and nothing else) the files were last generated from; it runs at
+  startup and config load, at the admin account endpoints for all three stores
+  (add/remove/relabel/re-authorize, `AdminDeps.agentsChanged`), and on a 15-second
+  check that regenerates only when the signature moved. That check is what picks
+  up an account the terminal CLI signed in or out (`login`, `claude-login`,
+  `google-login`, `logout`), which the router is never told about; a token refresh
+  changes no label, so it never regenerates or rewrites a file. Every
+  regeneration path ends in the same `tunnels.assetsChanged()` as a config save,
+  so a remote host over an SSH tunnel never keeps stale pinned workers. The CLI
+  bootstrap advertises the
+  pinned model ids (`agentModelIds`/`routable`), without which a worker carrying
+  one silently runs on the session's model.
 - Readiness vs liveness (0.1.2): `/api/status.readiness` and `GET /readyz`
   (200 or 503 + `retry-after: 5`) list what stands between a request and a
   model: `settings` (Claude Code not pointed at us), `upstream` (consecutive
@@ -1122,7 +1702,34 @@ from, to}` at hour granularity — buckets whose hour start is in `[from, to)`. 
   Anthropic tools/tool_choice. `max_output_tokens` → `max_tokens`, and
   `temperature` is preserved. `reasoning.effort` → `output_config.effort`; this
   ingress does not invent a thinking-token budget because that would change
-  the caller's requested output ceiling.
+  the caller's requested output ceiling. Codex's remote compaction control item
+  `{"type":"compaction_trigger"}` (last in the transcript, a request control
+  rather than a response item) becomes the user turn that asks for the summary,
+  and a transcript that ends with the assistant gets one short user turn, because
+  Anthropic reads that shape as prefill and models that take none refuse it
+  (#104, 2026-10-28). For a translated Responses request with that trigger,
+  the mapper buffers the model's summary and emits exactly one output item
+  `{type:"compaction", id:"cmp_…", encrypted_content:"clauderipple:compaction:v1:…"}`
+  instead of message/text events, in `response.output_item.added`, then
+  `response.output_item.done`, then `response.completed` (whose `output` holds
+  the same item). Non-streaming JSON uses the same item. The suffix is base64
+  UTF-8 JSON `{summary:<text>}`: a router-owned opaque replay value, **not
+  encryption**, not an OpenAI ciphertext. Replayed `compaction` input restores
+  `Summary of the earlier conversation: <text>` as a user turn at that position;
+  foreign formats are dropped with a warning that never includes their content.
+  Malformed router-owned payloads fail visibly rather than discard context.
+  Empty, interrupted, truncated or tool-call compaction answers do not emit a
+  successful compaction item. GPT passthrough remains byte-for-byte unchanged;
+  the older `/responses/compact` endpoint is still GPT-only.
+  Behavioral source (no code copied): OpenAI Codex tag
+  [`rust-v0.164.0-alpha.11.1`](https://github.com/openai/codex/tree/rust-v0.164.0-alpha.11.1),
+  `codex-rs/protocol/src/models.rs` (`ResponseItem::Compaction`: required string
+  `encrypted_content`, optional `id` and internal metadata),
+  `codex-rs/codex-api/src/sse/responses.rs` (added/done deserialize `item`), and
+  `codex-rs/core/src/compact_remote_v2.rs::collect_compaction_output` (counts
+  exactly one compaction from OutputItemDone and requires Completed).
+  Verified by `packages/router/test/ingress-server.test.ts` round trips over
+  local HTTP/SSE and JSON, plus `ingress-translate.test.ts` edge cases.
 - Cache discipline: serialization has no timestamps; cache breakpoints are put
   on the system block, the final tool definition, and the final user content
   block. Upstream Anthropic usage maps `cache_read_input_tokens` to Responses
@@ -1168,8 +1775,10 @@ what we do not have yet — so that adding a provider does not start with readin
   contract. A `google` entry folds into a `google`/`api-key` provider (2026-10-21): the
   provider's key moves from its headers to `apiKey`, the model's `url` becomes the base,
   and the provider's `sessionHeader` and every non-auth header travel with it. The key is
-  never restated in the model entry. A provider with no override for that model is returned
-  by identity.
+  never restated in the model entry. Since 2026-10-29 the provider's whole `credentials`
+  pool travels too, each key moved to `x-goog-api-key` (#112): folding only the first key
+  left a many-key provider unable to answer a spent one. A provider with no override for
+  that model is returned by identity.
   `authHeader` names a convention rather than restating the key: the provider's own
   credential is re-sent under the header that model's wire expects, so there is one copy
   of the key to rotate. Each endpoint follows the API it imitates — an Anthropic-wire
@@ -1287,6 +1896,16 @@ including the 2026-10-16 Antigravity measurement in §4d-ii, are identified sepa
   the session header OpenCode answers `400 MissingSessionID`. Plain AI Studio providers set
   neither and send no custom User-Agent. The provider's other headers are applied as given.
   Not live-measured as of this date.
+- **OpenCode Go's User-Agent (issue #132, reported 2026-11-08).** OpenCode's edge answered `403 error code: 1010` — Cloudflare, before the key is read — to a request with no `User-Agent`, per the reporter. The router's `fetch` has always sent Node's default `node` rather than none, and whether `node` is refused is unmeasured (the usage poll was accepted with it, `opencode-usage.ts`, 2026-10-15). The `opencode-go` preset declares `userAgent: "opencode/2.2.6"`, the value the reporter measured with a working key; not measured here. The OpenAI-style wires (Chat, Responses, `providers/openai/index.ts`) send it unless the provider's headers set a User-Agent in any case. The Anthropic wire forwards the caller's own User-Agent as it is and adds the preset's only when the caller sent none. The Gemini wire keeps its `clauderipple/<version>` above. A 403 whose body is `error code: 1010` is reported as a permission error naming the request's fingerprint and not the key (`isCloudflareFingerprintBlock`). The pool does not read it as a credential refusal: `classify` in `pool.ts` makes it non-retryable with no cooldown, because every key sends the same fingerprint and moving the conversation to another one only costs its cache. Tests: `pool.test.ts`, `openai-adapter.test.ts`, `proxy-headers.test.ts`, `google-adapter.test.ts`, `presets.test.ts`.
+- **The api-key wire takes a key from the provider's pool (2026-10-29, #112).** A provider may
+  declare `credentials`; the proxy picks one by conversation affinity and configured order, the
+  adapter sends that key on `x-goog-api-key`, and a refusal another key could answer (a 429, an
+  exhaustion, a refused key) is retried on the next ready key before any status or byte reaches
+  the client — one key is charged for the refusal and the answer is charged to the key that
+  produced it. `KEY`/`RETRY` log lines and the request record's `credential` are the same as on
+  the other translated wires. A provider with one key (the AI Studio `apiKey`, or the single
+  `headers` set a folded relay model carries) sends exactly what it always did. The
+  `antigravity` accounts keep their own pool and rotation below.
 - `systemInstruction` takes `{role:"user"|"model", parts:[…]}`; `contents` is the
   `user`/`model` turn list; a part is `{text}`, `{inlineData:{mimeType,data}}`,
   `{functionCall:{name,args}}` or `{functionResponse:{name,response}}`. The `role` of a
@@ -1379,7 +1998,11 @@ They were not live-tested during the original implementation. Files are under `s
   `sessionId` (`adapters/google.ts:1145-1158`; `google-antigravity-wire.ts:53-77`). Headers:
   `Authorization: Bearer <token>` and `User-Agent: antigravity/ide/<ver> (os_type=…; arch=…;
   aidev_client; auth_method=oauth)` — the IDE client family is required, the backend 404s
-  CLI-shaped UAs (`adapters/client-fingerprint.ts:44-65`). Response frames nest the standard
+  CLI-shaped UAs (`adapters/client-fingerprint.ts:44-65`). The one exception is Gemini 4 Argon,
+  served to the CLI family only: its requests carry `antigravity/cli/1.3.4 (…)`
+  (`antigravityUserAgentFor`; measured 2026-10-27, one Google AI Pro account: Argon 404s under the IDE UA on
+  the daily host and answers 200 under the CLI one; opencodex `antigravityCliUserAgent`). The IDE
+  override env vars do not replace the CLI UA. Response frames nest the standard
   Gemini payload under `response` (`adapters/google.ts:1281,1591-1596`).
 - **Two hosts, different catalogues and separate quotas (measured 2026-10-20, user's account,
   `fetchAvailableModels` on the same OAuth token).** `daily-cloudcode-pa.googleapis.com` and
@@ -1408,18 +2031,34 @@ They were not live-tested during the original implementation. Files are under `s
     window kind shows the **higher used percent** of the two (`mergeHostGroups`, lower remaining
     fraction wins) — the quota closest to running out. `hasRemainingQuota` evidence is per host and
     per account/project: it is true only for the host the model's request is sent to.
+  - **Argon's Pro quota (measured 2026-10-28, one Google AI Pro account).** On both hosts,
+    `retrieveUserQuotaSummary` under the CLI UA adds `Gemini 4 Argon`, with the single weekly
+    bucket `gemini-argon-wtu-weekly`; the IDE UA omits it. The CLI answer also carries the existing
+    Gemini and Claude/GPT groups. The measured Argon bucket was exhausted while the ordinary
+    Gemini windows still had quota. Its description explicitly says paid Pro has separate Argon
+    quota, whereas Ultra includes it in a larger Gemini bucket; Ultra has not been live-tested.
+    Quota reads use the CLI UA, falling back to the IDE answer when the CLI lookup is unreadable.
+    The limits row names the reported bucket `Argon weekly`, even when no third-party models are
+    selected. An absent Argon bucket is unknown: it is not evidence of Ultra or permission to use
+    the ordinary Gemini buckets as Argon's positive-quota evidence. `fetchAvailableModels`
+    is not a substitute: in the same measurement, production's Argon High quota metadata matched
+    the ordinary Gemini five-hour window while the explicit summary reported spent Argon weekly
+    quota, and other Argon catalogue entries omitted `remainingFraction`.
 - Model ids. CCA's wire ids carry the tier as a suffix (`gemini-3.8-flash-low`) or a
   `-tiered` rename (`gemini-3.7-flash-tiered`), while the picker shows a collapsed base id.
   Resolution, from `providers/antigravity-models.ts`: `gemini-3.8-flash` → its suffix per
   effort (`…-low/medium/high`, no `thinkingLevel` beside it — the suffix IS the effort);
   `gemini-3.1-pro` → `gemini-3.1-pro-low` / `gemini-pro-agent` with `thinkingLevel`;
-  `gemini-3.7-flash` → `gemini-3.7-flash-tiered` with `thinkingLevel`; a `claude-*` id takes a
+  `gemini-3.7-flash` → `gemini-3.7-flash-tiered` with `thinkingLevel`; `gemini-4-argon` → its
+  suffix per effort (`…-low/medium/high`, default medium, no `thinkingLevel`); a `claude-*` id takes a
   `thinkingLevel` only (`resolveAntigravityThinkingLevel` clamps `xhigh/max/ultra`→`high`).
   CCA's own catalogue is `POST {host}/v1internal:fetchAvailableModels` with `{project}`, per host
-  (see "Two hosts" below), body `{models:{<wireId>:{maxTokens,…}}, agentModelSorts:[{groups:[{modelIds:[…]}]}],
+  (see "Two hosts" below) and per client family: the IDE answer gives every model, and a second ask
+  under the CLI UA adds only Argon's ids (which the IDE answer omits); an unreadable IDE answer leaves
+  the host unread as before. Body `{models:{<wireId>:{maxTokens,…}}, agentModelSorts:[{groups:[{modelIds:[…]}]}],
   tieredModelIds:{flash:[…]}}` (`providers/quota/antigravity.ts:166-168`,
   `providers/antigravity-models.ts:489-560`); when it cannot be read on any host we fall back to the
-  static collapsed list (`gemini-3.8-flash`, `gemini-3.7-flash`, `gemini-3.1-pro`,
+  static collapsed list (`gemini-3.8-flash`, `gemini-4-argon`, `gemini-3.7-flash`, `gemini-3.1-pro`,
   `gemini-3.1-flash-image`, `claude-sonnet-4-6`, `claude-opus-4-6-thinking`,
   `gpt-oss-120b-medium`, context windows from CCA `maxTokens`).
 - Claude models on CCA force `toolConfig.functionCallingConfig.mode = "VALIDATED"`; a client
@@ -1438,7 +2077,32 @@ They were not live-tested during the original implementation. Files are under `s
   credential refusal) gets one refresh and a replay, a fresh token refused with a 401 again
   marks the account for sign-in; 429/402 rest the account to its `retry-after` (or a default);
   another 403, 5xx or a connect failure rests it briefly; any other 4xx is the request's fault
-  and is not retried. The exception is the model-capacity 503 below, which rests nothing. Refresh is per account, single-flight per token generation, five minutes
+  and is not retried. The exception is the model-capacity 503 below, which rests nothing.
+  **A 429 that proves one quota group spent rests only that group** (`isGroupQuotaExhausted`:
+  an ErrorInfo `reason: "QUOTA_EXHAUSTED"` whose `metadata.model` is in the turn's group;
+  `antigravityQuotaScope`: `gemini` for other gemini-*, `3p` for claude-*/gpt-oss*, and `argon`
+  for gemini-4-argon*. The distinct Argon scope preserves the measured Pro quota boundary;
+  its positive-quota evidence requires its own explicitly reported weekly bucket, never the
+  ordinary Gemini windows (see the 2026-10-28 measurement above). This does not infer a shared
+  Ultra quota scope from a missing bucket). Measured 2026-10-23: one such 429 for
+  `claude-opus-5-5-low` ("Individual quota reached … Resets in 4h51m35s"), while the limits row read
+  the 3P weekly window at 100% and Gemini's at 0.3%, rested the whole account, so every
+  `gemini-3.8-flash` turn for the next five hours was refused "every signed-in account is at its
+  limit" without reaching Google, and the same 429 marked the provider exhausted, so the mod's
+  picker skipped the Gemini worker too. Now the pool keeps a per-account rest for the group on the
+  host the turn went to (`CredentialPool` `scope`, `antigravityScopeKey`:
+  `3p@daily-cloudcode-pa.googleapis.com`), because each host counts quota separately (above) and a
+  group spent on daily still answers on prod: a turn picks an account whose group has room, the account stays
+  `ready` for the other group (the dashboard shows the group's rest from `quotaCooldowns` and
+  offers its clear-cooldown button, which clears the groups too), and the refusal names the spent
+  group when the other still answers. Such a 429 is not reported as the provider's exhaustion;
+  `/api/mod-options` lists a model under `providers[].models` while every account in rotation
+  rests that model's group on that model's host (the adapter's `quotaScopeOf`), until the soonest
+  account is back: per account the later of its own rest and the group's, so an account that is
+  only cooling counts. The picker skips only those models, looked up without an `@effort` suffix. A 429 without that proof (a
+  per-minute limit, the generic `RESOURCE_EXHAUSTED`, a detail naming no model), a 402, a refused
+  credential or a broken upstream still rests the whole account, and so does any 429 for a model
+  in no known group. Refresh is per account, single-flight per token generation, five minutes
   ahead; only a structured `invalid_grant` marks an account for sign-in. Only the access token
   and the account email/project id are ever in memory; no token reaches a log or an API response.
 - **No capacity for the model (measured 2026-10-20, daily host, `gemini-3.8-flash-high`, router.log
@@ -1474,8 +2138,9 @@ They were not live-tested during the original implementation. Files are under `s
   every request, and Google can use the same generic 429 for real limits. `prompt-refusal.ts`
   checks the outbound paragraph, exact generic `RESOURCE_EXHAUSTED` JSON, and absence of a
   retry header or nonempty error details. The adapter additionally requires a **fresh successful
-  usage snapshot for the attempted account and project**, with quota remaining in both the 5h
-  and weekly windows of the requested model's known quota group (Gemini or Claude/GPT).
+  usage snapshot for the attempted account and project**, with quota remaining in every required
+  window of the requested model's known quota group: both 5h and weekly for Gemini or Claude/GPT,
+  or the single explicitly reported weekly bucket for Argon.
   Evidence expires after five minutes or a bucket's reset time, and a failed refresh invalidates
   it even when the dashboard retains old values. Missing, malformed, ambiguous, stale or exhausted
   evidence follows ordinary 429 cooldown/account rotation. This is a cache-only check; it does
@@ -1604,6 +2269,8 @@ plan unless marked otherwise.
 | Every GPT request failed with 400 after a Claude Code update added a lookahead regex to the `Artifact` tool schema (2026-09-13; proxenos too) | Tool-schema scrub in the translator (§4). Upstream error bodies are logged, never just the status. |
 | Tool names over 64 characters were forwarded to the Responses API unchanged, so a single connected MCP server — the product's own use case (§2) — failed every request of that turn (found by reading the source, issue #1, 2026-09-17) | Any name a translated provider sends is mangled into the provider's constraint deterministically and restored on the way back (§4). A translator must validate what it forwards against the wire it forwards to, not only what it builds itself. |
 | Unknown-model context window defaulted to 200K, compaction fired at 151K; fixed via `CLAUDE_CODE_MAX_CONTEXT_TOKENS=272000` (applies only to models not in the CLI's built-in table; Claude models unaffected) | Installer sets this env for mapped models; document that it does not affect Claude models. |
+| That 272000 then capped every routed worker: Claude Code compacts a model it does not know at the smaller of this cap and the model's own `auto_compact_windows` entry, so 6.1 Sol's 475000 and DeepSeek's, MiniMax's and Gemini's million all compacted at 272000. Separately, an `auto_compact_windows` value outside the CLI's settings range (100K–1M) is dropped whole, so Gemini's 1,048,576 never applied and it fell back to the session's own setting (read from 2.1.308's resolver, 2026-10-24) | The cap is Claude Code's ceiling for a per-model window (`CLI_WINDOW_MAX`, 1,000,000): `install` writes it unless `--max-context-tokens` names another, and the bootstrap sends each window at most that. Every routed model the CLI can be asked for carries its own entry (picker models, agent-file ids, route aliases; the global `cli.autoCompactWindow` only where none is known), so the raised cap never stands in for a window. |
+| Global settings `autoCompactWindow: 600000` overrode bootstrap's per-model 475000 for a GPT-routed slot (owner `/context` measurement, CLI 2.1.308, 2026-10-28), so the upstream could overflow before compaction; mobile displayed native 1M beside desktop 600k | Bootstrap alone is not enforcement. Manage routed per-model settings with exact-value ownership, preserve user overrides and native settings, and expose the same effective compact window to host and mod; `/context` rawMaxTokens remains authoritative (§4). |
 | Server tools (`web_search`) were declared to translated providers as ordinary functions: a tool the model can call and nothing can run. Not observed live, because Claude Code currently routes its web search elsewhere (§4) — the failure was one server-side flag away, and its shape is an empty answer with nothing logged (issue #4, 2026-09-17) | A translator declares only what the provider can actually execute, and says in the log what it removed. A capability that silently disappears is worse than one that visibly fails. |
 | Routed workers were told to call the `advisor` after its declaration was dropped: Claude Code explains the tool in a user message the router left in place, so 26 of 28 worker transcripts reported it missing, every turn (issue #47, 2026-10-04) | Removing a capability includes withdrawing what was said about it. A translator that drops a tool adds one stable line saying so, rather than editing the caller's text. |
 | One context window was written to every routed model and every slot, because `cli.autoCompactWindow` is a single number while `auto_compact_windows` and `context_window_by_model` are per-model maps. Routed models do not share a window: set it high and the smaller model overflows before it compacts, set it low and the larger throws away most of its own (issue #2, 2026-09-17) | A window belongs to a model, not to the router. `CliModel.contextWindow` and `Route.contextWindow` win, then whatever the vendor's `/models` reported as `context_length`, then the global value as the fallback it always was. A value the config can only express once must not be injected into a map that is keyed per model. |
@@ -1626,8 +2293,8 @@ plan unless marked otherwise.
 | The DeepSeek `401` stayed unexplained for a day: a provider error was logged as a status code only (2026-09-15) | Upstream 4xx/5xx bodies are logged (first 300 characters, key-shaped strings masked) and kept in the request record. This is the same rule already required of the translator above. |
 | "Connect Claude subscription" from the tray/GUI failed with "setup-token failed": `claude setup-token` is an interactive terminal flow and neither place has a terminal (2026-09-15, Windows) | Without a TTY the error says to run `clauderipple claude-login` in a terminal and that an existing Claude Code login is reused anyway; other failures carry what `claude` printed. A button that cannot work where it is must say where it works. |
 | Closing Claude Desktop's window does not quit it; reopening hits `Not main instance, returning early` and the app silently keeps the OLD proxy setting. The user sees "I configured it and nothing happened" with no error anywhere (2026-09-14) | Tell the user that closing the window is not enough, and detect it: with picker mode on, the router knows whether the app is actually routing through it. Surface "configured, but the app has not restarted yet" rather than letting it fail silently. |
-| A subagent prompt carried `[[ripple: deepseek@high]]` while `aliases` had no `deepseek`; the marker resolved to a model id nobody declared, `resolve()` returned null, and the request went to Anthropic as an ordinary `PASS` — 30 × `404 model: deepseek-v4.1-flash` over two days, read by the session as "the model stopped working" (2026-09-19/20) | A non-`claude-*` model this router cannot route is **refused here, by name**: `400 invalid_request_error "ClaudeRipple: <reason>"`, tag `REFUSE`, reason in the request record (`unroutableReason`: undeclared / declared by two providers / ingress-only owner / unknown marker alias / alias to an undeclared model). Native `claude-*` ids keep passing through untouched — Claude traffic is never hijacked to say no. And the marker alias table is derived from the agent files themselves (§4), so an agent that exists is an alias that resolves. |
-| A rejected Claude account remained quarantined after its access/refresh token was replaced, because runtime health used the durable account id; keying affinity on that same generation id would instead move a healthy conversation after every refresh (found during multi-account implementation, 2026-09-20) | Runtime health keys on `<local-owner>:<token-generation-digest>`, while conversation affinity and admin state key on the durable local owner. A refresh or re-login receives fresh health without losing its prompt-cache claim; compare-and-swap prevents an old rejection from marking the new generation. |
+| A subagent prompt carried `[[ripple: deepseek@high]]` while `aliases` had no `deepseek`; the marker resolved to a model id nobody declared, `resolve()` returned null, and the request went to Anthropic as an ordinary `PASS` — 30 × `404 model: deepseek-v4.1-flash` over two days, read by the session as "the model stopped working" (2026-09-19/20) | A non-`claude-*` model this router cannot route is **refused here, by name**: `400 invalid_request_error "ClaudeRipple: <reason>"`, tag `REFUSE`, reason in the request record (`decide()`'s `refusal`: undeclared / declared by two providers / ingress-only owner / unknown marker alias / alias to an undeclared model). Native `claude-*` ids keep passing through untouched — Claude traffic is never hijacked to say no. And the marker alias table is derived from the agent files themselves (§4), so an agent that exists is an alias that resolves. |
+| A rejected Claude account remained quarantined after its access/refresh token was replaced, because runtime health used the durable account id; keying affinity on that same generation id would instead move a healthy conversation after every refresh (found during multi-account implementation, 2026-09-20) | Runtime health keys on `<local-owner>:<token-generation-digest>`, while conversation affinity and admin state key on the durable local owner. A refresh or re-login receives fresh health without losing its prompt-cache claim; compare-and-swap prevents an old rejection from marking the new generation. **Refined 2026-11-07:** a *rest* — a 429 cooldown, its failure count and a quota scope — is keyed by the durable account (`ownerId`), so a token refresh during a 5h/7d window rest does not hand back a fresh credential with no cooldown; only the quarantine stays with the token generation. Every generation of the app's own login is named `current`, so that login states its account explicitly (`healthKey`): Claude Code's local `oauthAccount.accountUuid` (or organization id), hashed and never stored or logged; a token refresh keeps it and switching the app's login changes it, so the old account's rest is left behind. When that identity is unreadable the runtime generation is used, so a refresh may revive a rest but a different login never inherits one. |
 | The worker registry was four places that did not know each other — `providers.*.models`, `aliases`, `~/.claude/agents/*.md`, and prose in CLAUDE.md — and every new provider needed all four edited by hand; the one left out was the one that failed (2026-09-19, DeepSeek) | One source: a ticked model *is* a worker. Agent files and marker aliases are generated from `config.json` (§4 "worker definitions"); nothing about a worker is written twice. |
 | ChatGPT prompt-cache hit fell from 93% (2026-09-13) to 9% (2026-09-20) with nothing in our request changing — the backend had started keying the cache on the conversation's identity (`session-id`/`thread-id`/`x-client-request-id`/`client_metadata`), which we never sent; `prompt_cache_key` alone no longer earned a write | The adapter states the conversation's identity the way the Codex CLI does (§4) and echoes `x-codex-turn-state`. The acceptance metric (≥90% on translated providers) is watched per day in `requests.jsonl`; a fall with an unchanged request means the wire changed under us, and the reference to diff against is the real CLI captured through a local proxy, not our own memory of the protocol. |
 | Remote Control registration failed locally with 405 before Anthropic saw it: Claude Code 2.1.275 uses HTTPS absolute-form (`POST https://api.anthropic.com/v1/environments/bridge HTTP/1.1`) rather than CONNECT for registration, polling and heartbeats, while the forward-proxy socket accepted CONNECT only (issue #10, Windows 11) | Accept valid HTTPS absolute-form, strip proxy-only headers, replace Host, rewrite only the target to origin-form, and relay one request over direct TLS outside model routing. Force `Connection: close`: reusing that TLS socket could send a later proxy-form request to the first origin. Parser tests plus a live local TLS origin verify body and credential preservation. |
@@ -1651,6 +2318,24 @@ plan unless marked otherwise.
 | Android hotspot never recognised (2026-10-20, found by reading the code for an owner with Windows laptops and Android phones in mind): "on the hotspot" was the iPhone range 172.20.10.0/28 alone, on macOS and Windows. An Android hotspot hands out 192.168.43.x (≤ Android 10) or a random /24 (Android 11+; 192.168/16, 172.16/12, 10/8 by Android 14), so after our own failover `join()` saw no hotspot address and reported `join-failed`/`hotspot-not-visible`, while on the phone the controller read Wi-Fi and never planned the way back, and a by-hand join was never recognised | The product does not assume an iPhone. After our own join of the configured SSID is accepted by the OS, a new, non-link-local address within the settle time is the join, and its subnet (address + netmask from `os.networkInterfaces()`: no Location, no elevation) is kept in `<home>/tether.json` for that hotspot name; "on the hotspot" = iPhone range OR that network (§8). Only our own join replaces it, and a subnet equal to the Wi-Fi watched before is not remembered (logged as ambiguous) so home Wi-Fi is never read as the hotspot. Hints name both phones where the step differs. Not yet run with a real Android phone. |
 | An expired Claude login on the Mac wrote `[desktop state] …로그인이 만료되었습니다…` every few seconds per Claude app session and read the keychain (a synchronous child process) for every request, while phones learned of it only by a failed send (2026-10-15) | A login problem is one host state: logged when it starts and ends, sent to phones as `HostInfo.desktopProblem` (a banner), and the keychain is reread at most every 30 s while expired or after a 401. Per-session Remote Control errors log once per change. The host never refreshes the login itself. |
 | OpenCode Go answered **402** for `minimax-m3.1-flash-free` while that model's endpoint was down (`server_error … Upstream request failed: Endpoint is unavailable`); read as billing exhaustion, it parked the whole `opencode-go` account for 30 minutes, DeepSeek with it, and delegated work fell back to Opus while the account had credit (2026-10-22) | A relay's refusal whose body says its upstream failed (`RELAY_UPSTREAM_FAILED`, `pool.ts`) is transient whatever status it carries — 402 as well as 403 — and never a provider exhaustion (`health.ts`). A plain 402 or a body naming balance, billing or quota still is. |
+| A Google 429 for spending-cap exhaustion (`Your project has exceeded its monthly spending cap.`) was classified and recorded in ProviderHealth, so the next delegation skipped the provider — but the worker that received the plain 429 retried it ten times over ~2.5 minutes (08:56:35–08:59:06) before failing (#89, 2026-10-24) | Same status and body, plus `x-should-retry: false` and a `retry-after` to the exhaustion's `until` (min 1s), wherever a definite exhaustion is written: the generic path (`proxy.ts`) and the Google, ChatGPT and OpenAI-compatible adapters. Claude Code reads `x-should-retry` before its 429 rule, so the worker fails at once. A bare rate limit keeps no such header. |
+| A Workflow script sent eight agents with `[[ripple: gemini-3-8-flash@high]]` as the prompt's first line (and `subagent_type`, which `agent()` does not take — its option is `agentType`); all eight ran on the session's Opus. CLI 2.1.308 frames a workflow agent's prompt: a relayed user request, then a `[Workflow harness — computed task] … follows:` header line, then the script's text indented — so no user message started with the marker (2026-10-22) | A text block that starts with that header is read from the line after it: the script's first line is the prompt's top, as a spawned subagent's is (`routing.ts`, `WORKFLOW_TASK`). Only a block that *starts* with the header counts — the harness indents everything inside, so a header quoted lower down is prose. |
+| A closed lid was held awake on battery overnight (2026-10-24, owner-reported, `pmset -g log` + router.log): the lid closed and the Mac slept at 00:59 ("Clamshell Sleep"), but in two maintenance dark wakes (01:09 and 09:51) model calls ran — the mod's cache keep-warm pings (4-token turns on idle sessions) and a Claude app scheduled task — and `working` mode counted them as work: "sleep disabled (working: 1 model call running)" turned a ~45 s dark wake into 72 min (01:09–02:21) and 35 min (09:51–10:26) awake, 6 of the night's 10 battery points | A hold is never **started** in a dark wake: ioreg's IOPMrootDomain `System Capabilities` (read with the clamshell flags, no extra process) without Graphics (2) means the Mac is asleep to its user, and `decideAwake` answers "asleep: …" (logged once). A hold already taken is kept whatever the reading, and mode `on` is unaffected. Measured: 15 in a full wake; a held lid-closed Mac (2026-10-23 18:22–19:32) logged no transition to DarkWake. Tests: `awake.test.ts`. |
+| Our sleepnow overrode other processes keeping the Mac awake (2026-10-26, owner-reported, `pmset -g log` + router.log + unified log): in `working` mode the hold was released 10 min after the last call and, with the lid closed and `AppleClamshellCausesSleep` reading Yes although an awake TV was attached over HDMI, `pmset sleepnow` ran — at 18:48 under an Amphetamine session (remote sessions dropped overnight), and at 17:17 while audio played at the desk (coreaudiod's assertions released at the sleep). The log line claimed "nothing else holds the Mac awake" without checking | Before sleepnow, a non-guard release leaves the Mac to macOS when an external display is attached (ioreg framebuffers, not the flag) or another process holds PreventSystemSleep, or either read fails; the log names the reason. Guard releases (battery, heat, failed guard read) still sleep. Tests: `awake.test.ts`. |
+| A closed lid ran on battery for 4 hours because idle assertions were taken for sleep holds (2026-10-28, owner-reported, `pmset -g log` + router.log): a call at 05:14 set the bit, the lid was closed while it was set, and the 05:33:52 release logged "other processes prevent sleep (Amphetamine, powerd)" and skipped sleepnow. Both were PreventUserIdleSystemSleep — Amphetamine's indefinite session and powerd's "display is on" — which do not stop lid-close sleep (the Mac had slept every lid close that night under the same session) and, never letting go, kept idle sleep away too. No sleep was logged until AC at 09:19: 55% → 11% | Only PreventSystemSleep counts as another process's hold, beside an attached external display (the row above). Tests: `awake.test.ts` "idle-sleep holders … do not keep a released closed lid awake". |
+| A closed lid fell asleep although we were holding it, because another app writes the same bit: AlDente Pro's "Disable Sleep until Charge Limit" (`completelyDisableSleep`) sets it while AlDente charges below its limit and clears it when charging stops, so on 2026-10-30 the bit read 0 at 09:31:18 as its helper let go at the charge limit with AC still attached (our 15 s tick re-set it at 09:31:28 and logged "sleep was re-enabled outside ClaudeRipple"), and at 09:25:43.99 when a dock — power and two displays — was unplugged with the lid already closed, where macOS clamshell-slept at 09:25:44.44 (owner-reported, `pmset -g log` + ioreg + `defaults` reads) | A second writer of the bit is detected and named, not out-raced: a known-writer table (`SLEEP_SETTING_WRITERS`; now only AlDente's `completelyDisableSleep`) is read with `defaults` (no privilege, at most once a 60 s full tick, and at once after an outside re-enable); a match, or an outside re-enable with no known writer behind it and no boot since the hold (unknown cause, kept 24 h), is reported once in the log, `clauderipple power` and the laptop page, with the fix where one is known ("Stop Charging when Sleeping"). Re-asserting faster cannot win against an immediate clamshell sleep. AlDente's Calibration Mode and clamshell discharge disable sleep without this key, so those stay invisible (known limit). Tests: `awake.test.ts`. |
+| A new worker could not be spawned in a session that was open when it was added: the router wrote `zai-org-glm-5-3-flash.md` at 10:51:45, the MAMBO session (idle since 10:47) got its next message 26 s later, and the Agent tool answered "not found" at 10:52 and 11:12; after a `/clear` the mod rewrote `ripple:auto` to the worker and the CLI refused that too (11:24). The ClaudeRipple session, in use at the time, listed it by 10:55 (2026-10-23). CLI 2.1.308 polls `~/.claude/agents` every 2 s in use and 30 s after a minute idle; going back to 2 s rebuilds the watcher from the directory as it then is, and the catch-up compares only skills and commands, so a write in the last 30 s of idling is never read, and `/clear` keeps the process's list | Every sync that writes or removes a generated agent touches the generated files again `RETOUCH_AFTER_MS` (45 s) later (`agents.ts` `retouchLater`): any agent file's change makes a session reread all of them, and 45 s is past the idle poll. A session that already missed one is fixed the same way, by touching any file in `~/.claude/agents`. Tests: `agents.test.ts`. |
+| A routed request's `messages` array carried Anthropic-only shapes — a mid-conversation `role: "system"` message and `tool_addition`/`tool_removal` content blocks — and the compat layer cleaned only the top-level fields, so the vendor's Anthropic skin answered 400 `Invalid Anthropic Messages API request` on every turn once a SessionStart hook or a deferred MCP tool was in play (issue #92, CLI 2.1.308+, 2026-10-26) | A compat layer validates the **whole body** it forwards, `messages` included, not just the fields the CLI adds at the top level: a role an Anthropic-shaped vendor does not accept in `messages` is folded to `user` with the text untouched, a content block type only Anthropic defines is either converted into something the wire already has (a deferred tool's definition joins `tools`) or dropped, and a message left with no content goes whole. The request log counts each fold (`system_role×N`, `tool_addition×N`, `tool_removal×N`) so a vendor's next refusal can be read against what was sent. Same rule as the tool-schema row: what is forwarded must be valid for the wire it is forwarded to, not merely for the client that produced it. |
+| The router starved behind a build on Windows (2026-10-29, measured): the scheduled task had Task Scheduler's default priority 7, so conhost, the launcher and the router ran BelowNormal. With cargo and rustc holding every core at Normal, `/api/status` took 1-3 s; an update's probe got `ECONNREFUSED` from a router that was listening (a full accept queue); `install` skipped the version restart because `/api/status` gave no answer within 10 s; and `restart` refused the router as "another ClaudeRipple installation" because the 5 s PowerShell listener lookup timed out | The task is registered with `-Priority 4` (Normal), the launcher raises itself from BelowNormal or Idle to Normal before it starts the router, and the router applies `Config.processPriority` (Normal unless set) at start and on every config change. The listener lookup waits 15 s. Below Normal is now only the person's own choice. Tests: `process-priority.test.ts`, `schtasks-definition.test.ts`, `ui-priority.test.ts`. |
+| An already-running Code tab session never used the stored Claude sub-account, which was marked preferred: every turn's `continue` carried only the delta, so `requestConversationKey` hashed a different first `tool_result` each turn, the pool seeded a new affinity, and picked the preferred account — which held no such server-side thread, so Anthropic answered `404 thread_not_found`; the CLI then replayed the full history, whose original key was sticky to the CLI login, and that answered 200. `router.log`, every turn: `KEY anthropic credential=#1 conversation=<new hash> reason=configured-order`, then `credential=#2 conversation=0016c66c… reason=affinity` (2026-11-04) | A `continue` follows the answer it continues: a successful native pool answer's message id is remembered with its conversation's affinity key (60-minute TTL, size-capped, in memory only, and not added to the request log), and a `thread.type:"continue"` naming a remembered `previous_message_id` uses that key instead of the computed one; an unknown id keeps the computed key. Separately, changing the preferred account now migrates that provider's held conversations (the pool drops their affinity when the preferred owner changes) at the cost of one cold turn — the new account answers `thread_not_found`, the CLI replays, and the full-history request claims it there; a cooldown ending moves nothing. Removing the preference also migrates held conversations, back to the configured order: until 0.12.27 it moved nothing, and after the owner un-preferred a sub-account and went back to the app login, every conversation already running stayed on the sub-account while only new ones used the app login (2026-11-05, 59 of the last 300 picks still `credential=#2 reason=affinity`). A retry's list that merely leaves out the preferred credential is not a removal. Tests: `pool.test.ts`, `shared-account-controls.test.ts`, `anthropic-account-proxy.test.ts`. |
+| The current Claude login vanished from Providers → Claude → Accounts and got no traffic while it was being used through the pool (2026-11-01/02, issue #123): `ObservedClaudeCodeAuth` held it 12 h from the last **un-routed** `/v1/messages` only, so 12 h after that request it dropped out of the accounts list and the pool, and the router logged 27,252 routed and 0 un-routed `/v1/messages` in between; a later router restart plus one un-routed request was the only way back. Its usage card also stayed at the last successful `/api/oauth/usage` reading (5h 58%) for hours while the account was at 100% and the endpoint answered 429 | The app's own login is observed on every `/v1/messages` it carries, routed or not, and an answer on it through the pool (proxy or OpenAI ingress) refreshes the same 12 h idle guard, so the guard counts from the last evidence of that token rather than from the last un-routed request; a different token (sign-in, account switch) replaces it on the next request. The login is not kept past its validity: a 401 for that exact token drops the observed copy, the rejected token is not re-adopted, and only a different token becomes current again. A refused usage lookup keeps the last numbers but marks the snapshot `stale` with `failed_at`/`failed_status`, backs off for the 429's `retry-after` (or a doubling wait) and logs it, and the unified limit headers on any Messages answer — fractions 0..1 and epoch-second resets, measured in the installed CLI 2.1.317 — refill the windows while the body source is stale. Tests: `anthropic-account-pool.test.ts`, `anthropic-account-proxy.test.ts`, `anthropic-usage.test.ts`. |
+| Named Claude workers fell back to DeepSeek although Claude answered (2026-11-05 14:07–14:12 KST): a script in another project's session, inheriting the session's `HTTPS_PROXY`, called `api.anthropic.com/v1/messages` on its own API key (`x-api-key`, no `?beta=true`, `Python-urllib`). The pool dropped the key and sent it on the subscription accounts (`account=current`), which answered `429 rate_limit_error`; both accounts cooled for 60 s, `/api/mod-options` reported `anthropic` unusable, and the mod replaced `claude-opus-5-5`/`claude-sonnet-5-5` with the ladder. The script's calls were also billed to the subscription instead of its key | A Messages request that carries its own `x-api-key`, no `Authorization`, and neither `x-app: cli` nor a `claude-cli/` user agent is not routed (a login beside a key keeps the old path: a real Bearer with a placeholder key is common): it takes the un-routed path on its own headers, byte for byte, with no pool, no mapping, no search or compaction override (`callerOwnsKey`, log tag `PASS caller-key`). Its answers touch no account's cooldown. Claude Code on an API key keeps the pool path as before. Tests: `anthropic-account-proxy.test.ts`. |
+| A Claude subscription 429 without `retry-after` cooled the account for 60 s although `anthropic-ratelimit-unified-status: rejected` with `-5h-utilization: 1` said its window was spent until a reset hours away; a token refresh during that rest produced a fresh credential id with no cooldown, so the spent account was tried again (2026-11-06/07, account-pool audit) | A rejected unified window rests the account until the soonest stated reset (`claudeLimitResetMs` in `anthropic-usage.ts`; the documented 6 h clamp still bounds it). A rest belongs to the durable account, so a token refresh never clears it; a quarantine still belongs to the token generation, so a re-login does not inherit it (pool.ts). A shorter `retry-after` on the same answer cannot shorten that rest: the account cools for the later of the two, and when no account can take the turn the 429 carries `x-should-retry: false` and `retry-after` with that same value, so pool and caller agree on the reset. Tests: `pool.test.ts`, `anthropic-usage.test.ts`, `anthropic-account-pool.test.ts`, `anthropic-account-proxy.test.ts`. |
+| OpenCode Go answered 429 `{"error":{"type":"server_error","message":"Upstream request failed: [prefill_cap_refused] the cell is at capacity; retry shortly (after 5 s)"}}` (2026-11-06 15:34:34; `[overloaded] … retry shortly` the same day) for its own failing upstream. The key was charged a rate-limit cooldown and the turn reached the user as a 429, though the same key answered 200 five seconds later | A 429 whose body matches `RELAY_UPSTREAM_FAILED` is transient: zero cooldown, and `fetchWithRetry` retries it in-turn on the same ladder as a relay 403/402. Tests: `pool.test.ts`, `retry.test.ts`. |
+| Google answered 403 `PERMISSION_DENIED` with ErrorInfo `reason: "TOS_VIOLATION"` ("This service has been disabled in this account for violation of Terms of Service…", 2026-11-06, router.log.1; 73 such 403s and 39 refresh+replays on one account in one night) and the auth heuristic refreshed and replayed the token, rested the account 60 s and kept it in rotation | A 403 with `TOS_VIOLATION` parks the account as a dead credential (pool quarantine, one warn naming the account and the reason, no refresh or replay); the account reads as not ready until an operator clears it. Tests: `google-quota-scope.test.ts`. |
+| After an in-turn retry the completion line still named the account the turn started on, and a credential refreshed between the first pick and the retry was printed as `#0` in the RETRY line and `requests.jsonl` (2026-11-07) | The `CLAUDE` completion tag is updated to the credential that answered, and `credentialLabel` falls back to the durable owner when the runtime id is not in the first pick's list. Tests: `anthropic-account-proxy.test.ts`. |
+| Three failovers measured on 2026-11-06 each harmed the connection they meant to protect (owner's MacBook, router.log + `log show` of airportd/WiFiAgent/sharingd). On the iPhone hotspot "PBJ" from 18:32: (1) a directed scan said a known Wi-Fi was visible at 18:37/18:39; the router disassociated at 18:39:25, then every `sudo networksetup -setairportnetwork en0 PBJ` failed ("Failed to join network PBJ", then "Could not find network PBJ") because an idle iPhone stops advertising, and each call cancelled macOS's own Instant Hotspot auto-join (`Auto-join COMPLETED … error=(53 'Auto-join disabled'), wasCancelled=1`), leaving the Mac offline until the owner rejoined from Control Center at 18:43:28. airportd's own auto-join right after the scan found `candidateBSSCount=0`, and a CoreWLAN answer measured then is airportd's cache (~25ms, ~8-10s old) whose membership differed from the next real scan's (13 vs 11). (2) At 19:43:45, 37s after the owner joined home Wi-Fi, the 5-probe window still held the hotspot period's and the switch's failures (probes bound to the old address: `EADDRNOTAVAIL`), so the router joined PBJ over a working home Wi-Fi and disassociated it at 19:44:01. | macOS with no address at all leaves the first `HOTSPOT_JOIN_GRACE_MS` (60s) to macOS and then tries at most once a minute — no 10s ladder — because macOS's auto-join can wake the iPhone and ours cannot and cancels it. A return requires a saved non-hotspot SSID at `RETURN_MIN_RSSI_DBM` (-70 dBm; measured in range -36..-40, merely heard -69..-92) seen by a scan that took at least `SCAN_FRESH_MIN_MS` (1s); a cached answer is re-asked after `SCAN_CACHE_TTL_MS` (10s), else the return is refused. Nothing associated within `JOIN_KNOWN_AFTER_MS` (8s) of leaving → rejoin the hotspot at once while the iPhone still advertises. A change of the Wi-Fi address, subnet or class empties the probe window, and one that brought an address also gives the new network `NETWORK_SETTLE_MS` (30s) in which failures do not count — so a network the OS or the person joined is never failed over in that period, while losing the address keeps the old failover timing (the third failed round). The address is read again after the probe and before the join, so a Wi-Fi joined mid-tick is not evicted. Tests: `tether.test.ts`, `tether-win.test.ts`. |
+| Windows auto-update left the router down until logon (#131, 2026-10-29 to 11-07, 8 of 8 updates): the launcher ran `Start-Process -Wait`, which on PowerShell 5.1 also waits for the router's detached update installer, and the installer's `restartWindowsRouter` waits for the task to end, so each side waited on the other | The launcher waits on its own process handle only (`$null = $p.Handle; $p.WaitForExit()`), never `-Wait`; `schtasks-definition.test.ts` asserts the form and the exit-code handling. |
 
 ### Router-owned automatic updates (2026-10-21)
 
@@ -1686,6 +2371,25 @@ No remotely pushed command or live installation test is part of this feature's v
 
 Sources: `packages/router/src/autoupdate.ts`, `cli-control.ts`, `index.ts`, `admin.ts`, `config.ts`;
 `packages/app/src/update-model.ts`, `main.ts`; scheduler and tray decision tests.
+
+### Windows process priority (2026-10-29)
+
+`Config.processPriority` is `below-normal`, `normal`, `above-normal` or `high`, the Task Manager
+levels of those names; absent means `normal`. It applies on Windows only, since raising a priority
+elsewhere needs privileges; GET `/api/status` then reports `supported: false`. The router applies it
+right after its logger starts and again on every config change (`process-priority.ts`; a level
+already in effect is left alone and logs nothing). The phone host applies it when it starts and
+picks up a change at its next start. GET `/api/status` exposes `processPriority: { supported,
+setting, current, error? }`; `current` is what Windows reports now, which can also be `idle` or
+`realtime` when another program changed it. The dashboard's About view draws a menu from it: High
+asks before it is saved and keeps a warning on the row while it is on.
+
+The Task Scheduler registration (`-Priority 4`) and the launcher's raise give every start a Normal
+baseline before the router reads its config, so a router started from an older registration is not
+left below Normal, and a level below Normal is the router lowering itself on request.
+
+Sources: `packages/router/src/process-priority.ts`, `config.ts`, `admin.ts`, `index.ts`;
+`packages/cli/src/schtasks.ts`, `router-state.ts`; `packages/remote/src/main.ts`; `packages/ui/app.js`.
 
 ## 6. Blocked paths (measured, do not retry)
 
@@ -1737,17 +2441,57 @@ Windows backends `awake-win.ts`, `tether-win.ts`), `power.ts` (admin contract); 
 external display is `pmset -a disablesleep 1` as root: undocumented (absent from `man pmset`), but it
 is what Insomnia, MacMiniMode, Sleepless, Capsomnia and WiFiGuard all run; `caffeinate`/IOPMAssertion
 cannot do it (KeepingYouAwake README, "Does it work … with a closed lid? No."). Modes: `off`;
-`working` = a model call in flight or one in the last 10 min; `on` (optionally `until`). Evaluated
+`working` = a model call in flight or one in the last 10 min, but a hold is not started in a dark wake
+(ioreg `System Capabilities` without Graphics: calls there are background, §5 2026-10-24); `on`
+(optionally `until`). Evaluated
 every 15s. Forced off by: battery below `batteryFloorPercent` (default 20) on battery (`pmset -g
 batt`), a recorded thermal warning (`pmset -g therm`; measured on macOS 27.0.1 with nothing recorded:
 "No thermal warning level has been recorded" — unrecognised output is reported `unknown` and not
 acted on, a failed read is), and any error reading either. Releasing it with the lid closed and
 `AppleClamshellCausesSleep = Yes` (`ioreg`, no privilege) runs `pmset sleepnow` (unprivileged first,
 then through the rule): clearing the bit alone leaves a bagged Mac running (MacMiniMode does the
-same). With an external display (closed-display mode) CausesSleep reads No and nothing is slept.
+same). With an external display (closed-display mode) CausesSleep should read No and nothing is
+slept, but it read Yes on 2026-10-26 with an awake TV attached and on 2026-10-28 with two monitors
+attached (§5). So a release that is not a guard's sleeps only where macOS would have on the lid
+closing: it leaves the Mac to macOS when `ioreg -r -c IOMobileFramebufferShim -k DisplayAttributes -d 1`
+lists a framebuffer with `"external" = Yes` (an attached display; unused ports have no
+DisplayAttributes; Intel Macs have no such framebuffers and count none), or when `pmset -g assertions`
+shows another process holding PreventSystemSleep (AlDente on AC). Idle assertions
+(PreventUserIdleSystemSleep, NoIdleSleepAssertion: Amphetamine, coreaudiod, the Claude app, powerd's
+"display is on") do not count — a closed lid sleeps under them. A failed read of either leaves the Mac
+to macOS. A guard release (battery floor, thermal warning, a failed guard read) sleeps the lid
+regardless.
 `<home>/awake.json` journals `{applied, since, reason, lastActivityAt}`; the journal is written
 before setting the bit and after clearing it. A bit that reads cleared while the journal says set
 (reboot, another tool) is re-applied if still wanted.
+
+**Other apps that write the sleep setting (2026-10-30).** The bit is global, so other apps set and clear
+it too. Known writers are a table in `awake.ts` (`SLEEP_SETTING_WRITERS`), each entry one unprivileged
+`defaults read <domain> <key>` whose trimmed stdout must equal the value:
+
+| app | name | macOS domain | key | value |
+|---|---|---|---|---|
+| `aldente` | AlDente | `com.apphousekitchen.aldente-pro` | `completelyDisableSleep` | `1` |
+
+AlDente Pro's "Disable Sleep until Charge Limit" is the measured entry: it is set while AlDente charges
+below its limit (this Mac: `chargeVal = 55`) and cleared when charging stops — at the limit AlDente has
+already let go, which is why unplugging at the end of a workday with the lid closed and the battery at
+55% never slept (owner-reported, the battery held at 55% for days). The clear can land behind our back
+and a closed lid sleeps at once (§5), so the probe runs on full ticks — at most once a minute, and not
+at all while the mode is off with nothing held — and a conflict is logged once (and its end once),
+named in `clauderipple power` and warned about in the laptop page; the "re-enabled outside" line names a
+known app when the probe says it is the cause, and that path asks again at once instead of waiting for
+the minute. The fix for the measured app is the owner's: "Stop Charging when Sleeping", which leaves
+`sleepInhibitCharge = 1`, a key that does not touch the bit.
+
+A clear with no known writer behind it is an unknown cause: it stays reported for 24 h
+(`CONFLICT_KEEP_MS`) from the last outside re-enable, then goes. On macOS a reboot explains it away —
+the bit never survives one — so if the system booted after the hold was set (boot time = now −
+`os.uptime`, compared with when the hold was set) it is a reboot, not a conflict. On Windows a recovered
+`stillHeld()` false means the lid-close action was changed outside us, which is always an unknown cause
+(there is no OS-wide bit, and nothing else writes a plan's lid action). A known match takes precedence
+over an unknown one. Known limit: AlDente also disables sleep itself in Calibration Mode and clamshell
+discharge ("required" in its help text), which this key cannot show.
 
 **Exit ordering (decided).** The router's exit does **not** clear the bit, in any mode. A restart is
 the common exit; clearing then setting again ~1s later is exactly the off-then-on window in which a
@@ -1805,12 +2549,18 @@ says nothing the subnet does not. Limits: a by-hand join is recognised only on a
 before; a Wi-Fi elsewhere that happens to use the learned /24 reads as the hotspot. The way back
 can drop it only when another saved SSID is visible (visibility guard, 2026-10-21, below);
 `tether.pin` stops switching entirely. Failover (on Wi-Fi or no
-address, outage): wait at most 30s for an in-flight call, then `sudo -n networksetup
--setairportnetwork <dev> <NAME>` (macOS takes the password from the System keychain). Switches are at
-least a minute apart, but a join that failed ("Failed to join network", or not visible) switched
-nothing, so it is tried again 10 s, 20 s, 30 s … later up to that minute: walking out of the office
-the first join came as the hotspot was only just in range, failed, and the Mac stayed offline for the
-rest of the minute (2026-10-22). Setup failures (sudo, profile, Location) still wait the minute. The probe window
+address, outage): wait at most 30s for an in-flight call. **macOS with no address at all leaves the
+first `HOTSPOT_JOIN_GRACE_MS` (60s) to macOS and then tries at most once a minute** (`tether.ts`,
+2026-11-06): macOS's Instant Hotspot auto-join wakes the iPhone over Bluetooth and joins it, while a
+`networksetup` join cancels that auto-join in progress (`Auto-join COMPLETED … error=(53 'Auto-join
+disabled'), wasCancelled=1`, 22s and every later try "Could not find network PBJ") and cannot wake a
+phone whose SSID is hidden. Then `sudo -n networksetup -setairportnetwork <dev> <NAME>` (macOS takes
+the password from the System keychain). Switches are at least a minute apart, but a join that failed
+while the Wi-Fi still had an address ("Failed to join network", or not visible) switched nothing, so
+it is tried again 10 s, 20 s, 30 s … later up to that minute: walking out of the office the first
+join came as the hotspot was only just in range, failed, and the Mac stayed offline for the rest of
+the minute (2026-10-22). The no-address case has no such ladder on macOS. Setup failures (sudo,
+profile, Location) still wait the minute. The probe window
 lives in the process, so it only works if the router is not restarted every few seconds while the
 machine is offline (§5, health self-exit refined 2026-10-20). networksetup
 reports failure on stdout and may exit 0, so its text decides: "Could not find network" →
@@ -1823,16 +2573,25 @@ on a fixed schedule counted from landing there — 5, 10, 20, 30, 40, 50 and 60 
 10 minutes for as long as it stays (owner's decision, 2026-10-20: at most ~10 minutes on the hotspot
 after reaching a known Wi-Fi — a doubling backoff held it for up to 15 minutes). **Since
 2026-10-21 each point first checks whether another saved Wi-Fi is actually in range, without
-leaving the hotspot** (below). Only with a positive check, no call in flight and none started in the
-last 20s, disassociate via JXA as the console user (wifihop's exact call: `ObjC.import("CoreWLAN");
-$.CWWiFiClient.sharedWiFiClient.interface.disassociate`) so macOS auto-joins the best known network;
-two good probes within 20s keep it; otherwise stay on (or rejoin) the hotspot and move to the next
-scheduled point (a point already passed — a slow tick, a long gap attempt — is skipped for the next
-one at least `MIN_SWITCH_INTERVAL` out). Leaving the hotspot resets the schedule; landing again
-starts it over. At most one switch per 60s. `tether.pin` (in memory, via the API) pauses all
+leaving the hotspot** (below); since 2026-11-06 that means `RETURN_MIN_RSSI_DBM` (-70 dBm) or better
+in a scan the radio really ran, not an airportd cache answer. Only with a positive check, no call in
+flight and none started in the last 20s, disassociate via JXA as the console user (wifihop's exact
+call: `ObjC.import("CoreWLAN"); $.CWWiFiClient.sharedWiFiClient.interface.disassociate`) so macOS
+auto-joins the best known network; two good probes through it within 20s keep it. **Nothing
+associated within `JOIN_KNOWN_AFTER_MS` (8s) of leaving → the hotspot is rejoined at once**
+(`rejoinHotspotIfUnassociated`, macOS; 2026-11-06: waiting out the rest of the 20s can lose the only
+way back once the iPhone stops advertising). A Wi-Fi whose address appears late gets its
+**`NETWORK_SETTLE_MS`** from then before the loop calls it dead (below), so the 20s can stretch by up
+to one settle. Otherwise stay on (or rejoin) the hotspot and move to
+the next scheduled point (a point already passed — a slow tick, a long gap attempt — is skipped for
+the next one at least `MIN_SWITCH_INTERVAL` out). Leaving the hotspot resets the schedule; landing
+again starts it over. At most one switch per 60s. `tether.pin` (in memory, via the API) pauses all
 switching. Every decision is logged once, with its reason. "Ask to join hotspots: Automatic"
-(macOS 26+, Apple 109321) covers the no-Wi-Fi-at-all case by itself; its setting lives in a root-only
-file (`com.apple.airport.preferences.plist`: permission denied, measured), so it is only hinted at.
+(macOS 26+, Apple 109321) covers the no-Wi-Fi-at-all case by itself; its setting,
+`AutoHotspotMode` in `/Library/Preferences/SystemConfiguration/com.apple.airport.preferences`, read
+`Automatic` here with `defaults read` and no privilege on 2026-11-06 (the separate
+`com.apple.airport.preferences.plist` was permission denied on 2026-10-21). It is not read by the
+router, so no behaviour depends on it.
 
 **Visibility before return (2026-10-21).** The blind drop was not brief: while travelling with
 the lid closed and no known Wi-Fi, the owner reported this sequence in router.log, 18:40–19:08 KST:
@@ -1873,6 +2632,23 @@ Read-only measurements on the owner's Mac (2026-10-21, `sw_vers`: macOS **27.0.1
   current network. These were successive snapshots while travelling, not simultaneous counts.
   This path cannot identify a saved SSID here and is not used.
 
+**Re-measured 2026-11-06** (the same Mac, at home; read-only, no join/leave/disassociate; en0
+**192.168.45.242/24**, 50 saved SSIDs). A full `scanForNetworksWithNameError($(), error)` took
+**9.5–9.8s** — a real radio scan — and returned 9–13 CWNetworks with SSIDs and RSSIs. Every scan
+answer for the next **~8–10s** took **19–32ms** and came from airportd's cache: at +2/+4/+6/+8s the
+same call answered from cache (count 13), at +10s the radio scanned again (count 11), and a cached
+full scan carried two `ssid` fields as null where a fresh one had none. In range, the saved
+`SK_6954_5G`/`_2.4G`/`_Mesh` read **-36 to -40 dBm**; networks the scan merely heard read **-58 to
+-92** (-69, -73, -74, -79, -81, -83, -85, -92). Directed scans for out-of-range saved SSIDs
+(`mambo_academy 5G`, `KT_starbucks`) and an absent control returned **count 0**; in-range ones
+**count 1**. The shipped `SCAN_KNOWN_JS` was then executed as written: `{"freshMs":9507,…,
+"found":[{"name":"SK_6954_2.4G","rssi":-37}]}`. So the guard takes only a saved non-hotspot SSID at
+**`RETURN_MIN_RSSI_DBM` = -70** or better from a scan that took at least **`SCAN_FRESH_MIN_MS`**
+(1s); a faster answer is re-asked once after **`SCAN_CACHE_TTL_MS`** (10s), and a second cached
+answer is unknown visibility and stays. The 2026-10-21 rule (a non-empty directed set) was true but
+not sufficient: the 18:37 return's "visible" network was weak or already gone — airportd's own
+auto-join right after found `candidateBSSCount=0` — which is what dropped a working hotspot.
+
 Windows uses `netsh wlan show networks mode=ssid interface="<adapter>"` and saved profiles from
 `show profiles` plus exported XML (SSID and auto/manual mode), excluding the hotspot. Only a visible
 SSID with an automatic profile permits return; names of profiles alone are not SSID evidence.
@@ -1891,7 +2667,9 @@ refused, not 503 — until the gate is released or `HOLD_MAX_MS` (120s) has pass
 it proceeds normally (logged `HOLD POST /v1/messages waited N.Ns`). WEB/PASS and any non-model
 request is never held. (2) Wait up to `RETURN_DRAIN_WAIT_MS` (60s; with the switch it stays inside `HOLD_MAX_MS`, and far under the ~180s after which Claude Code gave up on an unanswered call on 2026-10-20) for the calls already running
 (held ones are not counted, so this can only fall, except for a call that hit its 120s). (3) They
-finished → the ordinary leave → probe → keep-or-rejoin sequence above; they did not → no switch, move
+finished → the ordinary leave → probe → keep-or-rejoin sequence above, with its probe loop capped so
+the hotspot is back before the earliest held call goes ahead by itself (120s after the engagement,
+less the ≤45s rejoin — see "A change after an await wins"); they did not → no switch, move
 to the next scheduled point (the same fixed 5/10/20/30/40/50/60-minute schedule, no doubling).
 (4) Release the gate in a `finally`, whatever happened —
 a thrown error included; `stop()` releases it too, the gate releases itself after
@@ -1901,6 +2679,53 @@ self-exit. Each step is logged once: "Wi-Fi return postponed Ns past due while m
 holding new model calls to make a gap…", "running model calls finished after Ns; N held", "hold
 released; N held model calls going ahead". Not measured: how long the CLI's own request timeout lets a
 held request sit (10 min in the Anthropic SDK by default, far above 120s, but the CLI closed unanswered Google turns at 182–190s on 2026-10-20) — no real switch has run yet.
+
+**A network change resets judgement (2026-11-06).** When the Wi-Fi interface's IPv4 address or
+subnet changes, or its class (hotspot↔wifi↔none), `tether.ts` empties the probe window, clears the
+join-failure ladder and the trusted-visibility stamp; a network that **arrived** (the new state has
+an address) also gets **`NETWORK_SETTLE_MS`** (30s) during which failed probes do not count. The
+switch itself fails probes bound to the old address (`EADDRNOTAVAIL`); at 19:43:45, 37s after the
+owner joined home Wi-Fi, five such failures were still in the window and the router joined the
+hotspot over the working network, disassociating it at 19:44:01 (§5). **Losing the address does not
+settle**: a Wi-Fi that went away has no new network to protect, and giving it 30s of ignored
+failures pushed Windows' first hotspot join from ~20s to ~50s after the loss (the window is still
+emptied, which leaves the timing of a healthy Wi-Fi's loss the same as before the settle logic: the
+third failed round). The first observation after a start is a baseline, not a change, so a restart
+does not delay failover.
+
+**A change after an await wins (2026-11-06).** A tick samples the address, then probes it (seconds)
+and, in failover, waits up to `FAILOVER_IDLE_WAIT_MS` (30s) for in-flight calls. Both places read the
+address again before acting: if it changed, the change is handled as above and the tick does not fail
+over — otherwise a Wi-Fi the OS or the person joined during the probe or the wait would be evicted by
+the failover that began before it. A lost address has nothing to evict, so the hotspot join still
+goes ahead. The way back reads it again before the leave too, after either await that precedes it —
+the visibility scan on the quiet path and the drain wait in `returnWithGap` (2026-11-07): a change,
+or a hotspot no longer held, stops the leave, the hold is still released in the `finally`, and the
+next tick judges the new network with its settle (`sampleNetwork` has already reset the window and
+started it). So a Wi-Fi the person or the OS joined while the running calls drained is not
+disassociated by the return decided before it arrived. `leaveHotspot`'s loop then probes for
+`RETURN_PROBE_MS` (20s) and re-reads the address **and subnet** after every probe, so each non-hotspot
+network that appears — even during a probe — resets the good-probe count and extends the deadline to
+`NETWORK_SETTLE_MS` from that appearance, every time (no cap one settle past the base window: a second
+network at +28s keeps its full 30s) before declaring "the Wi-Fi macOS chose has no internet" — a
+network's address can arrive seconds after the disassociate while it is still initialising. A Wi-Fi
+that went away and came back is a new network: a `none` (or the hotspot again) observation clears
+the last-seen Wi-Fi key, so the same address and subnet reappearing gets a full settle instead of
+the deadline of its first appearance (2026-11-07). The whole quiet loop is bounded by
+`RETURN_LOOP_CEILING_MS` (100s); if it is hit, the hotspot is rejoined as after the deadline and the
+loop logs why. A loop under a held gap (`returnWithGap`) is bounded tighter instead: the earliest
+call held at the gate goes ahead `HOLD_MAX_MS` (120s) after the gate engaged, and the final hotspot
+rejoin needs up to `HOTSPOT_REJOIN_BUDGET_MS` (networksetup ≤30s + 15s join settle) of that, so the
+loop and every settle in it end 45s before that — 75s from the engagement at most, drain and leave
+included, never a negative wait (if less than the 20s base window is left, the loop uses what
+remains and logs that the held-call budget cut it). A probe cannot be recalled, so one that would
+still be running at that bound is not started at all (a probe's own maximum is `PROBE_TIMEOUT_MS`,
+4s): the rejoin goes ahead instead — a 58s drain with failing 4s probes starts the rejoin at +72s,
+inside the cap, where starting the last probe put it at +76s, after the 120s a held call waits
+(2026-11-07). Without that cap a held call could go out onto a Wi-Fi with no internet before the
+hotspot was back. The 8s early rejoin when nothing is associated is unchanged, and the hold's own
+failsafe still releases it at engagement + `RETURN_HOLD_FAILSAFE_MS`
+(240s) if the return never came back to release it. Tests: `tether.test.ts`, `tether-win.test.ts`.
 
 **Surfaces.** `GET /api/power` → `{ platform: "darwin"|"win32"|"linux", awake: { mode, applied, reason,
 setup, battery, thermal, lidClosed, until }, tether: { enabled, network, state, pinned, hotspotSsid,
@@ -2015,3 +2840,110 @@ C# compiling under Add-Type, the child's stdin/EOF behaviour under powershell.ex
 SetSuspendState, `powercfg /q` output on a real laptop, and every netsh path are covered only by
 fakes and by a Node stand-in for the child's line protocol. Lid and Wi-Fi need a real laptop with a
 phone in any case — and the learned-network path (§5, 2026-10-20) a real Android phone on both OSes.
+
+## 9. Ripple Remote dead-man switch (2026-11-06)
+
+**What.** The phone is told when the computer it drives stops answering while Claude was working:
+the network dropped, the computer slept, or the host process died. The host cannot push in that
+state, so the relay does it. Code: `packages/remote/src/watch.ts` (host), `relay/room.ts` (room
+logic), `relay/worker.ts` (Durable Object glue), `src/expo-push.ts` (`ExpoNotifier.targets`,
+`system`), `src/relay.ts` (`control`, `onHello`), `src/sessions.ts` (`workActive`).
+
+**Armed while work is active.** `Sessions.workActive()` is the host's own knowledge: a session
+starting/running/waiting, a pending approval, a blocked wrap_up question nobody has answered yet
+(read from the Claude app transcript's own pending state, not from the attention flag that opening
+the session clears), background work a finished turn left running (a host-run session's
+`BackgroundActivity.active` — an async Agent, a background shell, a monitor; observing it active
+also refreshes the idle tail, so the two quiet minutes start when that work finishes), a Claude app
+conversation the host tails or alerts on (its registry status, or `macStates`), or a queue/send in
+flight. While it is true the host sends, every `WATCH_RENEW_MS` (60 s, checked on a 10 s tick) on
+its control socket:
+
+- `{"t":"watch","tokens":[{"token","lang"}],"host":"<host public key>"}` — at most
+  `WATCH_TOKENS_MAX` (10) native Expo tokens, validated with `EXPO_TOKEN_RE` (the same shape
+  `ExpoNotifier` accepts).
+- `{"t":"unwatch"}` once work has been idle for `WATCH_IDLE_MS` (2 min), and as the first control
+  frame a new process sends when it starts idle. The idle window lives in `workActive` (it returns
+  true for `WATCH_IDLE_MS` after the last observation of a running turn — and is moved forward while
+  background work is observed — so even a turn shorter than the relay poll arms the switch);
+  `RelayWatch` sends the unwatch on its first inactive tick.
+
+Every relay `hello` on a new control socket is answered with the current state outright — `watch`
+(renewal) while active, `unwatch` while idle — never "what the host believes the room last heard": a
+frame sent on a socket that died looks sent here, and an idle host that stayed silent after
+reconnecting would leave the old alarm to fire.
+
+**At the room.** A `watch` is kept in Durable Object storage (`watch`) and sets a DO alarm at
+`now + WATCH_ALARM_MS` (3 min); every renewal moves it. If the alarm fires, the room writes
+`firedAt`, POSTs one Expo batch to `https://exp.host/--/api/v2/push/send` (the only network call)
+with `{"to", title:"Ripple Remote", body, data:{session:"",host}, sound:"default", ttl:3600}`, and
+never repeats for that outage — a retried alarm sees `firedAt` and does nothing. Body copy is built
+at the relay from each token's `lang` (`OUTAGE_COPY` in `src/protocol.ts`); the host sends no text.
+Control frames only come from the host's control socket, which the secret was checked for before
+acceptance; a phone socket sending one changes nothing. Liveness is untouched: plain "ping" is
+still answered by the runtime inside the hibernation API. The room's only wake-ups are renewals and
+the alarm.
+
+**Recovery.** On reconnection the room sends `{"relay":"hello"}` then, if this watch has `firedAt`,
+`{"relay":"fired","firedAt":<ms>}`. A `watch` renewal that arrives while `firedAt` is set is that
+same reconnection on a control socket that survived the outage: the computer slept past the alarm
+and resumed on the same WebSocket, so the room says `fired` on that (newest, authenticated) socket
+too and re-arms the alarm; the host's dedupe below keeps it to one notice. An `unwatch` arriving
+while `firedAt` is set is the same reconnection with no renewal — the computer woke idle and drops
+the watch before it renews — so the room says `fired` on that socket as well and keeps `firedAt`
+until the host's `cleared` (with no tokens and no alarm, so no new outage can be pushed while
+unwatched). The host answers `fired` the same way whether or not it is watching: it pushes one
+recovery notice with the outage length in whole minutes (`max(1, round(ms/60000))`) through
+`ExpoNotifier.system`, answers `{"t":"cleared","firedAt"}`, and the room forgets the moment and
+goes back to ordinary renewals. The reported `firedAt` is persisted in `<home>/watch.json` so a host
+restart inside the acknowledge window does not push the same recovery twice (`relay.ts` hands the
+frame to `RelayWatch.hello`).
+
+**No false alarm.** Renewal every 60 s, the idle tail 120 s after the last observed work, alarm
+180 s after the last renewal; the 10 s tick puts `unwatch` at most ~10 s past the idle tail, while
+the last renewal is at most 60 s older, so the alarm is cleared with a minute or more to spare. A
+host restart takes seconds: the new process's first control frame is `unwatch` when it starts with
+no work, which removes the previous process's alarm (and, if an outage was already reported,
+carries the `fired` frame above); a process that starts with work already
+running sends `watch` and moves it. A host that is idle and sleeps leaves no alarm at all. A
+restart longer than 3 min does fire (the host really was gone for that long).
+
+**Online notice: expired Claude login.** Two sources feed one host state: `Sessions.noteBridge`
+entering the existing `HostInfo.desktopProblem` state (a `BridgeAuthError`), and a host-run SDK turn
+refused because the CLI's own login is missing or expired (`isLoginRefusal`; the result error or a
+thrown turn failure). Each source reports beside the other, and `main.ts` asks one
+`DesktopProblemAlert` about `desktopProblem ?? cliLoginProblem` on every problem change and on every
+session update, and the alert pushes once per occurrence the first time the problem holds while
+`workActive()` — to every Expo device (`ExpoNotifier.system`) and every web subscriber
+(`Notifier.system`) regardless of `SEEN_MS`. A problem first seen while nothing was running
+therefore notifies when work starts while it persists; a message that changes without clearing is
+the same occurrence, and a clear followed by a new problem is a new one. The CLI problem clears only when a
+later turn succeeds; any other failure (a dropped connection, an API error) says nothing about the
+login and leaves the problem as it was, so a refusal that recurs after such a failure is the same
+occurrence and sends no second notice. The app problem clears when a bridge request succeeds.
+
+**Privacy.** The relay now stores, per host, the Expo push tokens of the owner's phones, each
+token's language, and the host's public key — the first content the relay holds. It still never
+sees session data (frames stay end-to-end encrypted) and the disconnect body is fixed copy, but
+Expo/Apple/Google now learn that one of this host's phones exists and can be pushed until
+`unwatch`. Web push is not watched: signing a web push needs the host's VAPID private key, which
+must not go to the relay, so only native Expo devices get these two notices.
+
+**Tap behaviour.** Both notices carry no session (`session:""`). The private app ignores a response
+whose session is empty or blank (`app/_layout.tsx` `open`): it clears no destination, navigates
+nowhere and shows no error — a cold or warm tap simply opens the app where it was (iOS and
+Android). The Android push task leaves a message without `e` to the OS notification
+(`push-delivery.ts`), so it is not duplicated and the system shows the title/body. The web push
+path, when used for the login notice, opens Home (`session` is falsy in `web/sw.ts`).
+
+Tests: `test/relay-deadman.test.ts` (alarm moving, one Expo POST with exact payload, unwatch,
+fired/cleared, a renewal on the socket that survived the outage re-announcing `fired` and re-arming,
+an idle unwatch on that socket announcing `fired` and keeping it until `cleared`, token validation
+and cap, unauthenticated socket) and `test/deadman.test.ts` (renewal/idle, current state stated on
+every hello even after a lost frame, fired after the watch was taken away, stale-watch clear,
+recovery minutes and persistence, login notice once per occurrence including a problem seen while
+idle and work starting behind it); `test/sessions.test.ts` covers `workActive` for the idle tail and
+for background work left by a finished turn (its tail starting when that work ends), and the
+CLI-refusal path that feeds the login notice (including an unrelated failure between two refusals
+not resetting it); `test/wrap-up.test.ts` covers a blocked question keeping `workActive` true after
+`markSeen` clears its attention.

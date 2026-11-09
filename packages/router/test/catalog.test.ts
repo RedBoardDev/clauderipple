@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { catalogEntry, loadModelCatalog } from "../src/catalog.ts";
+import { catalogEntry, catalogueWindow, loadModelCatalog } from "../src/catalog.ts";
 
 // Shapes as models.dev served them 2026-10-02.
 const catalog = {
@@ -61,4 +61,52 @@ test("catalogEntry says nothing for a preset without a catalogue or a model it d
 test("loadModelCatalog answers undefined rather than throwing when the catalogue cannot be had", async () => {
   const failing = (async () => { throw new Error("offline"); }) as unknown as typeof fetch;
   assert.equal(await loadModelCatalog(failing), undefined);
+});
+
+// The same model filed under several providers, with the spreads models.dev served on 2026-10-28:
+// one reseller stating a quarter of the model's window, and the rest within rounding of 1M.
+const shared = {
+  "opencode-go": { models: { "deepseek-v4.1-flash": { limit: { context: 1000000 } }, "glm-5.3-flash": { limit: { context: 1000000 } } } },
+  scaleway: { models: { "deepseek-v4.1-flash": { limit: { context: 256000 } } } },
+  engy: { models: { "glm-5.3-flash": { limit: { context: 327680 } } } },
+  deepseek: { models: {
+    "deepseek-flash": { limit: { context: 1048576 } },
+    "dated-20260101": { limit: { context: 512000 } },
+    "zero-window": { limit: { context: 0 } },
+    "fractional-window": { limit: { context: 200000.5 } },
+    "string-window": { limit: { context: "1000000" } },
+    "no-limit": { reasoning: true },
+  } },
+};
+
+test("catalogueWindow matches a model filed under another provider by its bare id", () => {
+  // Hive's ids carry the org and a build stamp (`deepseek-v4.1-flash-1017`); the catalogue's do not.
+  assert.equal(catalogueWindow(shared, "deepseek-ai/deepseek-v4.1-flash-1017"), 256000);
+  assert.equal(catalogueWindow(shared, "zai-org/glm-5.3-flash"), 327680);
+  assert.equal(catalogueWindow(shared, "deepseek-v4.1-flash"), 256000, "a bare id needs no stripping");
+  assert.equal(catalogueWindow(shared, "DeepSeek-V4.1-Flash"), 256000, "case is not a different model");
+});
+
+test("catalogueWindow takes the smallest window the entries state", () => {
+  // Not the model's nominal 1M: an unknown reseller may be the one that cut it, and a window that is
+  // too large overflows and loses the request, while one that is too small only compacts early.
+  assert.equal(catalogueWindow(shared, "org/deepseek-v4.1-flash"), 256000);
+  assert.equal(catalogueWindow(shared, "org/glm-5.3-flash"), 327680);
+});
+
+test("catalogueWindow prefers a catalogue id that already is the stamped one", () => {
+  assert.equal(catalogueWindow(shared, "deepseek/deepseek-v4.1-flash"), 256000);
+  assert.equal(catalogueWindow(shared, "org/dated-20260101"), 512000, "the exact id is tried before stripping");
+});
+
+test("catalogueWindow matches nothing rather than something close", () => {
+  // `deepseek-flash` is a different model that exists in the catalogue, and jev-1.13 is in none.
+  assert.equal(catalogueWindow(shared, "deepseek-ai/deepseek-v4.1-flash-1017-1017"), undefined);
+  assert.equal(catalogueWindow(shared, "opencode/jev-1.13"), undefined);
+  assert.equal(catalogueWindow(shared, "org/deepseek"), undefined, "a prefix is not a model id");
+  assert.equal(catalogueWindow(shared, "org/zero-window"), undefined);
+  assert.equal(catalogueWindow(shared, "org/fractional-window"), undefined);
+  assert.equal(catalogueWindow(shared, "org/string-window"), undefined, "a window is a number, not a string");
+  assert.equal(catalogueWindow(shared, "org/no-limit"), undefined);
+  assert.equal(catalogueWindow(undefined, "org/deepseek-v4.1-flash"), undefined);
 });

@@ -2,7 +2,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { DEFAULTS } from '../../packages/mod/hooks/settings.ts'
 import { EFFORT_JUDGE_SYSTEM, isShortFollowUp, looksLikeQuestion, looksLikeRetry, shouldJudge, judgeContext,
-  parseEffortVerdict, verdictObject, jevEffortRequest, jevWorkerRequest, parseJevEffort, parseJevWorker,
+  parseEffortVerdict, verdictObject, jevEffortRequest, parseJevEffort,
   jevUsage, jevFailure, parseJevKey, tipped, bounded, capped, finalEffort, isCacheSafeModel } from '../../packages/mod/hooks/judge.ts'
 import type { JudgeInput, Pick } from '../../packages/mod/types/index.d.ts'
 
@@ -103,17 +103,6 @@ test('Jev effort body has only the specified root/state/questions and all effort
   assert.equal(empty.state.current_effort, null)
 })
 
-test('Jev worker body asks domain, level, kind and effort, not model, and truncates prompt to 3000', () => {
-  const body = jevWorkerRequest({ description: 'Review', prompt: 'a'.repeat(3000) + 'omitted' })
-  assert.equal(body.model, 'jev-latest')
-  assert.deepEqual(Object.keys(body.questions), ['effort', 'domain', 'level', 'kind'])
-  assert.deepEqual(Object.keys(body.questions.level.criteria), ['light', 'standard', 'deep'])
-  assert.deepEqual(Object.keys(body.questions.kind.criteria), ['plan', 'do'])
-  assert.equal(body.questions.domain.type, 'choice')
-  assert.equal(body.questions.kind.type, 'choice')
-  assert.ok(!body.state.next_message.includes('omitted'))
-})
-
 test('Jev parses direct/nested answers and confidence fallback, keeps a plausible current effort only below .5', () => {
   assert.deepEqual(parseJevEffort({ answers: { effort: { choice: 'low', confidence: 0.49 } } }, pick), { effort: 'high', sure: 0.49, why: 'Unsure, kept the running effort' })
   assert.deepEqual(parseJevEffort({ answers: { effort: { choice: 'medium', confidence: 0.4, probabilities: { medium: 0.6, high: 0.3, low: 0.1 } } } }, pick), { effort: 'high', sure: 0.4, why: 'Unsure, kept the running effort' })
@@ -124,15 +113,6 @@ test('Jev parses direct/nested answers and confidence fallback, keeps a plausibl
   assert.equal(parseJevEffort({ answers: { effort: { choice: 'bad' } } }), undefined)
   assert.equal(parseJevEffort(null), undefined)
   assert.deepEqual(parseJevEffort({ answers: { effort: { choice: 'high', confidence: 2 } } }), { effort: 'high', why: '' })
-})
-
-test('Jev worker needs every choice; only the level confidence is its sureness, all are kept as odds', () => {
-  assert.deepEqual(parseJevWorker({ result: { answers: { domain: { choice: 'design', confidence: 0.8 }, level: { choice: 'deep', confidence: 0.9 }, effort: { choice: 'high', probabilities: { high: 0.6 } } } } }), { domain: 'design', level: 'deep', kind: 'do', effort: 'high', sure: 0.9, odds: { domain: 0.8, level: 0.9, effort: 0.6 }, why: '' })
-  assert.deepEqual(parseJevWorker({ answers: { domain: { choice: 'general' }, level: { choice: 'light' }, effort: { choice: 'low' } } }), { domain: 'general', level: 'light', kind: 'do', effort: 'low', why: '' })
-  // Neither a torn domain, kind nor effort moves the task up: that is the level's to say.
-  assert.deepEqual(parseJevWorker({ answers: { domain: { choice: 'backend', confidence: 0.3 }, level: { choice: 'standard', confidence: 0.8 }, kind: { choice: 'plan', confidence: 0.2 }, effort: { choice: 'high', confidence: 0.4 } } }), { domain: 'backend', level: 'standard', kind: 'plan', effort: 'high', sure: 0.8, odds: { domain: 0.3, level: 0.8, kind: 0.2, effort: 0.4 }, why: '' })
-  assert.equal(parseJevWorker({ answers: { domain: { choice: 'general' }, level: { choice: 'light' }, kind: { choice: 'think' }, effort: { choice: 'low' } } })?.kind, 'do')
-  for (const json of [null, {}, { answers: { tier: { choice: 'bad' }, effort: { choice: 'high' } } }, { answers: { tier: { choice: 'deep' } } }]) assert.equal(parseJevWorker(json), undefined)
 })
 
 test('Jev usage is top-level and failures give readable status-specific reasons', () => {

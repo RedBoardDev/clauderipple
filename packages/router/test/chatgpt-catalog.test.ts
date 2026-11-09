@@ -38,7 +38,7 @@ test("parseCodexCatalog keeps listed models, drops hidden ones and formats names
   assert.equal(models[0]!.name, "GPT-6 Sol", "a hyphen before a capital reads as a space");
   assert.equal(models[1]!.name, "GPT-5.5", "a numeric suffix is not a joining hyphen");
   assert.deepEqual(models[0]!.effortLevels, ["low", "ultra"]);
-  assert.equal(models[0]!.contextWindow, 272000);
+  assert.equal(models[0]!.contextWindow, 258400, "272000 at Codex's default 95%");
   assert.deepEqual(models[1]!.effortLevels, ["low", "medium", "high", "xhigh"]);
 });
 
@@ -55,6 +55,25 @@ test("parseCodexCatalog tolerates garbage and missing fields", () => {
   const odd = parseCodexCatalog({ models: [{ slug: "m", visibility: "list", context_window: 0 }, { slug: "n", visibility: "list", context_window: "272000" }] });
   assert.equal(odd[0]!.contextWindow, undefined);
   assert.equal(odd[1]!.contextWindow, undefined);
+});
+
+test("parseCodexCatalog reports the effective window Codex runs with", () => {
+  const models = parseCodexCatalog({
+    models: [
+      { slug: "gpt-6.1-sol", visibility: "list", context_window: 500000, effective_context_window_percent: 95 },
+      { slug: "gpt-6-astra", visibility: "list", context_window: 272000, effective_context_window_percent: 95 },
+      { slug: "no-percent", visibility: "list", context_window: 200000 },
+      { slug: "odd-percent", visibility: "list", context_window: 200000, effective_context_window_percent: "95" },
+      { slug: "rounded", visibility: "list", context_window: 272001, effective_context_window_percent: 95 },
+    ],
+  });
+  const byId = new Map(models.map((m) => [m.id, m.contextWindow]));
+  assert.equal(byId.get("gpt-6.1-sol"), 475000, "500000 × 95%, the window Codex itself uses");
+  assert.equal(byId.get("gpt-6-astra"), 258400);
+  // The backend sends no percent (2026-10-23) and Codex fills in 95 itself; so does ClaudeRipple.
+  assert.equal(byId.get("no-percent"), 190000, "a catalogue without the percent gets Codex's default 95%");
+  assert.equal(byId.get("odd-percent"), 190000, "a percent that is not a number falls back to the same 95%");
+  assert.equal(byId.get("rounded"), 258400, "rounded down");
 });
 
 test("codexClientVersion floors without a cache file and honours a newer one", () => {
@@ -85,7 +104,7 @@ test("codexClientVersion floors without a cache file and honours a newer one", (
 
 test("the fallback catalogue carries the measured ladders", () => {
   const byId = new Map(CHATGPT_FALLBACK_MODELS.map((m) => [m.id, m]));
-  assert.deepEqual([...byId.keys()], ["gpt-5.6-terra", "gpt-5.6-sol", "gpt-5.6-luna", "gpt-6-astra", "gpt-6-sol", "gpt-6-luna"]);
+  assert.deepEqual([...byId.keys()], ["gpt-5.6-terra", "gpt-5.6-sol", "gpt-5.6-luna", "gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "gpt-6.1-sol"]);
   assert.deepEqual(byId.get("gpt-5.6-terra")!.effortLevels, ["low", "medium", "high", "xhigh", "max", "ultra"]);
   assert.deepEqual(byId.get("gpt-5.6-sol")!.effortLevels, ["low", "medium", "high", "xhigh", "max", "ultra"]);
   assert.deepEqual(byId.get("gpt-6-sol")!.effortLevels, ["low", "medium", "high", "xhigh", "max", "ultra"]);
@@ -93,4 +112,5 @@ test("the fallback catalogue carries the measured ladders", () => {
   assert.deepEqual(byId.get("gpt-5.6-luna")!.effortLevels, ["low", "medium", "high", "xhigh", "max"], "Luna takes no ultra");
   assert.deepEqual(byId.get("gpt-6-luna")!.effortLevels, ["low", "medium", "high", "xhigh", "max"], "Luna takes no ultra");
   assert.equal(byId.get("gpt-5.6-luna")!.contextWindow, 272000);
+  assert.equal(byId.get("gpt-6.1-sol")!.contextWindow, 475000, "the effective window measured 2026-10-23");
 });

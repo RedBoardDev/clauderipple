@@ -23,6 +23,8 @@
 // committed: replacing it mid-stream produces two half-answers spliced together. The caller
 // enforces this; `Outcome.retryable` only ever means "if nothing has been sent yet".
 
+import { matchesAccountPin } from "./routing.ts";
+
 export type FailureKind =
   /** Credentials refused. Does not heal on its own. */
   | "auth"
@@ -39,10 +41,14 @@ export type Verdict =
 
 /** A rate limit with no stated reset. Long enough not to hammer, short enough to recover a session. */
 const DEFAULT_RATE_LIMIT_MS = 60_000;
+/** How long an idle conversation, or a rememberable answer, keeps its claim on a credential. */
+const DEFAULT_STICKY_MS = 60 * 60_000;
 const TRANSIENT_MS = 10_000;
 const EXHAUSTED_MS = 30 * 60_000;
 /** A relay passing on its upstream's failure; whatever status it chose, the credential did nothing. */
 export const RELAY_UPSTREAM_FAILED = /upstream (request )?failed/i;
+/** Cloudflare refusing a request by its fingerprint before the vendor reads the key (#132). */
+export const CLOUDFLARE_FINGERPRINT_BLOCK = /\berror (?:code:\s*)?1010\b/i;
 /** A `Retry-After` beyond this is treated as "not within this session"; the credential is parked. */
 const MAX_COOLDOWN_MS = 6 * 60 * 60_000;
 
@@ -52,12 +58,28 @@ const MAX_COOLDOWN_MS = 6 * 60 * 60_000;
  */
 export function classify(status: number, retryAfterMs?: number, body = ""): Verdict {
   const bounded = (ms: number): number => Math.max(1_000, Math.min(MAX_COOLDOWN_MS, Math.round(ms)));
+  // #101: this relay 400 names the workspace's opt-in, not the request shape. Another key can
+  // answer it. Do not generalise to every relay/server_error 400: malformed requests still stop.
+  if (status === 400 && RELAY_UPSTREAM_FAILED.test(body)) {
+    let error: { type?: unknown; message?: unknown } | undefined;
+    try { error = (JSON.parse(body) as { error?: typeof error } | null)?.error; } catch { /* not the measured JSON refusal */ }
+    if (error?.type === "server_error" && typeof error.message === "string" &&
+        RELAY_UPSTREAM_FAILED.test(error.message) && /This Go model requires Global regions\b/i.test(error.message)) {
+      return { retryable: true, kind: "auth", cooldownMs: bounded(retryAfterMs ?? DEFAULT_RATE_LIMIT_MS), quarantine: false };
+    }
+  }
   // 401 is the credential being rejected, and that does not heal: park it.
   if (status === 401) return { retryable: true, kind: "auth", cooldownMs: 0, quarantine: true };
   // 403 is not only that. It is also a content policy, a blocked region, a model the account may
   // not use, or an edge refusing what it took for a bot — none of which mean the key is dead.
   // Parking a working credential until someone notices is the worse mistake, so this waits instead.
   if (status === 403) {
+    // Cloudflare's `error code: 1010` refuses the request's fingerprint before any key is read
+    // (#132). Every credential sends the same fingerprint, so trying the next one, or cooling this
+    // one, only moves the conversation off its cache to be refused again.
+    if (CLOUDFLARE_FINGERPRINT_BLOCK.test(body)) {
+      return { retryable: false, reason: "Cloudflare refused the request's fingerprint (error 1010), not the credential" };
+    }
     // Except when the vendor says the refusal was not about us. A relay passing on a broken upstream
     // answers 403, and that is not a statement about the credential at all: charging it a minute of
     // cooldown made every turn in that minute come back to the user as an authentication error
@@ -70,6 +92,11 @@ export function classify(status: number, retryAfterMs?: number, body = ""): Verd
     }
     return { retryable: true, kind: "auth", cooldownMs: bounded(retryAfterMs ?? DEFAULT_RATE_LIMIT_MS), quarantine: false };
   }
+  // The same relay answers 429 for its own upstream failing, not for our key being over a limit
+  // (`[prefill_cap_refused] the cell is at capacity; retry shortly`, `[overloaded]`, 2026-11-06): the
+  // key answered 200 five seconds later. Charging it a cooldown moved every turn of that window to
+  // another credential (or failed it), and the identical request works on the next attempt.
+  if (status === 429 && RELAY_UPSTREAM_FAILED.test(body)) return { retryable: true, kind: "transient", cooldownMs: 0, quarantine: false };
   if (status === 429) return { retryable: true, kind: "rate-limit", cooldownMs: bounded(retryAfterMs ?? DEFAULT_RATE_LIMIT_MS), quarantine: false };
   // The same relay answers 402 for a model whose own endpoint is down ("server_error … Upstream
   // request failed: Endpoint is unavailable", OpenCode Go for minimax-m3.1-flash-free, 2026-10-22).
@@ -113,10 +140,17 @@ export function retryAfterMs(headers: Record<string, string | string[] | undefin
   return undefined;
 }
 
-/** A single usable credential. `id` keys runtime health; `ownerId` identifies its durable account. */
-export type Credential = { id: string; headers: Record<string, string>; label?: string; ownerId?: string };
+/**
+ * A single usable credential. `ownerId` keys affinity and admin surfaces; `id` is the runtime
+ * generation a quarantine belongs to. Health defaults to `ownerId`, and `healthKey` overrides it
+ * when the display owner is shared: every Claude login generation is named `current`, so the app's
+ * own login states the account itself there (its upstream account uuid, locally read and hashed) or
+ * falls back to the runtime generation.
+ */
+export type Credential = { id: string; headers: Record<string, string>; label?: string; ownerId?: string; healthKey?: string; preferred?: boolean; paused?: boolean };
 
-type Health = { cooldownUntil: number; quarantined: boolean; failures: number };
+/** Cooldowns and failures belong to the durable account, so a token refresh never clears a rest. */
+type Health = { cooldownUntil: number; failures: number };
 
 export type CredentialReport = {
   id: string;
@@ -125,65 +159,159 @@ export type CredentialReport = {
   /** Seconds until this credential is usable again; absent when it is ready or quarantined. */
   cooldownSeconds?: number;
   failures: number;
-  /** Last account to serve a successful upstream response, not merely a usable credential. */
-  active: boolean;
+  paused: boolean;
+  preferred: boolean;
+  inUse: boolean;
 };
 
 /**
  * Health and stickiness for one router's credentials, keyed `provider/credential`. In memory only:
  * a cooldown that outlived a restart would be a restart that made things worse, and a quarantine is
  * re-earned on the first request anyway.
+ *
+ * **A rest belongs to the durable account.** Claude credentials carry a token-generation digest in
+ * `id`, so a refresh during a 5h/7d window rest used to hand back a fresh id with no cooldown and
+ * spend an account whose window was still gone (2026-11-07, the account-pool audit). Cooldowns and
+ * failure counts are keyed by the durable account — a credential's `healthKey`, else its `ownerId`,
+ * else its runtime `id` — so a refresh never revives a resting account. A quarantine is the opposite
+ * statement — this exact token was refused — and stays keyed by the runtime `id`, so a re-login does
+ * not inherit it (the reason the generation digest exists, 2026-09-20).
+ *
+ * An operator changing which credential is preferred is the one move allowed to break a healthy
+ * affinity: the owner asked for that account, so held conversations re-pick it on their next turn.
+ * A credential merely recovering from a cooldown is not such a move, and neither is removing the
+ * preference.
  */
 export class CredentialPool {
   private readonly health = new Map<string, Health>();
-  private readonly active = new Map<string, string>();
-  /** conversation → durable owner id (or runtime id when there is no owner), preserving its cache across token refreshes. */
-  private readonly sticky = new Map<string, { provider: string; ownerId: string; at: number }>();
+  /** Runtime credential id → the durable account whose cooldowns and failures it shares. */
+  private readonly accounts = new Map<string, { ownerId: string; healthKey: string }>();
+  /** Runtime credential ids whose token generation a 401 parked; a new generation starts unparked. */
+  private readonly quarantined = new Set<string>();
+  /** (provider, conversation) → durable owner id (or runtime id), preserving each provider's cache. */
+  private readonly sticky = new Map<string, { ownerId: string; at: number }>();
+  /** The preferred owner id each provider was last seen with, so a change re-picks held conversations. */
+  private readonly lastPreferred = new Map<string, string>();
   private readonly now: () => number;
   /** How long an idle conversation keeps its claim on a credential. */
   private readonly stickyTtlMs: number;
 
   constructor(opts: { now?: () => number; stickyTtlMs?: number } = {}) {
     this.now = opts.now ?? Date.now;
-    this.stickyTtlMs = opts.stickyTtlMs ?? 60 * 60_000;
+    this.stickyTtlMs = opts.stickyTtlMs ?? DEFAULT_STICKY_MS;
   }
 
   private key(provider: string, id: string): string { return `${provider}/${id}`; }
 
+  /** The durable account a runtime credential belongs to, once the pool has seen it. */
+  private accountOf(provider: string, id: string): string {
+    return this.accounts.get(this.key(provider, id))?.healthKey ?? id;
+  }
+
+  /** Remember which account each runtime generation belongs to. Cheap, and idempotent. */
+  private remember(provider: string, credentials: readonly Credential[]): void {
+    for (const credential of credentials) {
+      this.accounts.set(this.key(provider, credential.id), {
+        ownerId: credential.ownerId ?? credential.id,
+        healthKey: credential.healthKey ?? credential.ownerId ?? credential.id,
+      });
+    }
+  }
+
+  /** A conversation's claim, scoped by provider so one provider's preference change cannot touch another's. */
+  private stickyKey(provider: string, conversation: string): string { return `${provider}\u0000${conversation}`; }
+
   private healthOf(provider: string, id: string): Health {
-    const key = this.key(provider, id);
+    const key = this.key(provider, this.accountOf(provider, id));
     let h = this.health.get(key);
-    if (!h) { h = { cooldownUntil: 0, quarantined: false, failures: 0 }; this.health.set(key, h); }
+    if (!h) { h = { cooldownUntil: 0, failures: 0 }; this.health.set(key, h); }
     return h;
   }
 
-  private usable(provider: string, id: string): boolean {
+  /**
+   * A quota scope's health lives beside the credential's own, under `provider/account#scope`. A
+   * scope is a part of one credential's quota that runs out on its own: Antigravity counts Gemini
+   * models and Claude/GPT models separately, and one group at 100% must not rest the other.
+   */
+  private scopedKey(provider: string, id: string, scope: string): string { return `${this.key(provider, this.accountOf(provider, id))}#${scope}`; }
+
+  private scopedHealthOf(provider: string, id: string, scope: string): Health {
+    const key = this.scopedKey(provider, id, scope);
+    let h = this.health.get(key);
+    if (!h) { h = { cooldownUntil: 0, failures: 0 }; this.health.set(key, h); }
+    return h;
+  }
+
+  private usable(provider: string, id: string, scope?: string): boolean {
     const h = this.healthOf(provider, id);
-    return !h.quarantined && h.cooldownUntil <= this.now();
+    if (this.quarantined.has(this.key(provider, id)) || h.cooldownUntil > this.now()) return false;
+    if (!scope) return true;
+    return (this.health.get(this.scopedKey(provider, id, scope))?.cooldownUntil ?? 0) <= this.now();
   }
 
   /**
    * The credential to use, or null when every one of them is cooling or quarantined. The
    * conversation's existing credential wins while it is healthy; otherwise the first usable one in
-   * configured order, which makes the order meaningful rather than incidental.
+   * configured order, which makes the order meaningful rather than incidental. With a `scope`, a
+   * credential whose quota for that scope is resting is skipped too.
+   *
+   * A change of preferred owner is applied before the held claim is read, so a conversation the
+   * operator has moved re-picks the new account right here rather than one turn later.
    */
-  pick(provider: string, credentials: readonly Credential[], conversation?: string): Credential | null {
+  pick(provider: string, credentials: readonly Credential[], conversation?: string, scope?: string): Credential | null {
     if (credentials.length === 0) return null;
+    this.remember(provider, credentials);
     this.expireSticky();
+    this.observePreference(provider, credentials);
+    const stickyKey = conversation ? this.stickyKey(provider, conversation) : "";
     if (conversation) {
-      const held = this.sticky.get(conversation);
-      if (held && held.provider === provider) {
+      const held = this.sticky.get(stickyKey);
+      if (held) {
         const current = credentials.find((c) => (c.ownerId ?? c.id) === held.ownerId);
-        if (current && this.usable(provider, current.id)) {
+        if (current && !current.paused && this.usable(provider, current.id, scope)) {
           held.at = this.now();
           return current;
         }
       }
     }
-    const next = credentials.find((c) => this.usable(provider, c.id));
+    const usable = (c: Credential): boolean => !c.paused && this.usable(provider, c.id, scope);
+    const next = credentials.find((c) => c.preferred && usable(c)) ?? credentials.find(usable);
     if (!next) return null;
-    if (conversation) this.sticky.set(conversation, { provider, ownerId: next.ownerId ?? next.id, at: this.now() });
+    if (conversation) this.sticky.set(stickyKey, { ownerId: next.ownerId ?? next.id, at: this.now() });
     return next;
+  }
+
+  /**
+   * Note which credential this provider now calls preferred, whether or not it is usable: a cooldown
+   * ending is not a preference change. A defined owner that differs from the last one seen — including
+   * the first one seen after no preference at all — drops the provider's held conversations, so each
+   * re-picks; a preference change deliberately costs those conversations one cold prompt cache.
+   * Removing the preference is a change too: the owner is asking for the configured order back, so
+   * held conversations re-pick from it. Until 0.12.27 a removal moved nothing, and conversations
+   * kept running on the account the owner had just stopped preferring (2026-11-05). Only a list that
+   * still holds the last preferred owner, now unmarked, proves a removal: a retry's list leaves out
+   * the credential it already tried.
+   */
+  private observePreference(provider: string, credentials: readonly Credential[]): void {
+    const preferred = credentials.find((c) => c.preferred);
+    if (!preferred) {
+      const seen = this.lastPreferred.get(provider);
+      if (seen !== undefined && credentials.some((c) => (c.ownerId ?? c.id) === seen)) {
+        this.lastPreferred.delete(provider);
+        this.dropSticky(provider);
+      }
+      return;
+    }
+    const ownerId = preferred.ownerId ?? preferred.id;
+    const seen = this.lastPreferred.get(provider);
+    this.lastPreferred.set(provider, ownerId);
+    if (seen !== ownerId) this.dropSticky(provider);
+  }
+
+  /** Drop this provider's held conversations; another provider's claims must survive it. */
+  private dropSticky(provider: string): void {
+    const prefix = this.stickyKey(provider, "");
+    for (const key of this.sticky.keys()) if (key.startsWith(prefix)) this.sticky.delete(key);
   }
 
   /**
@@ -191,17 +319,24 @@ export class CredentialPool {
    * committed to a provider, so a session whose primary is rate-limited for the next hour goes to
    * its fallback instead of failing once per request until the window resets.
    */
-  hasUsable(provider: string, credentials: readonly Credential[]): boolean {
-    return credentials.some((c) => this.usable(provider, c.id));
+  hasUsable(provider: string, credentials: readonly Credential[], scope?: string): boolean {
+    this.remember(provider, credentials);
+    return credentials.some((c) => !c.paused && this.usable(provider, c.id, scope));
   }
 
-  /** Record a failure. Returns the verdict so the caller can decide whether to try the next one. */
-  penalise(provider: string, id: string, status: number, retryAfterMs?: number, body = ""): Verdict {
+  /**
+   * Record a failure. Returns the verdict so the caller can decide whether to try the next one.
+   *
+   * With a `scope`, a rate limit rests only that scope of the credential: the vendor said one quota
+   * group is spent, not that the credential is. Every other failure (a refused credential, a 402, a
+   * broken upstream) is still about the whole credential and rests all of it.
+   */
+  penalise(provider: string, id: string, status: number, retryAfterMs?: number, body = "", scope?: string): Verdict {
     const verdict = classify(status, retryAfterMs, body);
     if (!verdict.retryable) return verdict;
-    const h = this.healthOf(provider, id);
+    const h = scope && verdict.kind === "rate-limit" ? this.scopedHealthOf(provider, id, scope) : this.healthOf(provider, id);
     h.failures++;
-    if (verdict.quarantine) h.quarantined = true;
+    if (verdict.quarantine) this.quarantined.add(this.key(provider, id));
     else h.cooldownUntil = Math.max(h.cooldownUntil, this.now() + verdict.cooldownMs);
     return verdict;
   }
@@ -211,38 +346,84 @@ export class CredentialPool {
    *
    * An unexpired cooldown is left alone. Requests overlap, and a 200 arriving after a concurrent
    * 429 does not mean the rate limit went away — clearing it here would send the next turn straight
-   * back into the limit. The cooldown expires on its own soon enough.
+   * back into the limit. The cooldown expires on its own soon enough. The same holds for the scope
+   * the answer was in.
    */
-  succeed(provider: string, id: string, ownerId = id): void {
-    this.active.set(provider, ownerId);
+  succeed(provider: string, id: string, scope?: string): void {
     const h = this.healthOf(provider, id);
     if (h.cooldownUntil <= this.now()) h.cooldownUntil = 0;
-    h.quarantined = false;
+    this.quarantined.delete(this.key(provider, id));
     h.failures = 0;
+    const scoped = scope ? this.health.get(this.scopedKey(provider, id, scope)) : undefined;
+    if (scoped && scoped.cooldownUntil <= this.now()) this.health.delete(this.scopedKey(provider, id, scope!));
   }
 
-  /** Durable owner of the last success, even when its credential has since expired. */
-  activeOwner(provider: string): string | null { return this.active.get(provider) ?? null; }
-
-  /** Operator action from the dashboard: give a parked credential another chance now. */
+  /** Operator action from the dashboard: give a parked credential, and all its scopes, another chance now. */
   clear(provider: string, id?: string): void {
-    if (id) { this.health.delete(this.key(provider, id)); return; }
+    if (id) {
+      const runtime = this.key(provider, id);
+      this.quarantined.delete(runtime);
+      const account = this.key(provider, this.accounts.get(runtime)?.healthKey ?? id);
+      this.health.delete(account);
+      for (const k of [...this.health.keys()]) if (k.startsWith(`${account}#`)) this.health.delete(k);
+      return;
+    }
     for (const key of [...this.health.keys()]) if (key.startsWith(`${provider}/`)) this.health.delete(key);
+    for (const key of [...this.quarantined]) if (key.startsWith(`${provider}/`)) this.quarantined.delete(key);
+  }
+
+  /**
+   * Clear every token generation of one durable login, including a paused or expired one, and its
+   * scopes. The login's own rest may live under a health key of its own (the app login's account
+   * identity), which the runtime map is what connects back to `ownerId`.
+   */
+  clearOwner(provider: string, ownerId: string): void {
+    const account = this.key(provider, ownerId);
+    for (const key of [...this.health.keys()]) {
+      if (key === account || key.startsWith(`${account}#`) || key.startsWith(`${account}:`)) this.health.delete(key);
+    }
+    for (const [runtime, record] of [...this.accounts]) {
+      // Two providers can share one login ("current"): each clear forgets only its own mappings.
+      if (record.ownerId !== ownerId || !runtime.startsWith(`${provider}/`)) continue;
+      const health = this.key(provider, record.healthKey);
+      for (const key of [...this.health.keys()]) {
+        if (key === health || key.startsWith(`${health}#`) || key.startsWith(`${health}:`)) this.health.delete(key);
+      }
+      this.quarantined.delete(runtime);
+      this.accounts.delete(runtime);
+    }
+    for (const key of [...this.quarantined]) if (key === account || key.startsWith(`${account}:`)) this.quarantined.delete(key);
+  }
+
+  /** Seconds until each resting scope of one credential is usable again; empty when none rests. */
+  scopeCooldowns(provider: string, id: string): Record<string, number> {
+    const now = this.now();
+    const prefix = `${this.key(provider, this.accountOf(provider, id))}#`;
+    const out: Record<string, number> = {};
+    for (const [key, h] of this.health) {
+      if (key.startsWith(prefix) && h.cooldownUntil > now) out[key.slice(prefix.length)] = Math.ceil((h.cooldownUntil - now) / 1000);
+    }
+    return out;
   }
 
   /** For the Health screen: why a credential is not being used, and for how long. */
   report(provider: string, credentials: readonly Credential[]): CredentialReport[] {
+    this.remember(provider, credentials);
     const now = this.now();
+    const inUse = this.pick(provider, credentials)?.id;
     return credentials.map((c) => {
       const h = this.healthOf(provider, c.id);
-      const cooling = !h.quarantined && h.cooldownUntil > now;
+      const quarantined = this.quarantined.has(this.key(provider, c.id));
+      const cooling = !quarantined && h.cooldownUntil > now;
       return {
         id: c.id,
         ...(c.label ? { label: c.label } : {}),
-        state: h.quarantined ? "quarantined" : cooling ? "cooling" : "ready",
+        state: quarantined ? "quarantined" : cooling ? "cooling" : "ready",
         ...(cooling ? { cooldownSeconds: Math.ceil((h.cooldownUntil - now) / 1000) } : {}),
         failures: h.failures,
-        active: this.active.get(provider) === (c.ownerId ?? c.id),
+        paused: c.paused === true,
+        preferred: c.preferred === true,
+        inUse: c.id === inUse,
       };
     });
   }
@@ -250,6 +431,72 @@ export class CredentialPool {
   private expireSticky(): void {
     const cutoff = this.now() - this.stickyTtlMs;
     for (const [conversation, held] of this.sticky) if (held.at < cutoff) this.sticky.delete(conversation);
+  }
+}
+
+/**
+ * The credential a resolved route pins, when it is present and usable. This is the one answer for
+ * every provider whose turn picks among stored accounts (Claude OAuth, ChatGPT, Google Antigravity):
+ * a pinned account that is absent, paused, cooling or quarantined returns undefined, and the caller
+ * takes its ordinary pick, so a pin never fails a turn. A quota `scope` rests only that part of the
+ * account, as `hasUsable` does. `tried` is the caller's business: hand it a list without the
+ * accounts this turn already spent, and the pin is honoured first and then falls back like the rest.
+ */
+export function pinnedCredential<T extends Credential>(provider: string, credentials: readonly T[], pin: string | undefined, pool: CredentialPool, scope?: string): T | undefined {
+  if (!pin) return undefined;
+  const pinned = credentials.find((credential) => matchesAccountPin(credential.ownerId, pin));
+  return pinned && pool.hasUsable(provider, [pinned], scope) ? pinned : undefined;
+}
+
+/**
+ * Which conversation produced a given assistant message id, for server-side thread continuation.
+ *
+ * A `continue` carries only the new messages (tool results and attachments), so its first user
+ * message is not the conversation's and the conversation key computed from the request is a new
+ * one every turn. A pool would then start a fresh affinity and pick the preferred account, while
+ * the thread lives on the account that produced `previous_message_id` (measured 2026-11-04: every
+ * turn spent a 404 `thread_not_found` and a full replay). Remembering the producing conversation's
+ * key lets the continue ask the pool for that same key. Process memory only, bounded by the same
+ * TTL as an idle conversation and by a size cap; an unknown id keeps the computed key.
+ */
+export class ThreadAffinity {
+  private readonly entries = new Map<string, { key: string; at: number }>();
+  private readonly now: () => number;
+  private readonly ttlMs: number;
+  private readonly maxEntries: number;
+
+  constructor(opts: { now?: () => number; ttlMs?: number; maxEntries?: number } = {}) {
+    this.now = opts.now ?? Date.now;
+    this.ttlMs = opts.ttlMs ?? DEFAULT_STICKY_MS;
+    this.maxEntries = opts.maxEntries ?? 20_000;
+  }
+
+  remember(messageId: string, conversation: string): void {
+    this.prune();
+    // Re-insert so the oldest-eviction order reflects the latest use.
+    this.entries.delete(messageId);
+    this.entries.set(messageId, { key: conversation, at: this.now() });
+    for (const id of this.entries.keys()) {
+      if (this.entries.size <= this.maxEntries) break;
+      this.entries.delete(id);
+    }
+  }
+
+  lookup(messageId: string): string | undefined {
+    const entry = this.entries.get(messageId);
+    if (!entry) return undefined;
+    if (entry.at < this.now() - this.ttlMs) {
+      this.entries.delete(messageId);
+      return undefined;
+    }
+    return entry.key;
+  }
+
+  get size(): number { return this.entries.size; }
+
+  private prune(): void {
+    const cutoff = this.now() - this.ttlMs;
+    for (const [id, entry] of this.entries) if (entry.at < cutoff) this.entries.delete(id);
   }
 }
 

@@ -89,6 +89,26 @@ test("the authorize URL carries a PKCE challenge, and the loopback callback comp
   fs.rmSync(home, { recursive: true, force: true });
 });
 
+test("a cancel that arrives while the callback's code is being exchanged does not lose the sign-in", async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "cr-claude-oauth-"));
+  const port = await freePort();
+  let release!: () => void;
+  const held = new Promise<void>((r) => { release = r; });
+  const endpoint = tokenEndpoint();
+  const slow = async (url: string, init: RequestInit): Promise<Response> => { await held; return endpoint.fetchImpl(url, init); };
+  const session = new ClaudeOAuthSession({ home, port, fetch: slow });
+  const state = new URL((await session.start()).url).searchParams.get("state")!;
+
+  const page = await fetch(`http://127.0.0.1:${port}${CLAUDE_OAUTH.callbackPath}?code=the-code&state=${state}`);
+  assert.equal(page.status, 200, "the browser is told it is connected before the exchange ends");
+  session.cancel(); // the dashboard dialog closed meanwhile
+  release();
+  await session.result;
+  assert.equal(session.snapshot.ok, true);
+  assert.equal(readClaudeAccountsFile(home).length, 1, "the account is saved");
+  fs.rmSync(home, { recursive: true, force: true });
+});
+
 test("a taken preferred port falls back to a random loopback port before manual mode", async () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "cr-claude-oauth-"));
   const taken = net.createServer();
@@ -163,6 +183,33 @@ test("a refused exchange fails the attempt with the endpoint's reason", async ()
   await assert.rejects(session.result, /code already used/);
   assert.equal(readClaudeAuthFile(home), null);
   fs.rmSync(home, { recursive: true, force: true });
+});
+
+test("malformed successful token exchanges reject and finish the attempt instead of leaving it pending", { timeout: 5000 }, async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "cr-claude-oauth-"));
+  try {
+    for (const body of ["{}", '{"access_token":"incomplete"}', "null", "not JSON"]) {
+      const session = new ClaudeOAuthSession({ home, port: 0, fetch: async () => new Response(body, { status: 200 }) });
+      try {
+        await session.start();
+        await session.submitCode("malformed-reply");
+        assert.equal(session.snapshot.running, false, `reply ${body} must finish the attempt`);
+        await assert.rejects(session.result);
+        assert.equal(session.snapshot.ok, false);
+        assert.ok(session.snapshot.error);
+        assert.ok(session.snapshot.finishedAt);
+        session.cancel();
+        assert.equal(session.snapshot.running, false);
+        assert.deepEqual(readClaudeAccountsFile(home), []);
+        assert.equal(fs.existsSync(claudeAccountsPath(home)), false);
+        const probe = net.createServer();
+        await new Promise<void>((resolve, reject) => {
+          probe.once("error", reject);
+          probe.listen(session.port!, "127.0.0.1", () => probe.close(error => error ? reject(error) : resolve()));
+        });
+      } finally { session.cancel(); }
+    }
+  } finally { fs.rmSync(home, { recursive: true, force: true }); }
 });
 
 test("token endpoint errors cannot echo authorization or refresh secrets", async () => {

@@ -26,6 +26,8 @@ export const CODEX_CLIENT_VERSION_FLOOR = "0.159.0";
  * Copied from the Codex catalog 2026-09-23, used only when the live catalog cannot be read. The
  * catalog lists `ultra` on astra, sol and 5.6 terra/sol and not on either Luna — the reverse of a
  * 2026-09-11 measurement (ARCHITECTURE §4); `effortClamp` keeps `ultra` off the wire regardless.
+ * gpt-6.1-sol was measured on 2026-10-23 (`context_window: 500000`,
+ * `effective_context_window_percent: 95`, so 475000 — the window Codex itself runs with).
  */
 export const CHATGPT_FALLBACK_MODELS: ProviderModel[] = [
   { id: "gpt-5.6-terra", name: "GPT-5.6 Terra", effortLevels: ["low", "medium", "high", "xhigh", "max", "ultra"], contextWindow: 272000 },
@@ -34,7 +36,22 @@ export const CHATGPT_FALLBACK_MODELS: ProviderModel[] = [
   { id: "gpt-6-astra", name: "GPT-6 Astra", effortLevels: ["low", "medium", "high", "xhigh", "max", "ultra"], contextWindow: 272000 },
   { id: "gpt-6-sol", name: "GPT-6 Sol", effortLevels: ["low", "medium", "high", "xhigh", "max", "ultra"], contextWindow: 272000 },
   { id: "gpt-6-luna", name: "GPT-6 Luna", effortLevels: ["low", "medium", "high", "xhigh", "max"], contextWindow: 272000 },
+  { id: "gpt-6.1-sol", name: "GPT-6.1 Sol", effortLevels: ["low", "medium", "high", "xhigh", "max", "ultra"], contextWindow: 475000 },
 ];
+
+/**
+ * The window Codex itself runs with: `context_window` times `effective_context_window_percent`,
+ * rounded down (gpt-6.1-sol: 500000 × 95% = 475000, 2026-10-23). The backend leaves the percent
+ * out (2026-10-23, client_version 0.163.0 and 0.164.0: gpt-6.1-sol came back as context_window
+ * 500000 alone) while Codex's own models_cache.json records 95 for every model, so Codex fills in
+ * 95 itself; a missing or nonsensical percent (not a number, ≤ 0, > 100) gets that same 95.
+ */
+const CODEX_DEFAULT_WINDOW_PERCENT = 95;
+
+function effectiveWindow(contextWindow: number, percent: unknown): number {
+  const pct = typeof percent === "number" && Number.isFinite(percent) && percent > 0 && percent <= 100 ? percent : CODEX_DEFAULT_WINDOW_PERCENT;
+  return Math.floor((contextWindow * pct) / 100);
+}
 
 /** A hyphen that joins a capitalised word ("GPT-6-Sol", "GPT-6-Astra") reads as a space. */
 const JOINING_HYPHEN = /-(?=[A-Z])/g;
@@ -47,6 +64,8 @@ function displayName(slug: string, display: unknown): string {
 /**
  * The catalogue's `list` entries as provider models. `hide` entries (codex-auto-review,
  * gpt-reserve) are for the CLI's own machinery, not for the user's picker, so they are dropped.
+ * `contextWindow` is the effective window Codex runs with (see `effectiveWindow`), not the raw
+ * `context_window` — the two differ whenever the backend keeps back a fraction.
  * Anything unrecognisable yields [].
  */
 export function parseCodexCatalog(json: unknown): ProviderModel[] {
@@ -55,7 +74,7 @@ export function parseCodexCatalog(json: unknown): ProviderModel[] {
   const out: ProviderModel[] = [];
   for (const entry of entries) {
     if (!entry || typeof entry !== "object") continue;
-    const e = entry as { slug?: unknown; display_name?: unknown; visibility?: unknown; context_window?: unknown; supported_reasoning_levels?: unknown };
+    const e = entry as { slug?: unknown; display_name?: unknown; visibility?: unknown; context_window?: unknown; effective_context_window_percent?: unknown; supported_reasoning_levels?: unknown };
     if (typeof e.slug !== "string" || e.slug === "" || e.visibility !== "list") continue;
     const model: ProviderModel = { id: e.slug, name: displayName(e.slug, e.display_name) };
     if (Array.isArray(e.supported_reasoning_levels)) {
@@ -66,7 +85,7 @@ export function parseCodexCatalog(json: unknown): ProviderModel[] {
       // carried through rather than omitted.
       model.effortLevels = [...new Set(levels)];
     }
-    if (typeof e.context_window === "number" && Number.isFinite(e.context_window) && e.context_window > 0) model.contextWindow = e.context_window;
+    if (typeof e.context_window === "number" && Number.isFinite(e.context_window) && e.context_window > 0) model.contextWindow = effectiveWindow(e.context_window, e.effective_context_window_percent);
     out.push(model);
   }
   return out;

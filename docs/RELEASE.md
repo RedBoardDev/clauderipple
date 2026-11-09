@@ -59,6 +59,11 @@ Node를 우리가 내려받은 경우에는 npm이 만든 `env node` 셔뱅 링�
    메뉴 막대 앱 실행기(`~/Applications/ClaudeRipple.app`)도 `CLAUDERIPPLE_LAUNCHER_DIR`로 따로 둡니다.
    빠뜨리면 확인용 설치가 실제 실행기를 덮어쓰고, `uninstall --purge`가 그것을 지웁니다(2026-10-21).
    그랬다면 `clauderipple app --install`로 되살립니다.
+   Claude Desktop 프록시, Codex 설정, 키체인 CA, `~/.claude/agents`는 홈과 상관없이 계정에 하나뿐입니다.
+   0.12.14까지는 확인용 설치의 `uninstall`이 실제 설치의 이것들까지 지웠습니다(2026-10-24, 그때는 실제 설치가
+   쓰지 않아 피해가 없었음). 0.12.15부터는 기본 홈(`~/.clauderipple`)이 아닌 홈의 제거는 자기 포트를 가리키는
+   프록시와 Codex 설정, 지문이 같은 CA, 기본 홈이 기록하지 않은 워커 파일만 지웁니다. 그 이전 판을 확인할 때는
+   `HOME`도 임시 폴더로 둡니다.
 
    ```sh
    npm install --prefix /tmp/cr-check ./clauderipple-<버전>.tgz

@@ -35,11 +35,20 @@ export type ProviderPreset = {
    * some of them key their prompt cache on it and charge full price without it.
    */
   sessionHeader?: string;
+  /**
+   * The `User-Agent` this vendor's edge expects from the router. Sent on the vendor's OpenAI-style
+   * requests unless the provider's own headers already set one (any case). Absent, the router sends
+   * no User-Agent of its own and Node's fetch sends `node`.
+   */
+  userAgent?: string;
   fallbackModels: PresetModel[];
   /** Empty means output_config.effort is stripped for this provider. */
   effortLevels: string[];
-  /** Whether adaptive CLI thinking can safely become Anthropic enabled thinking. */
-  thinking: "enabled" | "none";
+  /**
+   * What becomes of the CLI's adaptive thinking: passed on as `adaptive` where the vendor documents
+   * it, turned into Anthropic's older `enabled` shape where only that is accepted, or dropped.
+   */
+  thinking: "adaptive" | "enabled" | "none";
   /**
    * Whether the vendor runs Anthropic server tools (`web_search`) itself. Only ever set from a
    * measured reply, never from a docs page: DeepSeek's docs do not mention it and it works.
@@ -56,6 +65,11 @@ export type ProviderPreset = {
    * from a measured reply: a vendor that does not know the field may refuse the turn outright.
    */
   sealedReasoning?: boolean;
+  /**
+   * Send the conversation as `prompt_cache_key`, which the vendor routes its prompt cache by. Only
+   * where the vendor documents the field: one that does not know it may refuse the turn.
+   */
+  promptCacheKey?: boolean;
   verified: boolean;
   notes?: string;
   docsUrl: string;
@@ -140,16 +154,18 @@ export const PRESETS: ProviderPreset[] = [
     vendorUrl: "https://www.minimax.io/",
     anthropicBaseUrl: "https://api.minimax.io/anthropic",
     authHeader: "x-api-key",
+    // The Anthropic interface serves only these two (docs, checked 2026-11-08); M2.7 is not on it.
     fallbackModels: [
+      { id: "MiniMax-M3.1-Flash", name: "MiniMax M3.1 Flash" },
       { id: "MiniMax-M3", name: "MiniMax M3" },
-      { id: "MiniMax-M2.7", name: "MiniMax M2.7" },
     ],
-    // https://platform.minimax.io/docs/api-reference/text-anthropic-api documents adaptive thinking,
-    // but not output_config.effort.
+    // output_config.effort (low…max, max when omitted) is documented for M3.1 Flash only, so the
+    // provider-wide ladder stays empty and saving the provider measures each model's own.
     effortLevels: [],
-    thinking: "enabled",
+    // The docs give M3.1 Flash and M3 `thinking` omitted or `adaptive`, never `enabled` with a budget.
+    thinking: "adaptive",
     verified: true,
-    notes: "Uses the thinking parameter; M3 supports adaptive thinking.",
+    notes: "Takes adaptive thinking as sent. M3.1 Flash always thinks (thinking disabled is a 400) and takes output_config.effort; M3 thinks only when asked.",
     docsUrl: "https://platform.minimax.io/docs/api-reference/text-anthropic-api",
   },
   // Docs: https://help.aliyun.com/en/model-studio/claude-code
@@ -215,6 +231,30 @@ export const PRESETS: ProviderPreset[] = [
     notes: "The Anthropic skin passes through thinking blocks and native tool use.",
     docsUrl: "https://openrouter.ai/docs/cookbook/coding-agents/claude-code-integration",
   },
+  // Docs: https://platform.openai.com/docs/api-reference/responses
+  //
+  // An API key, billed per token, beside the ChatGPT plan (`chatgpt`) that serves the same models
+  // through a sign-in. It never takes a model the plan also declares on a bare id: its models are
+  // reached by name, as the `<model>-openai` workers do (targets.ts `bareOwners`). Model discovery
+  // fills the list; `/models` also lists embedding, audio and image models, which are not ticked.
+  {
+    id: "openai",
+    kind: "openai-compatible",
+    name: "OpenAI API",
+    vendorUrl: "https://platform.openai.com/",
+    anthropicBaseUrl: "https://api.openai.com/v1",
+    authHeader: "authorization-bearer",
+    modelsUrl: "https://api.openai.com/v1/models",
+    modelsAuthHeader: "authorization-bearer",
+    wire: "responses",
+    fallbackModels: [],
+    effortLevels: ["low", "medium", "high", "xhigh"],
+    thinking: "none",
+    promptCacheKey: true,
+    verified: false,
+    notes: "Not yet checked against a live key: sealed reasoning stays off until a reply shows it.",
+    docsUrl: "https://platform.openai.com/docs/api-reference/responses",
+  },
   // Docs: https://docs.x.ai/docs/guides/reasoning
   {
     id: "xai-grok",
@@ -260,6 +300,11 @@ export const PRESETS: ProviderPreset[] = [
     authHeader: "authorization-bearer",
     wire: "responses",
     sessionHeader: "x-opencode-session",
+    // Cloudflare in front of OpenCode answered `error code: 1010` (403, before auth) to a request with
+    // no User-Agent (issue #132). Node's fetch sends `node` rather than none, and whether `node` is
+    // refused is not measured here: the usage poll was accepted with it (opencode-usage.ts, 2026-10-15).
+    // The value is the one the reporter measured with a working key on 2026-11-08 (`opencode/2.2.6`).
+    userAgent: "opencode/2.2.6",
     // Measured 2026-10-14 on muse-spark-1.3-contributor: `include` and `summary` are accepted, the
     // sealed item comes back on a tool-bearing turn, and replaying it in place answers 200.
     sealedReasoning: true,
@@ -321,6 +366,12 @@ export const PRESETS: ProviderPreset[] = [
       // full URL as https://opencode.ai/inference/go/google/v1beta/models/<id> (read 2026-10-21).
       // `providerFor` folds it into an ordinary google provider, and the transport appends
       // `/v1beta/models/<id>:generateContent` to this base (providers/google/transport.ts).
+      //
+      // Measured 2026-10-25 (#94): `/models` no longer lists `gemini-4-argon-contributor` and lists
+      // `gemini-4-argon` instead, as does the plan's docs. A model picked from `/models` keeps only
+      // `{id, name}`, so without this row it would inherit the preset's Responses wire and be refused
+      // (`Model does not support this protocol`); the same id saved with this wire and url answered 200.
+      { id: "gemini-4-argon", name: "Gemini 4 Argon", wire: "google", url: "https://opencode.ai/inference/go/google" },
       { id: "gemini-4-argon-contributor", name: "Gemini 4 Argon (Contributor)", wire: "google", url: "https://opencode.ai/inference/go/google" },
     ],
     // Measured 2026-09-18 against the live endpoint, one effort at a time: none, minimal, low,
@@ -508,3 +559,18 @@ export const PRESETS: ProviderPreset[] = [
     docsUrl: "https://lmstudio.ai/docs/developer/openai-compat/models",
   },
 ];
+
+/** The User-Agent a preset declares, for a provider built from it (`provider.preset`). */
+export function presetUserAgent(presetId: string | undefined): string | undefined {
+  return presetId ? PRESETS.find((entry) => entry.id === presetId)?.userAgent : undefined;
+}
+
+/**
+ * `headers` with a default `user-agent` added. A User-Agent the headers already carry, in any case,
+ * wins: two spellings of one header name would reach the vendor as one header with both values
+ * joined, so the default is added only when no spelling is present.
+ */
+export function withDefaultUserAgent(headers: Record<string, string>, userAgent: string | undefined): Record<string, string> {
+  if (!userAgent || Object.keys(headers).some((name) => name.toLowerCase() === "user-agent")) return headers;
+  return { ...headers, "user-agent": userAgent };
+}

@@ -10,6 +10,7 @@ import path from "node:path";
 import type { AnthropicProvider } from "../config.ts";
 import { type ObservedClaudeCodeAuth, type ObservedClaudeCodeAuthSnapshot } from "./anthropic-observed.ts";
 import { readClaudeAuthFile, saveClaudeOAuthFile } from "./anthropic-token-file.ts";
+import { claudeCliUserAgent, claudeCliVersion, type ClaudeCliVersionSources } from "./claude-cli-version.ts";
 import { CLAUDE_OAUTH, refreshClaudeOAuth, type FetchLike } from "./claude-oauth.ts";
 
 export const CLAUDE_CODE_OAUTH_BETA = "claude-code-20250219,oauth-2025-04-20";
@@ -192,15 +193,21 @@ export class ClaudeCodeAuthStore {
     if (credentialsFile && this.now() < credentialsFile.expiresAt) return "credentials-file";
     return readClaudeAuthFile(this.home) ? "token-file" : null;
   }
-}
 
-/** Prefix custom tool names for subscription OAuth; builtin Anthropic tools stay unchanged. */
-export function toClaudeCodeToolName(name: string): string {
-  return /^(custom_|web_search$|code_execution$|text_editor$|computer$)/i.test(name) ? name : `custom_${name}`;
-}
+  /** CLI version of the last recent observation, so fallback headers can name it (issue #103). */
+  observedCliVersion(): string | null {
+    return this.observed?.cliVersion(this.now()) ?? null;
+  }
 
-export function fromClaudeCodeToolName(name: string): string {
-  return name.startsWith("custom_") ? name.slice("custom_".length) : name;
+  /** Counts an observed login being presented or answered on as still current (issue #123). */
+  noteObservedUse(authorization: string): void {
+    this.observed?.noteUsed(authorization, this.now());
+  }
+
+  /** Drops an observed login the upstream rejected; a newer observed token is left alone (issue #123). */
+  forgetObserved(authorization: string): void {
+    this.observed?.forget(authorization);
+  }
 }
 
 /**
@@ -212,7 +219,7 @@ export function observedAnthropicHeaders(observed: ObservedClaudeCodeAuthSnapsho
   return { ...observed.headers };
 }
 
-export function nativeAnthropicHeaders(provider: AnthropicProvider, credentials?: ClaudeCodeCredentials): Record<string, string> {
+export function nativeAnthropicHeaders(provider: AnthropicProvider, credentials?: ClaudeCodeCredentials, versionSources: ClaudeCliVersionSources = {}): Record<string, string> {
   if (provider.auth === "api-key") {
     const apiKey = provider.apiKey ?? process.env.ANTHROPIC_API_KEY;
     if (!apiKey) throw new Error("Anthropic API key missing — set providers.<name>.apiKey or ANTHROPIC_API_KEY");
@@ -223,7 +230,7 @@ export function nativeAnthropicHeaders(provider: AnthropicProvider, credentials?
     authorization: `Bearer ${credentials.accessToken}`,
     "anthropic-version": "2023-06-01",
     "anthropic-beta": CLAUDE_CODE_OAUTH_BETA,
-    "user-agent": "claude-cli/2.1.266 (external, cli)",
+    "user-agent": claudeCliUserAgent(claudeCliVersion(versionSources)),
     "x-app": "cli",
     "x-stainless-lang": "js",
     "x-stainless-package-version": "0.74.0",

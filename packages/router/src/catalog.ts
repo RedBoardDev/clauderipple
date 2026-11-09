@@ -81,6 +81,64 @@ export function catalogEntry(catalog: unknown, preset: string | undefined, model
   };
 }
 
+/**
+ * The window the catalogue states for a model under its canonical id, for a provider the catalogue
+ * has no entry of its own for — a hand-entered `openai-compatible` endpoint (Hive) whose `/models`
+ * lists ids and nothing else. `catalogEntry` cannot answer there: it reads one provider's block, and
+ * an unknown endpoint has no block.
+ *
+ * models.dev files the same model under every provider that serves it, and a reseller may state a
+ * smaller window than the model was built with (2026-10-28: `deepseek-v4.1-flash` is 1,000,000 on
+ * most entries and 256,000 on Scaleway's; `glm-5.3-flash` is 1,000,000 on most and 262,144 on
+ * AMD's, 327,680 on Engy's). The endpoint we are filling a blank for is an unknown reseller, so the
+ * smallest stated window is the only value every entry agrees is safe: too small compacts early and
+ * costs room, too large overflows and loses the request.
+ *
+ * Matching is narrow on purpose. The org prefix (`deepseek-ai/`) is dropped from *our* id, and that
+ * must equal a catalogue id exactly; only when there is no such id is a trailing build stamp or
+ * release date (`-1017`, `-20240101`) also dropped and the result required to equal one exactly.
+ * `deepseek-flash` is not `deepseek-v4.1-flash`, and a near miss is no match.
+ */
+export function catalogueWindow(catalog: unknown, modelId: string): number | undefined {
+  if (!catalog || typeof catalog !== "object") return undefined;
+  const index = windowIndex(catalog as Record<string, CatalogProvider>);
+  const bare = bareModelId(modelId);
+  const exact = index.get(bare);
+  if (exact !== undefined) return exact;
+  return index.get(bare.replace(/[-_](?:\d{8}|\d{4})$/, ""));
+}
+
+/** Our id without the org prefix. Case is folded: no two models differ by case alone, so a case
+ * difference is not a different model. */
+function bareModelId(modelId: string): string {
+  const slash = modelId.lastIndexOf("/");
+  return (slash >= 0 ? modelId.slice(slash + 1) : modelId).toLowerCase();
+}
+
+const windowIndexes = new WeakMap<object, Map<string, number>>();
+
+/** Every catalogue model id, case folded, against the smallest `limit.context` any provider states
+ * for it. Built once per catalogue object: one download backs every model of every provider, and
+ * re-walking 5,000+ entries per model would be the slow part of a start-up pass. */
+function windowIndex(catalog: Record<string, CatalogProvider>): Map<string, number> {
+  const cached = windowIndexes.get(catalog);
+  if (cached) return cached;
+  const index = new Map<string, number>();
+  for (const provider of Object.values(catalog)) {
+    const models = provider?.models;
+    if (!models || typeof models !== "object") continue;
+    for (const [id, model] of Object.entries(models)) {
+      const context = model?.limit?.context;
+      if (typeof context !== "number" || !Number.isInteger(context) || context <= 0) continue;
+      const key = id.toLowerCase();
+      const seen = index.get(key);
+      if (seen === undefined || context < seen) index.set(key, context);
+    }
+  }
+  windowIndexes.set(catalog, index);
+  return index;
+}
+
 let cached: { at: number; catalog: unknown } | undefined;
 
 /**

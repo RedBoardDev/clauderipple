@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { ENVELOPE_PREFIX, decodeEnvelope, encodeEnvelope, envelopeFor, isOurSignature, refusesReplayedReasoning, replayableReasoning } from "../src/reasoning.ts";
+import { ENVELOPE_PREFIX, decodeEnvelope, encodeEnvelope, envelopeFor, isOurSignature, refusesReplayedReasoning, replayableReasoning, requiresThinkingReplay } from "../src/reasoning.ts";
 import { dropForeignThinking } from "../src/thinking.ts";
 
 // The carrier is a thinking block's signature (measured 2026-10-14 against a fake upstream: the CLI
@@ -81,6 +81,15 @@ test("our envelopes are dropped before a request reaches Anthropic; Anthropic's 
     { role: "user", content: [{ type: "tool_result", tool_use_id: "call_1", content: "hi" }] },
     { role: "assistant", content: [signed, { type: "text", text: "done" }] },
   ]);
+});
+
+test("missing mandatory thinking is narrowly recognised, not a refusal of replay (#109)", () => {
+  const message = "Upstream request failed: The `content[].thinking` in the thinking mode must be passed back to the API. (reasoning signature required)";
+  assert.equal(requiresThinkingReplay(400, message), true);
+  assert.equal(refusesReplayedReasoning(400, message), false);
+  assert.equal(requiresThinkingReplay(500, message), false);
+  assert.equal(requiresThinkingReplay(400, "reasoning_content must be provided"), false);
+  assert.equal(requiresThinkingReplay(400, "Invalid content[].thinking signature"), false);
 });
 
 test("only a 4xx that says reasoning earns the retry without it", () => {

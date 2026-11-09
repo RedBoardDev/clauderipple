@@ -1,20 +1,27 @@
 // Web push to the phone (RFC 8030 delivery, RFC 8291 payload encryption, RFC 8292 VAPID, via the
-// `web-push` package). Three moments, and only when no connected phone looked at that session in
-// the last SEEN_MS (180 s): a permission request is waiting, a turn finished, a turn failed.
+// `web-push` package). Four moments, and only when no connected phone looked at that session in
+// the last SEEN_MS (180 s): a permission request is waiting, a turn finished, a turn failed, and a
+// Claude app turn that closed on a question the person must answer.
 // They arrive as an appended event, or as a Mac-session alert (Sessions.onAlert) for a session the
 // host is not tailing. Tapping the push opens exactly that session (its id is in the payload's
-// session field). The payload is metadata only — session title plus fixed state words, never
-// conversation text.
+// session field). The payload is the session title and what the turn did (its last reply, the
+// approval it waits for, or the question), as in the native push: RFC 8291 encrypts it end to end,
+// so the push service never reads it. Without that context it is the title plus fixed state words.
 //
 // The VAPID key pair is made once and kept under the host's config dir (0600); a new pair would
 // orphan every subscription. Subscriptions are per device (the phone's clientId) and a push
 // service answering 404/410 means the subscription is gone for good, so it is dropped.
 import path from "node:path";
 import webpush from "web-push";
+import { SLOW_PING_MS } from "./protocol.ts";
 import { readJson, writeFileAtomic } from "./fsutil.ts";
+import { pushContent, type PushContext } from "./push-content.ts";
 import type { PushEvent, PushSubscriptionJSON, SessionSummary } from "./protocol.ts";
 
 export const VISIBLE_MS = 30_000;
+/** A client on the slow cadence (a presence report every SLOW_PING_MS) stays visible for three
+ * missed reports, as a fast client does at VISIBLE_MS. */
+export const SLOW_VISIBLE_MS = 3 * SLOW_PING_MS;
 /** A session a connected phone looked at within this needs no push (Paseo agent-attention-policy PRESENCE_THRESHOLD_MS). */
 export const SEEN_MS = 180_000;
 
@@ -59,11 +66,13 @@ export interface PushPayload { title: string; body: string; session: string; tag
 const COPY = {
   ko: {
     permission: "승인을 기다립니다",
+    question: "답변이 필요합니다",
     done: "작업을 마쳤습니다",
     failed: "작업이 실패했습니다",
   },
   en: {
     permission: "Waiting for approval",
+    question: "Answer needed",
     done: "Work finished",
     failed: "Work failed",
   },
@@ -72,14 +81,19 @@ const COPY = {
 const clip = (s: string, n: number): string => (s.length > n ? s.slice(0, n - 1) + "…" : s);
 const folderOf = (cwd: string): string => path.basename(cwd) || cwd;
 
-/** The push for an event or Mac-session alert, or null if it is not one of the three moments.
- * Metadata only: the session title plus fixed state words. Neither Expo/Apple nor the web push
- * service ever receives assistant text, tool input, or error detail. */
+/** The push for an event or Mac-session alert, or null if it is not one of those moments.
+ * The session title plus fixed state words — and for a question, the closing box's `ask`, which is
+ * what the person must answer. That is the model's text, so it goes only where the payload is
+ * encrypted end to end (this web push, RFC 8291; Expo's `e`): neither Expo/Apple nor the web push
+ * service ever reads assistant text, tool input, or error detail. */
 export function pushFor(event: PushEvent, s: Pick<SessionSummary, "id" | "title" | "cwd">, lang: "ko" | "en"): PushPayload | null {
   const c = COPY[lang];
   const title = clip(s.title || folderOf(s.cwd), 140);
   if (event.kind === "permission") {
     return { title, body: c.permission, session: s.id, tag: `perm-${s.id}` };
+  }
+  if (event.kind === "question") {
+    return { title, body: `${c.question} · ${clip(event.ask, 160)}`, session: s.id, tag: `ask-${s.id}` };
   }
   if (event.kind === "result" && event.ok) {
     return { title, body: c.done, session: s.id, tag: `turn-${s.id}` };
@@ -96,6 +110,8 @@ export interface NotifierOptions {
   /** true while a connected phone looked at this session in the last SEEN_MS */
   seenRecently: (session: string) => boolean;
   summary: (session: string) => SessionSummary | undefined;
+  /** The same private context the native push encrypts (push-content.ts); a web push is end-to-end encrypted too. */
+  context?: (session: string, event: PushEvent) => PushContext | Promise<PushContext>;
   log?: (line: string) => void;
 }
 
@@ -129,20 +145,54 @@ export class Notifier {
 
   /** Called for every appended session event, and for each Mac-session alert (Sessions.onAlert). Resolves when every send finished (tests wait on it). */
   async onEvent(session: string, event: PushEvent): Promise<void> {
-    if (event.kind !== "permission" && event.kind !== "result") return;
+    if (event.kind !== "permission" && event.kind !== "result" && event.kind !== "question") return;
     if (!Object.keys(this.subs).length || this.opts.seenRecently(session)) return;
     const s = this.opts.summary(session);
     if (!s) return;
+    // A question is an ask like an approval: it waits for the person, so it is urgent and short-lived.
+    const urgent = event.kind === "permission" || event.kind === "question";
+    // Resolve once per event, and only when there is a subscription to send it to.
+    let context: Promise<PushContext> | undefined;
     await Promise.all(Object.entries(this.subs).map(async ([clientId, stored]) => {
-      const p = pushFor(event, s, stored.lang);
+      let p = pushFor(event, s, stored.lang);
       if (!p) return;
+      // Say what the turn did, as the native push does; a phone that installed the web app keeps the
+      // fixed words only when the context cannot be read.
+      if (this.opts.context) {
+        try {
+          context ??= Promise.resolve(this.opts.context(session, event));
+          const content = pushContent(event, stored.lang, await context, p.body);
+          p = { ...p, title: content.title, body: content.body };
+        } catch {
+          this.opts.log?.(`push: content unavailable for device ${clientId.slice(0, 8)}; sending fixed words`);
+        }
+      }
       try {
-        await this.opts.send(stored.sub, JSON.stringify(p), { urgency: event.kind === "permission" ? "high" : "normal", ttl: event.kind === "permission" ? 3600 : 86_400, topic: p.tag.replace(/[^\w-]/g, "").slice(0, 32) });
+        await this.opts.send(stored.sub, JSON.stringify(p), { urgency: urgent ? "high" : "normal", ttl: urgent ? 3600 : 86_400, topic: p.tag.replace(/[^\w-]/g, "").slice(0, 32) });
       } catch (e) {
         if (isGone(e)) {
           // Only drop it if it is still the subscription this send used, not one the phone just replaced.
           if (this.subs[clientId]?.sub.endpoint === stored.sub.endpoint) { delete this.subs[clientId]; this.save(); }
           this.opts.log?.(`push: subscription for device ${clientId.slice(0, 8)} is gone (${(e as { statusCode: number }).statusCode}); removed`);
+        } else this.opts.log?.(`push: send failed for device ${clientId.slice(0, 8)}: ${(e as Error).message}`);
+      }
+    }));
+  }
+
+  /**
+   * A host-wide notice (the Claude login expired) to every web subscriber, whatever session a phone
+   * is looking at: SEEN_MS is about conversation alerts, not this. Fixed copy, no session id.
+   */
+  async system(body: (lang: "ko" | "en") => string, tag: string, ttl = 86_400): Promise<void> {
+    if (!Object.keys(this.subs).length) return;
+    await Promise.all(Object.entries(this.subs).map(async ([clientId, stored]) => {
+      const payload: PushPayload = { title: "Ripple Remote", body: body(stored.lang), session: "", tag };
+      try {
+        await this.opts.send(stored.sub, JSON.stringify(payload), { urgency: "normal", ttl, topic: tag.replace(/[^\w-]/g, "").slice(0, 32) });
+      } catch (e) {
+        if (isGone(e)) {
+          if (this.subs[clientId]?.sub.endpoint === stored.sub.endpoint) { delete this.subs[clientId]; this.save(); }
+          this.opts.log?.(`push: subscription for device ${clientId.slice(0, 8)} is gone; removed`);
         } else this.opts.log?.(`push: send failed for device ${clientId.slice(0, 8)}: ${(e as Error).message}`);
       }
     }));

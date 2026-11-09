@@ -88,7 +88,7 @@ test('old modes copy the actual base ladder; single steps become independent ord
   assert.deepEqual(normalizeSettings(s), s)
 })
 
-test('active modes route their own ordered rungs, then one rung up, then session; base stays unchanged', () => {
+test('active modes route their own ordered rungs, then one rung up, then nothing; base stays unchanged', () => {
   const rungs = { light: [{ target: { agent: 'gpt-6-luna' }, effort: 'low' }, { target: sonnet, effort: 'high' }], standard: [{ target: opus, effort: 'max' }] }
   const s = normalizeSettings({ modes: [{ id: 'work', name: 'Work', rungs }], activeMode: 'work', activeSince: 5 })
   const routing = routingSettings(s)
@@ -98,7 +98,7 @@ test('active modes route their own ordered rungs, then one rung up, then session
   assert.deepEqual([pick(routing, false).target, pick(routing, false).position], [sonnet, 2])
   const unticked = { ...routing, allow: ['general-purpose:opus'] }
   assert.deepEqual([pick(unticked, false).target, pick(unticked, false).rung], [opus, 'standard'])
-  assert.deepEqual(pick({ ...routing, allow: ['missing'] }, false).target, { agent: 'general-purpose' })
+  assert.equal(pick({ ...routing, allow: ['missing'] }, false).target, undefined)
   assert.deepEqual(s.rules.general.rungs, USER)
   assert.equal(routingSettings({ ...s, activeMode: undefined }).rules.general, s.rules.general)
 })
@@ -106,13 +106,18 @@ test('active modes route their own ordered rungs, then one rung up, then session
 test('modes replace domain ladders as a whole and never inherit Base overrides', () => {
   const s = normalizeSettings({ domainRules: { ui: DEFAULTS.rules.general, backend: DEFAULTS.rules.general }, modes: [
     { id: 'old', name: 'Old' },
-    { id: 'own', name: 'Own', domainRules: { backend: { mode: 'ladder', rungs: { light: { target: haiku, effort: 'low' } } }, ui: { mode: 'auto' } } },
+    { id: 'own', name: 'Own', domainRules: { backend: { mode: 'ladder', rungs: { light: { target: haiku, effort: 'low' } } }, review: { mode: 'ladder', rungs: { light: { target: sonnet, effort: 'high' } } }, ui: { mode: 'auto' } } },
   ], activeMode: 'old' })
   assert.equal(Object.hasOwn(s.modes[0]!, 'domainRules'), false)
   assert.equal(routingSettings(s).domainRules, undefined)
   const own = routingSettings({ ...s, activeMode: 'own' })
-  // The mode's own domain ladder is folded like Base's: the light pair holds one list.
-  assert.deepEqual(own.domainRules, { backend: { mode: 'ladder', rungs: { light: [{ target: haiku, effort: 'low' }], standard: [{ target: haiku, effort: 'low' }] } } })
+  // The mode's own domain ladder is folded like Base's: its one filled row runs every rung.
+  const h = [{ target: haiku, effort: 'low' }]
+  const r = [{ target: sonnet, effort: 'high' }]
+  assert.deepEqual(own.domainRules, {
+    backend: { mode: 'ladder', rungs: { light: h, standard: h, hard: h, plan: h } },
+    review: { mode: 'ladder', rungs: { light: r, standard: r, hard: r, plan: r } },
+  })
   assert.equal(own.domainRules?.ui, undefined)
   assert.equal(routingSettings({ ...s, activeMode: undefined }).domainRules, s.domainRules)
   assert.deepEqual(normalizeSettings(JSON.parse(JSON.stringify(s))), s)
@@ -175,18 +180,17 @@ test('a mode ends at its time, or the first known quota reset after activation',
   assert.deepEqual(quotaWindows({}), [])
 })
 
-test('the eager note goes with the first prompt after the mode turns on and after each compaction, not every turn', () => {
+test('the eager note goes with every prompt while eager, not once per activation or compaction', () => {
   const modes = normalizeModes([{ id: 'burn', name: 'Burn GPT', targets: ['chatgpt'], delegation: 'eager' }, { id: 'calm', name: 'Calm', targets: ['chatgpt'] }])
   const on = { modes, activeMode: 'burn', activeSince: 5 }
   const first = eagerNote(on, null)
   assert.equal(first.note, modeNote('Burn GPT'))
   assert.equal(first.note, 'ClaudeRipple mode Burn GPT: delegate everything except judgment and final review to ripple:auto.')
   assert.equal(first.noted, modeKey(on))
-  // The next turn: nothing.
-  assert.deepEqual(eagerNote(on, first.noted), { noted: first.noted })
-  // A compaction clears what was noted: the next prompt carries it again.
+  // The next turn carries it too: one sent only once is buried in a long context.
+  assert.equal(eagerNote(on, first.noted).note, first.note)
   assert.equal(eagerNote(on, null).note, first.note)
-  // Turned off and on again is a new turning-on.
+  // Turned off and on again, still every prompt.
   assert.equal(eagerNote({ ...on, activeSince: 9 }, first.noted).note, first.note)
   // A normal mode, or none, adds nothing and clears what was noted (Base's delegation is normal).
   assert.deepEqual(eagerNote({ modes, activeMode: 'calm', activeSince: 5 }, null), { noted: null })

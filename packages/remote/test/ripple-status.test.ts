@@ -52,6 +52,42 @@ test("an account label appears only when a provider has more than one", () => {
   assert.deepEqual(s.limits.map(l => [l.provider, l.account, l.usedPct]), [["anthropic", undefined, 4], ["chatgpt", "#1", 1], ["chatgpt", "#2", 2], ["chatgpt", "#2", 3]]);
 });
 
+test("of several Claude accounts only the one in use shows, unnumbered, as on the desktop band", () => {
+  const claude = (accounts: Record<string, unknown>[]) => ({ providers: [{ provider: "anthropic", type: "anthropic", title: "Claude", accounts }] });
+  const marked = rippleStatus(claude([
+    { account: 0, windows: [win("five_hour", 81, NOW + 1000)] },
+    { account: 1, label: "work@example.com", inUse: true, windows: [win("five_hour", 15, NOW + 1000)] },
+    { account: 2, label: "spare", windows: [win("five_hour", 40, NOW + 1000)] },
+  ]), settings(), NOW);
+  assert.deepEqual(marked.limits.map(l => [l.account, l.usedPct]), [[undefined, 15]]);
+  // None marked (an older router, or the in-use account's usage not known yet): the first.
+  const unmarked = rippleStatus(claude([
+    { account: 0, windows: [win("five_hour", 81, NOW + 1000)] },
+    { account: 2, windows: [win("five_hour", 40, NOW + 1000)] },
+  ]), settings(), NOW);
+  assert.deepEqual(unmarked.limits.map(l => [l.account, l.usedPct]), [[undefined, 81]]);
+});
+
+test("scoped Argon weekly reaches remote status with its label, account and reset intact", () => {
+  const resetAt = NOW + 2 * 86_400_000;
+  const body = { providers: [{ provider: "ag", type: "google", title: "Gemini", accounts: [
+    { account: 0, at: NOW, windows: [
+      win("five_hour", 13, resetAt), win("seven_day", 24, resetAt),
+      win("scoped", 65, resetAt, { label: "Argon weekly" }),
+    ] },
+    { account: 1, at: NOW, windows: [win("scoped", 35, resetAt, { label: "Argon weekly" })] },
+  ] }] };
+  // The host status travels as JSON to remote clients; no new kind or schema field is needed.
+  const status = JSON.parse(JSON.stringify(rippleStatus(body, settings(), NOW)));
+  assert.deepEqual(status.limits.map((l: { kind: string; label: string | null; usedPct: number }) => [l.kind, l.label, l.usedPct]), [
+    ["five_hour", null, 13], ["seven_day", null, 24], ["scoped", "Argon weekly", 65], ["scoped", "Argon weekly", 35],
+  ]);
+  assert.deepEqual(status.limits.slice(2), [
+    { provider: "ag", title: "Gemini", account: "#1", kind: "scoped", label: "Argon weekly", usedPct: 65, windowMinutes: 10080, resetAt: sec(resetAt) * 1000 },
+    { provider: "ag", title: "Gemini", account: "#2", kind: "scoped", label: "Argon weekly", usedPct: 35, windowMinutes: 10080, resetAt: sec(resetAt) * 1000 },
+  ]);
+});
+
 test("no active mode, an unknown mode and missing settings all give a null mode", () => {
   assert.equal(rippleStatus(limits(), settings({ activeMode: undefined }), NOW).mode, null);
   assert.equal(rippleStatus(limits(), settings({ activeMode: "gone" }), NOW).mode, null);

@@ -76,6 +76,34 @@ export function antigravityUserAgent(): string {
   return `antigravity/ide/${ANTIGRAVITY_IDE_VERSION} (os_type=${osType}; arch=${arch}; aidev_client; auth_method=oauth)`;
 }
 
+/** Antigravity CLI version whose User-Agent CCA serves Gemini 4 Argon to. Source: opencodex `ANTIGRAVITY_CLI_VERSION`. */
+export const ANTIGRAVITY_CLI_VERSION = "1.3.4";
+
+/**
+ * The User-Agent the Antigravity CLI sends. CCA serves Gemini 4 Argon only to this client family:
+ * `fetchAvailableModels` lists `gemini-4-argon-{low,medium,high}` under it and not under the IDE UA
+ * (measured 2026-10-27 on both hosts, one Google AI Pro account), and opencodex measured Argon requests 404
+ * under the IDE UA while `gemini-3.7-flash-tiered` and `gemini-3.1-pro-low` 404 under this one. So it
+ * is used for Argon generation and the quota summary, not other models' generation. The IDE
+ * override does not apply: it names the IDE header, and letting it replace this one would lock
+ * Argon again. Source: opencodex
+ * `src/adapters/client-fingerprint.ts antigravityCliUserAgent`.
+ */
+export function antigravityCliUserAgent(): string {
+  const [osType, arch] = "windows/amd64".split("/");
+  return `antigravity/cli/${ANTIGRAVITY_CLI_VERSION} (os_type=${osType}; arch=${arch}; aidev_client; auth_method=oauth)`;
+}
+
+/** True for the models CCA serves only to the CLI client family: Gemini 4 Argon, as a base or wire id. */
+export function servedToAntigravityCli(model: string): boolean {
+  return /^gemini-4-argon(?:-|$)/.test(model);
+}
+
+/** The User-Agent a generation request for `model` (a base or wire id) must carry. */
+export function antigravityUserAgentFor(model: string): string {
+  return servedToAntigravityCli(model) ? antigravityCliUserAgent() : antigravityUserAgent();
+}
+
 // ── Model id resolution ─────────────────────────────────────────────────────────────────────────
 
 /**
@@ -109,6 +137,12 @@ const SUFFIX_TIER_MODELS: Record<string, { wire: Record<string, string>; default
   // still goes through as it is.
   "gemini-3.8-flash": {
     wire: { low: "gemini-3.8-flash-low", medium: "gemini-3.8-flash-medium", high: "gemini-3.8-flash-medium" },
+    default: "medium",
+  },
+  // Medium is Argon's own default level (translate.ts, Gemini API thinking guide). Only the CLI
+  // client family is served these ids (`antigravityCliUserAgent`).
+  "gemini-4-argon": {
+    wire: { low: "gemini-4-argon-low", medium: "gemini-4-argon-medium", high: "gemini-4-argon-high" },
     default: "medium",
   },
 };
@@ -193,6 +227,7 @@ export function antigravityRequestId(): string {
  * `ANTIGRAVITY_WIRE_MODEL_CONTEXT_WINDOWS`.
  */
 const CONTEXT_WINDOWS: Record<string, number> = {
+  "gemini-4-argon": 1_048_576,
   "gemini-3.8-flash": 1_048_576,
   "gemini-3.7-flash": 1_048_576,
   "gemini-3.1-pro": 1_048_576,
@@ -208,6 +243,7 @@ const CONTEXT_WINDOWS: Record<string, number> = {
  * same collapsing). Source: opencodex `ANTIGRAVITY_MODEL_EFFORTS`.
  */
 const EFFORT_LEVELS: Record<string, string[]> = {
+  "gemini-4-argon": ["low", "medium", "high"],
   "gemini-3.8-flash": ["low", "medium", "high"],
   "gemini-3.7-flash": ["low", "medium", "high"],
   "gemini-3.1-pro": ["low", "high"],
@@ -217,7 +253,10 @@ const EFFORT_LEVELS: Record<string, string[]> = {
 
 /** The collapsed base models the CCA backend serves. Source: opencodex `ANTIGRAVITY_MODELS`. */
 export const ANTIGRAVITY_BASE_MODELS = [
+  // First stays a model every account is served under the IDE UA: the verification recheck pings
+  // the first static model when the provider lists none.
   "gemini-3.8-flash",
+  "gemini-4-argon",
   "gemini-3.7-flash",
   "gemini-3.1-pro",
   "gemini-3.1-flash-image",
@@ -431,20 +470,62 @@ export async function fetchUserEmail(accessToken: string, fetchImpl: FetchLike =
   }
 }
 
-/** One host's catalogue, or null when the endpoint cannot be read. Never throws. */
-export async function fetchHostCatalogue(accessToken: string, projectId: string, host: string, fetchImpl: FetchLike = fetch, signal?: AbortSignal): Promise<ParsedHostCatalogue | null> {
+/** `failed` hears why a null came back: the status, or the error's name or code, never a body or message. */
+async function fetchHostCatalogueAs(userAgent: string, accessToken: string, projectId: string, host: string, fetchImpl: FetchLike, signal?: AbortSignal, failed?: (reason: string) => void): Promise<ParsedHostCatalogue | null> {
   try {
     const response = await fetchImpl(`${host}/${GOOGLE_OAUTH.apiVersion}:fetchAvailableModels`, {
       method: "POST",
-      headers: { authorization: `Bearer ${accessToken}`, accept: "*/*", "content-type": "application/json", "user-agent": antigravityUserAgent() },
+      headers: { authorization: `Bearer ${accessToken}`, accept: "*/*", "content-type": "application/json", "user-agent": userAgent },
       body: JSON.stringify({ project: projectId }),
       signal: signalFor(signal),
     });
-    if (!response.ok) return null;
-    return parseHostCatalogue(await response.json().catch(() => undefined));
-  } catch {
+    if (!response.ok) {
+      failed?.(`HTTP ${response.status}`);
+      return null;
+    }
+    const parsed = parseHostCatalogue(await response.json().catch(() => undefined));
+    if (!parsed) failed?.("unreadable answer");
+    return parsed;
+  } catch (error) {
+    failed?.(signal?.aborted ? "cut off" : ((error as NodeJS.ErrnoException).code ?? (error as Error).name ?? "error"));
     return null;
   }
+}
+
+/** How long the CLI ask may still run once the IDE answer is in. Both normally answer together. */
+export const CLI_CATALOGUE_GRACE_MS = 3_000;
+
+/**
+ * One host's catalogue, or null when the endpoint cannot be read. Never throws. Each model is listed
+ * from the answer to the User-Agent it will be called with: the IDE answer gives every model as
+ * before, and a second ask under the CLI UA adds only the CLI-served ones (Gemini 4 Argon). An
+ * unreadable IDE answer is null as before, so a CLI-only list never replaces the static fallback.
+ * The CLI ask is optional, so a stalled one is cut off `cliGraceMs` after the IDE answer instead of
+ * holding the first turn after a restart for the full request timeout. Because the IDE catalogue
+ * still answers, a failed CLI ask is otherwise silent while Argon drops out of the list:
+ * `cliFailed` hears it, once the IDE answer is in.
+ */
+export async function fetchHostCatalogue(accessToken: string, projectId: string, host: string, fetchImpl: FetchLike = fetch, signal?: AbortSignal, cliGraceMs = CLI_CATALOGUE_GRACE_MS, cliFailed?: (reason: string) => void): Promise<ParsedHostCatalogue | null> {
+  const cliAbort = new AbortController();
+  const cliSignal = signal ? AbortSignal.any([signal, cliAbort.signal]) : cliAbort.signal;
+  let cliFailure: string | undefined;
+  const pendingCli = fetchHostCatalogueAs(antigravityCliUserAgent(), accessToken, projectId, host, fetchImpl, cliSignal, (reason) => { cliFailure = reason; });
+  const ide = await fetchHostCatalogueAs(antigravityUserAgent(), accessToken, projectId, host, fetchImpl, signal);
+  if (!ide) {
+    cliAbort.abort();
+    return null;
+  }
+  const grace = setTimeout(() => cliAbort.abort(), cliGraceMs);
+  const cli = await pendingCli;
+  clearTimeout(grace);
+  if (!cli) {
+    if (cliFailure && !signal?.aborted) cliFailed?.(cliFailure);
+    return ide;
+  }
+  const ids = new Set(ide.models.map((m) => m.id));
+  const models = [...ide.models, ...cli.models.filter((m) => servedToAntigravityCli(m.id) && !ids.has(m.id))];
+  const wireIds = [...ide.wireIds, ...cli.wireIds.filter((id) => servedToAntigravityCli(id) && !ide.wireIds.includes(id))];
+  return { models, wireIds };
 }
 
 /** The merged catalogue of every host that answered, and which hosts offer which model. */
@@ -465,10 +546,10 @@ export type MergedCatalogue = {
 export async function fetchAvailableModels(
   accessToken: string,
   projectId: string,
-  opts: { hosts?: readonly string[]; fetchImpl?: FetchLike; signal?: AbortSignal } = {},
+  opts: { hosts?: readonly string[]; fetchImpl?: FetchLike; signal?: AbortSignal; cliFailed?: (host: string, reason: string) => void } = {},
 ): Promise<MergedCatalogue | null> {
   const hosts = opts.hosts ?? GOOGLE_OAUTH.hosts;
-  const results = await Promise.all(hosts.map(async (host) => [host, await fetchHostCatalogue(accessToken, projectId, host, opts.fetchImpl ?? fetch, opts.signal)] as const));
+  const results = await Promise.all(hosts.map(async (host) => [host, await fetchHostCatalogue(accessToken, projectId, host, opts.fetchImpl ?? fetch, opts.signal, CLI_CATALOGUE_GRACE_MS, opts.cliFailed && ((reason) => opts.cliFailed!(host, reason)))] as const));
   const byHost = new Map<string, ParsedHostCatalogue>();
   for (const [host, catalogue] of results) if (catalogue) byHost.set(host, catalogue);
   if (byHost.size === 0) return null;
