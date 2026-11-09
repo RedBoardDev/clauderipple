@@ -1,0 +1,24 @@
+{
+  "requests": [
+    {
+      "at": "2027-01-15T07:59:59.000Z",
+      "effort": "medium",
+      "id": "contract-request",
+      "kind": "messages",
+      "ms": 1250,
+      "ok": true,
+      "provider": "chatgpt",
+      "session": "contract-session",
+      "source": "claude-haiku-5-5",
+      "status": 200,
+      "stream": true,
+      "target": "gpt-6-1-sol",
+      "usage": {
+        "cached": 900,
+        "cacheWrite": 50,
+        "input": 100,
+        "output": 75
+      }
+    }
+  ]
+}

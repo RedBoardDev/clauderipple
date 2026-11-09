@@ -5,7 +5,9 @@ extension AdminClient {
     public static var pickerTimeout: TimeInterval { 5 * 60 }
 
     public func clientCapabilities() async throws -> ClientCapabilities {
-        ClientCapabilities(document: try await getDocument("/api/status"))
+        let document = try await getDocument("/api/status")
+        _ = try RouterStatus(document: document)
+        return ClientCapabilities(document: document)
     }
 
     public func codexIntegration() async throws -> CodexIntegration {

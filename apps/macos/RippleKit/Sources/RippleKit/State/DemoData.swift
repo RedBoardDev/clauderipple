@@ -35,8 +35,8 @@ public enum DemoData {
         let text = """
         {"version":"0.11.1","readiness":{"ready":true,"problems":[]},"runtime":{"node":"v24.3.0","router":"0.11.1","startedAt":"2026-10-21T06:00:00.000Z"},
         "stats":{"inFlight":2,"messagesInFlight":2,"started":1290,"completed":1288,"failed":0},"routes":6,"adminPort":8791,
-        "cliVersion":"0.11.1","statusMod":true,"picker":{"enabled":true,"hosts":[],"last":null},
-        "providers":{"claude":{"url":"https://api.anthropic.com","type":"anthropic","reachable":true,"usable":true,"accountCount":2},
+        "cliVersion":"0.11.1","uiRevision":"demo","pickerModels":[],"consecutiveUpstreamFailures":0,"settings":{"pointsAtRouter":true},"statusMod":true,"picker":{"enabled":true,"hosts":[],"last":null},
+        "providers":{"claude":{"url":"https://api.anthropic.com","type":"anthropic","authSource":"observed","signedIn":"oauth","reachable":true,"usable":true,"accountCount":2},
         "chatgpt-subscription":{"url":"https://chatgpt.com","type":"chatgpt","reachable":true,"usable":true,"accountCount":2}},
         "chatgpt":{"quota":{},"auth":{},"signedIn":{},"accounts":{}},"credentials":{}}
         """

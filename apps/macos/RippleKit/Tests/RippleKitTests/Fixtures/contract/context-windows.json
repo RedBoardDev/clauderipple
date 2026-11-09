@@ -1,0 +1,87 @@
+{
+  "catalogWindows": {},
+  "resolvedWindows": {
+    "claude-fable-5": {
+      "compactWindow": null,
+      "contextWindow": null,
+      "model": "claude-fable-5",
+      "provider": null
+    },
+    "claude-fable-5-1": {
+      "compactWindow": null,
+      "contextWindow": null,
+      "model": "claude-fable-5-1",
+      "provider": null
+    },
+    "claude-haiku-4-5": {
+      "compactWindow": null,
+      "contextWindow": null,
+      "model": "claude-haiku-4-5",
+      "provider": null
+    },
+    "claude-haiku-5-5": {
+      "compactWindow": 475000,
+      "contextWindow": 475000,
+      "model": "gpt-6-1-sol",
+      "provider": "chatgpt"
+    },
+    "claude-opus-4-6": {
+      "compactWindow": null,
+      "contextWindow": null,
+      "model": "claude-opus-4-6",
+      "provider": null
+    },
+    "claude-opus-4-7": {
+      "compactWindow": null,
+      "contextWindow": null,
+      "model": "claude-opus-4-7",
+      "provider": null
+    },
+    "claude-opus-4-8": {
+      "compactWindow": null,
+      "contextWindow": null,
+      "model": "claude-opus-4-8",
+      "provider": null
+    },
+    "claude-opus-5": {
+      "compactWindow": null,
+      "contextWindow": null,
+      "model": "claude-opus-5",
+      "provider": null
+    },
+    "claude-opus-5-5": {
+      "compactWindow": null,
+      "contextWindow": null,
+      "model": "claude-opus-5-5",
+      "provider": null
+    },
+    "claude-sonnet-4-6": {
+      "compactWindow": null,
+      "contextWindow": null,
+      "model": "claude-sonnet-4-6",
+      "provider": null
+    },
+    "claude-sonnet-5": {
+      "compactWindow": null,
+      "contextWindow": null,
+      "model": "claude-sonnet-5",
+      "provider": null
+    },
+    "claude-sonnet-5-5": {
+      "compactWindow": null,
+      "contextWindow": null,
+      "model": "claude-sonnet-5-5",
+      "provider": "claude"
+    },
+    "gpt-6-1-sol": {
+      "compactWindow": 475000,
+      "contextWindow": 475000,
+      "model": "gpt-6-1-sol",
+      "provider": "chatgpt"
+    }
+  },
+  "windows": {
+    "claude-haiku-5-5": 475000,
+    "gpt-6-1-sol": 475000
+  }
+}

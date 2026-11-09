@@ -1,0 +1,36 @@
+{
+  "awake": {
+    "applied": true,
+    "battery": {
+      "onBattery": false,
+      "percent": 82
+    },
+    "conflict": null,
+    "lidClosed": true,
+    "mode": "working",
+    "reason": "contract model call",
+    "setup": "ok",
+    "thermal": "normal",
+    "until": null
+  },
+  "platform": "darwin",
+  "tether": {
+    "enabled": true,
+    "hint": null,
+    "hotspotSsid": "Contract hotspot",
+    "lastProbe": {
+      "at": "2027-01-15T08:00:00.000Z",
+      "network": "wifi",
+      "ok": true
+    },
+    "lastSwitch": {
+      "at": "2027-01-15T08:00:00.000Z",
+      "ok": true,
+      "reason": "contract",
+      "to": "wifi"
+    },
+    "network": "wifi",
+    "pinned": false,
+    "state": "watching"
+  }
+}

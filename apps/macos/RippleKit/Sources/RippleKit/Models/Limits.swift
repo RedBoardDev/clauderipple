@@ -14,6 +14,15 @@ public struct LimitsProvider: Decodable, Sendable {
     public let type: String
     public let title: String?
     public let accounts: [LimitsAccount]
+
+    enum CodingKeys: String, CodingKey { case provider, type, title, accounts }
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        provider = try c.decode(String.self, forKey: .provider)
+        type = try c.decode(String.self, forKey: .type)
+        title = try c.decode(String.self, forKey: .title)
+        accounts = try c.decode([LimitsAccount].self, forKey: .accounts)
+    }
 }
 
 public struct LimitsAccount: Decodable, Sendable {
@@ -71,15 +80,16 @@ public struct LimitsAccount: Decodable, Sendable {
 
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
-        account = try c.decodeIfPresent(Int.self, forKey: .account) ?? 0
-        windows = (try? c.decodeIfPresent([LegacyWindow].self, forKey: .windows)) ?? []
-        at = try c.decodeIfPresent(Double.self, forKey: .at) ?? 0
+        account = try c.decode(Int.self, forKey: .account)
+        windows = try c.decode([LegacyWindow].self, forKey: .windows)
+        at = try c.decode(Double.self, forKey: .at)
+        // The recorded router sends anonymous rows; only the per-account variant adds these fields.
         id = try c.decodeIfPresent(String.self, forKey: .id)
         label = try c.decodeIfPresent(String.self, forKey: .label)
         preferred = try c.decodeIfPresent(Bool.self, forKey: .preferred)
         active = try c.decodeIfPresent(Bool.self, forKey: .active)
-        health = try? c.decodeIfPresent(Health.self, forKey: .health)
-        usageWindows = try? c.decodeIfPresent(UsageWindows.self, forKey: .usageWindows)
+        health = try c.decodeIfPresent(Health.self, forKey: .health)
+        usageWindows = try c.decodeIfPresent(UsageWindows.self, forKey: .usageWindows)
         unknown = try c.decodeIfPresent(Bool.self, forKey: .unknown)
         stale = try c.decodeIfPresent(Bool.self, forKey: .stale)
         fetchedAt = try c.decodeIfPresent(Double.self, forKey: .fetchedAt)

@@ -8,7 +8,7 @@ public enum ModSettingsValidationError: Error, LocalizedError, Equatable, Sendab
 /// Pure editing and three-way merge. Arrays are atomic; objects merge by key path, except rule-mode changes.
 public struct ModSettingsEditor: Sendable {
     /// The router's schema and credential-free settings size limit.
-    public static let schemaVersion = 1
+    public static let schemaVersion = 2
     public static let maximumBytes = 64 * 1024
     public static let maximumModes = 20
     public static let maximumNameLength = 40

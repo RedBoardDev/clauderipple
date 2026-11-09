@@ -1,0 +1,45 @@
+{
+  "models": [
+    {
+      "avgMs": 1250,
+      "cached": 900,
+      "cacheHitPercent": 85.7,
+      "cacheWrite": 50,
+      "count": 1,
+      "failed": 0,
+      "input": 100,
+      "model": "gpt-6-1-sol",
+      "ok": 1,
+      "output": 75,
+      "provider": "chatgpt"
+    }
+  ],
+  "providers": {
+    "chatgpt": {
+      "avgMs": 1250,
+      "cached": 900,
+      "cacheHitPercent": 85.7,
+      "cacheWrite": 50,
+      "conversationTokens": 1125,
+      "count": 1,
+      "failed": 0,
+      "input": 100,
+      "ok": 1,
+      "output": 75,
+      "ungroupedRequests": 1
+    }
+  },
+  "total": {
+    "avgMs": 1250,
+    "cached": 900,
+    "cacheHitPercent": 85.7,
+    "cacheWrite": 50,
+    "conversationTokens": 1125,
+    "count": 1,
+    "failed": 0,
+    "input": 100,
+    "ok": 1,
+    "output": 75,
+    "ungroupedRequests": 1
+  }
+}

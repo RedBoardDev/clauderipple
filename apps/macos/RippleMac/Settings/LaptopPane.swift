@@ -157,10 +157,9 @@ struct LaptopPane: View {
             guard !Task.isCancelled else { return }
             power = .loaded(status)
             if !setupRunning {
-                if let job = try? await store.client.powerSetup() {
-                    setup = job
-                    setupRunning = job.running
-                }
+                let job = try await store.client.powerSetup()
+                setup = job
+                setupRunning = job.running
             }
         } catch {
             guard !Task.isCancelled else { return }
@@ -169,7 +168,7 @@ struct LaptopPane: View {
     }
 
     private func apply(_ operation: () async throws -> PowerStatus) async {
-        guard !busy else { return }
+        guard !busy, power.value != nil else { return }
         busy = true
         actionError = nil
         defer { busy = false }
@@ -182,7 +181,7 @@ struct LaptopPane: View {
     }
 
     private func startSetup() async {
-        guard !setupRunning, !busy else { return }
+        guard !setupRunning, !busy, power.value != nil else { return }
         busy = true
         actionError = nil
         defer { busy = false }

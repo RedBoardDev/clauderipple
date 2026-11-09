@@ -18,7 +18,7 @@ struct ClientsPane: View {
                 codexSection
             }
             .formStyle(.grouped)
-            .disabled(editor.busy != nil)
+            .disabled(editor.busy != nil || store.incompatibilities["/api/status"] != nil)
         }
         .task { await editor.load(using: store) }
         .confirmationDialog("Enable the Desktop model picker?", isPresented: $confirmPicker, titleVisibility: .visible) {
@@ -33,6 +33,9 @@ struct ClientsPane: View {
 
     @ViewBuilder
     private var feedback: some View {
+        if let error = store.incompatibilities["/api/status"] {
+            Section { InlineError(error.userMessage) }
+        }
         if let busy = editor.busy {
             Section {
                 HStack {

@@ -1,0 +1,209 @@
+{
+  "adminPort": 18792,
+  "autoUpdate": {
+    "enabled": false,
+    "running": false
+  },
+  "chatgpt": {
+    "accounts": {
+      "chatgpt": [
+        {
+          "active": true,
+          "cooldownSeconds": 60,
+          "email": "gpt@example.test",
+          "expiresAt": 1800003600000,
+          "id": "00000000-0000-4000-8000-000000000002",
+          "inUse": true,
+          "label": "gpt@example.test",
+          "needsReauth": false,
+          "paused": false,
+          "planType": "contract-plan",
+          "preferred": false,
+          "quota": {
+            "at": 1800000000000,
+            "plan_type": "contract-plan",
+            "rate_limits": {
+              "primary": {
+                "reset_at": 1800003600,
+                "used_percent": 24,
+                "window_minutes": 300
+              },
+              "secondary": {
+                "reset_at": 1800086400,
+                "used_percent": 42,
+                "window_minutes": 10080
+              }
+            }
+          },
+          "source": "own",
+          "state": "cooling"
+        }
+      ]
+    },
+    "auth": {
+      "chatgpt": "own"
+    },
+    "quota": {
+      "chatgpt": {
+        "at": 1800000000000,
+        "plan_type": "contract-plan",
+        "rate_limits": {
+          "primary": {
+            "reset_at": 1800003600,
+            "used_percent": 24,
+            "window_minutes": 300
+          },
+          "secondary": {
+            "reset_at": 1800086400,
+            "used_percent": 42,
+            "window_minutes": 10080
+          }
+        }
+      }
+    },
+    "signedIn": {
+      "chatgpt": true
+    }
+  },
+  "claude": {
+    "accounts": [
+      {
+        "id": "current",
+        "inUse": true,
+        "label": "Current Claude login",
+        "quota": {
+          "at": 1800000000000,
+          "plan_type": "contract-plan",
+          "rate_limits": {
+            "primary": {
+              "reset_at": 1800003600,
+              "used_percent": 24,
+              "window_minutes": 300
+            },
+            "secondary": {
+              "reset_at": 1800086400,
+              "used_percent": 42,
+              "window_minutes": 10080
+            }
+          }
+        }
+      },
+      {
+        "id": "00000000-0000-4000-8000-000000000001",
+        "label": "claude@example.test",
+        "quota": {
+          "at": 1800000000000,
+          "plan_type": "contract-plan",
+          "rate_limits": {
+            "primary": {
+              "reset_at": 1800003600,
+              "used_percent": 24,
+              "window_minutes": 300
+            },
+            "secondary": {
+              "reset_at": 1800086400,
+              "used_percent": 42,
+              "window_minutes": 10080
+            }
+          }
+        }
+      }
+    ]
+  },
+  "cliVersion": "n/a",
+  "config": {
+    "errors": []
+  },
+  "consecutiveUpstreamFailures": 0,
+  "credentials": {
+    "claude": [
+      {
+        "failures": 0,
+        "id": "current",
+        "inUse": true,
+        "label": "Current login",
+        "state": "ready"
+      },
+      {
+        "failures": 0,
+        "id": "00000000-0000-4000-8000-000000000001",
+        "inUse": false,
+        "label": "claude@example.test",
+        "state": "ready"
+      }
+    ]
+  },
+  "envProxy": {
+    "set": []
+  },
+  "home": "/contract/home",
+  "installId": null,
+  "listen": {
+    "host": "127.0.0.1",
+    "port": 8790
+  },
+  "picker": {
+    "enabled": false,
+    "hosts": [],
+    "last": null
+  },
+  "pickerModels": [
+    "Contract GPT"
+  ],
+  "pid": null,
+  "processPriority": {
+    "current": null,
+    "setting": "normal",
+    "supported": false
+  },
+  "providers": {
+    "chatgpt": {
+      "needsLogin": false,
+      "reachable": false,
+      "type": "chatgpt",
+      "url": "https://contract.invalid",
+      "usable": false,
+      "webSearch": true
+    },
+    "claude": {
+      "accountCount": 1,
+      "authSource": "observed",
+      "reachable": false,
+      "signedIn": "oauth",
+      "type": "anthropic",
+      "url": "https://api.anthropic.com",
+      "usable": false,
+      "webSearch": true
+    }
+  },
+  "readiness": {
+    "problems": [
+      "settings",
+      "provider:claude",
+      "provider:chatgpt"
+    ],
+    "ready": false
+  },
+  "routes": 1,
+  "runtime": {
+    "node": "/contract/node",
+    "router": "/contract/router.ts",
+    "startedAt": "2027-01-15T08:00:00.000Z"
+  },
+  "settings": {
+    "HTTPS_PROXY": null,
+    "NODE_EXTRA_CA_CERTS": null,
+    "pointsAtRouter": false
+  },
+  "stats": {
+    "completed": 2,
+    "failed": 0,
+    "inFlight": 1,
+    "messagesInFlight": 1,
+    "started": 3
+  },
+  "statusMod": false,
+  "uiRevision": "contract-ui",
+  "upstream": "api.anthropic.com",
+  "version": "0.12.33"
+}

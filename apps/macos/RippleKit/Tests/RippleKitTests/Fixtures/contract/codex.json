@@ -1,0 +1,5 @@
+{
+  "codexHome": "/contract/home/codex",
+  "configPath": "/contract/home/codex/config.toml",
+  "enabled": false
+}

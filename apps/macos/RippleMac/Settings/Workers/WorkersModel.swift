@@ -30,24 +30,21 @@ final class WorkersModel {
         self.client = client
         do {
             async let snapshot = client.modSettings()
-            async let optionsResult = fetchOptions(client)
+            async let optionsResult = client.modOptions()
             let fresh = try await snapshot
             if editor != nil { editor?.rebase(on: fresh) } else { editor = ModSettingsEditor(snapshot: fresh) }
             reconcileModeSelection()
-            let result = await optionsResult
-            options = result.0
-            optionsError = result.1
+            options = try await optionsResult
+            optionsError = nil
+            // A GET does not advertise a writer schema: it cannot clear a previous 426 refusal.
             loadState = .loaded(true)
-        } catch { loadState = .failed(error.asAdminError) }
-    }
-
-    private func fetchOptions(_ client: AdminClient) async -> (ModOptions?, String?) {
-        do { return (try await client.modOptions(), nil) }
-        catch { return (nil, "Model choices couldn't load. Existing settings are preserved. \(error.asAdminError.userMessage)") }
+        } catch {
+            loadState = .failed(error.asAdminError)
+        }
     }
 
     func edit(_ update: (inout ModSettingsEditor) -> Void) {
-        guard var editor, !schemaUnsupported else { return }
+        guard var editor, !schemaUnsupported, loadState.value != nil else { return }
         update(&editor)
         self.editor = editor
         scheduleSave()
@@ -68,7 +65,7 @@ final class WorkersModel {
     }
 
     func save() async {
-        guard !schemaUnsupported, !saving, let client, let sent = editor, sent.isDirty else { return }
+        guard !schemaUnsupported, loadState.value != nil, !saving, let client, let sent = editor, sent.isDirty else { return }
         saving = true
         saveError = nil
         do {
@@ -79,8 +76,11 @@ final class WorkersModel {
             if editor?.isDirty == true, debounceTask == nil { scheduleSave() }
         } catch {
             saving = false
-            if case ModSaveError.unsupportedSchema = error {
-                schemaUnsupported = true
+            if error.asAdminError.isIncompatible {
+                if case .incompatible(route: "/api/mod-settings", codingPath: "schemaVersion") = error.asAdminError {
+                    schemaUnsupported = true
+                }
+                loadState = .failed(error.asAdminError)
                 debounceTask?.cancel()
                 debounceTask = nil
             }

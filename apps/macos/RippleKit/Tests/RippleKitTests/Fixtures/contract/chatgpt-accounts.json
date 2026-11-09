@@ -1,0 +1,36 @@
+{
+  "accounts": [
+    {
+      "active": true,
+      "cooldownSeconds": 60,
+      "email": "gpt@example.test",
+      "expiresAt": 1800003600000,
+      "id": "00000000-0000-4000-8000-000000000002",
+      "inUse": true,
+      "label": "gpt@example.test",
+      "needsReauth": false,
+      "paused": false,
+      "planType": "contract-plan",
+      "preferred": false,
+      "quota": {
+        "at": 1800000000000,
+        "plan_type": "contract-plan",
+        "rate_limits": {
+          "primary": {
+            "reset_at": 1800003600,
+            "used_percent": 24,
+            "window_minutes": 300
+          },
+          "secondary": {
+            "reset_at": 1800086400,
+            "used_percent": 42,
+            "window_minutes": 10080
+          }
+        }
+      },
+      "source": "own",
+      "state": "cooling"
+    }
+  ],
+  "provider": "chatgpt"
+}

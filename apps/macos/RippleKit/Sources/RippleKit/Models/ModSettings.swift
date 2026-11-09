@@ -13,12 +13,17 @@ public struct ModSettingsSnapshot: Sendable, Equatable {
     }
 
     public init(document: JSONValue) throws {
-        guard let settings = document["settings"], settings.objectValue != nil,
-              let number = document["revision"]?.doubleValue, number.isFinite,
-              number >= 0, number <= ModSettingsEditor.maximumRevision, number.rounded() == number else {
-            throw AdminError.decoding("invalid mod settings snapshot")
+        let route = "/api/mod-settings"
+        let _: ModSettingsContract = try document.required("settings", route: route)
+        let number: Int = try document.required("revision", route: route)
+        guard number >= 0, Double(number) <= ModSettingsEditor.maximumRevision else {
+            throw AdminError.incompatible(route: route, codingPath: "revision")
         }
-        self.init(settings: settings, revision: Int(number), legacy: document["legacy"]?.boolValue == true)
+        let _: Bool = try document.required("stored", route: route)
+        let _: Int? = try document.required("compactAt", route: route)
+        // legacy is only sent when the store contained retired routing rules.
+        let legacy = try document["legacy"].map { _ in try document.required("legacy", route: route, as: Bool.self) } ?? false
+        self.init(settings: document["settings"]!, revision: number, legacy: legacy)
     }
 }
 
@@ -40,12 +45,31 @@ public struct ModOptions: Decodable, Sendable {
         public let provider: String
         public let efforts: [String]?
         public let billing: String?
+
+        enum CodingKeys: String, CodingKey { case name, model, provider, efforts, billing }
+        public init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            name = try c.decode(String.self, forKey: .name)
+            model = try c.decode(String.self, forKey: .model)
+            provider = try c.decode(String.self, forKey: .provider)
+            efforts = try c.decode([String].self, forKey: .efforts)
+            billing = try c.decode(String.self, forKey: .billing)
+        }
     }
     public struct Model: Decodable, Sendable {
         public let model: String
         public let provider: String
         public let name: String?
         public let judgeOnly: Bool?
+
+        enum CodingKeys: String, CodingKey { case model, provider, name, judgeOnly }
+        public init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            model = try c.decode(String.self, forKey: .model)
+            provider = try c.decode(String.self, forKey: .provider)
+            name = try c.decode(String.self, forKey: .name)
+            judgeOnly = try c.decode(Bool.self, forKey: .judgeOnly)
+        }
     }
     public struct Provider: Decodable, Sendable {
         public let name: String
@@ -53,11 +77,31 @@ public struct ModOptions: Decodable, Sendable {
         public let usable: Bool
         public let billing: String?
         public let reason: String?
+
+        enum CodingKeys: String, CodingKey { case name, type, usable, billing, reason }
+        public init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            name = try c.decode(String.self, forKey: .name)
+            type = try c.decode(String.self, forKey: .type)
+            usable = try c.decode(Bool.self, forKey: .usable)
+            billing = try c.decode(String.self, forKey: .billing)
+            // Only exhausted providers carry a reason.
+            reason = try c.decodeIfPresent(String.self, forKey: .reason)
+        }
     }
     public let agents: [Agent]
     public let models: [Model]
     public let providers: [Provider]
     public let claudeEfforts: [String]?
+
+    enum CodingKeys: String, CodingKey { case agents, models, providers, claudeEfforts }
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        agents = try c.decode([Agent].self, forKey: .agents)
+        models = try c.decode([Model].self, forKey: .models)
+        providers = try c.decode([Provider].self, forKey: .providers)
+        claudeEfforts = try c.decode([String].self, forKey: .claudeEfforts)
+    }
 
     public var workerChoices: [ModWorkerChoice] {
         let workers = agents.map { agent in

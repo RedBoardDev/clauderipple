@@ -63,7 +63,7 @@ final class SystemTests: XCTestCase {
         let update = try JSONDecoder().decode(UpdateCheck.self, from: fixture("system-update"))
         XCTAssertTrue(update.canUpdate)
         for kind in ["checkout", "packaged", "local", "future"] {
-            let unsupported = try JSONDecoder().decode(UpdateCheck.self, from: Data("{\"current\":\"1\",\"latest\":\"2\",\"newer\":true,\"kind\":\"\(kind)\"}".utf8))
+            let unsupported = try JSONDecoder().decode(UpdateCheck.self, from: Data("{\"current\":\"1\",\"latest\":\"2\",\"newer\":true,\"kind\":\"\(kind)\",\"running\":false}".utf8))
             XCTAssertFalse(unsupported.supportsUpdate)
             XCTAssertNotNil(unsupported.installationNote)
         }

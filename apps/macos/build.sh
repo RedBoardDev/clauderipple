@@ -2,7 +2,8 @@
 # Build, test and install the native ClaudeRipple menu-bar app (apps/macos).
 #
 #   apps/macos/build.sh gen       regenerate ClaudeRipple.xcodeproj from project.yml (XcodeGen)
-#   apps/macos/build.sh test      run the RippleKit unit tests (swift test)
+#   apps/macos/build.sh test      record the real admin contract, then run Swift tests
+#   apps/macos/build.sh contract  record the real admin contract alone
 #   apps/macos/build.sh build     Release build into $BUILD_DIR (default /tmp/clauderipple-mac-build)
 #   apps/macos/build.sh install   build, copy to /Applications, launch
 #   apps/macos/build.sh open      open the project in Xcode
@@ -47,9 +48,14 @@ build() {
   echo "$BUILD_DIR/derived/Build/Products/Release/$APP_NAME.app"
 }
 
+contract() {
+  (cd "$HERE/../.." && node --test apps/macos/contract)
+}
+
 case "${1:-build}" in
   gen) gen ;;
-  test) (cd "$HERE/RippleKit" && swift test --scratch-path "$BUILD_DIR/spm") ;;
+  contract) contract ;;
+  test) contract && (cd "$HERE/RippleKit" && swift test --scratch-path "$BUILD_DIR/spm") ;;
   build) build ;;
   install)
     app="$(build | tail -1)"

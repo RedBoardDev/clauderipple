@@ -7,12 +7,31 @@ public struct ClaudeAccountsResponse: Decodable, Sendable {
         public let label: String
         public let source: String?
         public let quota: Quota?
-        /// Kept out of the pool by the user; absent on routers without the switch.
-        public let paused: Bool?
+        /// Always sent, including false: dropping the control is an incompatible API change.
+        public let paused: Bool
+
+        enum CodingKeys: String, CodingKey { case id, label, source, quota, paused }
+        public init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            id = try c.decode(String.self, forKey: .id)
+            label = try c.decode(String.self, forKey: .label)
+            source = try c.decode(String.self, forKey: .source)
+            paused = try c.decode(Bool.self, forKey: .paused)
+            // Usage is omitted until the subscription quota lookup succeeds.
+            quota = try c.decodeIfPresent(Quota.self, forKey: .quota)
+        }
     }
 
     public let current: Current?
     public let accounts: [ClaudeAccount]
+
+    enum CodingKeys: String, CodingKey { case current, accounts }
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        // A login not yet observed is an explicit null.
+        current = try c.decode(Current?.self, forKey: .current)
+        accounts = try c.decode([ClaudeAccount].self, forKey: .accounts)
+    }
 }
 
 public struct ClaudeAccount: Decodable, Sendable, Identifiable, Equatable {
@@ -31,13 +50,15 @@ public struct ClaudeAccount: Decodable, Sendable, Identifiable, Equatable {
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         id = try c.decode(String.self, forKey: .id)
-        label = try c.decodeIfPresent(String.self, forKey: .label) ?? ""
+        label = try c.decode(String.self, forKey: .label)
+        // Email is omitted when the grant did not identify the account.
         email = try c.decodeIfPresent(String.self, forKey: .email)
-        expiresAt = try c.decodeIfPresent(Double.self, forKey: .expiresAt)
-        needsReauth = try c.decodeIfPresent(Bool.self, forKey: .needsReauth) ?? false
-        preferred = try c.decodeIfPresent(Bool.self, forKey: .preferred) ?? false
-        paused = try c.decodeIfPresent(Bool.self, forKey: .paused) ?? false
-        quota = try? c.decodeIfPresent(Quota.self, forKey: .quota)
+        expiresAt = try c.decode(Double.self, forKey: .expiresAt)
+        needsReauth = try c.decode(Bool.self, forKey: .needsReauth)
+        preferred = try c.decode(Bool.self, forKey: .preferred)
+        paused = try c.decode(Bool.self, forKey: .paused)
+        // Quota is omitted until a subscription usage lookup succeeds.
+        quota = try c.decodeIfPresent(Quota.self, forKey: .quota)
     }
 }
 
@@ -45,6 +66,14 @@ public struct ClaudeAccount: Decodable, Sendable, Identifiable, Equatable {
 public struct ChatGptAccountsResponse: Decodable, Sendable {
     public let provider: String?
     public let accounts: [ChatGptAccount]
+
+    enum CodingKeys: String, CodingKey { case provider, accounts }
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        // Without an adapter the router previews stored accounts and explicitly sends null.
+        provider = try c.decode(String?.self, forKey: .provider)
+        accounts = try c.decode([ChatGptAccount].self, forKey: .accounts)
+    }
 }
 
 public struct ChatGptAccount: Decodable, Sendable, Identifiable, Equatable {
@@ -67,7 +96,7 @@ public struct ChatGptAccount: Decodable, Sendable, Identifiable, Equatable {
     public let paused: Bool
     /// "own" (router login) or "codex" (borrowed from Codex, which this app cannot rename or remove).
     public let source: String?
-    /// Absent on a summary-only fallback list.
+    /// Both live adapter rows and summary-only previews always report a state.
     public let state: State?
     public let cooldownSeconds: Double?
     public let quota: Quota?
@@ -80,17 +109,25 @@ public struct ChatGptAccount: Decodable, Sendable, Identifiable, Equatable {
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         id = try c.decode(String.self, forKey: .id)
-        label = try c.decodeIfPresent(String.self, forKey: .label) ?? ""
+        label = try c.decode(String.self, forKey: .label)
+        // Email and plan are omitted when the provider's grant has no identity/plan claims.
         email = try c.decodeIfPresent(String.self, forKey: .email)
         planType = try c.decodeIfPresent(String.self, forKey: .planType)
-        expiresAt = try c.decodeIfPresent(Double.self, forKey: .expiresAt)
-        needsReauth = try c.decodeIfPresent(Bool.self, forKey: .needsReauth) ?? false
-        paused = try c.decodeIfPresent(Bool.self, forKey: .paused) ?? false
-        source = try c.decodeIfPresent(String.self, forKey: .source)
-        state = try c.decodeIfPresent(State.self, forKey: .state)
+        expiresAt = try c.decode(Double.self, forKey: .expiresAt)
+        needsReauth = try c.decode(Bool.self, forKey: .needsReauth)
+        paused = try c.decode(Bool.self, forKey: .paused)
+        source = try c.decode(String.self, forKey: .source)
+        state = try c.decode(State.self, forKey: .state)
+        // Only a cooling account has a cooldown deadline.
         cooldownSeconds = try c.decodeIfPresent(Double.self, forKey: .cooldownSeconds)
-        quota = try? c.decodeIfPresent(Quota.self, forKey: .quota)
-        active = try c.decodeIfPresent(Bool.self, forKey: .active) ?? false
+        // The summary-only preview (no adapter yet) omits quota and active together.
+        if c.contains(.quota) || c.contains(.active) {
+            quota = try c.decode(Quota?.self, forKey: .quota)
+            active = try c.decode(Bool.self, forKey: .active)
+        } else {
+            quota = nil
+            active = false
+        }
     }
 
     /// The Codex login is borrowed: the router can clear its cooldown but not rename, pause or remove it.
@@ -105,6 +142,18 @@ public struct ClaudeOAuthState: Decodable, Sendable, Equatable {
     public let ok: Bool?
     public let error: String?
     public let opened: Bool?
+
+    enum CodingKeys: String, CodingKey { case running, url, manual, ok, error, opened }
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        running = try c.decode(Bool.self, forKey: .running)
+        url = try c.decode(String?.self, forKey: .url)
+        manual = try c.decode(Bool.self, forKey: .manual)
+        ok = try c.decode(Bool?.self, forKey: .ok)
+        error = try c.decode(String?.self, forKey: .error)
+        // Only POST start reports whether it opened a browser; GET and code submission omit it.
+        opened = try c.decodeIfPresent(Bool.self, forKey: .opened)
+    }
 }
 
 /// ChatGPT CLI login job (`GET/POST /api/chatgpt-login`).
@@ -159,7 +208,7 @@ public extension ClaudeAccountsResponse {
         if let current {
             let row = ClaudeAccountRow(id: current.id, label: current.label, email: nil, quota: current.quota,
                                        isCurrentLogin: true, isFirst: leader == current.id, needsSignIn: false,
-                                       paused: current.paused ?? false)
+                                       paused: current.paused)
             rows.insert(row, at: preferredIndex == nil ? 0 : min(1, rows.count))
         }
         return rows

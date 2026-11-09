@@ -1,11 +1,17 @@
 {
   "version": "0.9.5",
+  "readiness": {"ready": true, "problems": []},
+  "runtime": {"node": "test", "router": null, "startedAt": "2027-01-15T08:00:00Z"},
+  "stats": {"inFlight": 0, "messagesInFlight": 0, "started": 0, "completed": 0, "failed": 0},
+  "consecutiveUpstreamFailures": 0, "routes": 0, "adminPort": 18792,
+  "cliVersion": "test", "uiRevision": "test", "settings": {"pointsAtRouter": true},
+  "chatgpt": {"accounts": {}}, "credentials": {},
   "picker": {"enabled": true, "last": {"at": "2026-01-02T03:04:05.000Z", "injected": 2, "surfaces": [{"id": "code", "models": ["alpha-model"]}]}},
   "statusMod": false,
   "pickerModels": ["Alpha", "Beta"],
   "providers": {
-    "alpha": {"type": "chatgpt", "reachable": true, "usable": true, "webSearch": true},
-    "beta": {"type": "openai-compatible", "reachable": true, "usable": true, "webSearchModels": ["beta-search"]},
-    "pool": {"type": "anthropic", "reachable": true, "usable": true, "webSearch": true}
+    "alpha": {"url": "https://alpha.example.test", "type": "chatgpt", "reachable": true, "usable": true, "webSearch": true},
+    "beta": {"url": "https://beta.example.test", "type": "openai-compatible", "reachable": true, "usable": true, "webSearchModels": ["beta-search"]},
+    "pool": {"url": "https://api.example.test", "authSource": "observed", "signedIn": "oauth", "accountCount": 1, "type": "anthropic", "reachable": true, "usable": true, "webSearch": true}
   }
 }

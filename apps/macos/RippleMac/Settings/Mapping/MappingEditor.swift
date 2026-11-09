@@ -46,6 +46,7 @@ final class MappingEditor {
     }
 
     func change(_ edits: [RouteEdit], store: RouterStore) {
+        guard load.value != nil else { return }
         do {
             try ConfigEdits.apply(edits, to: &document)
             configuration = RoutingConfiguration(document: document)
@@ -84,6 +85,10 @@ final class MappingEditor {
                     saveState = pending.isEmpty ? "Saved" : "Saving…"
                 } catch {
                     self.error = error.asAdminError.userMessage
+                    if error.asAdminError.isIncompatible {
+                        pending = []
+                        load = .failed(error.asAdminError)
+                    }
                     saveState = "Not saved"
                     return
                 }

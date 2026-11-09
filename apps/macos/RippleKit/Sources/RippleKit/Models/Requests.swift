@@ -33,15 +33,17 @@ public struct RequestRecord: Decodable, Sendable, Identifiable {
 
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
-        id = try c.decodeIfPresent(String.self, forKey: .id) ?? UUID().uuidString
-        at = try c.decodeIfPresent(String.self, forKey: .at)
-        ms = try c.decodeIfPresent(Double.self, forKey: .ms)
+        id = try c.decode(String.self, forKey: .id)
+        at = try c.decode(String.self, forKey: .at)
+        ms = try c.decode(Double.self, forKey: .ms)
+        // Older persisted records may lack status; RequestLog's reader does not require it.
         status = try c.decodeIfPresent(RequestStatus.self, forKey: .status)
-        ok = try c.decodeIfPresent(Bool.self, forKey: .ok)
-        kind = try c.decodeIfPresent(String.self, forKey: .kind)
-        source = try c.decodeIfPresent(String.self, forKey: .source)
-        target = try c.decodeIfPresent(String.self, forKey: .target)
-        provider = try c.decodeIfPresent(String.self, forKey: .provider)
+        ok = try c.decode(Bool.self, forKey: .ok)
+        kind = try c.decode(String.self, forKey: .kind)
+        source = try c.decode(String.self, forKey: .source)
+        target = try c.decode(String.self, forKey: .target)
+        provider = try c.decode(String.self, forKey: .provider)
+        // Optional request metadata: only emitted when the corresponding upstream fact is known.
         effort = try c.decodeIfPresent(String.self, forKey: .effort)
         requestedTier = try c.decodeIfPresent(String.self, forKey: .requestedTier)
         servedTier = try c.decodeIfPresent(String.self, forKey: .servedTier)
@@ -51,7 +53,7 @@ public struct RequestRecord: Decodable, Sendable, Identifiable {
         purpose = try c.decodeIfPresent(String.self, forKey: .purpose)
         note = try c.decodeIfPresent(String.self, forKey: .note)
         session = try c.decodeIfPresent(String.self, forKey: .session)
-        stream = try c.decodeIfPresent(Bool.self, forKey: .stream)
+        stream = try c.decode(Bool.self, forKey: .stream)
         resent = try c.decodeIfPresent(Bool.self, forKey: .resent)
         upstreamCalled = try c.decodeIfPresent(Bool.self, forKey: .upstreamCalled)
         upstreamRequestId = try c.decodeIfPresent(String.self, forKey: .upstreamRequestId)

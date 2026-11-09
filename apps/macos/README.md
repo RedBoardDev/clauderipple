@@ -1,7 +1,7 @@
 # ClaudeRipple for macOS (native menu-bar app)
 
-SwiftUI menu-bar client for the local router's admin API (`http://127.0.0.1:8791`). It replaces the
-Electron tray and most of the web dashboard: the panel shows every Claude and ChatGPT account's
+Fork-only, optional SwiftUI menu-bar client for the local router's admin API (loopback; port discovered
+from the router config). It does not replace the upstream Electron tray. The panel shows every Claude and ChatGPT account's
 5-hour and weekly limits with reset times; the settings window covers accounts,
 model mapping, workers and effort, clients, activity, laptop, general and about.
 
@@ -32,7 +32,8 @@ apps/macos/
 ## Build
 
 ```sh
-apps/macos/build.sh test      # RippleKit unit tests
+apps/macos/build.sh test      # Real admin contract recorder, then RippleKit tests
+apps/macos/build.sh contract  # Record the admin contract alone (Node 24, no new dependencies)
 apps/macos/build.sh build     # Release build into /tmp/clauderipple-mac-build (BUILD_DIR overrides)
 apps/macos/build.sh install   # build, copy to /Applications, launch
 ```
@@ -66,8 +67,28 @@ selection highlights, glass and prominent buttons draw in their inactive colours
 - Config edits go through `AdminClient.updateConfig`: re-read the whole config, change it, write it
   back. `JSONValue` keeps key order (provider order is routing order) and number literals.
   The config carries credentials: keep it in memory, never log it or put it in a fixture.
-- Mod settings writes send `schemaVersion: 1` and the `revision` read; a 409 carries the current
+- Mod settings writes send the app's hardcoded `schemaVersion: 2` and the `revision` read; a 409 carries the current
   snapshot to rebase on.
+
+## Contract workflow after an upstream merge
+
+Run `apps/macos/build.sh test`, then inspect
+`git diff -- apps/macos/RippleKit/Tests/RippleKitTests/Fixtures/contract` and adapt the models to any
+breaking changes. The Node recorder starts the real admin server on an ephemeral loopback port with
+made-up accounts, isolated state and stubbed external boundaries. It records every decoded GET,
+checks write bodies and effects, and writes the router version and mod-settings schema to `meta.json`.
+Swift tests decode those responses with the app's models and compare the mod PUT body with the body
+accepted by Node. Hand-written fixtures are reserved for UI and historical edge cases.
+
+Always-present fields are required; missing or mistyped facts surface as
+“Router API changed: <route> <field path>. Update the app.” Failed panes cannot save, and config PUTs
+require a fresh, validated GET. Extra fields are ignored by typed projections and retained in JSON
+documents. Review domain ladders are shown and preserved; their ordered model editing remains on the
+web dashboard. The panel's quiet “untested router <version>” note compares `/api/status` with the
+recorded metadata bundled into RippleKit; a version difference alone is not an error.
+
+The upstream CLI still opens the Electron tray. To use only the optional native app, quit the
+Electron tray and remove its login item with `clauderipple tray --login off`.
 
 ## Conventions
 

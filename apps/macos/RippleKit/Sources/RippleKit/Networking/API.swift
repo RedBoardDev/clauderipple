@@ -85,7 +85,15 @@ public extension AdminClient {
     }
 
     func chatgptLoginState() async throws -> ChatGptLoginState {
-        try await get("/api/chatgpt-login")
+        let route = "/api/chatgpt-login"
+        let document = try await getDocument(route)
+        let _: Bool = try document.required("running", route: route)
+        let _: Bool = try document.required("signedIn", route: route)
+        let _: Int = try document.required("accountCount", route: route)
+        do { return try document.decode(ChatGptLoginState.self) }
+        catch let error as DecodingError {
+            throw AdminError.incompatible(route: route, codingPath: Self.codingPath(error))
+        }
     }
 
     // MARK: Activity and power (popover readouts)
@@ -114,7 +122,9 @@ public extension AdminClient {
 
     /// The full router config. It carries provider credentials: keep it in memory only, never log it.
     func config() async throws -> JSONValue {
-        try await getDocument("/api/config")
+        let document = try await getDocument("/api/config")
+        try AdminConfiguration.validate(document)
+        return document
     }
 
     /// Re-reads the config, applies `change` to the fresh copy and writes it back, so an edit made

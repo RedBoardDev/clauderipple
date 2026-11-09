@@ -50,14 +50,14 @@ public struct QuotaCredits: Decodable, Sendable, Equatable {
 
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
+        // Provider credit snapshots may omit any credit fact; malformed present values still throw.
         hasCredits = try c.decodeIfPresent(Bool.self, forKey: .hasCredits)
         unlimited = try c.decodeIfPresent(Bool.self, forKey: .unlimited)
-        if let s = try? c.decodeIfPresent(String.self, forKey: .balance) {
+        if let s = try? c.decode(String.self, forKey: .balance) {
             balance = s
-        } else if let n = try? c.decodeIfPresent(Double.self, forKey: .balance) {
-            balance = n.rounded() == n ? String(Int(n)) : String(n)
         } else {
-            balance = nil
+            // The provider reports balance as either a string or a number, never arbitrary JSON.
+            balance = try c.decodeIfPresent(Double.self, forKey: .balance).map { $0.rounded() == $0 ? String(format: "%.0f", $0) : String($0) }
         }
     }
 }
