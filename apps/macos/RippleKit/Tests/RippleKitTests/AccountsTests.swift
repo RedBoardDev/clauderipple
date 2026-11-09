@@ -38,6 +38,14 @@ final class ClaudeAccountRowsTests: XCTestCase {
         XCTAssertFalse(rows[1].needsSignIn, "no expiry known is not an expiry")
     }
 
+    // WHY: a paused account, the current login included, must read as paused so "Resume" is offered.
+    func testPausedAccountsAreMarked() throws {
+        let data = try response(#"{"current":{"id":"current","label":"Current Claude login","paused":true},"accounts":[{"id":"a","label":"A","paused":true},{"id":"b","label":"B"}]}"#)
+        XCTAssertEqual(data.rows(now: now).map(\.paused), [true, true, false])
+        XCTAssertFalse(try response(#"{"current":{"id":"current","label":"Current Claude login"},"accounts":[]}"#).rows(now: now)[0].paused,
+                       "a router without the switch reports nothing, which is not paused")
+    }
+
     func testOneAccountOffersNoChoice() throws {
         XCTAssertFalse(try response(#"{"current":{"id":"current","label":"Current Claude login"},"accounts":[]}"#).hasChoice)
     }
@@ -126,6 +134,15 @@ final class AccountRoutesTests: XCTestCase {
         } catch {
             XCTAssertEqual(error as? AdminError, .http(status: 500, message: "keychain locked"))
         }
+    }
+
+    func testClaudePauseSendsOnlyPaused() async throws {
+        let client = MockRouter.client { _ in .json(#"{"ok":true}"#) }
+        try await client.setClaudeAccountPaused("current", true)
+        let sent = try XCTUnwrap(MockRouter.requests().first)
+        XCTAssertEqual(sent.method, "PATCH")
+        XCTAssertEqual(sent.path, "/api/claude-accounts/current")
+        XCTAssertEqual(sent.json?.serialized(), #"{"paused":true}"#)
     }
 
     func testChatGptPatchSendsOnlyTheGivenMembers() async throws {

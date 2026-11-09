@@ -7,6 +7,8 @@ public struct ClaudeAccountsResponse: Decodable, Sendable {
         public let label: String
         public let source: String?
         public let quota: Quota?
+        /// Kept out of the pool by the user; absent on routers without the switch.
+        public let paused: Bool?
     }
 
     public let current: Current?
@@ -21,9 +23,10 @@ public struct ClaudeAccount: Decodable, Sendable, Identifiable, Equatable {
     public let expiresAt: Double?
     public let needsReauth: Bool
     public let preferred: Bool
+    public let paused: Bool
     public let quota: Quota?
 
-    enum CodingKeys: String, CodingKey { case id, label, email, expiresAt, needsReauth, preferred, quota }
+    enum CodingKeys: String, CodingKey { case id, label, email, expiresAt, needsReauth, preferred, paused, quota }
 
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -33,6 +36,7 @@ public struct ClaudeAccount: Decodable, Sendable, Identifiable, Equatable {
         expiresAt = try c.decodeIfPresent(Double.self, forKey: .expiresAt)
         needsReauth = try c.decodeIfPresent(Bool.self, forKey: .needsReauth) ?? false
         preferred = try c.decodeIfPresent(Bool.self, forKey: .preferred) ?? false
+        paused = try c.decodeIfPresent(Bool.self, forKey: .paused) ?? false
         quota = try? c.decodeIfPresent(Quota.self, forKey: .quota)
     }
 }
@@ -127,6 +131,8 @@ public struct ClaudeAccountRow: Sendable, Equatable, Identifiable {
     public let isFirst: Bool
     /// Refused or expired: the router skips it until it is signed in again.
     public let needsSignIn: Bool
+    /// Paused by the user: the router never sends a request with it until it is resumed.
+    public let paused: Bool
 
     /// The external login belongs to Claude Code / Claude Desktop; the router cannot rename or remove it.
     public var isStored: Bool { !isCurrentLogin }
@@ -147,11 +153,13 @@ public extension ClaudeAccountsResponse {
         var rows = stored.map { account in
             ClaudeAccountRow(id: account.id, label: account.label, email: account.email == account.label ? nil : account.email,
                              quota: account.quota, isCurrentLogin: false, isFirst: account.id == leader,
-                             needsSignIn: account.needsReauth || account.expiresAt.map { $0 <= nowMs } == true)
+                             needsSignIn: account.needsReauth || account.expiresAt.map { $0 <= nowMs } == true,
+                             paused: account.paused)
         }
         if let current {
             let row = ClaudeAccountRow(id: current.id, label: current.label, email: nil, quota: current.quota,
-                                       isCurrentLogin: true, isFirst: leader == current.id, needsSignIn: false)
+                                       isCurrentLogin: true, isFirst: leader == current.id, needsSignIn: false,
+                                       paused: current.paused ?? false)
             rows.insert(row, at: preferredIndex == nil ? 0 : min(1, rows.count))
         }
         return rows

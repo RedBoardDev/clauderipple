@@ -29,6 +29,11 @@ public extension AdminClient {
         try await send("PATCH", "/api/claude-accounts/\(Self.pathSegment(id))", json: .object([("label", .string(label))]))
     }
 
+    /// Pause or resume an account; "current" names the Claude Code / Claude Desktop login.
+    func setClaudeAccountPaused(_ id: String, _ paused: Bool) async throws {
+        try await send("PATCH", "/api/claude-accounts/\(Self.pathSegment(id))", json: .object([("paused", .bool(paused))]))
+    }
+
     func removeClaudeAccount(_ id: String) async throws {
         try await send("DELETE", "/api/claude-accounts/\(Self.pathSegment(id))")
     }

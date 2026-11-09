@@ -81,11 +81,13 @@ struct ClaudeAccountsSection: View {
         if row.needsSignIn {
             Button("Sign in again") { actions.signingInClaude = true }
         }
-        if choosable, !row.isFirst {
+        if choosable, !row.isFirst, !row.paused {
             Button("Use first") { useFirst(row) }
                 .disabled(row.needsSignIn)
                 .help("New conversations start on this account")
         }
+        Button(row.paused ? "Resume" : "Pause") { setPaused(row, !row.paused) }
+            .help(row.paused ? "Use this account again" : "Never send requests with this account until it is resumed")
         if row.isStored {
             AccountMoreMenu {
                 actions.rename(.init(kind: .claude, id: row.id, label: row.label))
@@ -97,8 +99,9 @@ struct ClaudeAccountsSection: View {
 
     private func badges(for row: ClaudeAccountRow, choosable: Bool) -> [StatusBadge] {
         var out: [StatusBadge] = []
-        if choosable, row.isFirst { out.append(StatusBadge("First", tone: .accent, symbol: "star.fill")) }
-        if row.needsSignIn { out.append(StatusBadge("Sign in again", tone: .bad, symbol: "exclamationmark")) }
+        if choosable, row.isFirst, !row.paused { out.append(StatusBadge("First", tone: .accent, symbol: "star.fill")) }
+        if row.paused { out.append(StatusBadge("Paused", tone: .neutral, symbol: "pause.fill")) }
+        else if row.needsSignIn { out.append(StatusBadge("Sign in again", tone: .bad, symbol: "exclamationmark")) }
         else if row.isCurrentLogin { out.append(StatusBadge("Current login", tone: .ok)) }
         return out
     }
@@ -113,6 +116,14 @@ struct ClaudeAccountsSection: View {
             await actions.perform(.claude, row.id, reload: reload) {
                 // The current login is first by default: preferring it clears the preference.
                 try await store.client.setPreferredClaudeAccount(row.isCurrentLogin ? nil : row.id)
+            }
+        }
+    }
+
+    private func setPaused(_ row: ClaudeAccountRow, _ paused: Bool) {
+        Task {
+            await actions.perform(.claude, row.id, reload: reload) {
+                try await store.client.setClaudeAccountPaused(row.id, paused)
             }
         }
     }
