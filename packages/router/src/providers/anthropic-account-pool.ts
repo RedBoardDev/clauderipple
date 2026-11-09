@@ -7,6 +7,7 @@ import type { Logger } from "../log.ts";
 import type { Credential } from "../pool.ts";
 import { redactErrorText } from "../redact.ts";
 import {
+  isCurrentClaudeLoginPaused,
   markClaudeAccountNeedsReauth,
   readClaudeOAuthAccounts,
   replaceClaudeOAuthAccount,
@@ -124,7 +125,8 @@ export class ClaudeAccountAuthPool {
   /** Current projection without network I/O, used by status and pre-routing health checks. */
   peekCredentials(): Credential[] {
     const out: Credential[] = [];
-    const current = this.current.get();
+    // A paused login is never projected: no request, usage probe or model listing carries its token.
+    const current = isCurrentClaudeLoginPaused(this.home) ? new Error("current Claude login paused") : this.current.get();
     let currentToken: string | undefined;
     if (!(current instanceof Error)) {
       if (current.source === "observed") {

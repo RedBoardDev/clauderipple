@@ -2201,6 +2201,17 @@ function claudePreferButton(name, id, disabled) {
   return button;
 }
 
+/** Pause keeps the external Claude Code/Desktop login out of rotation; it cannot be removed, only benched. */
+function claudeCurrentPauseButton(name, current) {
+  const button = el("button", { class: "btn secondary compact", type: "button", text: current.paused ? t("providers.currentResume") : t("providers.currentPause") });
+  button.addEventListener("click", async () => {
+    button.disabled = true;
+    try { await api("/api/claude-accounts/current", { method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify({ paused: !current.paused }) }); await refreshClaudeAccountPanel(name); }
+    catch (error) { button.disabled = false; toast(t("common.actionFailed"), true, error.message); }
+  });
+  return button;
+}
+
 function renderClaudeAccountRows(target, data, name, generation) {
   if (generation !== providerDetailGeneration) return;
   // Rows follow the order the router tries them in: the preferred account, else the current login, first.
@@ -2213,10 +2224,13 @@ function renderClaudeAccountRows(target, data, name, generation) {
   const rows = [];
   const currentRow = data.current ? el("article", { class: "cell account-card current" }, [
     el("div", { class: "cell-text account-card-copy" }, [
-      el("strong", { text: data.current.label }), el("span", { class: "small", text: anthropicSourceText(data.current.source) }), claudeQuotaNode(data.current), hint(t("providers.currentAccountHelp")),
-      choosable && leader !== "current" ? el("div", { class: "account-card-actions" }, [claudePreferButton(name, null, false)]) : null,
+      el("strong", { text: data.current.label }), el("span", { class: "small", text: anthropicSourceText(data.current.source) }), claudeQuotaNode(data.current), hint(t(data.current.paused ? "providers.currentPausedHelp" : "providers.currentAccountHelp")),
+      el("div", { class: "account-card-actions" }, [
+        choosable && leader !== "current" && !data.current.paused ? claudePreferButton(name, null, false) : null,
+        claudeCurrentPauseButton(name, data.current),
+      ]),
     ]),
-    el("div", { class: "account-card-badges" }, [firstBadge("current"), el("span", { class: "badge ok", text: t("providers.anthropicCurrent") })]),
+    el("div", { class: "account-card-badges" }, [data.current.paused ? null : firstBadge("current"), data.current.paused ? el("span", { class: "badge warn", text: t("providers.currentPaused") }) : el("span", { class: "badge ok", text: t("providers.anthropicCurrent") })]),
   ]) : null;
   if (currentRow && preferredIndex < 0) rows.push(currentRow);
   for (const account of stored) {

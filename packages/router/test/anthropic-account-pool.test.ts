@@ -12,6 +12,7 @@ import {
   readClaudeAccountsFile,
   replaceClaudeOAuthAccount,
   saveClaudeOAuthAccount,
+  setCurrentClaudeLoginPaused,
   setPreferredClaudeAccount,
 } from "../src/providers/anthropic-accounts.ts";
 import { ClaudeCodeAuthStore, ClaudeCodeCredentialStore } from "../src/providers/anthropic.ts";
@@ -299,5 +300,24 @@ test("invalid_grant requires reauthentication, while a transient endpoint failur
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }
+  }
+});
+
+test("a paused current login is never projected, and resuming brings it back", () => {
+  const dir = home();
+  try {
+    const now = () => 1_000_000;
+    saveClaudeOAuthAccount(dir, { accessToken: "stored-access", refreshToken: "stored-refresh", expiresAt: 9_000_000, accountId: "stored-id" });
+    const current = new ClaudeCodeAuthStore(
+      new ClaudeCodeCredentialStore(() => JSON.stringify({ claudeAiOauth: { accessToken: "current-access", expiresAt: 9_000_000 } }), now),
+      { home: dir, env: {}, now },
+    );
+    const pool = new ClaudeAccountAuthPool({ home: dir, now, current, log: log().logger });
+    setCurrentClaudeLoginPaused(dir, true);
+    assert.deepEqual(pool.peekCredentials().map((c) => c.headers.authorization), ["Bearer stored-access"]);
+    setCurrentClaudeLoginPaused(dir, false);
+    assert.equal(pool.peekCredentials()[0]!.headers.authorization, "Bearer current-access");
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
   }
 });

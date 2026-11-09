@@ -287,3 +287,18 @@ export function summarize(account: ClaudeOAuthAccount): ClaudeAccountSummary {
 export function listClaudeAccounts(home: string): ClaudeAccountSummary[] {
   return readClaudeOAuthAccounts(home).map(summarize);
 }
+
+/** A marker file, not a field of claude-accounts.json: the current login is owned by Claude Code, not by this pool. */
+function currentPausedPath(home: string): string {
+  return path.join(home, "claude-current-paused");
+}
+
+/** True while the user keeps the external Claude Code/Desktop login out of rotation. */
+export function isCurrentClaudeLoginPaused(home: string): boolean {
+  return fs.existsSync(currentPausedPath(home));
+}
+
+export function setCurrentClaudeLoginPaused(home: string, paused: boolean): void {
+  if (paused) fs.writeFileSync(currentPausedPath(home), "", { mode: 0o600 });
+  else fs.rmSync(currentPausedPath(home), { force: true });
+}

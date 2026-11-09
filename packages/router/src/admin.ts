@@ -63,7 +63,7 @@ import { desktopClaudeCodeDirs } from "../../cli/src/claude-auth.ts";
 import { statusModEnabled, syncModelSlots } from "../../cli/src/settings.ts";
 import { ClaudeOAuthSession, type ClaudeOAuthState } from "./providers/claude-oauth.ts";
 import { readClaudeAuthFile } from "./providers/anthropic-token-file.ts";
-import { listClaudeAccounts, removeClaudeAccount, renameClaudeAccount, setPreferredClaudeAccount } from "./providers/anthropic-accounts.ts";
+import { isCurrentClaudeLoginPaused, listClaudeAccounts, removeClaudeAccount, setCurrentClaudeLoginPaused, renameClaudeAccount, setPreferredClaudeAccount } from "./providers/anthropic-accounts.ts";
 import { readChatGptAccounts, removeChatGptAccount, summarize as summarizeChatGptAccount, updateChatGptAccount } from "./providers/chatgpt/accounts.ts";
 import { exhaustedForMs, IMAGE_ASPECTS, IMAGE_BACKGROUNDS, IMAGE_FORMATS, type ChatGptAccountStatus, type ImageRequest, type ImageResult } from "./providers/chatgpt/index.ts";
 import type { GoogleAccountStatus } from "./providers/google/index.ts";
@@ -2254,7 +2254,7 @@ export function startAdmin(deps: AdminDeps): Promise<{ port: number; close(): vo
         let usage: Record<string, Record<string, unknown>> = {};
         if (hasClaudeSubscription(deps.config())) usage = (await deps.claudeUsage?.().catch(() => null)) ?? {};
         sendJson(res, 200, {
-          current: source ? { id: "current", label: "Current Claude login", source, external: true, ...(usage.current ? { quota: usage.current } : {}) } : null,
+          current: source ? { id: "current", label: "Current Claude login", source, external: true, paused: isCurrentClaudeLoginPaused(homeDir()), ...(usage.current ? { quota: usage.current } : {}) } : null,
           accounts: listClaudeAccounts(homeDir()).map((account) => (usage[account.id] ? { ...account, quota: usage[account.id] } : account)),
         });
         return;
@@ -2287,6 +2287,23 @@ export function startAdmin(deps: AdminDeps): Promise<{ port: number; close(): vo
           id = decodeURIComponent(pathname.slice("/api/claude-accounts/".length));
         } catch {
           sendJson(res, 400, { error: "invalid account id" });
+          return;
+        }
+        if (id === "current" && method === "PATCH") {
+          let paused: unknown;
+          try {
+            paused = (JSON.parse((await readBody(req)).toString("utf8")) as { paused?: unknown }).paused;
+          } catch {
+            sendJson(res, 400, { error: "invalid JSON" });
+            return;
+          }
+          if (typeof paused !== "boolean") {
+            sendJson(res, 400, { error: "expected {paused: boolean}" });
+            return;
+          }
+          setCurrentClaudeLoginPaused(homeDir(), paused);
+          deps.log.info(`admin: current Claude login ${paused ? "paused" : "resumed"}`);
+          sendJson(res, 200, { ok: true });
           return;
         }
         const validId = id === "legacy" || /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(id);
