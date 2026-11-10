@@ -12,7 +12,7 @@
 // by code that never sees the adapter.
 
 import type { Config, ProviderModel } from "../../config.ts";
-import { declaredBy } from "../../routing.ts";
+import { declaredBy, qualifiedModel } from "../../routing.ts";
 
 /** chatgpt model slug → effective window the live catalogue stated. */
 const windows = new Map<string, number>();
@@ -41,6 +41,8 @@ const isChatgpt = (cfg: Config, provider: string): boolean => cfg.providers[prov
  */
 export function chatgptModelWindow(cfg: Config, model: string): number | undefined {
   const base = model.split("@")[0]!;
+  const qualified = qualifiedModel(base, cfg);
+  if (qualified) return isChatgpt(cfg, qualified.provider) ? windows.get(qualified.model) ?? windows.get(qualified.model.replace(/-\d{8}$/, "")) : undefined;
   // The same order `resolve` uses — prefix rule, then picker slot, then the provider that declares
   // the id — so the window follows the provider the request would actually go to.
   const direct = cfg.direct.find((d) => base.startsWith(d.prefix));
@@ -53,6 +55,8 @@ export function chatgptModelWindow(cfg: Config, model: string): number | undefin
   }
   // An alias is a marker name; the window belongs to the model it names.
   for (const id of new Set([cfg.aliases[base] ?? base, base])) {
+    const qualified = qualifiedModel(id, cfg);
+    if (qualified) return isChatgpt(cfg, qualified.provider) ? windows.get(qualified.model) ?? windows.get(qualified.model.replace(/-\d{8}$/, "")) : undefined;
     const owners = declaredBy(id, cfg);
     if (owners.length === 0) continue;
     // Several owners is the same ambiguity `resolve` refuses to guess at: it routes nowhere, so it

@@ -24,7 +24,46 @@ NODE_FALLBACK="v24.21.0"
 RUNTIME="$PREFIX/runtime"
 
 say() { printf '%s\n' "$*"; }
+warn() { printf 'warning: %s\n' "$*" >&2; }
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }
+
+# The previous runtime survives until npm and the command wrapper have both succeeded. Record the
+# backup name before the first rename so even a failure immediately after that rename rolls back.
+STAGING=""
+BACKUP=""
+DOWNLOAD=""
+LEFTOVER_BACKUP=""
+cleanup() {
+  status=$?
+  trap - EXIT INT TERM
+  if [ -n "$BACKUP" ] && [ -d "$BACKUP" ]; then
+    if [ -e "$RUNTIME" ]; then rm -rf "$RUNTIME"; fi
+    if ! mv "$BACKUP" "$RUNTIME"; then status=1; fi
+  fi
+  if [ -n "$STAGING" ]; then rm -rf "$STAGING"; fi
+  if [ -n "$DOWNLOAD" ]; then rm -rf "$DOWNLOAD"; fi
+  # The install goes on after a backup that could not be deleted, so the path is repeated here,
+  # last, where it is the final thing the user reads rather than one line among the progress output.
+  if [ -n "$LEFTOVER_BACKUP" ]; then
+    warn "이전 Node 백업이 남아 있습니다. 필요 없으면 직접 삭제해 주세요. ($LEFTOVER_BACKUP)"
+  fi
+  exit "$status"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+# A hard interruption may bypass traps. Restore the single old-only runtime before using Node.
+# Ambiguous backups are preserved rather than guessed at.
+if [ ! -e "$RUNTIME" ]; then
+  recovered=""
+  for old in "$RUNTIME".old.*; do
+    [ -d "$old" ] || continue
+    [ -z "$recovered" ] || die "기존 Node 복사본이 여러 개 있어 자동 복구를 중단했습니다. 설치 폴더를 확인해 주세요."
+    recovered="$old"
+  done
+  if [ -n "$recovered" ]; then mv "$recovered" "$RUNTIME"; fi
+fi
 
 # --- the Node to install with -------------------------------------------------------------------
 
@@ -53,7 +92,8 @@ download_node() {
   [ -n "$version" ] || version="$NODE_FALLBACK"
   name="node-$version-$os-$arch"
   base="https://nodejs.org/dist/$version"
-  tmp="$(mktemp -d)"
+  tmp="$(mktemp -d "${TMPDIR:-/tmp}/clauderipple-node.XXXXXX")"
+  DOWNLOAD="$tmp"
   say "Downloading Node $version ($os-$arch)…"
   curl -fsSL "$base/$name.tar.gz" -o "$tmp/node.tar.gz" || die "could not download Node from $base"
   # The download is verified against the release's own checksum file before anything is unpacked.
@@ -64,9 +104,20 @@ download_node() {
   elif command -v sha256sum >/dev/null 2>&1; then actual="$(sha256sum "$tmp/node.tar.gz" | cut -d' ' -f1)"
   else die "neither shasum nor sha256sum is available to verify the download"; fi
   [ "$actual" = "$expected" ] || die "the Node download does not match its published checksum"
-  rm -rf "$RUNTIME"
-  mkdir -p "$RUNTIME"
-  tar -xzf "$tmp/node.tar.gz" -C "$RUNTIME" --strip-components 1
+  # Unpack beside the runtime, not into it: an interrupted or failed extraction must leave the
+  # runtime an existing ClaudeRipple already uses untouched. The swap is two renames on one
+  # filesystem, and the previous runtime is kept until the new one is in place (G-D03).
+  STAGING="$RUNTIME.new.$$"
+  rm -rf "$STAGING"
+  mkdir -p "$STAGING"
+  tar -xzf "$tmp/node.tar.gz" -C "$STAGING" --strip-components 1 || { rm -rf "$STAGING"; die "could not unpack Node from $base"; }
+  [ -x "$STAGING/bin/node" ] || { rm -rf "$STAGING"; die "unpacked Node but found no executable at $STAGING/bin/node"; }
+  if [ -e "$RUNTIME" ]; then
+    BACKUP="$RUNTIME.old.$$"
+    mv "$RUNTIME" "$BACKUP"
+  fi
+  mv "$STAGING" "$RUNTIME"
+  STAGING=""
   rm -rf "$tmp"
 }
 
@@ -120,11 +171,24 @@ case "$NODE" in
   "$RUNTIME"/*)
     ENTRY="$PREFIX/lib/node_modules/clauderipple/bin/clauderipple.js"
     [ -f "$ENTRY" ] || die "the installed package has no entry point at $ENTRY"
-    rm -f "$BIN/clauderipple"
-    printf '#!/bin/sh\nexec "%s" "%s" "$@"\n' "$NODE" "$ENTRY" > "$BIN/clauderipple"
-    chmod +x "$BIN/clauderipple"
+    # Replaced by rename: an interrupted write leaves the command that was there, not half a file.
+    WRAPPER="$BIN/.clauderipple.new.$$"
+    printf '#!/bin/sh\nexec "%s" "%s" "$@"\n' "$NODE" "$ENTRY" > "$WRAPPER"
+    chmod +x "$WRAPPER"
+    mv -f "$WRAPPER" "$BIN/clauderipple"
     ;;
 esac
+
+# Commit the runtime only after npm and the executable wrapper are usable. Later setup errors must
+# not roll back Node beneath a successfully installed package. A backup that cannot be deleted is
+# garbage beside a working install, so it is reported and left for the user instead of ending the
+# run: the PATH change, the service install and the menu-bar app still have to happen.
+committed_backup="$BACKUP"
+BACKUP=""
+if [ -n "$committed_backup" ] && ! rm -rf "$committed_backup"; then
+  LEFTOVER_BACKUP="$committed_backup"
+  warn "새 Node 설치는 그대로 두고 설치를 계속합니다. 이전 Node 백업을 삭제하지 못했습니다. 필요 없으면 직접 삭제해 주세요. ($committed_backup)"
+fi
 
 # --- PATH ---------------------------------------------------------------------------------------
 

@@ -9,6 +9,8 @@ import { fileURLToPath } from "node:url";
 import { WebSocket } from "ws";
 import { loadConfig, saveConfig } from "../src/config.ts";
 import { LocalControl, isLoopback, localSecret } from "../src/local-control.ts";
+import { ModInbox } from "../src/mod-inbox.ts";
+import { SettingsJobs } from "../src/settings-jobs.ts";
 import { HostServer } from "../src/server.ts";
 import { ExpoNotifier } from "../src/expo-push.ts";
 import { posixModes } from "../../../test/capabilities.ts";
@@ -22,7 +24,11 @@ async function fixture(t: import("node:test").TestContext, relay?: string, liste
   const push = new ExpoNotifier({ dir, send: async () => "sent", seenRecently: () => false, log: line => logs.push(line) });
   push.subscribe("offline-phone", "ExpoPushToken[offline]", "en");
   let host: HostServer;
-  const local = new LocalControl({ dir, config: cfg, version: "test", hostPublicKey: "public-key", phones: () => host.phones(), rotate: token => host.rotateToken(token) });
+  const outcomes: string[] = [];
+  const inbox = new ModInbox(() => true, (_offer, outcome) => outcomes.push(outcome));
+  const settingsJobs = new SettingsJobs();
+  t.after(() => { inbox.close(); settingsJobs.close(); });
+  const local = new LocalControl({ dir, config: cfg, version: "test", hostPublicKey: "public-key", inbox, settingsJobs, phones: () => host.phones(), rotate: token => host.rotateToken(token) });
   host = new HostServer({
     listen, port: 0, token: cfg.token, webDir: fileURLToPath(new URL("../web", import.meta.url)),
     sessions: { list: () => [], groups: () => undefined, pollDesktop: async () => {}, pollQueued: () => {}, watchAttached: () => {} } as never,
@@ -35,7 +41,7 @@ async function fixture(t: import("node:test").TestContext, relay?: string, liste
   const secret = localSecret(dir);
   const base = `http://127.0.0.1:${host.address().port}`;
   const call = (route: string, body?: unknown) => fetch(`${base}/local/${route}`, { headers: { "x-ripple-local": secret }, ...(body === undefined ? {} : { method: "POST", body: JSON.stringify(body) }) });
-  return { dir, cfg, host, local, logs, push, call, base, secret };
+  return { dir, cfg, host, local, logs, push, call, base, secret, inbox, outcomes, settingsJobs };
 }
 
 async function hello(t: import("node:test").TestContext, port: number, token: string, id = "online-phone") {
@@ -135,6 +141,45 @@ test("rotate immediately drops authenticated sockets, clears push, and refuses t
   assert.equal((await hello(t, f.host.address().port, loadConfig(f.dir, false).token)).frame.t, "ready");
   const pairing = await (await f.call("pairing")).json() as { url: string };
   assert.equal(new URLSearchParams(new URL(pairing.url).hash.slice(1)).get("pair"), f.cfg.token);
+});
+
+test("inbox routes authenticate, validate and enforce first-wins without logging text", async t => {
+  const f = await fixture(t);
+  const offered = f.inbox.offer({ sessionId: "cli-1", itemId: "item-1", text: "private inbox text", offeredAt: 123 }, 1000);
+  assert.equal((await fetch(`${f.base}/local/inbox?session=cli-1`)).status, 403);
+  assert.equal((await f.call("inbox")).status, 400);
+  assert.deepEqual(await (await f.call("inbox?session=other")).json(), { offers: [] });
+  assert.deepEqual(await (await f.call("inbox?session=cli-1")).json(), { offers: [{ sessionId: "cli-1", itemId: "item-1", text: "private inbox text", offeredAt: 123 }] });
+  for (const bad of [null, [], {}, { itemId: "bad id" }, { itemId: "item-1", extra: true }]) assert.equal((await f.call("inbox/claim", bad)).status, 400);
+  assert.equal((await f.call("inbox/result", { itemId: "item-1", outcome: "other" })).status, 400);
+  assert.equal((await f.call("inbox/result", { itemId: "item-1", outcome: "submitted" })).status, 409);
+  assert.deepEqual(await (await f.call("inbox/claim", { itemId: "item-1" })).json(), { ok: true });
+  assert.equal(await offered, "claimed");
+  assert.equal((await f.call("inbox/claim", { itemId: "item-1" })).status, 409);
+  assert.equal((await f.call("inbox/result", { itemId: "item-1", outcome: "submitted" })).status, 200);
+  assert.deepEqual(f.outcomes, ["submitted"]);
+  assert.equal((await f.call("inbox/result", { itemId: "item-1", outcome: "submitted" })).status, 409);
+  assert.equal((await fetch(`${f.base}/local/inbox/claim`, { method: "POST", headers: { "x-ripple-local": f.secret }, body: "x".repeat(4097) })).status, 400);
+  assert.equal(f.logs.join("\n").includes("private inbox text"), false);
+});
+
+test("settings job routes authenticate, validate and enforce one helper", async t => {
+  const f = await fixture(t);
+  f.settingsJobs.request({ jobId: "job-1", appSessionId: "local_target", cliSessionId: "cli-1", model: "private-model", createdAt: 1 });
+  assert.equal((await fetch(`${f.base}/local/settings-jobs?exclude=local_helper`)).status, 403);
+  for (const query of ["", "?exclude=bad%20id", "?exclude=a&exclude=b"]) assert.equal((await f.call(`settings-jobs${query}`)).status, 400);
+  assert.deepEqual(await (await f.call("settings-jobs?exclude=local_target")).json(), { jobs: [] });
+  assert.equal(((await (await f.call("settings-jobs?exclude=local_helper")).json()) as { jobs: unknown[] }).jobs.length, 1);
+  for (const bad of [null, [], {}, { jobId: "bad id", helper: "a" }, { jobId: "job-1", helper: "a", extra: 1 }]) assert.equal((await f.call("settings-jobs/claim", bad)).status, 400);
+  for (const bad of [{ jobId: "job-1", outcome: "other" }, { jobId: "job-1", outcome: "failed", detail: "x".repeat(1001) }]) assert.equal((await f.call("settings-jobs/result", bad)).status, 400);
+  assert.equal((await f.call("settings-jobs/claim", { jobId: "job-1", helper: "local_target" })).status, 409);
+  assert.equal((await f.call("settings-jobs/result", { jobId: "job-1", outcome: "applied" })).status, 409);
+  assert.equal((await f.call("settings-jobs/claim", { jobId: "job-1", helper: "local_helper" })).status, 200);
+  assert.equal((await f.call("settings-jobs/claim", { jobId: "job-1", helper: "local_helper" })).status, 409);
+  assert.equal((await f.call("settings-jobs/result", { jobId: "job-1", outcome: "failed", detail: "refused" })).status, 200);
+  assert.deepEqual(f.settingsJobs.status("local_target"), { jobId: "job-1", outcome: "failed", detail: "refused" });
+  assert.equal((await fetch(`${f.base}/local/settings-jobs/claim`, { method: "POST", headers: { "x-ripple-local": f.secret }, body: "x".repeat(4097) })).status, 400);
+  assert.equal(f.logs.join("\n").includes("private-model"), false);
 });
 
 test("settings validates before saving, preserves secrets and distinguishes running from pending config", async t => {

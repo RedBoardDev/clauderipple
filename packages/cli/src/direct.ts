@@ -14,9 +14,11 @@ import path from "node:path";
 import { ConfigStore, adminPort, type Config } from "../../router/src/config.ts";
 import { certPaths } from "./certs.ts";
 import { classifyMode, cliProxyState, desktopProxyState, fetchRouterStatus, proxyUrlFor, repair, type Mode, type RecoveryDeps } from "./doctor.ts";
-import { defaultHome } from "./integrations.ts";
-import { applyAppProxy, currentAppProxy, removeAppProxy } from "./picker.ts";
-import { MODEL_SLOT_ENV, editSettingsEnv, settingsEnv } from "./settings.ts";
+import { writeJsonAtomic } from "../../router/src/locked-file.ts";
+import { claimedElsewhere, claimsOf, readOwners } from "./owners.ts";
+import type { DesktopServiceDeps } from "./desktop-service.ts";
+import { applyAppProxy, appProxyOwner, currentAppProxy, migrateLegacyAppProxy, removeAppProxy } from "./picker.ts";
+import { MODEL_SLOT_ENV, editSettingsEnv, isNativeClaudeModel, settingsEnv, settingsPath } from "./settings.ts";
 
 export type DirectResult = { ok: boolean; mode: Mode; restartClaude: true; detail: string };
 
@@ -34,20 +36,24 @@ export function directStatePath(home: string): string {
 }
 
 function readState(home: string): DirectState | null {
+  let text: string;
   try {
-    const s = JSON.parse(fs.readFileSync(directStatePath(home), "utf8")) as DirectState;
-    return s && typeof s.cli === "object" ? s : null;
-  } catch {
-    return null;
+    text = fs.readFileSync(directStatePath(home), "utf8");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw error;
   }
+  const s = JSON.parse(text) as DirectState;
+  if (!s || typeof s.at !== "string" || !s.cli || Array.isArray(s.cli) || typeof s.cli !== "object" || !Object.values(s.cli).every(v => typeof v === "string") ||
+      (s.desktop !== null && (!s.desktop || typeof s.desktop.egressProxyUrl !== "string" || (s.desktop.appliedAfter !== null && typeof s.desktop.appliedAfter !== "string")))) {
+    throw new Error(`invalid direct snapshot: ${directStatePath(home)}; left untouched`);
+  }
+  return s;
 }
 
 function config(home: string): Config {
   return new ConfigStore(path.join(home, "config.json")).get();
 }
-
-/** A model name Claude answers itself. Anything else in a slot only works through the router. */
-const CLAUDE_MODEL = /claude|opus|sonnet|haiku|fable|mythos|^default$/i;
 
 function currentMode(home: string): Mode {
   const cfg = config(home);
@@ -57,16 +63,45 @@ function currentMode(home: string): Mode {
   return classifyMode(cli.proxy, desktop.proxy, cfg.picker?.enabled === true);
 }
 
-export function directOn(home: string): DirectResult {
+export function directOn(home: string, desktopService: DesktopServiceDeps = {}): DirectResult {
   const cfg = config(home);
   const proxyUrl = proxyUrlFor(cfg.listen.port);
+  const legacy = currentAppProxy();
+  if (legacy.ours && legacy.installationHome === undefined && legacy.egressProxyUrl === proxyUrl) migrateLegacyAppProxy(proxyUrl, home, desktopService);
   const caPath = certPaths(home).caPem;
   const removedCli: Record<string, string> = {};
   const notes: string[] = [];
 
+  let blocked = false;
+  let desktop: DirectState["desktop"] = null;
   const edit = editSettingsEnv((env) => {
+    const previous = readState(home);
+    const record = readOwners(settingsPath());
+    if (record.error) throw new Error(record.error);
+    const mine = claimsOf(record.store, home);
     const proxy = cliProxyState(env, proxyUrl, caPath);
-    if (proxy.proxy === "ripple" || proxy.stale) {
+    // Validate the whole transition before changing either client or the restoration snapshot.
+    const app = currentAppProxy();
+    // An entry ClaudeRipple did not mark (the person's own proxy, or the one picker mode replaced
+    // and direct on restores) is theirs to keep; only a marked entry this home cannot prove stops it.
+    if (app.egressProxyUrl && app.ours && (appProxyOwner(app, home, proxyUrl) !== "ours" || app.egressProxyUrl !== proxyUrl)) {
+      notes.push("Claude Desktop 프록시의 설치 소유권을 확인하지 못해 직접 연결로 전환하지 않았습니다. 기존 프록시 설정을 확인해 주세요.");
+      blocked = true;
+    }
+    if (env.HTTPS_PROXY && !((proxy.proxy === "ripple" || proxy.stale) && env.NODE_EXTRA_CA_CERTS === caPath)) {
+      notes.push("Claude Code 프록시의 설치 소유권을 확인하지 못해 직접 연결로 전환하지 않았습니다. 기존 프록시 설정을 확인해 주세요.");
+      blocked = true;
+    }
+    for (const [slot, name] of Object.entries(MODEL_SLOT_ENV)) {
+      const value = env[name];
+      if (value === undefined || isNativeClaudeModel(value)) continue;
+      if (mine.slots?.[slot] !== value || claimedElsewhere(record.store, home, c => c.slots?.[slot], value)) {
+        notes.push(`left ${name} (ownership unknown or shared)`);
+        blocked = true;
+      }
+    }
+    if (blocked) return false;
+    if ((proxy.proxy === "ripple" || proxy.stale) && env.NODE_EXTRA_CA_CERTS === caPath) {
       removedCli.HTTPS_PROXY = env.HTTPS_PROXY!;
       delete env.HTTPS_PROXY;
     } else if (env.HTTPS_PROXY) notes.push(`left HTTPS_PROXY=${env.HTTPS_PROXY} (not ClaudeRipple's)`);
@@ -79,32 +114,36 @@ export function directOn(home: string): DirectResult {
     if (!env.HTTPS_PROXY) {
       for (const [slot, name] of Object.entries(MODEL_SLOT_ENV)) {
         const value = env[name];
-        if (value === undefined) continue;
-        const ours = value === cfg.cli.models?.[slot as keyof typeof MODEL_SLOT_ENV] || !CLAUDE_MODEL.test(value);
-        if (!ours) continue;
+        if (value === undefined || isNativeClaudeModel(value)) continue;
+        const ours = mine.slots?.[slot] === value && !claimedElsewhere(record.store, home, c => c.slots?.[slot], value);
+        if (!ours) {
+          notes.push(`left ${name} (ownership unknown or shared)`);
+          continue;
+        }
         removedCli[name] = value;
         delete env[name];
       }
     }
+    const ap = currentAppProxy();
+    if (appProxyOwner(ap, home, proxyUrl) === "ours" && ap.egressProxyUrl === proxyUrl) {
+      desktop = { egressProxyUrl: proxyUrl, appliedAfter: ap.previousAppliedId ?? null };
+    } else if (ap.egressProxyUrl) notes.push("left Claude Desktop proxy (ownership unknown or another installation)");
+    // Durable write-ahead snapshot: a failed save leaves both clients unchanged. If a later client
+    // write fails, this snapshot remains available; repeated on never replaces its original values.
+    if (Object.keys(removedCli).length > 0 || desktop) {
+      for (const [key, value] of Object.entries(removedCli)) {
+        if (previous?.cli[key] !== undefined && previous.cli[key] !== value) throw new Error(`direct snapshot conflicts with current ${key}; left untouched`);
+      }
+      const state: DirectState = { at: previous?.at ?? new Date().toISOString(), cli: { ...removedCli, ...(previous?.cli ?? {}) }, desktop: previous?.desktop ?? desktop };
+      fs.mkdirSync(home, { recursive: true });
+      writeJsonAtomic(directStatePath(home), state);
+      if (desktop) removeAppProxy(proxyUrl, home);
+    }
     return Object.keys(removedCli).length > 0;
   });
 
-  let desktop: DirectState["desktop"] = null;
-  const ap = currentAppProxy();
-  // Another home's entry stays: only the default home takes one pointing at an older port.
-  if (ap.ours && ap.egressProxyUrl && (path.resolve(home) === path.resolve(defaultHome()) || ap.egressProxyUrl === proxyUrl)) {
-    removeAppProxy();
-    desktop = { egressProxyUrl: ap.egressProxyUrl, appliedAfter: currentAppProxy().appliedId };
-  } else if (ap.egressProxyUrl === proxyUrl) notes.push(`Claude Desktop's applied configuration ${ap.appliedId} points at ClaudeRipple but was not written by it; left as it is`);
-
+  if (blocked) return { ok: false, mode: currentMode(home), restartClaude: true, detail: notes.join(" ") };
   const changed = edit.changed || desktop !== null;
-  if (changed) {
-    // Merged with an earlier direct.json: running `direct on` twice must not forget the first.
-    const previous = readState(home);
-    const state: DirectState = { at: new Date().toISOString(), cli: { ...(previous?.cli ?? {}), ...removedCli }, desktop: desktop ?? previous?.desktop ?? null };
-    fs.mkdirSync(home, { recursive: true });
-    fs.writeFileSync(directStatePath(home), JSON.stringify(state, null, 2) + "\n", { mode: 0o600 });
-  }
   const removed = [
     ...Object.keys(removedCli).map((k) => `settings.json env.${k}`),
     ...(desktop ? ["Claude Desktop's proxy entry"] : []),
@@ -112,7 +151,13 @@ export function directOn(home: string): DirectResult {
   const detail = changed
     ? `Claude now connects directly. Removed: ${removed.join(", ")}. Saved in ${directStatePath(home)}.${edit.backup ? ` settings.json backup: ${edit.backup}.` : ""}`
     : "Claude was already on its default connection; nothing of ClaudeRipple's was in its settings.";
-  return { ok: true, mode: currentMode(home), restartClaude: true, detail: [detail, ...notes].join(" ") };
+  const mode = currentMode(home);
+  // Direct means nothing of this installation's proxy is left. A proxy the person had before
+  // (restored by removeAppProxy) or set themselves is theirs, not a leftover.
+  const after = currentAppProxy();
+  const desktopLeft = after.egressProxyUrl === proxyUrl || (after.ours && appProxyOwner(after, home, proxyUrl) !== "other");
+  const complete = mode === "direct" && settingsEnv().HTTPS_PROXY !== proxyUrl && !desktopLeft;
+  return { ok: complete, mode, restartClaude: true, detail: complete ? [detail, ...notes].join(" ") : "일부 프록시 설정이 남아 직접 연결로 전환하지 못했습니다. 저장된 복구 정보와 클라이언트 설정을 확인해 주세요." };
 }
 
 export async function directOff(deps: RecoveryDeps, opts: { force?: boolean } = {}): Promise<DirectResult> {
@@ -120,17 +165,9 @@ export async function directOff(deps: RecoveryDeps, opts: { force?: boolean } = 
   const cfg = config(home);
   const proxyUrl = proxyUrlFor(cfg.listen.port);
   const saved = readState(home);
-  // No direct.json (it was removed, or Claude was taken off by hand): what `install` and
-  // `picker on` would have written is the closest thing to "exactly as before".
-  const cli: Record<string, string> = saved ? { ...saved.cli, ...(saved.cli.HTTPS_PROXY ? { HTTPS_PROXY: proxyUrl } : {}) } : {
-    HTTPS_PROXY: proxyUrl,
-    NODE_EXTRA_CA_CERTS: certPaths(home).caPem,
-    ...Object.fromEntries(Object.entries(MODEL_SLOT_ENV).flatMap(([slot, name]) => {
-      const model = cfg.cli.models?.[slot as keyof typeof MODEL_SLOT_ENV];
-      return model ? [[name, model]] : [];
-    })),
-  };
-  const desktopUrl = (saved ? saved.desktop : cfg.picker?.enabled) ? proxyUrl : null;
+  if (!saved) return { ok: true, mode: currentMode(home), restartClaude: true, detail: "No direct snapshot; settings left untouched." };
+  const cli: Record<string, string> = { ...saved.cli, ...(saved.cli.HTTPS_PROXY ? { HTTPS_PROXY: proxyUrl } : {}) };
+  const desktopUrl = saved.desktop ? proxyUrl : null;
   const fail = (detail: string): DirectResult => ({ ok: false, mode: currentMode(home), restartClaude: true, detail });
 
   // Something set since `direct on` is someone else's choice, and replacing it needs saying so.
@@ -155,24 +192,32 @@ export async function directOff(deps: RecoveryDeps, opts: { force?: boolean } = 
   }
 
   const restoredKeys: string[] = [];
+  let desktopApplied = false;
   const edit = editSettingsEnv((current) => {
+    // Recheck after the asynchronous health/repair boundary, under the shared settings lock.
+    if (JSON.stringify(readState(home)) !== JSON.stringify(saved)) throw new Error("direct snapshot changed while waiting; left untouched");
+    const record = readOwners(settingsPath());
+    if (record.error) throw new Error(record.error);
+    for (const [k, v] of Object.entries(cli)) {
+      const slot = Object.entries(MODEL_SLOT_ENV).find(([, name]) => name === k)?.[0];
+      if (slot && (claimsOf(record.store, home).slots?.[slot] !== v || claimedElsewhere(record.store, home, c => c.slots?.[slot], v))) throw new Error(`cannot restore unowned or shared slot ${k}; left untouched`);
+      if (current[k] !== undefined && current[k] !== v && (slot || !opts.force)) throw new Error(`${k} changed since direct on; left untouched`);
+      if (current[k] !== env[k]) throw new Error(`${k} changed while waiting; left untouched`);
+    }
+    const now = currentAppProxy();
+    if (desktopUrl && (now.appliedId !== ap.appliedId || now.egressProxyUrl !== ap.egressProxyUrl)) throw new Error("Desktop proxy changed while waiting; left untouched");
     for (const [k, v] of Object.entries(cli)) {
       if (current[k] !== v) {
         current[k] = v;
         restoredKeys.push(k);
       }
     }
-    return restoredKeys.length > 0;
-  });
-  let desktopApplied = false;
-  if (desktopUrl) {
-    const now = currentAppProxy();
-    if (!(now.ours && now.egressProxyUrl === desktopUrl)) {
-      applyAppProxy(desktopUrl);
+    if (desktopUrl && appProxyOwner(now, home, desktopUrl) !== "ours") {
+      applyAppProxy(desktopUrl, home, now);
       desktopApplied = true;
     }
-  }
-  fs.rmSync(directStatePath(home), { force: true });
+    return restoredKeys.length > 0;
+  }, () => fs.rmSync(directStatePath(home), { force: true }));
   const restored = [...restoredKeys.map((k) => `settings.json env.${k}`), ...(desktopApplied ? ["Claude Desktop's proxy entry"] : [])];
   const detail = restored.length > 0 ? `Claude goes through ClaudeRipple again. Restored: ${restored.join(", ")}.${edit.backup ? ` settings.json backup: ${edit.backup}.` : ""}` : "Claude already went through ClaudeRipple; nothing to restore.";
   return { ok: true, mode: currentMode(home), restartClaude: true, detail: [...notes, detail].join(" ") };

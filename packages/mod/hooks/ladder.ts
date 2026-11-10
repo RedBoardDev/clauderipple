@@ -22,6 +22,28 @@ export function rungOf(verdict: Pick<WorkerVerdict, 'level' | 'kind' | 'sure'>):
   return rung === 'light' ? 'standard' : rung === 'standard' ? 'hard' : rung
 }
 
+export type WorkerLadderRoute = { pick: string; model: string; fallbacks: string[] }
+
+/** Spawn-time snapshot: only the remaining entries of the selected tier, never a model-name guess. */
+export function workerLadderLine(route: WorkerLadderRoute): string {
+  return `<!-- clauderipple-ladder ${encodeURIComponent(JSON.stringify(route))} -->`
+}
+
+/** Read only at a task's top; quoted metadata later in a conversation is not routing intent. */
+export function readWorkerLadder(text: string): WorkerLadderRoute | undefined {
+  const encoded = /^\s*<!-- clauderipple-ladder (\S{1,196608}) -->/.exec(text)?.[1]
+  if (!encoded) return undefined
+  try {
+    const value: unknown = JSON.parse(decodeURIComponent(encoded))
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined
+    const route = value as Record<string, unknown>
+    if (typeof route.pick !== 'string' || !/^[\w-]{1,100}$/.test(route.pick) || typeof route.model !== 'string' || !Array.isArray(route.fallbacks)) return undefined
+    const modelId = (id: unknown): id is string => typeof id === 'string' && /^\S{1,4096}$/.test(id)
+    if (!modelId(route.model) || !route.fallbacks.every(modelId)) return undefined
+    return { pick: route.pick, model: route.model, fallbacks: route.fallbacks }
+  } catch { return undefined } // Malformed task metadata is prose, never a reason to drop the request.
+}
+
 /** The rung above, none above Plan. */
 export function rungAbove(rung: Rung): Rung | undefined {
   return RUNGS[RUNGS.indexOf(rung) + 1]

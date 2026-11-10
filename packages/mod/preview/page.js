@@ -190,7 +190,9 @@
         img.src = 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(p.source)
         img.alt = p.alt
         apply(img, { display: 'block', flexShrink: 0 })
-        if (p.width) img.style.width = p.width + 'px'
+        // A picture fills the cells laid out for it, up to its own width (parts.tsx `filled` hands
+        // the host twice the drawn width, STRETCH, so it can fill a cell wider than CELL_PX).
+        if (p.width) { img.style.width = '100%'; img.style.maxWidth = p.width + 'px' }
         if (p.height) img.style.height = p.height + 'px'
         return img
       }

@@ -1,24 +1,36 @@
 /* ClaudeRipple settings — the System Settings idiom: a sidebar, inset grouped lists (label left,
    control right), sheets for add/edit, one tint used like a system accent. Colours are tokens so
-   light and dark are both first-class; status colours are for status only. */
+   light and dark are both first-class; status colours are for status only.
+
+   The palette is the mod's (packages/mod/hooks/ui/art.ts): warm graphite rather than a cool grey,
+   the dark theme the mod's own capsule water (#262523 → #1a1917), and violet kept for points — a
+   switch that is on, the tag on the account in use, a focus ring — never a ground or a broad fill.
+   Amber and red are for warnings only, so a warning stands out because nothing else shouts. */
 
 :root {
   color-scheme: light dark;
-  --bg: #f5f5f7;
-  --sidebar: #ececf0;
+  --bg: #f6f5f2;
+  --sidebar: #edebe6;
   --group: #ffffff;
-  --group-edge: rgba(0, 0, 0, 0.05);
-  --label: #1d1d1f;
-  --label-2: #6e6e73;
-  --label-3: #8e8e93;
-  --separator: rgba(60, 60, 67, 0.13);
-  --fill: rgba(120, 120, 128, 0.12);
-  --fill-hover: rgba(120, 120, 128, 0.2);
-  --fill-press: rgba(120, 120, 128, 0.28);
-  --nav-selected: rgba(0, 0, 0, 0.075);
+  --group-edge: rgba(40, 32, 20, 0.07);
+  --label: #1f1e1c;
+  --label-2: #67645e;
+  --label-3: #8c8880;
+  --separator: rgba(60, 50, 35, 0.11);
+  --fill: rgba(120, 110, 95, 0.11);
+  --fill-hover: rgba(120, 110, 95, 0.18);
+  --fill-press: rgba(120, 110, 95, 0.26);
+  --nav-selected: rgba(40, 32, 20, 0.07);
   --field: #ffffff;
-  --field-edge: rgba(60, 60, 67, 0.2);
+  --field-edge: rgba(60, 50, 35, 0.2);
   --segment-on: #ffffff;
+  /* A sheet or modal surface: the group's white here, a step above the group in the dark. */
+  --sheet: #ffffff;
+  /* A meter (a usage bar): a hairline track and graphite ink, amber and red only past their thresholds. */
+  --meter-track: rgba(120, 110, 95, 0.16);
+  --meter-fill: #4a4742;
+  /* An outlined tag in the accent: the one point of violet in a row. */
+  --accent-line: rgba(106, 86, 214, 0.42);
   --accent: #6a56d6;
   --accent-fill: #6a56d6;
   --accent-on: #ffffff;
@@ -44,21 +56,25 @@
 
 @media (prefers-color-scheme: dark) {
   :root {
-    --bg: #1c1c1e;
-    --sidebar: #252528;
-    --group: #2c2c2e;
-    --group-edge: rgba(255, 255, 255, 0.05);
-    --label: #f5f5f7;
-    --label-2: #a1a1a6;
-    --label-3: #7c7c82;
-    --separator: rgba(255, 255, 255, 0.1);
-    --fill: rgba(120, 120, 128, 0.24);
-    --fill-hover: rgba(120, 120, 128, 0.32);
-    --fill-press: rgba(120, 120, 128, 0.4);
-    --nav-selected: rgba(255, 255, 255, 0.09);
-    --field: rgba(255, 255, 255, 0.05);
-    --field-edge: rgba(255, 255, 255, 0.13);
-    --segment-on: #636366;
+    --bg: #1a1917;
+    --sidebar: #1f1e1c;
+    --group: #262523;
+    --group-edge: rgba(255, 250, 240, 0.06);
+    --label: #f2f0eb;
+    --label-2: #b3afa6;
+    --label-3: #8a867d;
+    --separator: rgba(255, 250, 240, 0.09);
+    --fill: rgba(200, 190, 170, 0.12);
+    --fill-hover: rgba(200, 190, 170, 0.18);
+    --fill-press: rgba(200, 190, 170, 0.25);
+    --nav-selected: rgba(255, 250, 240, 0.08);
+    --field: rgba(255, 250, 240, 0.04);
+    --field-edge: rgba(255, 250, 240, 0.13);
+    --segment-on: #4a4844;
+    --sheet: #201f1d;
+    --meter-track: rgba(255, 250, 240, 0.1);
+    --meter-fill: #d6d3cb;
+    --accent-line: rgba(168, 152, 255, 0.5);
     --accent: #a898ff;
     --accent-fill: #6f5ce0;
     --accent-on: #ffffff;
@@ -71,7 +87,7 @@
     --bad: #ff6961;
     --bad-dot: #ff453a;
     --sheet-shadow: 0 24px 64px rgba(0, 0, 0, 0.5), 0 0 0 0.5px rgba(255, 255, 255, 0.12);
-    --hud: rgba(44, 44, 46, 0.88);
+    --hud: rgba(38, 37, 35, 0.9);
     --chevron: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='14' viewBox='0 0 10 14'%3E%3Cpath d='M2 5l3-3 3 3M2 9l3 3 3-3' fill='none' stroke='%23a1a1a6' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
   }
 }
@@ -407,10 +423,121 @@ label.check input { margin-top: 2px; }
 .toast.error > div:first-child { color: var(--bad); font-weight: 500; }
 .toast-raw { margin-top: 4px; color: var(--label-2); font: 12px/1.4 var(--mono); word-break: break-word; }
 
+/* ---- Shared components: meter, tag, vendor dot, stat tiles ------------------------------ */
+/* The mod's drawn language in page form: thin meters in graphite ink, small pill tags, a vendor's
+   hue as a dot, figures in tabular numerals. Built on the tokens above so any page can use them. */
+
+/* A share of something as a thin bar. Amber and red come from the row's tone (`.tone-warn`, `.tone-bad`). */
+.meter { position: relative; height: 4px; border-radius: 2px; background: var(--meter-track); overflow: hidden; }
+.meter-fill { display: block; height: 100%; border-radius: 2px; background: var(--meter-fill); }
+.tone-warn .meter-fill { background: var(--warn-dot); }
+.tone-bad .meter-fill { background: var(--bad-dot); }
+.meter:focus-visible { outline-offset: 3px; border-radius: 2px; }
+
+/* A small pill that names a state. Plain is grey; `.accent` is outlined in violet (the one point in a
+   row); `.warn` and `.bad` are tinted. `.tag` is the class to use; a `.badge` in a tag row reads as one. */
+.tag {
+  display: inline-flex; align-items: center; gap: 0; max-width: 100%;
+  padding: 1px 7px; border-radius: 999px;
+  background: var(--fill); color: var(--label-2);
+  font-size: 11px; font-weight: 500; line-height: 16px; white-space: nowrap;
+}
+.tag.accent { background: transparent; box-shadow: inset 0 0 0 1px var(--accent-line); color: var(--accent); font-weight: 600; }
+.tag.warn { background: var(--tint-warn); color: var(--warn); }
+.tag.bad { background: var(--tint-bad); color: var(--bad); }
+
+/* A provider's identity: its vendor's hue (set as the element's colour by app.js providerHue). */
+.vendor-dot { width: 8px; height: 8px; flex: 0 0 auto; border-radius: 50%; background: currentColor; }
+
+/* Figures side by side in one surface, a hairline between them; stacked on a phone. A hidden tile takes no column. */
+.stat-tiles { display: grid; grid-auto-flow: column; grid-auto-columns: minmax(0, 1fr); }
+.stat-tile { position: relative; min-width: 0; padding: 13px 16px 14px; }
+.stat-tile:not([hidden]) + .stat-tile::before { content: ""; position: absolute; top: 14px; bottom: 14px; left: 0; width: 1px; background: var(--separator); }
+.stat-label { margin: 0 0 5px; color: var(--label-2); font-size: var(--fs-cap); font-weight: 500; letter-spacing: 0.01em; }
+.stat-value { color: var(--label); font-size: var(--fs-sub); font-weight: 600; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.stat-value .badge { color: var(--label); font-size: inherit; font-weight: inherit; }
+.stat-value .badge.bad { color: var(--bad); }
+.stat-sub { margin: 3px 0 0; color: var(--label-2); font-size: var(--fs-foot); line-height: 1.45; }
+
 /* ---- Status view --------------------------------------------------------------------- */
 
-.provider-status .cell-text strong { font-weight: 500; }
+/* Wider than a settings page: an account's windows read as one line each, a table across. */
+#view-health { max-width: 880px; }
+
+/* A provider: its header row opens its page; its accounts follow, one row each. Providers are
+   divided by full-width rules, accounts within one by inset hairlines. */
+#health-providers > * + *::before { left: 0; }
+.provider-status { min-height: 46px; padding-top: 11px; padding-bottom: 11px; }
+.provider-status .cell-text { gap: 3px; }
+.provider-title { display: inline-flex; align-items: center; gap: 10px; font-size: var(--fs-sub); font-weight: 600; }
+.provider-status .cell-sub, .provider-status .cell-actions, .provider-status .account-usage { margin-left: 18px; }
+.provider-status .cell-sub { font-size: var(--fs-cap); }
 .provider-status .account-usage { display: grid; gap: 1px; }
+.provider-status .cell-value .badge { font-size: var(--fs-foot); }
+/* No row-wide grey on hover: the header is one line of a larger card, so it answers with its chevron. */
+.provider-status.link:hover { background: transparent; }
+.provider-status .chevron { transition: transform 0.15s ease, color 0.15s ease; }
+.provider-status.link:hover .chevron { color: var(--label-2); transform: translateX(2px); }
+.provider-status.link:hover .provider-title > span:last-child { text-decoration: underline; text-decoration-color: var(--label-3); text-underline-offset: 3px; }
+
+.provider-block { position: relative; }
+.group > * + .provider-block::before { content: ""; position: absolute; top: 0; left: 16px; right: 0; height: 1px; background: var(--separator); }
+.provider-block:first-child > .cell { border-radius: var(--radius) var(--radius) 0 0; }
+.provider-limits { container-type: inline-size; padding-bottom: 4px; }
+
+/* An account: its name and state on the left, its windows as a table on the right. */
+.limits-account { position: relative; display: grid; grid-template-columns: minmax(0, 188px) minmax(0, 1fr); gap: 6px 20px; min-width: 0; padding: 10px 16px 10px 34px; }
+.limits-account::before { content: ""; position: absolute; top: 0; left: 34px; right: 0; height: 1px; background: var(--separator); }
+.limits-account-head { display: flex; flex-direction: column; align-items: flex-start; gap: 5px; min-width: 0; }
+.limits-account-head strong { max-width: 100%; overflow: hidden; color: var(--label); font-size: var(--fs-foot); font-weight: 500; line-height: 20px; text-overflow: ellipsis; white-space: nowrap; }
+.limits-badges { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; min-width: 0; max-width: 100%; }
+/* A provider's only, unnamed account: no name column, its windows under the provider's own name. */
+.limits-account.unnamed { grid-template-columns: minmax(0, 1fr); }
+.limits-account.unnamed > .limits-account-head { flex-direction: row; flex-wrap: wrap; align-items: center; }
+/* State badges read as tags here: the in-use mark outlined in the accent, a pause grey, a warning tinted. */
+.limits-badges .badge { display: inline-flex; max-width: 100%; padding: 1px 7px; border-radius: 999px; background: var(--fill); color: var(--label-2); font-size: 11px; font-weight: 500; line-height: 16px; white-space: normal; overflow-wrap: anywhere; }
+.limits-badges .badge::before { display: none; }
+.limits-badges .badge.first { background: transparent; box-shadow: inset 0 0 0 1px var(--accent-line); color: var(--accent); font-weight: 600; }
+.limits-badges .badge.warn { background: var(--tint-warn); color: var(--warn); }
+.limits-badges .badge.bad { background: var(--tint-bad); color: var(--bad); }
+.limits-fetched { color: var(--label-2); font-size: 11px; }
+.limits-empty { align-self: center; color: var(--label-2); font-size: var(--fs-cap); }
+
+/* The windows: a line each — name, bar, figure, then when it resets (and the pace) — in columns
+   that line up across accounts. An exhaust warning runs under the bar. */
+.limits-windows { display: grid; grid-template-columns: 6.5em minmax(48px, 1fr) 4em minmax(0, 1.4fr); column-gap: 12px; row-gap: 2px; align-items: center; min-width: 0; font-size: var(--fs-cap); font-variant-numeric: tabular-nums; }
+.limits-window, .limits-window-head { display: contents; }
+.limits-window + .limits-window .limits-window-head > * { margin-top: 6px; }
+/* A window's name is never cut: a long scoped label ("Argon weekly") wraps within its column. */
+.limits-window-name { min-width: 0; color: var(--label-2); line-height: 16px; padding: 2px 0; overflow-wrap: break-word; }
+.limits-window-figure { color: var(--label); font-size: var(--fs-foot); font-weight: 600; line-height: 20px; text-align: right; }
+.limits-window + .limits-window .limits-window-foot { margin-top: 6px; }
+.limits-window-foot { min-width: 0; color: var(--label-2); line-height: 1.4; overflow-wrap: anywhere; }
+.limits-window-foot .sep { color: var(--label-3); }
+.limits-window-note { grid-column: 2 / -1; font-size: var(--fs-cap); line-height: 1.4; overflow-wrap: anywhere; }
+.tone-warn .limits-window-figure { color: var(--warn); }
+.tone-bad .limits-window-figure { color: var(--bad); }
+
+/* A card too narrow for the reset beside the figure: it drops under the bar. */
+@container (max-width: 780px) {
+  .limits-windows { grid-template-columns: 6.5em minmax(0, 1fr) 4em; }
+  .limits-window-foot { grid-column: 2 / -1; }
+  .limits-window + .limits-window .limits-window-foot { margin-top: 0; }
+}
+/* Narrower (a phone, a narrow window): the account's name goes over its windows. */
+@container (max-width: 600px) {
+  .limits-account { grid-template-columns: minmax(0, 1fr); }
+  .limits-account-head { flex-direction: row; flex-wrap: wrap; align-items: center; gap: 4px 8px; }
+  .limits-windows { grid-template-columns: 4.8em minmax(0, 1fr) 4em; }
+}
+@container (max-width: 380px) {
+  .limits-account { padding-left: 16px; }
+  .limits-account::before { left: 16px; }
+}
+@media (forced-colors: active) {
+  .meter { border: 1px solid CanvasText; }
+  .meter-fill { background: Highlight; forced-color-adjust: none; }
+}
 
 /* One scale (0–100%) for both windows. */
 .provider-block { position: relative; }
@@ -441,77 +568,174 @@ label.check input { margin-top: 2px; }
 
 /* ---- Model mapping ------------------------------------------------------------------- */
 
+/* One dense row per Claude model: the model as a label (a menu that shows itself only on hover or
+   focus), an arrow, who answers it behind its vendor's dot, and the effort. A row that passes through
+   to Claude reads quieter, so the rows that send a model elsewhere are what the eye finds. */
 .map-head, .map-row {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 18px minmax(0, 1.25fr) 112px 30px;
+  grid-template-columns: minmax(0, 0.9fr) 16px minmax(0, 1.35fr) 104px 30px;
   gap: 10px;
   align-items: center;
 }
-.map-head { padding: 0 16px 8px; color: var(--label-2); font-size: var(--fs-foot); font-weight: 500; }
-.map-row { position: relative; padding: 9px 12px 9px 16px; }
+.map-head { padding: 0 16px 7px; color: var(--label-2); font-size: var(--fs-cap); font-weight: 500; }
+.map-row { position: relative; min-height: 46px; padding: 7px 10px 7px 16px; }
 .map-list > .map-row + .map-row::before { content: ""; position: absolute; top: 0; left: 16px; right: 0; height: 1px; background: var(--separator); }
-.map-arrow { color: var(--label-3); text-align: center; }
+.map-arrow { color: var(--label-3); text-align: center; font-size: var(--fs-foot); }
 .map-label { display: none; }
 .map-col { min-width: 0; }
 .map-col select { width: 100%; }
+.map-source select { margin-left: -9px; width: calc(100% + 9px); padding-left: 8px; border-color: transparent; background-color: transparent; background-image: none; color: var(--label); font-weight: 500; }
+.map-source select:hover { background-color: var(--fill); background-image: var(--chevron); }
+.map-source select:focus { border-color: var(--accent); background-color: var(--field); background-image: var(--chevron); }
+.map-target-control { display: flex; align-items: center; gap: 9px; min-width: 0; }
+.map-target-control > select { flex: 1 1 auto; min-width: 0; }
+.map-row.passthrough .map-target select { border-color: transparent; background-color: transparent; color: var(--label-2); }
+.map-row.passthrough .map-target select:hover { background-color: var(--fill); }
+.map-row.passthrough .map-target select:focus { border-color: var(--accent); background-color: var(--field); }
+.map-row.passthrough .map-target .vendor-dot { opacity: 0.55; }
+.map-effort select { font-variant-numeric: tabular-nums; }
 .map-empty { padding: 14px 16px; color: var(--label-2); font-size: var(--fs-sub); }
 .slots-status { color: var(--label-2); font-size: var(--fs-foot); }
+#slots-status:empty { display: none; }
 .muted-cell { position: relative; }
 .muted-cell::after { content: attr(data-empty); position: absolute; inset: 0; display: grid; place-items: center; color: var(--label-3); pointer-events: none; }
 .muted-cell select:disabled { opacity: 0; }
+#slots-summary { color: var(--label); }
+/* On a phone each row is a small card: the Claude model as its title, who answers and the effort under it. */
+@media (max-width: 860px) {
+  .map-source select { font-size: var(--fs-body); font-weight: 600; }
+  .map-source .map-label { display: none; }
+  .map-row { padding-top: 10px; }
+}
 
 /* ---- Clients ------------------------------------------------------------------------- */
 
 .slot-row .cell-value select { width: 240px; }
-/* The picker tile carries a name, a provider and a context window. On one flex line the name is
-   what collapses — it was rendering as "GPT…" — so name owns the first row and the rest share the
-   second. */
+/* A long explanation beside the menu (the web search row's) squeezed the menu's column narrower than
+   the menu, which then ran over the text. The menu keeps its width; the text wraps beside it. */
+.slot-row > .cell-value { flex-shrink: 0; }
+/* A classifier row has two menus and a two-line explanation, which do not share one line without the
+   menus running over the text. The menus take a line of their own: the target stretches, the effort
+   keeps the width of its longest word. */
+.classifier-row { flex-wrap: wrap; row-gap: 8px; }
+.classifier-row > .cell-text { flex-basis: 100%; }
+.classifier-row > .cell-value { flex: 1 1 100%; max-width: none; justify-content: flex-start; }
+.classifier-row .cell-value select { width: auto; max-width: none; flex: 1 1 0; min-width: 0; }
+.classifier-row .cell-value select.classifier-effort { flex: 0 0 200px; }
 .model-checklist { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 6px; padding: 10px; }
-#client-picker-models { grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); }
-.model-check, .picker-model { min-width: 0; padding: 8px 10px; border-radius: 8px; background: var(--fill); background: color-mix(in srgb, var(--fill) 60%, transparent); }
+.model-check { min-width: 0; padding: 8px 10px; border-radius: 8px; background: var(--fill); background: color-mix(in srgb, var(--fill) 60%, transparent); }
 .model-check { display: flex; align-items: center; gap: 8px; cursor: pointer; font-size: var(--fs-sub); }
 .model-check:hover { background: var(--fill); }
 .model-check span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.picker-model { display: grid; grid-template-columns: minmax(0, 1fr) auto; column-gap: 8px; row-gap: 2px; align-items: center; }
-.picker-model > .pm-main { grid-column: 1 / span 2; display: flex; align-items: center; gap: 8px; min-width: 0; cursor: pointer; font-size: var(--fs-sub); }
+/* The models in the picker: each provider's under its name and vendor's dot, as on Status, then a
+   line per model in two columns — the box and the name, the window at the end of the line — with no
+   grey tile around each. */
+#client-picker-models { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0 18px; padding: 0 8px 8px; }
+#client-picker-models > .hint { grid-column: 1 / -1; padding: 12px 8px 4px; }
+.picker-group-head { position: relative; grid-column: 1 / -1; display: flex; align-items: center; gap: 8px; min-width: 0; padding: 12px 8px 4px; color: var(--label-2); font-size: var(--fs-foot); font-weight: 500; }
+.picker-group-head > span:last-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.picker-group-head:not(:first-child) { margin-top: 6px; }
+.picker-group-head:not(:first-child)::before { content: ""; position: absolute; top: 0; left: 0; right: -8px; height: 1px; background: var(--separator); }
+/* Rows pack at the top, so a line whose catalogue note is absent does not centre in the taller row beside it. */
+.picker-model { display: grid; grid-template-columns: minmax(0, 1fr) auto; column-gap: 8px; row-gap: 0; align-items: center; align-content: start; min-width: 0; min-height: 34px; padding: 3px 4px 3px 8px; border-radius: 7px; }
+.picker-model:hover { background: var(--fill); background: color-mix(in srgb, var(--fill) 60%, transparent); }
+.picker-model > .pm-main { grid-column: 1; grid-row: 1; display: flex; align-items: center; gap: 9px; min-width: 0; min-height: 28px; cursor: pointer; font-size: var(--fs-sub); }
 .picker-model > .pm-main span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.picker-model > small { grid-column: 1; grid-row: 2; padding-left: 24px; font-size: var(--fs-cap); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-/* Most models never need their own window, so an empty box on every tile is noise. It stays quiet
+/* The note saying the catalogue's figure is the one in effect takes a line of its own, full width and
+   wrapping rather than ellipsized. It used to carry an inline `style`, which the page's CSP
+   (style-src 'self') drops — so it fell onto another line's text and the two overlapped. */
+.picker-model > small.pm-note { grid-column: 1 / -1; grid-row: 2; padding: 0 0 4px 25px; font-size: var(--fs-cap); white-space: normal; line-height: 1.35; }
+/* Most models never need their own window, so an empty box on every line is noise. It stays quiet
    until it is touched or actually holds a value. */
-.picker-model > .model-window { grid-column: 2; grid-row: 2; width: 9ch; min-height: 22px; padding: 1px 6px; font-size: var(--fs-cap); text-align: right; color: var(--label-2); background: transparent; border-color: transparent; }
+.picker-model > .model-window { grid-column: 2; grid-row: 1; width: 10ch; min-height: 24px; padding: 1px 6px; font-size: var(--fs-cap); font-variant-numeric: tabular-nums; text-align: right; color: var(--label-2); background: transparent; border-color: transparent; }
 .picker-model > .model-window::-webkit-inner-spin-button { display: none; }
-.picker-model > .model-window:hover, .picker-model > .model-window:focus, .picker-model > .model-window:not(:placeholder-shown) { color: var(--label); background: var(--field); border-color: var(--field-edge); }
+.picker-model > .model-window:hover, .picker-model > .model-window:focus { color: var(--label); background: var(--field); border-color: var(--field-edge); }
+.picker-model > .model-window:not(:placeholder-shown):not(:hover):not(:focus) { color: var(--label-2); background: transparent; box-shadow: inset 0 0 0 1px var(--separator); }
+/* The added models in picker order: the number, the name, its provider, two arrows — one line each. */
+.picker-order { margin: 0; padding: 2px 8px 2px 40px; }
+.picker-order-item { padding: 3px 0; }
+.picker-order-item + .picker-order-item { border-top: 1px solid var(--separator); }
+.picker-order-item::marker { color: var(--label-3); font: var(--fs-cap) var(--mono); }
+.po-row { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; column-gap: 12px; align-items: center; min-height: 34px; }
+.po-row > .po-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: var(--fs-sub); }
+.po-row > small { grid-column: 2; grid-row: 1; min-width: 0; max-width: 18ch; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: var(--fs-cap); color: var(--label-2); }
+.po-row > .rung-actions { grid-column: 3; grid-row: 1; gap: 2px; margin-left: 0; }
+.po-move { width: 28px; height: 28px; font-size: var(--fs-sub); line-height: 1; }
+/* Terminal Claude Code's mappings: the Claude model, and who answers it behind its vendor's dot. */
+.route-target { display: inline-flex; align-items: center; gap: 8px; min-width: 0; color: var(--label); }
+@media (max-width: 720px) {
+  #client-picker-models { grid-template-columns: minmax(0, 1fr); }
+  .po-row { grid-template-columns: minmax(0, 1fr) auto; column-gap: 8px; }
+  .po-row > small { grid-column: 1; grid-row: 2; max-width: none; }
+  .po-row > .rung-actions { grid-column: 2; grid-row: 1 / span 2; }
+}
 
 /* ---- Phone --------------------------------------------------------------------------- */
 
-.phone-choice { cursor: pointer; }
-.phone-choice input { flex: 0 0 auto; }
-.phone-qr:not(:empty) { display: flex; flex-wrap: wrap; align-items: center; justify-content: center; gap: 12px; padding: 16px; }
-.phone-qr-image { display: block; flex: 0 0 240px; width: 240px; height: 240px; padding: 8px; background: #fff; border-radius: 8px; }
+/* The host's state as Status's tiles; a phone as one dense row; the access choice as radio rows whose
+   Save wakes only when the choice differs from what is saved. */
+.phone-tiles .stat-value { font-weight: 500; }
+.phone-tiles .stat-sub { font-size: var(--fs-cap); font-variant-numeric: tabular-nums; }
+.phone-row .cell-label { font-size: var(--fs-sub); }
+.phone-row .cell-sub { font-size: var(--fs-cap); }
+.phone-row .cell-value .tag { font-size: var(--fs-cap); line-height: 18px; }
+.phone-row .cell-value .badge { font-size: var(--fs-foot); color: var(--label); }
+.phone-choice { cursor: pointer; align-items: flex-start; }
+.phone-choice input { flex: 0 0 auto; margin-top: 4px; }
+.phone-choice .cell-label { font-size: var(--fs-sub); }
+.phone-choice .cell-sub { font-size: var(--fs-cap); }
+.phone-choice:has(input:checked) .cell-label { font-weight: 600; }
+/* The QR on white, its two buttons stacked beside it; on a phone they go under it. */
+.phone-qr:not(:empty) { position: relative; display: grid; grid-template-columns: 240px auto; grid-template-rows: auto auto 1fr; justify-content: center; align-items: start; gap: 8px 16px; padding: 16px; }
+.phone-qr:not(:empty)::before { content: ""; position: absolute; top: 0; left: 16px; right: 0; height: 1px; background: var(--separator); }
+.phone-qr-image { display: block; grid-row: 1 / span 3; width: 240px; height: 240px; padding: 8px; background: #fff; border-radius: 10px; box-shadow: 0 0 0 1px var(--group-edge); }
+.phone-qr .btn { justify-self: stretch; }
 #phone-content .cell-value input { width: 280px; max-width: 100%; }
 #phone-content code { display: block; margin-top: 6px; overflow-wrap: anywhere; }
+#phone-content code.phone-install { padding: 6px 8px; border-radius: 6px; background: var(--fill); color: var(--label); font-size: var(--fs-cap); }
 #phone-content > .section:first-child { margin-top: 0; }
+#phone-content .cell-button.destructive { font-size: var(--fs-sub); }
+@media (max-width: 720px) {
+  /* Stacked tiles are divided by a hairline across, not the side-by-side rule. */
+  .phone-tiles .stat-tile + .stat-tile::before { top: 0; bottom: auto; left: 16px; right: 0; width: auto; height: 1px; }
+  .phone-tiles .stat-tile { padding: 11px 16px 12px; }
+  /* A row's buttons go under its words rather than over them. */
+  #phone-content .cell:has(.btn) { flex-wrap: wrap; row-gap: 8px; }
+  #phone-content .cell:has(.btn) > .cell-value { flex: 1 1 100%; max-width: none; justify-content: flex-start; }
+}
+@media (max-width: 520px) {
+  .phone-qr:not(:empty) { grid-template-columns: minmax(0, 240px); grid-template-rows: none; }
+  .phone-qr-image { grid-row: auto; }
+}
 
 /* Ripple Remote, until a phone is paired: the connection card's shape in the accent, like the
    laptop setup card. The QR below pairs from inside the app, so the store has its own button here. */
-.conn-card.remote-promo { --tone: var(--accent-fill); --tint: var(--accent-soft); margin-bottom: 12px; padding-bottom: 20px; }
+/* The violet is the icon and the eyebrow only: the card is the plain surface, its ticks graphite, and
+   the store buttons read as store badges in ink rather than two violet slabs. */
+.conn-card.remote-promo { --tone: var(--accent-fill); --tint: transparent; margin-bottom: 28px; padding-bottom: 20px; }
 .remote-promo:lang(ko) { word-break: keep-all; overflow-wrap: anywhere; }
-.remote-promo .conn-icon svg { stroke-width: 1.9; }
-.remote-eyebrow { margin: 0 0 3px; color: var(--accent); font-size: var(--fs-foot); font-weight: 600; }
-.remote-points { display: grid; gap: 8px; margin: 18px 0 0; padding: 0 0 0 60px; list-style: none; }
-.remote-points li { position: relative; padding-left: 22px; color: var(--label-2); font-size: var(--fs-sub); line-height: 1.45; }
-.remote-points li::before { content: ""; position: absolute; left: 2px; top: 0.42em; width: 9px; height: 5px; border-left: 2px solid var(--accent); border-bottom: 2px solid var(--accent); transform: rotate(-45deg); }
+.remote-promo .conn-icon { width: 40px; height: 40px; box-shadow: 0 0 0 4px var(--accent-soft); }
+.remote-promo .conn-icon svg { width: 20px; height: 20px; stroke-width: 1.9; }
+.remote-promo .conn-title { font-size: 18px; }
+.remote-promo .conn-lead { color: var(--label-2); font-size: var(--fs-sub); }
+.remote-eyebrow { margin: 0 0 3px; color: var(--accent); font-size: var(--fs-cap); font-weight: 600; letter-spacing: 0.01em; }
+.remote-points { display: grid; gap: 7px; margin: 16px 0 0; padding: 0 0 0 56px; list-style: none; }
+.remote-points li { position: relative; padding-left: 22px; color: var(--label-2); font-size: var(--fs-foot); line-height: 1.5; }
+.remote-points li::before { content: ""; position: absolute; left: 2px; top: 0.45em; width: 8px; height: 4px; border-left: 1.8px solid var(--label); border-bottom: 1.8px solid var(--label); transform: rotate(-45deg); }
 .remote-points strong { color: var(--label); font-weight: 600; }
-.remote-get { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 16px; margin: 20px 0 0 60px; }
-.btn.large.remote-store { width: auto; gap: 8px; }
+.remote-get { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin: 18px 0 0 56px; }
+.btn.large.remote-store { width: auto; gap: 8px; min-height: 36px; padding: 6px 16px; background: var(--label); color: var(--bg); font-size: var(--fs-sub); }
+.btn.large.remote-store:hover { filter: none; opacity: 0.88; }
 .remote-store-icon { width: 18px; height: 18px; stroke-width: 2; }
-.remote-get .hint { flex: 1 1 200px; }
-.remote-android .login-link { white-space: nowrap; }
-.remote-next { margin: 16px 0 0 60px; padding-top: 14px; border-top: 1px solid var(--separator); color: var(--label-2); font-size: var(--fs-foot); line-height: 1.45; }
+.remote-next { margin: 16px 0 0 56px; padding-top: 12px; border-top: 1px solid var(--separator); color: var(--label-2); font-size: var(--fs-foot); line-height: 1.45; }
 
 /* ---- Providers ----------------------------------------------------------------------- */
 
-.provider-workspace { display: grid; grid-template-columns: 264px minmax(0, 1fr); gap: 28px; align-items: start; }
+/* The Status screen's language: a provider is its vendor's dot and the name people know it by; a
+   page is one card of dense rows rather than a card per fact; tags under a name say its state, the
+   account in use being the one point of violet; destructive acts share one card at the bottom. */
+
+.provider-workspace { display: grid; grid-template-columns: 248px minmax(0, 1fr); gap: 28px; align-items: start; }
 .provider-rail { position: sticky; top: 24px; min-width: 0; }
 .provider-rail-tools { display: flex; gap: 6px; align-items: center; margin-bottom: 10px; }
 .provider-rail-tools input { flex: 1 1 auto; min-width: 0; }
@@ -519,12 +743,12 @@ label.check input { margin-top: 2px; }
 .provider-rail-item {
   appearance: none;
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-columns: auto minmax(0, 1fr) auto;
   align-items: center;
-  gap: 10px;
+  column-gap: 10px;
   width: 100%;
   min-width: 0;
-  padding: 8px 11px;
+  padding: 7px 10px 7px 11px;
   border: 0;
   border-radius: 8px;
   background: transparent;
@@ -533,10 +757,13 @@ label.check input { margin-top: 2px; }
   cursor: pointer;
 }
 .provider-rail-item:hover { background: var(--fill); }
-.provider-rail-item.selected { background: var(--accent-soft); }
-.provider-rail-copy { min-width: 0; display: flex; flex-direction: column; gap: 1px; }
-.provider-rail-copy strong { font-weight: 500; font-size: var(--fs-sub); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.provider-rail-copy span { color: var(--label-2); font-size: var(--fs-foot); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* The open provider is marked like the open page in the sidebar: a quiet fill, never a violet ground. */
+.provider-rail-item.selected { background: var(--nav-selected); }
+.provider-rail-item.selected strong { font-weight: 600; }
+.provider-rail-item > .vendor-dot { align-self: start; margin-top: 7px; }
+.provider-rail-copy { min-width: 0; display: flex; flex-direction: column; gap: 0; }
+.provider-rail-copy strong { font-weight: 500; font-size: var(--fs-sub); line-height: 20px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.provider-rail-copy span { color: var(--label-2); font-size: var(--fs-cap); line-height: 16px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .provider-rail-item .badge { font-size: 0; gap: 0; }
 .provider-rail-empty { padding: 20px 12px; color: var(--label-2); font-size: var(--fs-sub); text-align: center; }
 .provider-back { display: none; }
@@ -545,14 +772,48 @@ label.check input { margin-top: 2px; }
 .provider-detail-empty { display: grid; place-items: center; min-height: 320px; color: var(--label-2); }
 .provider-detail-header { display: flex; justify-content: space-between; align-items: flex-start; gap: 16px; margin-bottom: 18px; }
 .provider-detail-header > div:first-child { min-width: 0; }
-.provider-title-line { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
-.provider-title-line h2 { font-size: 22px; font-weight: 700; letter-spacing: -0.015em; overflow-wrap: anywhere; }
+.provider-title-line { display: flex; align-items: center; gap: 6px 10px; flex-wrap: wrap; }
+.provider-title-line > .vendor-dot { width: 10px; height: 10px; }
+.provider-title-line h2 { font-size: 22px; font-weight: 700; letter-spacing: -0.015em; line-height: 1.25; overflow-wrap: anywhere; }
+.provider-title-line .badge { font-size: var(--fs-foot); }
 .provider-detail-header p { margin: 3px 0 0; }
+.provider-kind { padding-left: 20px; }
+.provider-kind .provider-key::before { content: "·"; margin: 0 6px; color: var(--label-3); font-family: var(--sans); }
+.provider-key { color: var(--label-3); font-size: var(--fs-cap); }
 .provider-detail-actions { display: flex; gap: 8px; flex-wrap: wrap; justify-content: flex-end; flex: 0 0 auto; }
-.provider-tabs { margin-bottom: 22px; }
-.provider-panel { display: grid; gap: 26px; }
+.provider-tabs { margin-bottom: 20px; }
+.provider-panel { display: grid; gap: 24px; }
 .provider-panel > .section { margin-top: 0; }
+/* A switch keeps its width beside a long explanation: squeezed, its column shrank under the switch and the switch covered the text on a phone. */
+.provider-panel .cell-value:has(> .switch) { flex-shrink: 0; }
+
+/* The overview: one card of facts, a quiet name on the left and what it says on the right. */
+.provider-fact { position: relative; display: grid; grid-template-columns: 128px minmax(0, 1fr); column-gap: 16px; align-items: baseline; padding: 11px 16px; }
+.provider-facts > * + .provider-fact::before { content: ""; position: absolute; top: 0; left: 16px; right: 0; height: 1px; background: var(--separator); }
+.provider-fact-k { color: var(--label-2); font-size: var(--fs-foot); line-height: 20px; }
+.provider-fact-v { display: flex; flex-direction: column; align-items: flex-start; gap: 3px; min-width: 0; color: var(--label); font-size: var(--fs-sub); line-height: 20px; overflow-wrap: anywhere; }
+.provider-fact-v .badge { font-size: var(--fs-sub); color: var(--label); }
+.provider-fact-v .badge.bad { color: var(--bad); }
+.provider-fact-v .cell-actions { margin-top: 4px; }
+/* Its usage: Status's own account rows, without the indent they take under a provider's name there. */
+.provider-usage .limits-account { padding-left: 16px; }
+.provider-usage .limits-account::before { left: 16px; }
+.provider-usage > .limits-account:first-child::before { display: none; }
+.provider-usage { padding: 2px 0 4px; }
+
+/* The destructive acts, together at the bottom of the page. */
 .provider-remove { margin-top: 30px; }
+.provider-remove > .cell-button { position: relative; border-radius: 0; }
+.provider-remove > .cell-button:first-child { border-top-left-radius: var(--radius); border-top-right-radius: var(--radius); }
+.provider-remove > .cell-button:last-child { border-bottom-left-radius: var(--radius); border-bottom-right-radius: var(--radius); }
+.provider-remove > .cell-button + .cell-button::before { content: ""; position: absolute; top: 0; left: 16px; right: 0; height: 1px; background: var(--separator); }
+
+/* A provider's models: the name with its id under it, and a small tag for whether it takes an effort. */
+.provider-model-row { min-height: 0; padding-top: 9px; padding-bottom: 9px; }
+.provider-model-row .cell-label { font-size: var(--fs-sub); }
+.provider-model-row .cell-sub.mono { color: var(--label-3); font-size: var(--fs-cap); }
+.provider-model-row .model-effort-tag { padding: 1px 7px; border-radius: 999px; background: var(--fill); color: var(--label-2); font-size: 11px; font-weight: 500; line-height: 16px; }
+.provider-model-row .model-effort-tag.no-effort { background: transparent; box-shadow: inset 0 0 0 1px var(--separator); color: var(--label-3); }
 
 .account-card-list > div.small, .account-card-list > .bad-text { padding: 14px 16px; }
 .stacked-add { margin-top: 10px; }
@@ -561,17 +822,62 @@ label.check input { margin-top: 2px; }
 .model-effort-tag.no-effort { color: var(--label-3); }
 .model-check .model-effort-tag { margin-left: auto; }
 
-.account-card { align-items: flex-start; }
-.account-card .cell-text strong { font-weight: 500; font-size: var(--fs-body); overflow-wrap: anywhere; }
-.account-card .hint { margin-top: 2px; }
-.account-card .account-quota { margin: 0; color: var(--label); font-variant-numeric: tabular-nums; }
-.account-card-badges { display: flex; flex-direction: column; align-items: flex-end; gap: 4px; flex: 0 0 auto; padding-top: 2px; }
+/* An account list: the accounts, then "Add" as the last row of the same card. */
+.account-card-list > * + .cell::before, .account-group > .account-card-list + .cell-button::before {
+  content: ""; position: absolute; top: 0; left: 16px; right: 0; height: 1px; background: var(--separator);
+}
+.account-group > .cell-button { position: relative; border-radius: 0 0 var(--radius) var(--radius); }
+.account-group > .account-card-list:empty + .cell-button { border-radius: var(--radius); }
+.account-group > .account-card-list:empty + .cell-button::before { display: none; }
+
+/* An account: its name with its tags after it, then what it is, its usage, a note when it needs one,
+   and its actions. The copy column is laid out with the row, so the tags can follow the name. */
+.account-card { flex-wrap: wrap; align-items: center; column-gap: 8px; row-gap: 2px; padding-top: 11px; padding-bottom: 12px; }
+.account-card > .account-card-copy { display: contents; }
+.account-card-copy > strong { order: 0; flex: 0 1 auto; min-width: 0; color: var(--label); font-size: var(--fs-sub); font-weight: 600; line-height: 20px; overflow-wrap: anywhere; }
+.account-card > .account-card-badges { order: 1; flex: 1 1 auto; }
+.account-card-copy > :not(strong) { order: 2; flex: 1 1 100%; min-width: 0; }
+.account-card .small { color: var(--label-2); font-size: var(--fs-foot); line-height: 1.4; overflow-wrap: anywhere; }
+.account-card .hint { margin-top: 2px; font-size: var(--fs-cap); color: var(--label-2); }
+.account-card .account-quota { margin: 1px 0 0; color: var(--label); font-size: var(--fs-foot); font-variant-numeric: tabular-nums; }
+/* Its usage: a short meter per window, side by side, wrapping on a phone. */
+.account-meters { display: flex; flex-wrap: wrap; gap: 4px 18px; margin: 4px 0 1px; }
+.account-meter { display: inline-flex; align-items: center; gap: 7px; min-width: 0; font-size: var(--fs-cap); line-height: 18px; }
+.account-meter-name { color: var(--label-2); }
+.account-meter > .meter { flex: 0 0 64px; }
+.account-meter-figure { color: var(--label); font-size: var(--fs-foot); font-weight: 600; }
+.account-meter-reset { color: var(--label-2); }
+.account-meter.tone-warn .account-meter-figure { color: var(--warn); }
+.account-meter.tone-bad .account-meter-figure, .account-meter.tone-bad .account-meter-reset { color: var(--bad); }
+.account-card-badges { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; min-width: 0; }
+/* Its state as tags, as on Status: the account in use outlined in violet, first place in ink, a pause grey, a warning tinted. */
+.account-card-badges .badge { display: inline-flex; max-width: 100%; padding: 1px 7px; border-radius: 999px; background: var(--fill); color: var(--label-2); font-size: 11px; font-weight: 500; line-height: 16px; white-space: normal; overflow-wrap: anywhere; }
+.account-card-badges .badge::before { display: none; }
+.account-card-badges .badge.first { color: var(--label); font-weight: 600; }
+.account-card-badges .badge.in-use { background: transparent; box-shadow: inset 0 0 0 1px var(--accent-line); color: var(--accent); font-weight: 600; }
+.account-card-badges .badge.warn { background: var(--tint-warn); color: var(--warn); }
+.account-card-badges .badge.bad { background: var(--tint-bad); color: var(--bad); }
 .account-card-actions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+/* Row actions are outlined, so a list of accounts does not read as a wall of grey buttons. */
+.account-card-actions .btn.secondary, .account-card-actions .btn.danger { background: transparent; box-shadow: inset 0 0 0 1px var(--separator); }
+.account-card-actions .btn.secondary:hover, .account-card-actions .btn.danger:hover { background: var(--fill); }
 .account-empty { padding: 16px; color: var(--label-2); font-size: var(--fs-sub); }
 /* The API-key add/edit form, inline in the accounts list: the modal form's fields at row padding. */
 .key-account-form { padding-top: 14px; padding-bottom: 14px; }
 .key-account-form .form-field:first-child { margin-top: 0; }
 .key-account-form .actions { margin-top: 12px; }
+.account-group > .key-account-form { border-radius: 0 0 var(--radius) var(--radius); }
+
+/* A narrow window lists the providers and pushes to one: each row says so with a chevron, and none is marked open. */
+@media (max-width: 860px) {
+  .provider-rail-item { grid-template-columns: auto minmax(0, 1fr) auto auto; }
+  .provider-rail-item::after { content: ""; width: 7px; height: 7px; margin: 0 2px 0 4px; border-right: 1.6px solid var(--label-3); border-bottom: 1.6px solid var(--label-3); transform: rotate(-45deg); }
+  .provider-rail-item.selected strong { font-weight: 500; }
+}
+@media (max-width: 720px) {
+  .provider-fact { grid-template-columns: minmax(0, 1fr); row-gap: 2px; }
+  .provider-kind { padding-left: 0; }
+}
 
 .notice { display: flex; flex-direction: column; gap: 3px; font-size: var(--fs-foot); line-height: 1.45; color: var(--label-2); }
 .notice strong { color: var(--warn); font-weight: 600; }
@@ -581,59 +887,133 @@ label.check input { margin-top: 2px; }
 
 /* ---- Logs ---------------------------------------------------------------------------- */
 
-.logs-header-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin: 0 4px 8px; }
+/* The mod's pane in table form: figures in tabular numerals lined up on the right, graphite text,
+   a provider named with its vendor's dot, and colour only where a request failed. */
+.logs-header-row { display: flex; align-items: baseline; justify-content: space-between; gap: 4px 12px; flex-wrap: wrap; margin: 0 4px 8px; }
 .logs-header-row .section-title { display: inline; }
-.logs-header-row .small { margin-left: 8px; }
-.logs-summary { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); }
-.logs-chip { position: relative; min-width: 0; padding: 14px 16px; }
+.logs-header-row .small { margin-left: 8px; font-size: var(--fs-cap); }
+.logs-summary { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); }
+/* The cost chip is a seventh when the router prices requests; its note stands under the chips. Seven
+   in a row only in a wide window (the labels would be cut), else four and three. */
+.logs-summary.with-cost { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+.logs-summary.with-cost .logs-chip:nth-child(5)::before { display: none; }
+.logs-summary.with-cost .logs-chip:nth-child(n + 5) { border-top: 1px solid var(--separator); }
+/* The last chip takes what is left of its row, so the rule above the row runs the whole width. */
+.logs-summary.with-cost .logs-chip:last-child { grid-column: span 2; }
+@media (min-width: 1280px) {
+  .logs-summary.with-cost .logs-chip:last-child { grid-column: auto; }
+  .logs-summary.with-cost { grid-template-columns: repeat(7, minmax(0, 1fr)); }
+  .logs-summary.with-cost .logs-chip:nth-child(5)::before { display: block; }
+  .logs-summary.with-cost .logs-chip:nth-child(n + 5) { border-top: 0; }
+}
+.logs-cost-note { margin: 8px 16px 0; color: var(--label-2); font-size: var(--fs-cap); line-height: 1.5; }
+.logs-cost-note > div + div { margin-top: 1px; }
+/* The figures read as Status's tiles: a small grey label over a figure, a quieter line under it. */
+.logs-chip { position: relative; min-width: 0; padding: 12px 16px 13px; }
 .logs-chip + .logs-chip::before { content: ""; position: absolute; left: 0; top: 14px; bottom: 14px; width: 1px; background: var(--separator); }
-.logs-chip .label { display: block; color: var(--label-2); font-size: var(--fs-foot); margin-bottom: 3px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.logs-chip .value { display: block; font-size: 20px; font-weight: 600; letter-spacing: -0.01em; font-variant-numeric: tabular-nums; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.logs-chip .sub { display: block; margin-top: 1px; color: var(--label-2); font-size: var(--fs-cap); white-space: nowrap; }
-.logs-filter { display: inline-flex; align-items: center; gap: 8px; color: var(--label-2); font-size: var(--fs-foot); }
-.logs-filter select { width: auto; min-width: 130px; min-height: 28px; }
+.logs-chip .label { display: block; margin-bottom: 4px; color: var(--label-2); font-size: var(--fs-cap); font-weight: 500; letter-spacing: 0.01em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.logs-chip .value { display: block; color: var(--label); font-size: 19px; font-weight: 600; line-height: 1.25; letter-spacing: -0.015em; font-variant-numeric: tabular-nums; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.logs-chip .sub { display: block; margin-top: 2px; color: var(--label-2); font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+/* A compacted figure ("78.9억") carries the whole number on hover. */
+.logs-chip .value[title] { cursor: help; }
+.logs-filter { display: inline-flex; align-items: center; gap: 8px; margin-left: auto; color: var(--label-2); font-size: var(--fs-foot); }
+.logs-filter select { width: auto; min-width: 140px; max-width: 220px; min-height: 28px; }
 .logs-table-card { overflow-x: auto; }
-.logs-table-card table { min-width: 860px; }
-/* The usage period: a segmented control, and two date fields beside it for a custom range. */
-.logs-period-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; margin: 0 0 10px; }
+.logs-table-card table { min-width: 880px; }
+/* What the page covers: the period as a segmented control (two date fields beside it for a custom
+   range), the provider at the row's end. */
+.logs-period-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; margin: 0 0 22px; }
 .logs-custom { display: inline-flex; align-items: center; gap: 6px; }
 .logs-custom input { width: auto; min-height: 28px; padding: 3px 8px; font-size: var(--fs-foot); font-variant-numeric: tabular-nums; }
 .logs-custom-dash { color: var(--label-3); }
-#models-table { min-width: 600px; }
+/* Loading. A read in flight shows bars in the shape of its figures, shimmering quietly; figures from an
+   earlier selection stay readable but dimmed until their read lands; a failed read says so in red. */
+.logs-header-row .load-status { margin-left: auto; }
+.is-updating { opacity: 0.45; transition: opacity 0.2s ease; }
+.skeleton-bar { display: block; height: 0.9em; border-radius: 6px; background: linear-gradient(90deg, var(--fill) 0%, var(--fill-hover) 50%, var(--fill) 100%); background-size: 200% 100%; animation: skeleton-shimmer 1.6s ease-in-out infinite; }
+.skeleton-label { width: 56%; height: 0.75em; }
+.skeleton-value { width: 40%; height: 1.15em; margin-top: 6px; }
+.skeleton-w0 { width: 72%; }
+.skeleton-w1 { width: 46%; }
+.skeleton-w2 { width: 88%; }
+.skeleton-row td { padding-top: 15px; padding-bottom: 15px; }
+@keyframes skeleton-shimmer { from { background-position: 100% 0; } to { background-position: -100% 0; } }
+@media (prefers-reduced-motion: reduce) { .skeleton-bar { animation: none; } .is-updating { transition: none; } }
+#logs-usage-error, #models-error, #requests-error { color: var(--bad); }
 
-table { width: 100%; border-collapse: collapse; font-size: var(--fs-sub); }
-th { padding: 10px 12px 8px; color: var(--label-2); font-size: var(--fs-foot); font-weight: 500; text-align: left; white-space: nowrap; border-bottom: 1px solid var(--separator); }
+/* First loads on every page: a region whose read has not landed shows bars in the shape of its rows,
+   a failed read says so in red, and a status line names a read in flight. */
+.skeleton-lines { display: grid; gap: 12px; padding: 14px 16px; }
+.skeleton-lines .skeleton-bar { display: block; height: 1em; }
+.skeleton-stat { display: block; width: 58%; height: 1.5em; }
+.load-failed { padding: 12px 16px; color: var(--bad); font-size: var(--fs-foot); line-height: 1.45; }
+.load-status { display: inline-flex; align-items: center; gap: 8px; color: var(--label-2); font-size: var(--fs-cap); }
+.load-status.load-failed { padding: 0; color: var(--bad); }
+.stat-tile .load-failed { padding: 0; }
+.load-status .spinner { width: 12px; height: 12px; border-width: 1.5px; }
+#view-clients.is-unloaded .section { opacity: 0.45; pointer-events: none; transition: opacity 0.2s ease; }
+@media (prefers-reduced-motion: reduce) { #view-clients.is-unloaded .section { transition: none; } }
+#models-table { min-width: 700px; }
+
+table { width: 100%; border-collapse: collapse; font-size: var(--fs-foot); }
+th { padding: 9px 12px 7px; color: var(--label-2); font-size: var(--fs-cap); font-weight: 500; text-align: left; white-space: nowrap; border-bottom: 1px solid var(--separator); }
 th:first-child, td:first-child { padding-left: 16px; }
-td { padding: 9px 12px; vertical-align: middle; border-bottom: 1px solid var(--separator); font-variant-numeric: tabular-nums; }
+th:last-child, td:last-child { padding-right: 16px; }
+td { padding: 8px 12px; vertical-align: middle; border-bottom: 1px solid var(--separator); font-variant-numeric: tabular-nums; }
 tr:last-child td { border-bottom: 0; }
+/* Figures line up on the right, under their heading. */
+#models-table th:nth-child(n + 2), #requests-table th:nth-child(n + 4):not(:last-child),
+td.c-count, td.c-in, td.c-out, td.c-cost, td.c-dur { text-align: right; white-space: nowrap; }
+td.c-count, td.c-out, td.c-cost { color: var(--label); }
+/* A heading over a figure with a pill after it stands over the figure, not over the pill. */
+#models-table th:nth-child(3), #requests-table th:nth-child(4) { padding-right: calc(18px + 6.4 * 11px); }
+#models-table th:nth-child(6), #requests-table th:nth-child(6) { padding-right: calc(18px + 7.6 * 11px); }
+/* A cost with caveats on hover is underlined in dots; the rate explains itself on hover too. */
+td.c-cost[title] { cursor: help; text-decoration: underline dotted var(--label-3); text-underline-offset: 3px; }
+td.c-dur[title] { cursor: help; }
 #requests-table tbody tr.request-row { cursor: pointer; }
-#requests-table tbody tr.request-row:hover td { background: var(--fill); background: color-mix(in srgb, var(--fill) 55%, transparent); }
+#requests-table tbody tr.request-row:hover td, #models-table tbody tr:hover td { background: var(--fill); background: color-mix(in srgb, var(--fill) 50%, transparent); }
 #requests-table td.c-time { color: var(--label-2); white-space: nowrap; }
-.request-models { display: flex; align-items: center; gap: 6px; min-width: 0; }
-.request-models .model { max-width: 240px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 500; }
-.request-models .small { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-/* The provider is read as a name, not a colour: one quiet label for every provider. */
-.provider-badge { flex: 0 0 auto; padding: 1px 7px; border-radius: 5px; background: var(--fill); color: var(--label-2); font-size: var(--fs-cap); font-weight: 500; white-space: nowrap; }
+#requests-table td.c-effort { color: var(--label-2); }
+.request-models { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.request-models .model { max-width: 240px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--label); font-weight: 500; }
+.request-models .small { font-size: var(--fs-cap); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+/* The provider as Status names it: its vendor's hue as a dot, then the provider's or the account's name. */
+.provider-badge { display: inline-flex; align-items: center; gap: 5px; flex: 0 1 auto; min-width: 0; max-width: 220px; color: var(--label-2); font-size: var(--fs-cap); white-space: nowrap; }
+.provider-badge .vendor-dot { width: 6px; height: 6px; }
+.provider-badge-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.provider-badge[title] { cursor: default; }
+/* What kind of side request a row is, as a plain tag; a Fast request is the one point of violet. */
+.purpose-tag, .fast-tag { flex: 0 0 auto; padding: 0 7px; border-radius: 999px; font-size: 11px; font-weight: 500; line-height: 16px; white-space: nowrap; }
+.purpose-tag { background: var(--fill); color: var(--label-2); }
+.fast-tag { box-shadow: inset 0 0 0 1px var(--accent-line); color: var(--accent); font-weight: 600; letter-spacing: 0.03em; }
 .token-cell { white-space: nowrap; }
-.cache-pill { margin-left: 6px; color: var(--label-2); font-size: var(--fs-cap); }
+/* The cache's share and the rate ride after their figure at a set width, so the figures stay in line. */
+.cache-pill, .rate-pill { display: inline-block; margin-left: 6px; color: var(--label-2); font-size: 11px; text-align: left; white-space: nowrap; }
+.cache-pill { min-width: 6.4em; }
+.rate-pill { min-width: 7.6em; }
+#requests-table td.c-dur, #models-table td.c-dur, #models-table td.c-cost { white-space: nowrap; }
 .no-usage { color: var(--label-3); }
-.status-text { font-weight: 500; white-space: nowrap; }
-.status-text.ok { color: var(--ok); }
-.status-text.bad { color: var(--bad); }
-.status-text.resent { color: var(--label-2); font-weight: 400; }
-.request-detail td { padding: 0; background: var(--fill); background: color-mix(in srgb, var(--fill) 45%, transparent); }
-.request-detail-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px 16px; padding: 14px 16px; }
-.request-detail-grid .detail-label { display: block; margin-bottom: 2px; color: var(--label-2); font-size: var(--fs-cap); }
-.request-detail-grid .detail-value { font-family: var(--mono); font-size: var(--fs-foot); word-break: break-word; }
+/* A request that went through reads as quietly as the rest of its row; a failure is the one in red. */
+.status-text { white-space: nowrap; }
+.status-text.ok { color: var(--label-2); }
+.status-text.bad { color: var(--bad); font-weight: 600; }
+.status-text.resent { color: var(--label-3); }
+.request-detail td { padding: 0; background: var(--fill); background: color-mix(in srgb, var(--fill) 40%, transparent); }
+.request-detail-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px 20px; padding: 12px 16px 14px; }
+.request-detail-grid .detail-label { display: block; margin-bottom: 2px; color: var(--label-2); font-size: 11px; font-weight: 500; }
+.request-detail-grid .detail-value { color: var(--label); font-family: var(--mono); font-size: var(--fs-cap); word-break: break-word; }
 .request-note { grid-column: 1 / -1; }
 
 .raw-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin: 0 4px 8px; }
+.raw-toolbar .small { font-size: var(--fs-cap); }
+.raw-toolbar label.check { font-size: var(--fs-foot); color: var(--label-2); }
 pre#logbox {
   margin: 0;
-  height: 62vh;
-  padding: 14px 16px;
+  height: 64vh;
+  padding: 12px 16px;
   overflow: auto;
-  font: 12.5px/1.6 var(--mono);
+  font: 12px/1.65 var(--mono);
   white-space: pre-wrap;
   word-break: break-all;
 }
@@ -641,35 +1021,82 @@ pre#logbox {
 .tag-ERR { color: var(--bad); }
 .tag-WARN { color: var(--warn); }
 
+/* A phone: the figures, the period and the provider each take the width; the dates share a line. */
+@media (max-width: 720px) {
+  .logs-filter { flex: 1 1 100%; margin-left: 0; }
+  .logs-filter select { flex: 1 1 auto; max-width: none; }
+  .logs-period-row { margin-bottom: 18px; }
+  .logs-chip { padding: 11px 14px 12px; }
+  .logs-chip .value { font-size: 17px; }
+}
+
 /* ---- ClaudeRipple mod ---------------------------------------------------------------- */
 
 /* One long page of cards, each card a heading over the usual grouped lists. */
 a.cell { color: inherit; text-decoration: none; }
 #mod-notice:not([hidden]) + #mod-content { margin-top: 28px; }
-.mod-card + .mod-card { margin-top: 48px; }
-.mod-card-head { margin: 0 4px 12px; }
-.mod-card-head h2 { font-size: 20px; font-weight: 700; letter-spacing: -0.015em; line-height: 1.25; }
-.mod-card-head .hint { margin-top: 3px; font-size: var(--fs-sub); }
+/* A card is a heading the size of Status's provider names over its rows, not a second page title. */
+.mod-card + .mod-card { margin-top: 40px; }
+.mod-card-head { margin: 0 4px 10px; }
+.mod-card-head h2 { font-size: 16px; font-weight: 650; letter-spacing: -0.01em; line-height: 1.3; }
+.mod-card-head .hint { margin-top: 3px; font-size: var(--fs-foot); line-height: 1.5; }
 .mod-card-head + .section, .mod-card-head + .group { margin-top: 0; }
+.mod-card .section + .section { margin-top: 18px; }
+.mod-card .section-title { color: var(--label-2); font-size: var(--fs-foot); }
+/* Rows say what a setting is in the body size and how it works in a quieter line. */
+.mod-card .cell-label { font-size: var(--fs-sub); }
+.mod-card .cell-sub { font-size: var(--fs-cap); }
+.mod-card .group-footer { font-size: var(--fs-cap); line-height: 1.55; }
+/* On a phone a choice keeps its whole word ("모든 서브에이전트" was cut to "모든 서브에이…"):
+   the buttons size to their words and the control wraps when they do not fit. */
+@media (max-width: 720px) {
+  .mod-card .cell.wide .segmented { flex-wrap: wrap; }
+  .mod-card .cell.wide .segmented button { flex: 1 1 auto; overflow: visible; text-overflow: clip; }
+  .mode-tabs { display: flex; }
+}
 .group-footer.warn-text, .cell-note.warn-text, .cell-sub.warn-text { color: var(--warn); }
 .mod-card .cell-value select { width: 320px; max-width: 100%; }
 .mod-card .cell-value select.narrow { width: 160px; }
 .text-field { width: 320px; }
 
 /* The models to use: one block per provider, its billing beside the name, a checkbox for each model. */
-.tick-group + .tick-group { border-top: 1px solid var(--separator); }
-.tick-head { padding: 12px 16px 0; color: var(--label-2); font-size: var(--fs-foot); font-weight: 500; }
+.tick-group { position: relative; }
+.tick-group + .tick-group::before { content: ""; position: absolute; top: 0; left: 16px; right: 0; height: 1px; background: var(--separator); }
+.tick-head { padding: 11px 16px 0; color: var(--label-2); font-size: var(--fs-cap); font-weight: 500; }
+.tick-name { display: inline-flex; align-items: center; gap: 8px; min-width: 0; }
+.tick-name > span:last-child { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tick-name .vendor-dot { width: 7px; height: 7px; }
 .tick-group .model-check .model-effort-tag { margin-left: auto; }
+/* The models are ticks on the card, not grey tiles in it: a row each, a hover the only fill. */
+.tick-group .model-checklist { gap: 0 8px; padding: 4px 8px 8px; }
+.tick-group .model-check { padding: 6px 8px; border-radius: 7px; background: transparent; font-size: var(--fs-foot); }
+.tick-group .model-check:hover { background: var(--fill); }
+.tick-group .model-check:has(input:not(:checked)) > span:first-of-type { color: var(--label-2); }
+/* A provider with pinned workers: its account tabs at the head's right, one account's models below.
+   The lists share one cell, so the block is as tall as the longest and switching moves nothing. */
+.tick-head.has-tabs { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 8px 10px 0 16px; }
+.tick-head.has-tabs > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.account-tabs { flex: 0 1 auto; }
+.account-tabs button { padding: 3px 12px; }
+.account-panels { display: grid; }
+.account-panels > .model-checklist { grid-area: 1 / 1; align-content: start; }
+.account-panels > .account-hidden { visibility: hidden; }
 
 /* The four workers: a name and its meaning on the left; one menu for the model and effort on the right. */
 .rung-row { align-items: flex-start; }
 .rung-row > .cell-text { padding-top: 5px; }
+/* A long hint wraps beside the list rather than pushing a rung's buttons under its select. */
+.rung-row > .cell-value { flex-shrink: 0; max-width: 100%; }
 .mod-card .cell-value select.rung-model { width: 300px; }
 /* Saved worker sets: tabs browse, the separate control activates. Numbering is dispatch order. */
-.mode-on { display: inline-block; margin-left: 8px; padding: 1px 7px; border-radius: 999px; background: var(--accent-soft); color: var(--accent); font-size: var(--fs-cap); font-weight: 600; vertical-align: 1px; }
-.mode-tabs { display: flex; flex-wrap: wrap; gap: 6px; margin: 18px 0 12px; }
-.mode-tabs button { padding: 8px 12px; border: 1px solid var(--separator); border-radius: 8px; background: var(--fill); color: var(--label-2); max-width: 100%; overflow-wrap: anywhere; }
-.mode-tabs button.active { color: var(--accent); border-color: var(--accent); background: var(--accent-soft); }
+/* The set in use carries the accent's outlined tag, the one point of violet among the tabs. */
+.mode-on { display: inline-block; margin-left: 7px; padding: 0 6px; border-radius: 999px; box-shadow: inset 0 0 0 1px var(--accent-line); color: var(--accent); font-size: 11px; font-weight: 600; line-height: 16px; vertical-align: 1px; }
+/* Saved worker sets as a segmented control: the open one raised, the rest flat. */
+.mode-tabs { display: inline-flex; flex-wrap: wrap; gap: 2px; max-width: 100%; margin: 20px 0 14px; padding: 2px; border-radius: 9px; background: var(--fill); }
+.mode-tabs button { min-height: 28px; padding: 3px 14px; border: 0; border-radius: 7px; background: transparent; color: var(--label); font-size: var(--fs-foot); font-weight: 500; max-width: 100%; overflow-wrap: anywhere; cursor: pointer; }
+.mode-tabs button:hover:not(.active):not(:disabled) { background: var(--fill); }
+.mode-tabs button.active { background: var(--segment-on); box-shadow: 0 1px 3px rgba(0, 0, 0, 0.12), 0 0 0 0.5px rgba(0, 0, 0, 0.04); font-weight: 600; }
+.mode-tabs button[data-key="mode-add"] { color: var(--label-2); }
 .rung-list { min-width: 0; width: 100%; text-align: left; }
 .rung-list ol { margin: 0 0 8px; padding-left: 22px; }
 .rung-item { padding: 3px 0 6px; }
@@ -688,7 +1115,8 @@ a.cell { color: inherit; text-decoration: none; }
   .compact-at, .compact-at .segmented { flex-wrap: nowrap; }
   .compact-at .text-field { width: 112px; }
 }
-.offer-row { background: var(--accent-soft); }
+/* A one-time note: an accent rule at its edge rather than a violet ground. */
+.offer-row { box-shadow: inset 3px 0 0 var(--accent); }
 .offer-row .cell-label { font-size: var(--fs-sub); }
 
 /* The lean is a slider with a tick for each of its five stops, like a System Settings slider. */
@@ -727,13 +1155,17 @@ a.cell { color: inherit; text-decoration: none; }
 .mac-card .notice { margin-bottom: 10px; }
 .mac-card .details { margin: 12px 4px 0; }
 .mac-card .details .group { margin-top: 8px; }
-.mac-state { min-height: 58px; }
-.mac-dot { width: 10px; height: 10px; flex: 0 0 auto; border-radius: 50%; background: var(--label-3); }
-.mac-dot.on { background: var(--accent-fill); box-shadow: 0 0 0 4px color-mix(in srgb, var(--accent-fill) 18%, transparent); }
-.mac-dot.ok { background: var(--ok-dot); box-shadow: 0 0 0 4px color-mix(in srgb, var(--ok-dot) 18%, transparent); }
-.mac-dot.warn { background: var(--warn-dot); box-shadow: 0 0 0 4px color-mix(in srgb, var(--warn-dot) 18%, transparent); }
-.mac-dot.bad { background: var(--bad-dot); box-shadow: 0 0 0 4px color-mix(in srgb, var(--bad-dot) 18%, transparent); }
-.mac-side { flex: 0 1 auto; min-width: 0; color: var(--label-2); font-size: var(--fs-foot); font-variant-numeric: tabular-nums; text-align: right; }
+/* What is true now leads each card: a dot and a word, why under it, the machine's facts on the right. */
+.mac-state { min-height: 54px; gap: 12px; }
+.mac-state .cell-label.strong { font-size: var(--fs-sub); }
+.mac-dot { width: 8px; height: 8px; flex: 0 0 auto; border-radius: 50%; background: var(--label-3); }
+.mac-dot.on { background: var(--accent-fill); box-shadow: 0 0 0 3px var(--accent-soft); }
+.mac-dot.ok { background: var(--ok-dot); }
+.mac-dot.warn { background: var(--warn-dot); }
+.mac-dot.bad { background: var(--bad-dot); }
+.mac-side { flex: 0 1 auto; min-width: 0; color: var(--label-2); font-size: var(--fs-cap); font-variant-numeric: tabular-nums; text-align: right; }
+.mac-card .details > summary { font-size: var(--fs-foot); }
+.mac-card .conn-detail-rows .row .v { font-size: 11.5px; }
 .mac-ssid { color: var(--label); font-weight: 500; }
 .mac-ssid.empty { color: var(--label-3); font-weight: 400; }
 .mac-time { width: auto; min-width: 112px; font-variant-numeric: tabular-nums; }
@@ -743,9 +1175,20 @@ a.cell { color: inherit; text-decoration: none; }
 
 /* The language menu lives in the sidebar; on a phone the sidebar is a tab bar, so About carries it. */
 .narrow-only { display: none; }
-.about-text { padding: 14px 16px; font-size: var(--fs-sub); line-height: 1.5; }
-.about-text p { margin: 0; }
-.about-text p + p { margin-top: 6px; }
+/* Who this is: the mark, the name and licence beside it, the trademark notice under a hairline. */
+.about-card { padding: 16px 16px 14px; }
+.about-id { display: flex; align-items: center; gap: 14px; }
+.about-mark { width: 44px; height: 44px; flex: 0 0 auto; padding: 6px; border-radius: 11px; background: var(--accent-soft); }
+.about-name { font-size: 17px; font-weight: 650; letter-spacing: -0.01em; }
+.about-license { margin: 2px 0 0; color: var(--label-2); font-size: var(--fs-cap); }
+.about-body { margin: 14px 0 0; padding-top: 12px; border-top: 1px solid var(--separator); color: var(--label-2); font-size: var(--fs-foot); line-height: 1.55; }
+:lang(ko) .about-body { word-break: keep-all; overflow-wrap: anywhere; }
+/* The version, its updates and what is running: the same dense rows as the other settings. */
+.about-details .cell-label { font-size: var(--fs-sub); }
+.about-details .cell-sub { font-size: var(--fs-cap); }
+.about-details .cell-sub.mono { font-size: 11.5px; color: var(--label-2); }
+.about-details > .row .k { font-size: var(--fs-sub); }
+.about-details > .row .v { font-size: var(--fs-foot); }
 
 /* ---- Sheets -------------------------------------------------------------------------- */
 
@@ -765,12 +1208,11 @@ a.cell { color: inherit; text-decoration: none; }
   max-height: min(820px, calc(100vh - 48px));
   overflow: auto;
   overscroll-behavior: contain;
-  background: var(--group);
+  background: var(--sheet);
   border-radius: 14px;
   box-shadow: var(--sheet-shadow);
   animation: sheet-in 0.2s cubic-bezier(0.2, 0.8, 0.2, 1);
 }
-@media (prefers-color-scheme: dark) { .modal { background: #262628; } }
 #modal-content { padding: 22px 24px 24px; }
 .modal h1 { font-size: 19px; font-weight: 700; margin: 0 40px 6px 0; line-height: 1.3; }
 .modal h1 + .hint { margin-bottom: 4px; font-size: var(--fs-sub); }
@@ -784,10 +1226,9 @@ a.cell { color: inherit; text-decoration: none; }
   margin: 22px -24px -24px;
   padding: 14px 24px;
   background: inherit;
-  background: var(--group);
+  background: var(--sheet);
   border-top: 1px solid var(--separator);
 }
-@media (prefers-color-scheme: dark) { .modal .actions.end { background: #262628; } }
 @keyframes fade-in { from { opacity: 0; } }
 @keyframes sheet-in { from { opacity: 0; transform: translateY(10px) scale(0.985); } }
 @media (prefers-reduced-motion: reduce) { .modal, .modal-backdrop { animation: none; } .toast, .switch span, .switch span::after { transition: none; } }
@@ -950,8 +1391,11 @@ a.cell { color: inherit; text-decoration: none; }
 @media (max-width: 1020px) {
   .provider-workspace { grid-template-columns: 228px minmax(0, 1fr); gap: 22px; }
   .logs-summary { grid-template-columns: repeat(3, minmax(0, 1fr)); }
-  .logs-chip:nth-child(4)::before { display: none; }
+  .logs-chip:nth-child(4)::before, .logs-chip:nth-child(7)::before { display: none; }
   .logs-chip:nth-child(n + 4) { border-top: 1px solid var(--separator); }
+  .logs-summary.with-cost { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .logs-summary.with-cost .logs-chip:nth-child(5)::before { display: block; }
+  .logs-summary.with-cost .logs-chip:last-child { grid-column: span 3; }
 }
 
 @media (max-width: 860px) {
@@ -1014,17 +1458,23 @@ a.cell { color: inherit; text-decoration: none; }
   .cell-value { max-width: 55%; }
   .slot-row .cell-value select { width: 100%; max-width: none; }
   .slot-row .cell-value { flex: 1 1 100%; max-width: none; justify-content: stretch; }
+  /* A phone has no room for "provider default" beside a model name, so the two menus stack. */
+  .classifier-row .cell-value { flex-wrap: wrap; }
+  .classifier-row .cell-value select, .classifier-row .cell-value select.classifier-effort { flex: 1 1 100%; }
   .map-effort.muted-cell { display: none; }
   .map-row { grid-template-areas: "source remove" "target target" "effort effort"; }
   .provider-detail-header { flex-direction: column; align-items: stretch; gap: 12px; }
   .provider-detail-actions { justify-content: flex-start; }
   .provider-tabs { display: flex; }
   .provider-tabs button { flex: 1 1 0; }
+  .stat-tiles { grid-auto-flow: row; grid-auto-columns: auto; }
+  .stat-tile + .stat-tile::before { top: 0; bottom: auto; left: 16px; right: 0; width: auto; height: 1px; }
   .logs-summary { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .logs-chip:nth-child(n)::before { display: block; }
-  .logs-chip:nth-child(odd)::before { display: none; }
+  .logs-chip:nth-child(odd)::before, .logs-summary.with-cost .logs-chip:nth-child(5)::before { display: none; }
   .logs-chip:nth-child(n + 3) { border-top: 1px solid var(--separator); }
-  .logs-chip:nth-child(5) { grid-column: 1 / -1; }
+  .logs-summary.with-cost { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .logs-summary.with-cost .logs-chip:last-child { grid-column: span 2; }
   .chooser-tiles { grid-template-columns: 1fr; }
   .chooser-tiles:not(.single) > .chooser-tile:nth-child(2)::before { display: block; }
 
@@ -1046,7 +1496,6 @@ a.cell { color: inherit; text-decoration: none; }
   .remote-points, .remote-get, .remote-next { margin-left: 0; padding-left: 0; }
   .remote-get { flex-direction: column; align-items: stretch; }
   .btn.large.remote-store { width: 100%; }
-  .remote-get .hint { flex: 0 0 auto; text-align: center; }
 
   /* Requests read as a list: model and status on top, the numbers on one quiet line below. */
   .logs-table-card { overflow: visible; }
@@ -1060,8 +1509,14 @@ a.cell { color: inherit; text-decoration: none; }
   #requests-table td.c-model { order: 1; flex: 1 1 calc(100% - 110px); min-width: 0; padding-right: 10px; }
   #requests-table td.c-status { order: 2; margin-left: auto; font-size: var(--fs-foot); }
   #requests-table td.c-time, #requests-table td.c-effort, #requests-table td.c-in, #requests-table td.c-out, #requests-table td.c-dur { order: 3; color: var(--label-2); font-size: var(--fs-cap); white-space: nowrap; }
-  #requests-table td.c-time::after, #requests-table td.c-effort::after, #requests-table td.c-in::after, #requests-table td.c-out::after { content: "·"; margin: 0 6px; color: var(--label-3); }  #requests-table .request-models .model { max-width: 60vw; }
+  #requests-table td.c-time::after, #requests-table td.c-effort::after, #requests-table td.c-in::after, #requests-table td.c-out::after { content: "·"; margin: 0 6px; color: var(--label-3); }
+  #requests-table .request-models .model { max-width: 60vw; }
   #requests-table .request-models > .small { display: none; }
+  /* In a list line the figures follow one another: their pills keep no set width, an empty one takes none. */
+  #view-logs .cache-pill, #view-logs .rate-pill { min-width: 0; margin-left: 4px; }
+  #view-logs .cache-pill:empty, #view-logs .rate-pill:empty { display: none; }
+  #requests-table .request-models { flex-wrap: wrap; row-gap: 3px; }
+  #requests-table .provider-badge { max-width: 100%; }
   #requests-table tr.request-detail { position: relative; display: block; }
   #requests-table tr.request-detail td { display: block; }
   .request-detail-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
@@ -1079,9 +1534,9 @@ a.cell { color: inherit; text-decoration: none; }
   #models-table tr + tr::before { content: ""; position: absolute; top: 0; left: 16px; right: 0; height: 1px; background: var(--separator); }
   #models-table td { display: block; padding: 0; border: 0; }
   #models-table td.c-model { flex: 1 1 100%; min-width: 0; }
-  #models-table td.c-count, #models-table td.c-in, #models-table td.c-out, #models-table td.c-dur { color: var(--label-2); font-size: var(--fs-cap); white-space: nowrap; }
+  #models-table td.c-count, #models-table td.c-in, #models-table td.c-out, #models-table td.c-cost, #models-table td.c-dur { color: var(--label-2); font-size: var(--fs-cap); white-space: nowrap; }
   #models-table td[data-label]::before { content: attr(data-label) " "; color: var(--label-3); }
-  #models-table td.c-count::after, #models-table td.c-in::after, #models-table td.c-out::after { content: "·"; margin: 0 6px; color: var(--label-3); }
+  #models-table td.c-count::after, #models-table td.c-in::after, #models-table td.c-out::after, #models-table td.c-cost::after { content: "·"; margin: 0 6px; color: var(--label-3); }
   #models-table .request-models .model { max-width: 60vw; }
 
   .modal-backdrop { place-items: end center; padding: 0; }
@@ -1091,7 +1546,16 @@ a.cell { color: inherit; text-decoration: none; }
   .toast { bottom: calc(84px + env(safe-area-inset-bottom)); }
 }
 
-/* Nine tabs on a 375pt phone leave 41px each: the longest labels ("프로바이더", "Providers") need a hair less. */
-@media (max-width: 400px) {
-  .nav-btn { font-size: 9.5px; letter-spacing: -0.025em; }
+/* Nine tabs do not fit a phone at a readable size: squeezed into 41px each, "프로바이더" and
+   "클라이언트" ran into one another. Under 560px each tab keeps its label on one line at its own
+   width and the bar scrolls sideways when they do not all fit; the right edge fades so a cut tab reads
+   as "more this way". The open page's tab is scrolled into view (app.js showView). */
+@media (max-width: 560px) {
+  .nav-list { overflow-x: auto; overscroll-behavior-x: contain; scrollbar-width: none; -webkit-mask-image: linear-gradient(to right, #000 calc(100% - 22px), transparent); mask-image: linear-gradient(to right, #000 calc(100% - 22px), transparent); }
+  .nav-list::-webkit-scrollbar { display: none; }
+  .nav-list::after { content: ""; flex: 0 0 18px; }
+  .nav-btn { flex: 1 0 auto; width: auto; min-width: 44px; padding: 4px 5px; font-size: 10px; letter-spacing: 0; }
+  .nav-btn span { display: block; overflow: visible; white-space: nowrap; }
+  .nav-btn .nav-long { display: none; }
+  .nav-btn .nav-short { display: block; }
 }

@@ -158,3 +158,33 @@ test("a GUI save writes the slots, and a slot it does not name is left alone", (
   fs.writeFileSync(file, JSON.stringify({ env: { HTTPS_PROXY: "http://corp:3128" } }));
   assert.throws(() => syncModelSlots({ ...base, models: { smallFast: "deepseek-v4.1-flash" } }), /already/);
 });
+
+// install writes CLAUDE_CODE_MAX_CONTEXT_TOKENS as part of its own setup, so uninstall takes back
+// exactly that value; a cap set by hand is not evidence and stays (G-D16).
+test("install's context cap is taken back, a hand-set one stays", () => {
+  const file = process.env.CLAUDE_SETTINGS_PATH!;
+  const proxy = { proxyUrl: "http://127.0.0.1:8790", caPath: "/x/ca.pem", force: false };
+  fs.writeFileSync(file, JSON.stringify({ env: { FOO: "1" } }));
+  applyProxyEnv({ ...proxy, maxContextTokens: 500000 });
+  assert.equal(JSON.parse(fs.readFileSync(file, "utf8")).env.CLAUDE_CODE_MAX_CONTEXT_TOKENS, "500000");
+  removeProxyEnv({ proxyUrl: proxy.proxyUrl, caPath: proxy.caPath });
+  assert.deepEqual(JSON.parse(fs.readFileSync(file, "utf8")).env, { FOO: "1" });
+
+  fs.writeFileSync(file, JSON.stringify({ env: { CLAUDE_CODE_MAX_CONTEXT_TOKENS: "700000" } }));
+  applyProxyEnv({ ...proxy, maxContextTokens: 700000 });
+  const edit = removeProxyEnv({ proxyUrl: proxy.proxyUrl, caPath: proxy.caPath });
+  assert.equal(JSON.parse(fs.readFileSync(file, "utf8")).env.CLAUDE_CODE_MAX_CONTEXT_TOKENS, "700000", "the user's own cap is not ours to delete");
+  assert.ok(edit.notes.some((note) => /no record/.test(note)), edit.notes.join("\n"));
+});
+
+// G-D04: settings.json is shared with the CLI itself and with every installation. A file that is
+// not a JSON object must stop the edit, not be spread into a new object that loses its contents.
+test("a settings file that is not an object is refused, never rewritten", () => {
+  const file = process.env.CLAUDE_SETTINGS_PATH!;
+  for (const content of ["[]", "null", '"a string"', "42"]) {
+    fs.writeFileSync(file, content);
+    assert.throws(() => applyProxyEnv({ proxyUrl: "http://127.0.0.1:8790", caPath: "/x/ca.pem", force: true }), /not a JSON object/);
+    assert.throws(() => removeProxyEnv({ proxyUrl: "http://127.0.0.1:8790", caPath: "/x/ca.pem" }), /not a JSON object/);
+    assert.equal(fs.readFileSync(file, "utf8"), content);
+  }
+});

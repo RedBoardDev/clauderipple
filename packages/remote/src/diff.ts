@@ -7,7 +7,7 @@ import { execFile } from "node:child_process";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { FRAME_CAP } from "./protocol.ts";
-import type { DiffFile, DiffView } from "./protocol.ts";
+import type { DiffFile, DiffScope, DiffView } from "./protocol.ts";
 
 /** One file's patch; a longer one is cut and `truncated` says so. */
 export const DIFF_FILE_BYTES = 200 * 1024;
@@ -55,6 +55,15 @@ export interface DiffOptions {
   /** How long the whole view may take to build; patches not started by then are left out. */
   budgetMs?: number;
   now?: () => number;
+  /** Which comparison to answer with. Unknown values count as `auto`: the host's own order. */
+  scope?: DiffScope;
+}
+
+const SCOPES: readonly DiffScope[] = ["auto", "uncommitted", "branch"];
+
+/** A requested scope, or `auto` for anything a client should not have sent. */
+export function diffScope(value: unknown): DiffScope {
+  return typeof value === "string" && (SCOPES as readonly string[]).includes(value) ? value as DiffScope : "auto";
 }
 
 /**
@@ -65,6 +74,7 @@ export interface DiffOptions {
 export async function diffView(cwd: string, opts: DiffOptions = {}): Promise<DiffView> {
   const dir = path.resolve(cwd);
   const now = opts.now ?? Date.now;
+  const scope = diffScope(opts.scope);
   const deadline = now() + (opts.budgetMs ?? GIT_TIMEOUT_MS);
   const top = await git(dir, ["rev-parse", "--show-toplevel"]);
   if (!top.ok) {
@@ -78,7 +88,11 @@ export async function diffView(cwd: string, opts: DiffOptions = {}): Promise<Dif
   const spec = await scopeSpec(root, dir);
   const branch = await currentBranch(root);
   const head = await git(root, ["rev-parse", "--verify", "--quiet", "HEAD"]);
-  const { entries, truncated: listed } = await changedEntries(root, spec, head.ok);
+  // An explicit "branch" answer does not read the working tree at all: the person asked for what
+  // this branch adds, and uncommitted work is a different question.
+  const { entries, truncated: listed } = scope === "branch"
+    ? { entries: [] as Entry[], truncated: false }
+    : await changedEntries(root, spec, head.ok);
   let truncated = listed;
 
   if (entries.length > 0) {
@@ -86,6 +100,9 @@ export async function diffView(cwd: string, opts: DiffOptions = {}): Promise<Dif
     const files = await assemble(root, entries, refs, !head.ok, deadline, now);
     return { scope: "uncommitted", base: null, branch, files: files.files, truncated: truncated || files.truncated };
   }
+  // Asked for uncommitted work alone: an empty answer is the answer, not a reason to fall through
+  // to the branch (the person switched to this view to see that there is nothing waiting).
+  if (scope === "uncommitted") return { scope: "clean", base: null, branch, files: [], truncated };
 
   const base = branch ? await baseRef(root, branch) : null;
   if (base) {
@@ -162,11 +179,14 @@ interface Listed { entries: Entry[]; truncated: boolean }
 
 /**
  * What changed, from three read-only commands: numstat (line counts, binary, renames), name-status
- * (how each file changed) and ls-files (untracked, minus what .gitignore excludes).
+ * (how each file changed) and ls-files (untracked, minus what .gitignore excludes). `from` asks the
+ * branch question (merge base..HEAD), which never reads untracked files: those are the working
+ * tree's own new work and belong to the uncommitted answer.
  */
 async function changedEntries(root: string, spec: string, hasHead: boolean, from?: string): Promise<Listed> {
-  const others = await git(root, ["ls-files", "--others", "--exclude-standard", "-z", "--", spec]);
-  const untracked = others.ok ? segments(others.stdout).filter(Boolean) : [];
+  const others = from ? null : await git(root, ["ls-files", "--others", "--exclude-standard", "-z", "--", spec]);
+  const untracked = others?.ok ? segments(others.stdout).filter(Boolean) : [];
+  const othersOk = others === null || others.ok;
   if (!hasHead) {
     // No commit yet: every file in the folder is new work, whether staged or not.
     const cached = await git(root, ["ls-files", "--cached", "-z", "--", spec]);
@@ -175,7 +195,7 @@ async function changedEntries(root: string, spec: string, hasHead: boolean, from
       ...staged.map(name => ({ path: name, status: "added" as const, added: 0, removed: 0, fresh: true, paths: [] as string[] })),
       ...untracked.map(name => ({ path: name, status: "untracked" as const, added: 0, removed: 0, fresh: true, paths: [] as string[] })),
     ];
-    return { entries, truncated: !others.ok || !cached.ok };
+    return { entries, truncated: !othersOk || !cached.ok };
   }
   const refs = from ? [from, "HEAD"] : ["HEAD"];
   const [numstat, names] = await Promise.all([
@@ -200,7 +220,7 @@ async function changedEntries(root: string, spec: string, hasHead: boolean, from
   });
   for (const name of untracked) entries.push({ path: name, status: "untracked", added: 0, removed: 0, fresh: true, paths: [] });
   // A numstat that did not fit its buffer leaves counts at zero; say so rather than show a wrong zero.
-  return { entries, truncated: !numstat.ok || !others.ok };
+  return { entries, truncated: !numstat.ok || !othersOk };
 }
 
 interface Counts { added: number; removed: number; oldPath?: string; binary: boolean }
@@ -279,13 +299,16 @@ async function assemble(root: string, entries: Entry[], refs: string[], cut: boo
   const kept = entries.slice(0, DIFF_FILE_COUNT);
   let truncated = cut || entries.length > kept.length;
   const patches: string[] = new Array(kept.length).fill("");
+  // Per file, whether what is sent is less than the file's whole patch. The phone says so on that
+  // file instead of guessing from the view-wide `truncated`, which another file may have caused.
+  const partial = new Array<boolean>(kept.length).fill(false);
   const pending: number[] = [];
   for (let i = 0; i < kept.length; i++) if (!kept[i]!.fresh && kept[i]!.status !== "binary") pending.push(i);
   await mapLimit(pending, PATCH_PARALLEL, async (index) => {
     const entry = kept[index]!;
-    if (now() >= deadline) { truncated = true; return; }
+    if (now() >= deadline) { truncated = true; partial[index] = true; return; }
     const out = await git(root, ["diff", ...DIFF_FLAGS, "-M", ...refs, "--", ...entry.paths]);
-    if (!out.ok) { truncated = true; return; }
+    if (!out.ok) { truncated = true; partial[index] = true; return; }
     patches[index] = out.stdout.toString("utf8");
   });
   // Fresh files carry their content as added lines. Read them together; each read is bounded.
@@ -293,7 +316,7 @@ async function assemble(root: string, entries: Entry[], refs: string[], cut: boo
   await mapLimit(fresh, PATCH_PARALLEL, async ({ entry, index }) => {
     try {
       const read = await freshFile(root, entry.path);
-      if (read.cut) truncated = true;
+      if (read.cut) { truncated = true; partial[index] = true; }
       // A file the folder no longer has, or whose bytes are not text, says so; otherwise the listing's
       // own word stands ("added" for a staged file in a repository with no commit, else "untracked").
       if (read.deleted) entry.status = "deleted";
@@ -301,7 +324,7 @@ async function assemble(root: string, entries: Entry[], refs: string[], cut: boo
       entry.added = read.added;
       entry.removed = read.removed;
       patches[index] = read.patch;
-    } catch { truncated = true; }
+    } catch { truncated = true; partial[index] = true; }
   });
 
   const files: DiffFile[] = [];
@@ -310,12 +333,12 @@ async function assemble(root: string, entries: Entry[], refs: string[], cut: boo
   for (let i = 0; i < kept.length; i++) {
     const entry = kept[i]!;
     const full = capBytes(patches[i] ?? "", DIFF_FILE_BYTES);
-    if (full.cut) truncated = true;
+    if (full.cut) { truncated = true; partial[i] = true; }
     // The whole answer must fit a frame: a patch past the remaining budget is left out (its counts stay).
     const cost = Buffer.byteLength(JSON.stringify(full.text)) + Buffer.byteLength(entry.path) + 240;
     let text = full.text;
     if (spent + cost > budget) {
-      if (text) truncated = true;
+      if (text) { truncated = true; partial[i] = true; }
       text = "";
     } else {
       spent += cost;
@@ -327,6 +350,7 @@ async function assemble(root: string, entries: Entry[], refs: string[], cut: boo
       added: entry.added,
       removed: entry.removed,
       patch: text,
+      ...(partial[i] ? { cut: true } : {}),
     });
   }
   // Last guard, for what the per-file estimate cannot see (escaping, long paths): drop patches from
@@ -334,6 +358,7 @@ async function assemble(root: string, entries: Entry[], refs: string[], cut: boo
   for (let i = files.length - 1; i >= 0 && Buffer.byteLength(JSON.stringify(files)) > budget; i--) {
     if (!files[i]!.patch) continue;
     files[i]!.patch = "";
+    files[i]!.cut = true;
     truncated = true;
   }
   return { files, truncated };

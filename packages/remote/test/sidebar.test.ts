@@ -78,10 +78,10 @@ test("app group order, recency, exact titles and unread IDs (unless focused sinc
   assert.equal(sidebarState(joined[0]!), "unread"); assert.equal(sidebarState(joined[1]!), "read");
   assert.equal(sidebarState({ ...joined[1]!, state: "running" }), "running");
   assert.equal(sidebarState({ ...joined[0]!, state: "error" }), "error");
-  // The app's rule, checked on live sessions: unread outranks working; subagent-only work is
-  // working; a stale transcript task count alone is not.
-  assert.equal(sidebarState({ ...joined[0]!, state: "running" }), "unread");
-  assert.equal(sidebarState({ ...joined[1]!, state: "idle", background: true }), "running");
+  // Current Desktop precedence: active work outranks unread completion. A background-only
+  // turn has its own working glyph; a stale transcript task count alone is not liveness.
+  assert.equal(sidebarState({ ...joined[0]!, state: "running" }), "running");
+  assert.equal(sidebarState({ ...joined[1]!, state: "idle", background: true }), "background");
   assert.equal(sidebarState({ ...joined[1]!, state: "idle", tasks: 2 }), "read");
 });
 test("mtime cache obeys three-second gate; archived rows reach the phone and SDK IDs join phone handoffs", t => {
@@ -163,6 +163,18 @@ test("a CLI id the app session has moved on from is not listed beside it", t => 
   const joined = f.sidebar.join([summary(id, "host"), summary(old, "host"), summary("phone", "host")], s => s);
   assert.deepEqual(joined.map(s => s.id), [id, "phone"]);
 });
+test("desktop CLI id rotation keeps the app title, and blank app metadata falls back to the transcript", t => {
+  const f = fixture(t), next = "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee";
+  assert.equal(f.sidebar.join([summary(id)], s => s)[0]?.title, "앱 제목 c");
+  f.session(id, 300, { cliSessionId: next }); f.advance();
+  const joined = f.sidebar.join([{ ...summary(id), desktopBridge: true }, summary(next)], s => s);
+  assert.deepEqual(joined.map(s => [s.id, s.title]), [[next, "앱 제목 c"]]);
+  for (const title of ["", "  \t\n"]) {
+    f.session(id, 400, { cliSessionId: next, title }); f.advance();
+    assert.equal(f.sidebar.join([summary(next)], s => s)[0]?.title, "transcript title");
+  }
+});
+
 test("a /clear names no prior id: an app session's record that no app session holds is not listed", t => {
   const f = fixture(t), cleared = "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee";
   const joined = f.sidebar.join([{ ...summary(id, "host"), desktopBridge: true }, { ...summary(cleared, "host"), desktopBridge: true }, summary("phone", "host")], s => s);

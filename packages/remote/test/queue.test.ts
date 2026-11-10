@@ -46,6 +46,42 @@ test("the queue holds twenty; a failure records why and holds; resume clears bot
   assert.equal(q.held("s"), false);
 });
 
+test("a temporary obstacle survives reopen without holding, and Stop still wins", t => {
+  const d = dir(t);
+  const q = SendQueue.open(d);
+  q.add("s", { id: "a", text: "original", attachments: [] }, 1);
+  assert.equal(q.wait("s", "a", "waiting for RC"), true);
+  assert.equal(q.wait("s", "a", "waiting for RC"), false);
+  const again = SendQueue.open(d);
+  assert.equal(again.held("s"), false);
+  assert.equal(again.summary("s").queue![0]!.error, "waiting for RC");
+  again.hold("s");
+  const stopped = SendQueue.open(d);
+  stopped.retryFailures("waiting for RC", "retry automatically");
+  assert.equal(stopped.held("s"), true);
+});
+
+test("legacy automatic refusals recover without releasing an explicit Stop or other failures", t => {
+  const d = dir(t);
+  const q = SendQueue.open(d);
+  for (const id of ["legacy", "stopped", "other"]) q.add(id, { id: "a", text: id, attachments: [] }, 1);
+  q.fail("legacy", "a", "old desktop refusal");
+  q.fail("stopped", "a", "old desktop refusal");
+  q.hold("stopped");
+  q.fail("other", "a", "write outcome unknown");
+  const file = path.join(d, "queue.json");
+  const saved = JSON.parse(fs.readFileSync(file, "utf8"));
+  delete saved.legacy.heldBy; // Actual old format had no reason for its hold.
+  fs.writeFileSync(file, JSON.stringify(saved));
+  const again = SendQueue.open(d);
+  again.retryFailures("old desktop refusal", "waiting for RC");
+  assert.equal(again.held("legacy"), false);
+  assert.equal(again.summary("legacy").queue![0]!.error, "waiting for RC");
+  assert.equal(again.held("stopped"), true);
+  assert.equal(again.held("other"), true);
+  assert.equal(SendQueue.open(d).held("legacy"), false);
+});
+
 // A Claude app session reports no result, and its Remote Control state can still read idle for a
 // few seconds after a message is sent: idle counts only after an answer.
 test("a sent message's turn ends on a result, or on idle after an answer, or after long silence", t => {

@@ -1,6 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { emptyStats, weighted, addRequest, addPrompt, addJudge, addWorker, addWarm, formatStats } from '../../packages/mod/hooks/stats.ts'
+import { addAgentStep, agentTokens, emptyStats, weighted, addRequest, addPrompt, addJudge, addWorker, addWarm, formatStats } from '../../packages/mod/hooks/stats.ts'
+import type { AgentRec } from '../../packages/mod/types/index.d.ts'
 const usage = { input_tokens: 100, cache_creation_input_tokens: 80, cache_read_input_tokens: 1000, output_tokens: 20 }
 
 test('emptyStats has fresh nested counters and weighted accepts omitted usage', () => {
@@ -11,6 +12,27 @@ test('emptyStats has fresh nested counters and weighted accepts omitted usage', 
     byEffort: {}, judge: { haiku: 0, jev: 0, model: 0, ms: 0, tokens: 0 }, workers: {}, warm: { pings: 0, cost: 0 } })
   first.warm.pings = 4
   assert.equal(emptyStats().warm.pings, 0)
+})
+
+test('an agent keeps its last step\'s prompt and every step\'s output, as the Claude app counts tokens', () => {
+  const agent: AgentRec = { id: 'a', state: 'running', startedAt: 0, cost: 0 }
+  const first = addAgentStep(agent, usage, 'high')
+  // Not a sum: the step's own counts, the shape the pane reads (the last prompt is the conversation's size).
+  assert.deepEqual(first.usage, { input: 100, cached: 1000, cacheWrite: 80, output: 20 })
+  assert.equal(first.outputTotal, 20)
+  const second = addAgentStep(first, { input_tokens: 5, cache_creation_input_tokens: 0, cache_read_input_tokens: 2000, output_tokens: 30 }, 'low')
+  assert.deepEqual(second.usage, { input: 5, cached: 2000, cacheWrite: 0, output: 30 })
+  assert.equal(second.outputTotal, 50)
+  // The last prompt (5 + 0 + 2000) plus both steps' output (20 + 30).
+  assert.equal(agentTokens(second), 2055)
+  // A finished agent takes the larger of that and its last response's own prompt and output.
+  assert.equal(agentTokens({ ...second, state: 'done' }), Math.max(2055, 2035))
+  // The max bites on a record whose running total lags its last step.
+  assert.equal(agentTokens({ ...second, state: 'done', outputTotal: 0 }), 2035)
+  assert.equal(agentTokens(agent), undefined)
+  // The earlier record is untouched.
+  assert.equal(first.outputTotal, 20)
+  assert.deepEqual(first.usage, { input: 100, cached: 1000, cacheWrite: 80, output: 20 })
 })
 
 test('requests accumulate raw tokens and applied effort costs without counting prompts', () => {

@@ -189,8 +189,10 @@ test("sse parser handles split frames, multi-line data and [DONE]", () => {
   const p = new SseParser();
   const a = p.feed('event: x\ndata: {"a":1}\n\nevent: y\ndata: {"b":');
   assert.deepEqual(a, [{ a: 1 }]);
-  const b = p.feed('2}\n\ndata: [DONE]\n\ndata: {"c":\ndata: 3}\r\n\r\n');
+  const b = p.feed('2}\n\ndata: {"c":\ndata: 3}\r\n\r\ndata: [DONE]\n\ndata: {"ignored":true}\n\n');
   assert.deepEqual(b, [{ b: 2 }, { c: 3 }]);
+  assert.equal(p.sawDone, true);
+  assert.deepEqual(p.feed('data: {"ignored":true}\n\n'), []);
 });
 
 test("tool schemas: patterns the Codex regex engine rejects are dropped, others kept", () => {

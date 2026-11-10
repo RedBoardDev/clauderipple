@@ -14,11 +14,20 @@ export type StatusRequest = {
   source: string
   target: string
   provider: string
+  accountLabel?: string
   status: number | string
   ok: boolean
   ms: number
   effort?: string
+  /** The service tier the request asked for ('priority' is Fast); the tier served often differs. */
+  requestedTier?: string
   usage?: { input: number; cached: number; cacheWrite?: number; output: number }
+  /** 'messages' for a model call; the log polls only those. */
+  kind?: string
+  /** A side request, such as 'web-search', answered in one piece after the search. */
+  purpose?: string
+  /** False when the router answered the request itself without reaching a model. */
+  upstreamCalled?: false
   note?: string
   /** Not ok, but the client sent it again on its own: not a failure. */
   resent?: boolean
@@ -77,7 +86,7 @@ export type JudgeRun = {
 }
 
 /** Domain is the kind of work; level is its required capability, independently. */
-export type Domain = 'design' | 'frontend' | 'backend' | 'infra' | 'data' | 'test' | 'docs' | 'research' | 'general'
+export type Domain = 'design' | 'frontend' | 'backend' | 'review' | 'infra' | 'data' | 'test' | 'docs' | 'research' | 'general'
 export type Level = 'light' | 'standard' | 'deep'
 /** Whether a task decides what to build (plan) or carries out what was decided (do). */
 export type Kind = 'plan' | 'do'
@@ -99,7 +108,7 @@ export type Calibration = { effortOffset?: -2 | -1 | 0 | 1 | 2; floor?: Effort; 
 export type Rungs = Partial<Record<Rung, Step[]>>
 export type Rule = { mode: 'ladder'; rungs: Rungs }
 /** Optional ladders within one worker set; absent domains follow that set's general ladder. */
-export type DomainRules = { ui?: Rule; backend?: Rule }
+export type DomainRules = { ui?: Rule; backend?: Rule; review?: Rule }
 /** How a provider is paid for: what the Workers card tags each model with, and what presets read. */
 export type Billing = 'free' | 'payg' | 'subscription'
 /** A model a rung can run, as GET /api/mod-options describes it. */
@@ -198,6 +207,8 @@ export type Settings = {
    * model id (a Claude id or a router id) with an optional `@effort`. Defaults to Haiku.
    */
   compactModel: string
+  /** Additional models offered on the compact card, up to four: the card draws five choices at most. */
+  compactModels: string[]
   /** The heavy-context band; off unless switched on. */
   swampAlert: boolean
   layout: 'dashboard' | 'minimal'
@@ -249,7 +260,7 @@ export type WorkerVerdict = {
 /** What a spawn of ripple:auto (or a taken-over spawn) was turned into. */
 export type WorkerPick = WorkerVerdict & {
   /** The worker set's ladder selected for this task (explicit model choices bypass it). */
-  rule: 'ui' | 'backend' | 'general'
+  rule: 'ui' | 'backend' | 'review' | 'general'
   /** The ladder rung that ran it (absent for explicit choices). */
   rung?: Rung
   /** One-based position in the selected rung; skipped entries explain ordered fallback. */
@@ -268,7 +279,7 @@ export type WorkerPick = WorkerVerdict & {
   id?: string
 }
 
-export type AgentState = 'running' | 'waiting' | 'done' | 'failed' | 'killed'
+export type AgentState = 'running' | 'done' | 'failed' | 'killed'
 
 export type AgentRec = {
   id: string
@@ -283,8 +294,11 @@ export type AgentRec = {
   /** The tool it is in now, in a few words. */
   now?: string
   toolSince?: number
+  /** When its current run started; a resumed agent's restarts. */
   startedAt: number
   endedAt?: number
+  /** Time its earlier runs took, set once a message resumed it; the card adds the current run's. */
+  ranMs?: number
   /** Weighted tokens (spec §5 stats weights). */
   cost: number
   /** The provider it runs on by config name (`anthropic` for Claude's own), for its card's dot. */
@@ -296,10 +310,17 @@ export type AgentRec = {
   effort?: string | number
   /** The model that answered its last step, by the id the API reported (TurnUsage `model`). */
   answeredBy?: string
-  /** Its steps' token counts as the API reported them, summed; the shape of StatusRequest's usage. */
+  /**
+   * Its last step's token counts as the API reported them, in the shape of StatusRequest's usage:
+   * every step re-sends the whole conversation, so only the last prompt says how big it is.
+   */
   usage?: { input: number; cached: number; cacheWrite: number; output: number }
+  /** Every step's output tokens added up; the token figure adds this to the last step's prompt. */
+  outputTotal?: number
   /** Tool calls it started. */
   tools?: number
+  /** Coordinator deliveries, newest 20, anchored after the transcript rows visible at receipt. */
+  instructions?: { text: string; after: number; ordinal: number }[]
 }
 
 /**
@@ -334,6 +355,20 @@ export type CacheMemo = {
   expiresAt: number
 }
 
+/**
+ * A chat's keep-warm as the plugin store keeps it, per session id: the atoms hold these in one
+ * process's memory only, and the app restarts a session's CLI on its own (2026-10-30).
+ */
+export type CacheMemory = {
+  memo: CacheMemo
+  /** When the person's own reply last arrived, not a ping's: the keep-warm time bound counts from it. */
+  lastRealReplyAt: number
+  /** The context that reply was counted over, for a restarted process that has no live count yet. */
+  contextTokens: number
+  /** The model the memo was made under: another model's cache cannot be pinged for. */
+  model: string
+}
+
 /** Keep-warm bookkeeping for this chat. */
 export type WarmState = {
   pings: number
@@ -355,7 +390,8 @@ export type Hot = { kind: string; percent: number; resetsAt?: string }
  * `provider` is the provider's config name (the grouping key; 'claude' on the fallback path);
  * `type` is its kind ('anthropic', 'chatgpt', 'google', …), which picks the group head's colour;
  * `title` is the head's name ("Claude", "GPT", "Gemini"); `account` numbers the provider's eligible
- * accounts from 0 (the row reads "GPT" alone, or "GPT 1", "GPT 2", … when a provider has several);
+ * accounts from 0 (the row reads "GPT" alone, or "GPT 1", "GPT 2", … when a provider has several;
+ * Claude's are the app login, 0, then each stored account, every one the router knows usage for);
  * `kind` is 'five_hour', 'seven_day', 'scoped' (a per-model/third-party window, its name in `label`)
  * or 'window' (a window of another length, its minutes in `windowMinutes`).
  */
@@ -366,11 +402,50 @@ export type LimitItem = {
   /** The head's name; absent, derived from the provider's type or name. */
   title?: string
   account: number
+  /** The account's own name as the owner gave it (an email, often); absent for the Claude app login. */
+  accountLabel?: string
+  /** The account the router serves new turns with now; absent on the others and on older routers. */
+  inUse?: true
   kind: 'five_hour' | 'seven_day' | 'scoped' | 'window'
+  /** The window's own name (a scoped window's model, "Fable"); not the account's. */
   label: string
   windowMinutes?: number
   percent: number
   resetsAt?: string
+  /**
+   * When, at the window's average pace since it started (epoch ms), the window reaches 100% before it
+   * resets: the router's `exhaust_at`. Absent for a window that is no risk, or too early in it to tell.
+   */
+  exhaustsAt?: number
+  /**
+   * The used percent the window reaches at its reset at its average pace since it started: the router's
+   * `projected_percent` (may exceed 100). Absent for a window too early in it to tell, or at 0%, and for a
+   * window whose reset has passed. Read by the pace label only when there is no exhaust forecast and the reset is still ahead.
+   */
+  projectedPercent?: number
+}
+
+/** What a stretch of requests cost at public API prices, from one bucket of `GET /api/requests/summary`. */
+export type CostBucket = {
+  costUsd: number
+  /** Requests with no known price: not in `costUsd`. */
+  unpricedRequests: number
+  /** Requests priced with an estimated cache rate: in `costUsd`, as an estimate. */
+  estimatedRequests: number
+}
+
+/** One provider's or model's line of a cost summary. */
+export type CostLine = CostBucket & { name: string }
+
+/**
+ * The cost of the requests from `from` (epoch ms, a local midnight) until the summary was read:
+ * the total, each provider, and the models that cost most.
+ */
+export type CostSummary = {
+  from: number
+  total: CostBucket
+  providers: CostLine[]
+  models: CostLine[]
 }
 
 export type Stats = {
@@ -389,7 +464,7 @@ export type Stats = {
 /** `writing`: the fork is (or will be) writing the note; `opened`: a new session was opened with it; `copied`: no session could be opened, so it was copied. */
 export type HandoffStage = 'writing' | 'opened' | 'copied' | 'failed'
 export type SetupStep = 1 | 2 | 3 | 4
-export type ResultStage = 'handingOff' | 'handoffDone' | 'compacting' | 'compacted' | 'failed'
+export type ResultStage = 'tidying' | 'handingOff' | 'handoffDone' | 'compacting' | 'compacted' | 'failed'
 export type JevState = {
   source: 'env' | 'file' | 'pasted' | 'zen' | null
   test: { state: 'idle' | 'testing' | 'ok' | 'fail'; message?: string }
@@ -416,7 +491,7 @@ declare module 'claude-code' {
       agents: AgentRec[]
       /** Commands and watches left running in the background, and the latest that ended (tasks.ts). */
       bgTasks: BgTask[]
-      /** Running (or waiting) and all agents, for the band: written only when a count moves. */
+      /** Running and all agents, for the band: written only when a count moves. */
       agentCounts: { live: number; total: number }
       cache: CacheMemo | null
       warm: WarmState
@@ -438,7 +513,8 @@ declare module 'claude-code' {
       coldHidden: boolean
       kept: { pings: number; tokens: number } | null
       judgeDown: string | null
-      handoff: { stage: HandoffStage; text?: string } | null
+      /** `run` names the press whose fork is writing, so a result cannot land on a later chat (register.tsx driveHandoff). */
+      handoff: { stage: HandoffStage; text?: string; run?: number } | null
       /** The band's Handoff was pressed and its fork has not started: the tick starts it when the session is idle. */
       handoffQueued: boolean
       panel: 'settings' | 'setup' | 'compact' | 'clear' | null
@@ -455,6 +531,9 @@ declare module 'claude-code' {
       settingsDraft: Settings | null
       setupStep: SetupStep
       compactNote: string
+      compactPick: string
+      /** The compact card's "tidy up first" switch, on unless the person turned it off (register.tsx). */
+      compactTidy: boolean
       effortMenuOpen: boolean
       agentsOpen: boolean
       /** Finished compactions of the main conversation (the Compact icon's count). */
@@ -470,7 +549,7 @@ declare module 'claude-code' {
        * The Context pane's precise count (the token-count API's), kept against the context's tokens
        * when it was asked for (`basis`); `busy` while it runs, `error` when it failed.
        */
-      contextFull: { basis: number | null; breakdown?: import('claude-code').SessionContextBreakdown; busy?: boolean; error?: string } | null
+      contextFull: { basis: number | null; breakdown?: SessionContextBreakdown; busy?: boolean; error?: string } | null
       /** The Context pane's sections shown whole. */
       contextShowAll: ('memory' | 'mcp' | 'skills' | 'agents')[]
       /** The person's last two prompts as submitted, mid-turn ones included for the judge (2026-10-24). */
@@ -490,6 +569,8 @@ declare module 'claude-code' {
       limit: Hot | null
       /** Every provider's plan windows for the limits row, from `GET /api/limits`. Null until read. */
       limits: LimitItem[] | null
+      /** What requests cost at API prices, today and over the last seven days, for the limits pane. Null until read. */
+      cost: { today: CostSummary | null; week: CostSummary | null } | null
       demo: 'cold' | 'swamp' | 'hot' | 'down' | 'kept' | null
     }
   }

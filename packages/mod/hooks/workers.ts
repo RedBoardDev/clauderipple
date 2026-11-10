@@ -1,6 +1,6 @@
 import type { Billing, Domain, Effort, LadderChoice, LadderOptions, ModelScore, ProviderAvailability, RouterModel, Rule, Rung, Settings, TierTarget, WorkerCandidate, WorkerPick, WorkerVerdict } from '../types'
 import { CLAUDE_WORKERS, EFFORTS, candidateKey, isAllowed } from './settings'
-import { MARKER } from './worker'
+import { MARKER, providerModelId } from './worker'
 import { t } from './i18n'
 import type { Lang } from './i18n'
 import { claudeChoices, rungAbove, rungOf, tickedChoices } from './ladder'
@@ -21,8 +21,10 @@ export const AUTO_DESCRIPTION = 'Delegate tasks here. Put the tier, and a domain
   '[[ripple: light]], [[ripple: standard]], [[ripple: hard]] or [[ripple: max]]; light = lookups, mechanical edits, one small fix; ' +
   'standard = carry out a designed change (even across several files), research, summarize, read-only review; ' +
   'hard = subtle debugging, security review, or work where a wrong call is costly; max = planning or architecture where the deliverable is the decision itself. ' +
-  'Size, file count or the brief\'s warnings do not by themselves make a task hard. Add ui only when the work needs visual judgment: visual design, a new screen\'s layout, or UX decisions, as in [[ripple: standard ui]]; ' +
-  'restoring, porting, wiring or translating existing UI code takes no domain word. Add backend for server, API or database work. ' +
+  'Size, file count or the brief\'s warnings do not by themselves make a task hard. Add ui only for visual design, work a person weighs by eye: how a screen, page, illustration or graphic looks. ' +
+  'Within ui, standard = follow an existing concept or design closely, or a simple visual change, as in [[ripple: standard ui]]; hard = design from scratch, or a key screen whose look matters, as in [[ripple: hard ui]]. ' +
+  'Work beside the visuals that needs no visual judgment takes no domain word: installing or wiring finished art, filling an existing template with content, restoring, porting or translating existing UI code, UI bug fixes, running or capturing the app. Add backend for server, API or database work. ' +
+  'Add review when the task is a read-only adversarial review (red team) of finished work that reports defects, as in [[ripple: hard review]]. ' +
   'With no marker the task runs as general standard. The owner\'s ladder picks the model for the tier. ' +
   'Name a model instead only when the user asked for it for this task, or a written rule (CLAUDE.md, a memory file) assigns it to this step: ' +
   'put [[ripple: <worker agent name or opus/sonnet/haiku>@<effort>]] on the first line and on the second line "Model reason: user \\"<the user\'s exact words>\\"" or "Model reason: rule <file> — <the rule>". ' +
@@ -59,6 +61,22 @@ export function modelReason(prompt: string): ModelReason | null {
   const quote = pair?.slice(1).find(Boolean)?.trim()
   return { source: line[1]!.toLowerCase() as ModelReason['source'], text, ...(quote ? { quote } : {}) }
 }
+/**
+ * A rule reason's minimal form: a concrete file identifier first and a non-empty rule after it
+ * ("memory/translation.md — draft translations run on Opus"). It reads the line's shape only —
+ * never whether the file exists or what it says. An empty "Model reason: rule" used to pass and
+ * named a model with no source at all (2026-10-25).
+ */
+export function ruleReason(text: string): boolean {
+  const trimmed = text.trim()
+  const at = trimmed.search(/\s/)
+  if (at <= 0) return false
+  const file = trimmed.slice(0, at).replace(/[,;]+$/, '')
+  // A path segment or an extension: "memory/x.md", "docs/specs/a.md", "C:\rules\x.md".
+  if (!/[/\\]|\.[A-Za-z0-9]{1,8}$/.test(file)) return false
+  // " — ", " - ", ": " or a plain space; the rule itself must hold something.
+  return trimmed.slice(at).replace(/^\s*[—–:,-]\s*/, '').trim().length > 0
+}
 /** A prompt without its model-reason line, which is for the mod only. */
 export function withoutReason(prompt: string): string {
   return prompt.replace(new RegExp(REASON.source + '\\n?', 'gim'), '').replace(/^\s*\n/, '')
@@ -80,7 +98,7 @@ export function userSaid(quote: string, words: readonly string[]): boolean {
 
 /** The domain a tier marker names, as the verdict domain its ladder reads. No word: general. */
 export function markerDomain(word: string | undefined): Domain {
-  return word === 'ui' || word === 'frontend' ? 'frontend' : word === 'design' ? 'design' : word === 'backend' || word === 'server' ? 'backend' : 'general'
+  return word === 'ui' || word === 'frontend' ? 'frontend' : word === 'design' ? 'design' : word === 'backend' || word === 'server' ? 'backend' : word === 'review' || word === 'redteam' || word === 'red-team' ? 'review' : 'general'
 }
 export function agentProvider(agentFileText: string): string | undefined {
   const head = /^---\r?\n([\s\S]*?)\r?\n---/.exec(agentFileText)?.[1]
@@ -116,7 +134,9 @@ export function routerModelOptions(config: unknown): RouterModel[] {
       if (typeof id === 'string' && id) out.push({ value: id, label: `${id} · ${provider}`, provider, ...(typeof name === 'string' && name.trim() ? { name } : {}) })
     }
   }
-  return out
+  const counts = new Map<string, number>()
+  for (const model of out) counts.set(model.value, (counts.get(model.value) ?? 0) + 1)
+  return out.map(model => counts.get(model.value)! > 1 ? { ...model, value: `${model.provider}:${model.value}` } : model)
 }
 export function zenJev(config: unknown): { authorization?: string; model: string } {
   const provider = record(record(record(config).providers)['opencode-zen'])
@@ -205,7 +225,7 @@ export function liveProviders(providers: NonNullable<LadderOptions['providers']>
 }
 /** A model out while its provider answers others (a spent quota group), by its id without `@effort`. */
 function modelOut(candidate: WorkerCandidate, providers: NonNullable<LadderOptions['providers']>): boolean {
-  return !!providers[candidate.provider]?.models?.[baseModel(candidate.model)]
+  return !!providers[candidate.provider]?.models?.[providerModelId(candidate.model, candidate.provider)]
 }
 export function candidateUsable(candidate: WorkerCandidate, settings: Settings, chatgpt: boolean, providers: NonNullable<LadderOptions['providers']> = {}): boolean {
   const live = providers[candidate.provider]
@@ -213,12 +233,12 @@ export function candidateUsable(candidate: WorkerCandidate, settings: Settings, 
   return settings.providers[candidate.provider] !== false && (live ? live.usable : candidate.provider !== 'chatgpt' || chatgpt)
 }
 function unavailableReason(provider: string, providers: NonNullable<LadderOptions['providers']>, lang: Lang, model?: string): string {
-  const reason = model ? providers[provider]?.models?.[baseModel(model)]?.reason : providers[provider]?.reason
+  const reason = model ? providers[provider]?.models?.[providerModelId(model, provider)]?.reason : providers[provider]?.reason
   if (!reason && provider === 'chatgpt') return t(lang, 'toasts.providerQuota')
   const labels: Record<string, string> = lang === 'ko'
     ? { insufficient_balance: '잔액 부족', billing_exhausted: '결제 한도 소진', quota_exhausted: '사용량 한도 소진' }
     : { insufficient_balance: 'insufficient balance', billing_exhausted: 'billing exhausted', quota_exhausted: 'quota exhausted' }
-  return `${provider}: ${reason && labels[reason] || (lang === 'ko' ? '현재 사용 불가' : 'currently unavailable')}`
+  return `${provider}: ${reason === 'model_deprecated' ? reason : reason && labels[reason] || (lang === 'ko' ? '현재 사용 불가' : 'currently unavailable')}`
 }
 function sameTarget(a: TierTarget, b: TierTarget): boolean { return a.agent === b.agent && a.model === b.model }
 function candidateOf(target: TierTarget, candidates: readonly WorkerCandidate[]): WorkerCandidate | undefined {
@@ -226,7 +246,7 @@ function candidateOf(target: TierTarget, candidates: readonly WorkerCandidate[])
 }
 /** Domain overrides belong to the effective worker set; a missing override uses its general ladder. */
 export function workerRule(domain: Domain, settings: Settings): { rule: WorkerPick['rule']; ladder: Rule } {
-  const key = domain === 'design' || domain === 'frontend' ? 'ui' : domain === 'backend' ? 'backend' : 'general'
+  const key = domain === 'design' || domain === 'frontend' ? 'ui' : domain === 'backend' ? 'backend' : domain === 'review' ? 'review' : 'general'
   const ladder = key === 'general' ? undefined : settings.domainRules?.[key]
   return ladder ? { rule: key, ladder } : { rule: 'general', ladder: settings.rules.general }
 }
@@ -263,8 +283,26 @@ export function ladderPick(verdict: WorkerVerdict, rule: Rule, settings: Setting
   return { effort, rung: wanted, skipped, fallbackReason: reasons.join('; ') || t(lang, 'workers.none') }
 }
 
+/** Only allowed, installed entries after this pick in the same tier. Availability is rechecked by the router. */
+export function ladderFallbackModels(rule: Rule, pick: Resolution, candidates: readonly WorkerCandidate[], settings: Settings): string[] {
+  if (!pick.rung || !pick.position) return []
+  return (rule.rungs[pick.rung] ?? []).slice(pick.position).flatMap(step => {
+    const candidate = candidateOf(step.target, candidates)
+    if (!candidate || settings.providers[candidate.provider] === false || !allowed(candidate, settings.allow, settings.allowKnown)) return []
+    return [`${baseModel(candidate.model)}@${step.effort}`]
+  })
+}
+
+/** Resolve only native family aliases; explicit versions, custom ids and inheritance stay intact. */
+export function resolveClaudeModel(model: string | undefined): string | undefined {
+  if (!model) return model
+  const alias = baseModel(model).replace(/\[1m\]$/, '')
+  const worker = CLAUDE_WORKERS.find(w => w.target.model === alias)
+  return worker ? worker.model + model.slice(alias.length) : model
+}
+
 export function spawnModel(target: TierTarget, effort: Effort, fileModel?: string): string | undefined {
-  return fileModel && target.agent !== 'general-purpose' ? `${baseModel(fileModel)}@${effort}` : target.model
+  return resolveClaudeModel(fileModel && target.agent !== 'general-purpose' ? `${baseModel(fileModel)}@${effort}` : target.model)
 }
 /** A prefix this mod (or the retired agent-title hook) put on a title: "Sol·high · ". */
 const TITLE_PREFIX = /^[^\s·]+(?:·[a-z]+)? · /

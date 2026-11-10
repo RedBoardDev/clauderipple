@@ -5,6 +5,8 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { claudeBinary, claudeLoginHint, type ClaudeCodeLogin } from "../../cli/src/claude-auth.ts";
+import { ownerOf, plistEnvironment } from "../../cli/src/ownership.ts";
+import { assertGeneration, definitionGeneration, readServiceFile, withServiceFile } from "../../cli/src/service-definition.ts";
 
 export const LABEL = "com.clauderipple.host";
 
@@ -125,7 +127,7 @@ export function specFor(opts: { script: string; claudePath: string | undefined; 
   };
 }
 
-type Run = (cmd: string, args: string[]) => { status: number; out: string };
+export type Run = (cmd: string, args: string[]) => { status: number; out: string };
 const runSync: Run = (cmd, args) => {
   try { return { status: 0, out: execFileSync(cmd, args, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }) }; } catch (e) {
     const err = e as { status?: number; stdout?: string; stderr?: string };
@@ -136,36 +138,57 @@ const runSync: Run = (cmd, args) => {
 const domain = (): string => `gui/${process.getuid?.() ?? 501}`;
 
 export function install(spec: PlistSpec, run: Run = runSync, p: Paths = paths()): string[] {
-  const done: string[] = [];
-  fs.mkdirSync(path.dirname(p.plist), { recursive: true });
-  fs.mkdirSync(path.dirname(spec.log), { recursive: true, mode: 0o700 });
-  // A loaded agent keeps its old plist until it is booted out; replace it, do not stack a second one.
-  if (run("/bin/launchctl", ["print", `${domain()}/${LABEL}`]).status === 0) {
-    run("/bin/launchctl", ["bootout", `${domain()}/${LABEL}`]);
-    done.push("stopped the running agent");
-  }
-  fs.writeFileSync(p.plist, plist(spec), { mode: 0o644 });
-  done.push(`wrote ${p.plist}`);
-  // Right after a bootout, launchd may still be tearing the old agent down and answers
-  // "Bootstrap failed: 5: Input/output error"; the host then stayed down. Give it a few seconds.
-  let r = run("/bin/launchctl", ["bootstrap", domain(), p.plist]);
-  for (let tries = 1; r.status === 5 && tries < 10; tries++) {
-    run("/bin/sleep", ["0.5"]);
-    r = run("/bin/launchctl", ["bootstrap", domain(), p.plist]);
-  }
-  if (r.status !== 0) throw new Error(`launchctl bootstrap failed (${r.status}): ${r.out.trim()}`);
-  done.push(`loaded ${LABEL}; logs in ${spec.log}`);
-  return done;
+  return withServiceFile(p.plist, run, guard => {
+    run = guard.run;
+    const previous = readServiceFile(p.plist);
+    if (previous !== null && ownerOf(plistEnvironment(previous).CLAUDERIPPLE_HOME ?? null, spec.env.CLAUDERIPPLE_HOME ?? "").state !== "ours") {
+      throw new Error("휴대폰 호스트 서비스의 설치 소유권을 확인할 수 없어 기존 정의를 보존했습니다.");
+    }
+    const done: string[] = [];
+    fs.mkdirSync(path.dirname(spec.log), { recursive: true, mode: 0o700 });
+    const lookup = run("/bin/launchctl", ["print", `${domain()}/${LABEL}`]);
+    if (lookup.status !== 0 && lookup.status !== 113 && !/could not find service|service .*not found/i.test(lookup.out)) throw new Error("휴대폰 호스트의 서비스 상태를 확인하지 못해 서비스 정의를 보존했습니다.");
+    // A loaded job with no definition is not evidence that this installation owns it.
+    if (lookup.status === 0) {
+      if (previous === null) throw new Error("휴대폰 호스트 서비스의 설치 소유권을 확인할 수 없어 기존 정의를 보존했습니다.");
+      const stopped = run("/bin/launchctl", ["bootout", `${domain()}/${LABEL}`]);
+      if (stopped.status !== 0 && stopped.status !== 113) throw new Error("휴대폰 호스트의 서비스를 해제하지 못해 서비스 정의를 보존했습니다.");
+      done.push("stopped the running agent");
+    }
+    guard.write(plist(spec), 0o644);
+    done.push(`wrote ${p.plist}`);
+    // The old agent may still be tearing down. Recheck the generation after every wait.
+    let r = run("/bin/launchctl", ["bootstrap", domain(), p.plist]);
+    for (let tries = 1; r.status === 5 && tries < 10; tries++) {
+      run("/bin/sleep", ["0.5"]);
+      r = run("/bin/launchctl", ["bootstrap", domain(), p.plist]);
+    }
+    if (r.status !== 0) throw new Error(`launchctl bootstrap failed (${r.status}): ${r.out.trim()}`);
+    done.push(`loaded ${LABEL}; logs in ${spec.log}`);
+    return done;
+  });
 }
 
-export function uninstall(run: Run = runSync, p: Paths = paths()): string[] {
-  const done: string[] = [];
-  if (run("/bin/launchctl", ["print", `${domain()}/${LABEL}`]).status === 0) {
-    const r = run("/bin/launchctl", ["bootout", `${domain()}/${LABEL}`]);
-    done.push(r.status === 0 ? `stopped ${LABEL}` : `launchctl bootout said (${r.status}): ${r.out.trim()}`);
-  } else done.push(`${LABEL} was not loaded`);
-  if (fs.existsSync(p.plist)) { fs.rmSync(p.plist); done.push(`removed ${p.plist}`); }
-  return done;
+export type ServiceRemoval = { state: "removed" | "absent"; lines: string[] } | { state: "lookup-failed" | "stop-failed"; detail: string };
+
+export function uninstall(run: Run = runSync, p: Paths = paths(), expected?: string | null): ServiceRemoval {
+  return withServiceFile(p.plist, run, guard => {
+    run = guard.run;
+    if (expected !== undefined) assertGeneration(() => readServiceFile(p.plist), definitionGeneration(expected));
+    const done: string[] = [];
+    const missing = (r: { status: number; out: string }) => r.status === 113 || /could not find service|service .*not found/i.test(r.out);
+    const lookup = run("/bin/launchctl", ["print", `${domain()}/${LABEL}`]);
+    if (lookup.status !== 0 && !missing(lookup)) return { state: "lookup-failed", detail: "휴대폰 호스트의 서비스 상태를 확인하지 못해 서비스 정의를 보존했습니다." };
+    if (lookup.status === 0) {
+      const r = run("/bin/launchctl", ["bootout", `${domain()}/${LABEL}`]);
+      if (r.status !== 0 && !missing(r)) return { state: "stop-failed", detail: "휴대폰 호스트의 서비스를 해제하지 못해 서비스 정의를 보존했습니다." };
+      done.push(`stopped ${LABEL}`);
+    } else done.push(`${LABEL} was not loaded`);
+    if (readServiceFile(p.plist) === null) return { state: "absent", lines: done };
+    guard.remove();
+    done.push(`removed ${p.plist}`);
+    return { state: "removed", lines: done };
+  });
 }
 
 /** `launchctl print` is not a stable interface; only the two lines a person needs are read, and the raw state is shown as is. */

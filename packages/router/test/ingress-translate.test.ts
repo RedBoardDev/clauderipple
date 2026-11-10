@@ -40,6 +40,119 @@ test("Responses request becomes cache-friendly Anthropic Messages request", () =
   assert.equal(out.max_tokens, 123);
 });
 
+// Issue #104: Codex's remote compaction appends the control item `{"type":"compaction_trigger"}`
+// after the whole transcript, so the transcript itself still ends with the assistant's last turn.
+// Anthropic rejects that shape ("This model does not support assistant message prefill").
+const compactRequest = {
+  model: "claude-opus-5",
+  instructions: "You are Codex.",
+  input: [
+    { type: "message", role: "user", content: [{ type: "input_text", text: "add a test" }] },
+    { type: "message", role: "assistant", content: [{ type: "output_text", text: "I added it." }] },
+    { type: "compaction_trigger" },
+  ],
+  max_output_tokens: 16,
+};
+
+test("Codex compaction trigger becomes the user turn that asks for the summary", () => {
+  const out = responsesToAnthropic(compactRequest, "claude-opus-5");
+  assert.equal(out.messages.at(-1)?.role, "user");
+  assert.deepEqual(out.messages[0]?.content, [{ type: "text", text: "add a test" }]);
+  assert.deepEqual(out.messages[1]?.content, [{ type: "text", text: "I added it." }], "the assistant turn is kept as it was");
+  const last = out.messages.at(-1)!;
+  assert.equal(last.content.length, 1);
+  assert.match((last.content[0] as { text: string }).text, /summar/i);
+  assert.deepEqual((last.content[0] as { cache_control?: unknown }).cache_control, { type: "ephemeral" });
+});
+
+test("compaction combines text blocks once, preserves Unicode and restores at its input position", () => {
+  const mapper = new ResponsesEventMapper("claude-opus-5", undefined, true);
+  const events = [
+    { type: "message_start", message: { usage: { input_tokens: 10, output_tokens: 0 } } },
+    { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } },
+    { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "요약\n" } },
+    { type: "content_block_stop", index: 0 },
+    { type: "content_block_start", index: 1, content_block: { type: "text", text: "" } },
+    { type: "content_block_delta", index: 1, delta: { type: "text_delta", text: "constraints remain" } },
+    { type: "content_block_stop", index: 1 },
+    { type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { input_tokens: 10, output_tokens: 4 } },
+    { type: "message_stop" },
+  ].flatMap((event) => mapper.feed(event));
+  assert.deepEqual(events.map((event) => event.type), ["response.created", "response.output_item.added", "response.output_item.done", "response.completed"]);
+  assert.equal(mapper.output.length, 1);
+  assert.equal(mapper.output[0]!.type, "compaction");
+  assert.deepEqual(mapper.finish(), [], "completion cannot emit a second compaction item");
+  assert.equal(mapper.usage.output_tokens, 4);
+  const restored = responsesToAnthropic({ input: [
+    { type: "message", role: "user", content: "before" },
+    ...mapper.output,
+    { type: "message", role: "user", content: "after" },
+  ] }, "claude-opus-5");
+  assert.deepEqual(restored.messages.map((message) => message.content[0]), [
+    { type: "text", text: "before" },
+    { type: "text", text: "Summary of the earlier conversation: 요약\nconstraints remain" },
+    { type: "text", text: "after", cache_control: { type: "ephemeral" } },
+  ]);
+});
+
+test("foreign compaction is dropped with a diagnostic; malformed owned summaries fail visibly", () => {
+  let ignored = 0;
+  const out = responsesToAnthropic({ input: [
+    { type: "compaction", encrypted_content: "opaque-openai-value" },
+    { type: "message", role: "user", content: "continue" },
+  ] }, "claude-opus-5", undefined, () => ignored++);
+  assert.equal(ignored, 1);
+  assert.equal(out.messages.length, 1);
+  for (const payload of ["not-base64!", Buffer.from("not-json").toString("base64"), Buffer.from('{"summary":42}').toString("base64"), Buffer.from('{"summary":" "}').toString("base64")]) {
+    assert.throws(() => responsesToAnthropic({ input: [{ type: "compaction", encrypted_content: `clauderipple:compaction:v1:${payload}` }] }, "claude-opus-5"));
+  }
+});
+
+test("empty, interrupted, truncated and tool compactions never produce a successful item", () => {
+  assert.throws(() => new ResponsesEventMapper("claude-opus-5", undefined, true).feed({ type: "message_stop" }), /complete summary/);
+  const interrupted = new ResponsesEventMapper("claude-opus-5", undefined, true);
+  interrupted.feed({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "partial" } });
+  assert.throws(() => interrupted.finish(), /complete summary/);
+  assert.equal(interrupted.output.length, 0);
+  assert.throws(() => new ResponsesEventMapper("claude-opus-5", undefined, true).feed({ type: "message_delta", delta: { stop_reason: "max_tokens" } }), /did not finish/);
+  assert.throws(() => new ResponsesEventMapper("claude-opus-5", undefined, true).feed({ type: "content_block_start", content_block: { type: "tool_use" } }), /tool call/);
+  assert.throws(() => new ResponsesEventMapper("claude-opus-5", undefined, true).feed({ type: "error" }), /upstream/);
+});
+
+test("a transcript that ends with the assistant still ends with a user turn", () => {
+  const out = responsesToAnthropic({
+    model: "claude-opus-5",
+    input: [
+      { type: "message", role: "user", content: [{ type: "input_text", text: "hi" }] },
+      { type: "message", role: "assistant", content: [{ type: "output_text", text: "hello" }] },
+    ],
+  }, "claude-opus-5");
+  assert.equal(out.messages.at(-1)?.role, "user");
+  assert.deepEqual(out.messages[1]?.content, [{ type: "text", text: "hello" }], "nothing of the transcript is rewritten");
+});
+
+test("a transcript that ends with the user is left alone", () => {
+  const out = responsesToAnthropic({
+    model: "claude-opus-5",
+    input: [
+      { type: "message", role: "user", content: [{ type: "input_text", text: "hi" }] },
+      { type: "message", role: "assistant", content: [{ type: "output_text", text: "hello" }] },
+      { type: "message", role: "user", content: [{ type: "input_text", text: "again" }] },
+    ],
+  }, "claude-opus-5");
+  assert.equal(out.messages.length, 3);
+  assert.deepEqual(out.messages.at(-1)?.content, [{ type: "text", text: "again", cache_control: { type: "ephemeral" } }]);
+});
+
+test("Chat Completions: a transcript that ends with the assistant also ends with a user turn", () => {
+  const out = chatToAnthropic({
+    model: "claude-opus-5",
+    messages: [{ role: "user", content: "hi" }, { role: "assistant", content: "hello" }],
+  }, "claude-opus-5");
+  assert.equal(out.messages.at(-1)?.role, "user");
+  assert.deepEqual(out.messages[1]?.content, [{ type: "text", text: "hello" }]);
+});
+
 test("Chat Completions maps system, tools, images and tool calls", () => {
   const out = chatToAnthropic({
     model: "claude-sonnet-5",

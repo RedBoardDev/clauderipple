@@ -23,6 +23,7 @@ function ui(h: Harness): { toggleAutoUpdate(enabled: boolean): Promise<void>; au
     const configRequest = async next => { if (h.failWrite) throw new Error('save failed'); h.writes.push(next); };
     const refreshHealth = async () => { h.refreshes++; };
     const toast = (message, error) => { if (error) h.errors.push(message); };
+    ${source.slice(source.indexOf('function configSaved('), source.indexOf('// A save sends'))}
     const modSwitch = (key, checked) => { h.input.checked = checked; return { querySelector: () => h.input }; };
     const cell = (label, control, help) => ({label, control, help});
     ${block}

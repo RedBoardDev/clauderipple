@@ -10,8 +10,11 @@ export type EffortLevel = (typeof EFFORT_LEVELS)[number];
 export type CompatibleCaps = {
   /** Empty means the provider does not accept output_config.effort. */
   effortLevels?: string[];
-  /** Whether the provider accepts Anthropic's enabled thinking shape. */
-  thinking?: "enabled" | "none";
+  /**
+   * What the provider takes for Claude Code's `thinking: {type: "adaptive"}`: `adaptive` as sent
+   * (minus Claude-only fields), the older `enabled` shape with a fixed budget, or nothing.
+   */
+  thinking?: "adaptive" | "enabled" | "none";
   /** Whether the provider accepts Anthropic beta flags. Default false. */
   betas?: boolean;
   /** Whether cache_control blocks are accepted. Default true. */
@@ -31,7 +34,7 @@ export type CompatibleCaps = {
 
 export type ResolvedCompatibleCaps = {
   effortLevels: string[];
-  thinking: "enabled" | "none";
+  thinking: "adaptive" | "enabled" | "none";
   betas: boolean;
   cacheControl: boolean;
   serverTools: boolean;
@@ -130,6 +133,84 @@ function stripCacheControl(value: unknown): { value: unknown; count: number } {
 // measured 2026-09-13), and it means nothing to a provider that is not Anthropic.
 const BILLING_BLOCK = /^x-anthropic-billing-header:/;
 
+// Anthropic-only block types Claude Code puts inside the `messages` array: `tool_addition` declares
+// a deferred tool mid-conversation (`tool.definition` is a full tool definition) and `tool_removal`
+// withdraws one by name (`tool.type: "tool_reference"`). Anthropic's own API reads them; a vendor's
+// Anthropic skin validates the content union and answers 400 `Invalid Anthropic Messages API
+// request` for the whole request (issue #92, CLI 2.1.308+).
+
+/**
+ * Fold those extensions into shapes an Anthropic-compatible vendor accepts: `system`/`developer`
+ * messages become `user` (text byte-for-byte, adjacent user messages left unmerged so no cached
+ * byte moves), extension blocks leave their message, and the tool definitions they carried come
+ * back in `lifted` for the caller's tools loop to treat exactly like declared ones.
+ */
+function foldMessageExtensions(messages: unknown, tools: unknown): { messages: unknown; lifted: unknown[]; changes: string[] } {
+  if (!Array.isArray(messages)) return { messages, lifted: [], changes: [] };
+  const names = new Set<string>();
+  if (Array.isArray(tools)) {
+    for (const tool of tools) {
+      const source = record(tool);
+      if (source && typeof source.name === "string") names.add(source.name);
+    }
+  }
+  const lifted: unknown[] = [];
+  const kept: unknown[] = [];
+  let folded = 0;
+  let additions = 0;
+  let removals = 0;
+  for (const message of messages) {
+    const source = record(message);
+    if (!source) {
+      kept.push(message);
+      continue;
+    }
+    let next = source;
+    if (Array.isArray(source.content)) {
+      const content: unknown[] = [];
+      let touched = false;
+      for (const block of source.content) {
+        const item = record(block);
+        if (item?.type === "tool_addition") {
+          touched = true;
+          additions++;
+          const definition = record(record(item.tool)?.definition);
+          const name = typeof definition?.name === "string" ? definition.name : undefined;
+          // A name already declared top-level is left where it is: the caller's tools keep their
+          // prefix, and the definition the provider already has is the same one.
+          if (definition && name && !names.has(name)) {
+            names.add(name);
+            const liftedTool = { ...definition };
+            delete liftedTool.eager_input_streaming;
+            lifted.push(liftedTool);
+          }
+          continue;
+        }
+        if (item?.type === "tool_removal") {
+          touched = true;
+          removals++;
+          continue;
+        }
+        content.push(block);
+      }
+      // A message that held nothing but extension blocks would go out as an empty content array,
+      // which vendors reject; what it carried is in `tools` or withdrawn, so it goes whole.
+      if (touched && content.length === 0) continue;
+      if (touched) next = { ...source, content };
+    }
+    if (next.role === "system" || next.role === "developer") {
+      next = { ...next, role: "user" };
+      folded++;
+    }
+    kept.push(next);
+  }
+  const changes: string[] = [];
+  if (folded > 0) changes.push(`system_role×${folded}`);
+  if (additions > 0) changes.push(`tool_addition×${additions}`);
+  if (removals > 0) changes.push(`tool_removal×${removals}`);
+  return { messages: changes.length > 0 ? kept : messages, lifted, changes };
+}
+
 function appendSystemText(system: unknown, text: string): unknown {
   if (system === undefined || system === null || system === "") return text;
   if (typeof system === "string") return `${system}\n\n${text}`;
@@ -160,7 +241,10 @@ export function sanitizeForCompatible(json: Record<string, unknown>, caps: Resol
 
   const thinking = record(out.thinking);
   if (thinking) {
-    if (thinking.type === "adaptive") {
+    // A provider that documents adaptive thinking itself keeps it, with only the Claude-only fields
+    // removed below: turning it into a fixed budget changes how long the model thinks (2026-11-08,
+    // MiniMax M3.1 Flash under `enabled` 8192 thought ~25× longer per step at high than at max).
+    if (thinking.type === "adaptive" && caps.thinking !== "adaptive") {
       if (caps.thinking === "enabled") {
         out.thinking = { type: "enabled", budget_tokens: 8192 };
         changes.push("thinking adaptive→enabled");
@@ -205,13 +289,25 @@ export function sanitizeForCompatible(json: Record<string, unknown>, caps: Resol
     }
   }
 
-  if (Array.isArray(out.tools)) {
+  // Mid-conversation system messages (issue #92). Handled before `tools` so the definitions they
+  // lift meet the same loop as the caller's own.
+  const folded = foldMessageExtensions(out.messages, out.tools);
+  changes.push(...folded.changes);
+  if (folded.changes.length > 0) out.messages = folded.messages;
+  // Lifted definitions go after the caller's tools, in the order the messages named them. Appending
+  // keeps every byte of the prefix the vendor has already cached where it was; a later turn that
+  // adds another deferred tool extends the list without moving the tools before it.
+  const toolsSource = folded.lifted.length > 0
+    ? [...(Array.isArray(out.tools) ? out.tools : []), ...folded.lifted]
+    : out.tools;
+
+  if (Array.isArray(toolsSource)) {
     const kept: unknown[] = [];
     const droppedNames = new Set<string>();
     let deferred = 0;
     let dropped = 0;
     const patterns = { count: 0 };
-    for (const tool of out.tools) {
+    for (const tool of toolsSource) {
       const source = record(tool);
       if (!source) {
         kept.push(tool);
@@ -238,7 +334,12 @@ export function sanitizeForCompatible(json: Record<string, unknown>, caps: Resol
     if (deferred > 0) changes.push(`defer_loading×${deferred}`);
     if (dropped > 0) changes.push(`server_tools×${dropped}`);
     if (patterns.count > 0) changes.push(`pattern×${patterns.count}`);
-    if (deferred > 0 || dropped > 0 || patterns.count > 0) out.tools = kept;
+    if (deferred > 0 || dropped > 0 || patterns.count > 0 || folded.lifted.length > 0) {
+      // Every lifted tool dropped leaves nothing to declare; an empty array is a field the vendor
+      // still validates, so it goes rather than going empty.
+      if (kept.length === 0 && !Array.isArray(out.tools)) delete out.tools;
+      else out.tools = kept;
+    }
     const toolChoice = record(out.tool_choice);
     if (toolChoice && typeof toolChoice.name === "string" && droppedNames.has(toolChoice.name)) {
       delete out.tool_choice;

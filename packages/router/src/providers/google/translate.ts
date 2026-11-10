@@ -480,6 +480,7 @@ export class GoogleStreamMapper {
   usage: AnthropicUsage = { input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 };
   stopReason: "end_turn" | "tool_use" | "max_tokens" = "end_turn";
   failure: { type: string; message: string } | undefined;
+  redactError: (message: string) => string = (message) => message;
 
   readonly model: string;
   private readonly startInput: number;
@@ -616,6 +617,7 @@ export class GoogleStreamMapper {
     // `overloaded_error` is the one mid-stream error Claude Code retries on its own; `api_error` is
     // final. Gemini's RESOURCE_EXHAUSTED becomes a rate limit the client backs off from.
     const type = status === "RESOURCE_EXHAUSTED" ? "rate_limit_error" : status === "UNAVAILABLE" || status === "INTERNAL" || status === "DEADLINE_EXCEEDED" ? "overloaded_error" : "api_error";
+    message = this.redactError(message);
     this.failure = { type, message };
     return [...this.start(), ...this.closeBlock(), { event: "error", data: { type: "error", error: { type, message } } }];
   }

@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { groupSessions, sessionGroup, groupLabel, GROUP_ORDER } from "../web/sidebar.ts";
+import { groupSessions, sessionGroup, groupLabel, sidebarState, sessionTitle, GROUP_ORDER } from "../web/sidebar.ts";
 import type { AttentionReason, SessionSummary } from "../src/protocol.ts";
 
 function s(id: string, over: Partial<SessionSummary> = {}): SessionSummary {
@@ -55,6 +55,32 @@ test("a Claude app question counts as input needed; a reason this build does not
   assert.equal(sessionGroup(s("q", { attention: { reason: "question", at: 1 } })), "input");
   // An older client only compares the reasons it knows, so an unknown one must fall through, not throw.
   assert.equal(sessionGroup(s("x", { attention: { reason: "mystery" as AttentionReason, at: 1 } })), "done");
+});
+
+test("home groups and switcher glyphs follow the same snapshots and live work outranks old attention", () => {
+  const snapshots: [Partial<SessionSummary>, string, string][] = [
+    [{ state: "running", unread: true, attention: { reason: "question", at: 1 } }, "working", "running"],
+    [{ state: "waiting", pending: 1, unread: true }, "input", "waiting"],
+    [{ state: "running", attention: { reason: "finished", at: 1 } }, "working", "running"],
+    [{ state: "idle", attention: { reason: "question", at: 2 }, background: true }, "input", "waiting"],
+    [{ state: "idle", attention: { reason: "finished", at: 3 } }, "review", "unread"],
+    [{ state: "idle", attention: null, unread: true }, "review", "unread"],
+    [{ state: "idle", attention: null, unread: false }, "done", "read"],
+    [{ state: "idle", background: true, unread: true }, "working", "background"],
+    [{ state: "stopped", tasks: 2 }, "done", "read"],
+  ];
+  for (const [over, group, glyph] of snapshots) {
+    const snapshot = s("same-session", over);
+    assert.equal(groupSessions([snapshot])[0]?.key, `group:${group}`);
+    assert.equal(sessionGroup(snapshot), group);
+    assert.equal(sidebarState(snapshot), glyph);
+  }
+});
+
+test("a missing title uses the existing folder fallback, including whitespace-only titles", () => {
+  for (const title of ["", "  ", "\t\n"]) assert.equal(sessionTitle(s("id", { title, cwd: "/projects/ClaudeRipple" })), "ClaudeRipple");
+  assert.equal(sessionTitle(s("id", { title: " Original title " })), "Original title");
+  assert.equal(sessionTitle(s("id", { title: "", cwd: "/" })), "/");
 });
 
 test("bucket labels are localized and cover every bucket", () => {

@@ -22,6 +22,8 @@ interface Receipt {
   session: string;
   state: "pending" | "completed";
   at: number;
+  /** A digest of what the id was accepted with. Absent on receipts written before it was kept. */
+  fingerprint?: string;
 }
 
 const RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
@@ -31,7 +33,8 @@ function validReceipt(value: unknown): value is Receipt {
   return r !== null && typeof r === "object"
     && typeof r.key === "string" && typeof r.session === "string"
     && (r.state === "pending" || r.state === "completed")
-    && Number.isFinite(r.at);
+    && Number.isFinite(r.at)
+    && (r.fingerprint === undefined || typeof r.fingerprint === "string");
 }
 
 export class MessageReceipts {
@@ -74,8 +77,20 @@ export class MessageReceipts {
     return record?.state === "completed" ? record.session : null;
   }
 
+  /**
+   * True when this id was already accepted with different content. A resend of a *different*
+   * message under an id the host has seen must not be answered with a silent success: the phone
+   * would believe work ran that never did. Receipts from before fingerprints, and requests without
+   * one, keep the old idempotent answer.
+   */
+  conflict(key: string, fingerprint: string | undefined): boolean {
+    const record = this.records.get(key);
+    if (!record || record.fingerprint === undefined || fingerprint === undefined) return false;
+    return record.fingerprint !== fingerprint;
+  }
+
   /** Durably mark the attempt started, before it reaches the SDK. Overwrites nothing completed. */
-  begin(key: string, session: string): void {
+  begin(key: string, session: string, fingerprint?: string): void {
     const at = this.now();
     const records = new Map(this.records);
     const kept = new Map<string, Receipt>();
@@ -87,7 +102,7 @@ export class MessageReceipts {
       if (k !== key && record.at < at - RETENTION_MS) continue;
       kept.set(k, record);
     }
-    kept.set(key, { key, session, state: "pending", at });
+    kept.set(key, { key, session, state: "pending", at, ...(fingerprint === undefined ? {} : { fingerprint }) });
     this.persist(kept);
     this.flying.add(key);
   }
@@ -102,7 +117,7 @@ export class MessageReceipts {
       if (k !== key && r.state === "completed" && r.at < at - RETENTION_MS) continue;
       kept.set(k, r);
     }
-    kept.set(key, { key, session: session ?? record?.session ?? "", state: "completed", at });
+    kept.set(key, { key, session: session ?? record?.session ?? "", state: "completed", at, ...(record?.fingerprint === undefined ? {} : { fingerprint: record.fingerprint }) });
     this.persist(kept);
     this.flying.delete(key);
   }

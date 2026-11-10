@@ -9,11 +9,39 @@
 
 /** Largest WebSocket frame either side sends, in bytes of UTF-8 JSON (Paseo #2610: 8 MB killed the socket). */
 export const FRAME_CAP = 256 * 1024;
+/**
+ * A host frame over FRAME_CAP is split for a client that advertised `chunkedFrames`: a `chunk`
+ * frame carries one slice of the original frame's UTF-8 bytes, base64, and the shared Link joins
+ * them and hands the whole JSON text to the normal handling. The original bytes are never cut,
+ * escaped or rewritten, so a queue, edit answer or session list arrives exactly as it was built.
+ * Chunks are only ever sent to a client that asked; every other client keeps the one-frame wire.
+ *
+ * The size cap is fixed so a broken or hostile sender cannot grow the phone's memory without
+ * bound: past it the host takes today's `too_large` path instead of chunking.
+ */
+export const CHUNK_MESSAGE_MAX = 16 * 1024 * 1024;
+/** Bytes a chunk frame spends on keys, its id, index and numbers, before the base64 payload. */
+export const CHUNK_OVERHEAD = 1024;
+/** Payload bytes per chunk: the largest base64 that still leaves FRAME_CAP room for the envelope. */
+export const CHUNK_DATA_BYTES = Math.floor((FRAME_CAP - CHUNK_OVERHEAD) / 4) * 3;
+/** A partial assembly with no chunk for this long is dropped; the link then reconnects. */
+export const CHUNK_TIMEOUT_MS = 30_000;
+
 /** A string field longer than this is moved out of the event into a blob fetched on demand. */
 export const INLINE_CAP = 32 * 1024;
 /** Client pings this often; either side calls the link stale after STALE_MS of silence. */
 export const PING_MS = 10_000;
 export const STALE_MS = 30_000;
+/**
+ * The end-to-end check and presence cadence a client uses once the host advertises
+ * `capabilities.slowHeartbeat`. Through the relay it is what lets the room hibernate: every
+ * forwarded frame wakes the Durable Object, and a phone idle on screen should not send one
+ * every PING_MS. The relay's own plain "ping" (answered by the runtime, not the object) stays
+ * at PING_MS.
+ */
+export const SLOW_PING_MS = 60_000;
+/** The host gives a slow-cadence client three beats of silence before calling it gone (3 × 60 s). */
+export const SLOW_STALE_MS = 3 * SLOW_PING_MS;
 /** Reconnect backoff is min(BACKOFF_CAP_MS, attempt × 1 s) and never stops. */
 export const BACKOFF_CAP_MS = 30_000;
 /** A socket that opens but is not ready (relay hello, host ready) within this is abandoned. */
@@ -25,9 +53,81 @@ export const RELAY_FRAME_CAP = FRAME_CAP + 1024;
  * The relay's own words (plain text frames; everything else it forwards untouched, encrypted):
  *   to the host's control socket: {"relay":"hello"} once accepted, {"relay":"connect","conn":id} per phone;
  *   to a phone: {"relay":"open"} once the host's data socket for it is there.
- * The host pings its control socket with the text "ping" and the relay answers "pong".
+ * `firedAt` on a separate `fired` frame says the room's dead-man switch alerted the phone while
+ * this host was away (epoch ms); the host sends the recovery notice and answers
+ * {"t":"cleared","firedAt"} on the same socket. It follows the hello, so the hello frame keeps its
+ * shape for hosts that predate the switch.
+ * The host pings its control socket with the text "ping" and the relay answers "pong"; a phone may
+ * do the same on its socket. `liveness` on the open frame says this relay answers that plain ping
+ * itself (without waking the room). An older relay leaves it out, and a phone must not send one
+ * then: that relay would forward it to the host, whose channel expects sealed bytes only.
  */
-export type RelayMsg = { relay: "hello" } | { relay: "connect"; conn: string } | { relay: "open" };
+export type RelayMsg = { relay: "hello" } | { relay: "fired"; firedAt: number } | { relay: "connect"; conn: string } | { relay: "open"; liveness?: true };
+
+/**
+ * The host → relay control frames on the host's authenticated control socket, beside "ping".
+ * The room only ever reads these; the host sends no free text — `watch` carries Expo tokens and a
+ * language per device, and the copy is built at the relay from OUTAGE_COPY. Renewals keep the
+ * room's dead-man alarm moving; `unwatch` takes it away. See WATCH_* below.
+ */
+export type HostControlMsg =
+  | { t: "watch"; tokens: { token: string; lang: "ko" | "en" }[]; host: string }
+  | { t: "unwatch" }
+  /** The host has sent the recovery notice for this outage; the room forgets `firedAt`. */
+  | { t: "cleared"; firedAt: number };
+
+/**
+ * Dead-man switch between the host and its room while work is active (relay/room.ts, src/watch.ts).
+ * The host renews `watch` this often; `WATCH_IDLE_MS` without work sends `unwatch`; the room's alarm
+ * fires `WATCH_ALARM_MS` after the last renewal, far enough beyond both to survive a host restart
+ * (a new process clears a stale watch) or one late timer. Only native Expo devices are watched: web
+ * push needs VAPID signing on the sender, and the relay holds no key.
+ */
+export const WATCH_TICK_MS = 10_000;
+export const WATCH_RENEW_MS = 60_000;
+export const WATCH_IDLE_MS = 120_000;
+export const WATCH_ALARM_MS = 180_000;
+/** The room keeps at most this many Expo tokens per host. */
+export const WATCH_TOKENS_MAX = 10;
+/** The relay's own pushes live about an hour: the outage is long past by the time they are stale. */
+export const WATCH_TTL_S = 3600;
+/** Expo's push endpoint. The relay sends nowhere else. */
+export const EXPO_PUSH_URL = "https://exp.host/--/api/v2/push/send";
+/** The one Expo token shape (shared by ExpoNotifier and the relay). */
+export const EXPO_TOKEN_RE = /^(ExponentPushToken|ExpoPushToken)\[[A-Za-z0-9_-]+\]$/;
+
+/**
+ * The fixed words of the host-wide pushes (no session; no conversation text). They live here so
+ * the host and the relay read one copy: the relay builds the disconnect notice itself from `lang`,
+ * and the host builds the recovery and login notices. `{n}` is whole minutes, at least one.
+ */
+export const OUTAGE_COPY = {
+  disconnected: {
+    ko: "PC와의 연결이 끊어졌습니다. 진행 중이던 작업이 중단되었을 수 있으니 PC의 네트워크와 전원 상태를 확인해 주세요.",
+    en: "The PC has disconnected. Work in progress may have stopped; check the PC’s network and power.",
+  },
+  recovered: {
+    ko: "PC가 다시 연결되었습니다. 약 {n}분 동안 연결이 끊어져 있었습니다.",
+    en: "The PC is connected again. It was disconnected for about {n} minute(s).",
+  },
+  loginExpired: {
+    ko: "PC의 Claude 로그인이 만료되어 작업을 계속 진행할 수 없습니다. PC에서 다시 로그인해 주세요.",
+    en: "The PC’s Claude login has expired, so the work cannot continue. Please sign in again on the PC.",
+  },
+} as const;
+
+/** Whole minutes of an outage, never below one. */
+export const outageMinutes = (ms: number): number => Math.max(1, Math.round(Math.max(0, ms) / 60_000));
+
+export function outageBody(kind: "disconnected" | "loginExpired", lang: "ko" | "en"): string {
+  return OUTAGE_COPY[kind][lang];
+}
+
+export function recoveredBody(lang: "ko" | "en", minutes: number): string {
+  return OUTAGE_COPY.recovered[lang]
+    .replace("{n}", String(minutes))
+    .replace("minute(s)", minutes === 1 ? "minute" : "minutes");
+}
 /** Close codes the relay uses. `stale`: the host's control socket sent no ping for HOST_SILENT_MS. */
 export const RELAY_CLOSE = { badRequest: 4400, badSecret: 4401, hostOffline: 4404, stale: 4408, replaced: 4409, peerGone: 4410, tooBig: 1009 } as const;
 /**
@@ -47,6 +147,8 @@ export interface SettingsResult {
   model?: string;
   effort?: Effort | null;
   permissionMode?: PermissionMode;
+  /** Requested model/effort waiting for a safe SDK restart; values above remain in force. */
+  pending?: { model: string; effort: Effort | null };
   errors?: { model?: string; effort?: string; permissionMode?: string };
 }
 export interface SessionControls { model: boolean; effort: boolean; permissionModes: PermissionMode[] }
@@ -91,18 +193,30 @@ export function defaultEffort(efforts: Effort[]): Effort | null { return efforts
 
 export interface ToolCall { id: string; name: string; files?: SessionFile[]; /** one line a person reads: a command, a path */ summary: string; input?: Text; /** Computed before a large input becomes a blob. Counts describe supplied edits, not unseen file context. */ changes?: { added: number; removed: number } }
 
-export type EventBody = MessageImages & (
+export type EventBody = MessageImages & {
+  /** The uuid of the transcript line this event was converted from (Claude app tails only). The log
+   * keeps every fingerprint already emitted per line, so a line Remote Control re-appends under the
+   * same uuid after a reconnect is not emitted again (issue #126, 2026-11-05). Host-originated events
+   * have none. */
+  src?: string;
+  /** Fingerprint of that line's event-bearing content: a line rewritten under the same uuid with a
+   * different message still emits, as it did before #126. */
+  srcHash?: number;
+} & (
   | { kind: "user"; text: string; clientMsgId: string }
   | { kind: "turn"; model: string; effort: Effort | null }
   /** Streamed text, coalesced by the host (~80 ms). Superseded by the `assistant` event with the same `msg`. */
   | { kind: "delta"; msg: string; text: string }
   /** One thinking block; deltas append, a final block replaces them (never expose signatures). */
   | { kind: "thinking"; msg: string; block: number; text: Text; delta?: boolean }
+  /** A progress sentence the model wrote between tools: shown, unlike thinking. Its signature never travels. */
+  | { kind: "narration"; msg: string; block: number; text: Text }
   | { kind: "assistant"; msg: string; model: string; text: Text; tools: ToolCall[] }
   | { kind: "tool_result"; toolUseId: string; ok: boolean; text: Text }
   /** A subagent ran; its own log is `sub` and loads only when asked (Paseo #5820). */
-  | { kind: "subagent"; toolUseId: string; sub: string; description: string; model: string | null; status: "running" | "done" | "failed"; steps: number }
+  | { kind: "subagent"; toolUseId: string; sub: string; description: string; model: string | null; status: "running" | "done" | "failed" | "stopped"; steps: number }
   | ({ kind: "permission"; id: string; tool: string; title: string; summary: string; input: Text; canAlways: boolean } & PermissionContent)
+  | { kind: "background"; tasks: BackgroundTask[]; known: boolean }
   | { kind: "mode"; mode: PermissionMode }
   | { kind: "permission_decided"; id: string; decision: "allow" | "allow_always" | "deny" | "expired"; reason?: string; ruleStatus?: RuleStatus }
   | ({ kind: "settings"; reqId: string } & SettingsResult)
@@ -111,7 +225,7 @@ export type EventBody = MessageImages & (
   | { kind: "figures"; figures: Figures }
   | { kind: "notice"; code: NoticeCode; text?: string });
 
-export type NoticeCode = "host_restarted" | "interrupted" | "api_retry" | "router_down" | "model_changed" | "resumed" | "desktop_open" | "desktop_resumed" | "desktop_bridge" | "desktop_blocked";
+export type NoticeCode = "host_restarted" | "interrupted" | "api_retry" | "router_down" | "model_changed" | "resumed" | "desktop_open" | "desktop_resumed" | "desktop_bridge" | "desktop_blocked" | "desktop_handoff" | "desktop_handoff_requested" | "desktop_handoff_retry" | "desktop_handoff_failed" | "desktop_settings_failed";
 
 export type SessionEvent = EventBody & { seq: number; at: number };
 
@@ -181,6 +295,9 @@ export interface SessionSummary {
   id: string;
   origin?: "host" | "desktop";
   readOnly?: boolean;
+  /** Desktop sessions: the Claude app's own session id (`local_…`), so a `#local_…` link in a
+   * conversation can find this session. Absent on older hosts and for host-created sessions. */
+  appSessionId?: string;
   title: string;
   /** Desktop sidebar metadata; absent on older hosts. */
   unread?: boolean;
@@ -189,7 +306,10 @@ export interface SessionSummary {
   cwd: string;
   model: string;
   effort: Effort | null;
+  /** Absent means unknown, including a desktop handoff whose mode the host cannot confirm. */
   permissionMode?: PermissionMode;
+  /** Requested model/effort not yet in force while background work prevents restart. */
+  pendingSettings?: SettingsResult["pending"];
   /** Absent on older hosts: controls must stay disabled. Values above describe the next turn. */
   controls?: SessionControls;
   state: SessionState;
@@ -202,8 +322,12 @@ export interface SessionSummary {
   turnStartedAt?: number | null;
   /** What those background tasks are, oldest first; absent on older hosts. */
   taskList?: BackgroundTask[];
-  /** The Code tab's task list for the running turn (its update_plan tool), in order; empty when the
-   * turn has none or the session is not working. Absent on older hosts. */
+  taskHistory?: BackgroundTask[];
+  /** False/absent means transcript observations only, not a complete inventory of PR/CI subscriptions. */
+  backgroundKnown?: boolean;
+  activityAt?: number | null;
+  /** Confirmed tasks from update_plan, TodoWrite and TaskCreate/Update/List, in order.
+   * Session-scoped tasks survive turn completion; Code's per-turn plan clears on a new human turn. */
   plan?: PlanStep[];
   /** The main turn is idle but background work (subagents, shells) still runs: the app's dark blink. */
   background?: boolean;
@@ -230,16 +354,27 @@ export interface SessionSummary {
   epoch: string;
 }
 
-export interface BackgroundTask { id: string; kind: "agent" | "shell"; label: string; startedAt: number | null; /** an agent's own log for `op: "sub"`; absent on older hosts */ sub?: string }
-export interface PlanStep { text: string; status: "pending" | "in_progress" | "completed" }
+export interface BackgroundTask {
+  id: string; kind: "agent" | "shell" | "monitor" | "schedule" | "subscription" | "other"; label: string; startedAt: number | null;
+  sub?: string; state?: "running" | "done" | "failed" | "stopped" | "unknown";
+  command?: string; schedule?: string; nextAt?: number; endedAt?: number; category?: string;
+  /** a worker's model, as its card in the conversation names it */
+  model?: string;
+}
+export interface PlanStep { id?: string; text: string; status: "pending" | "in_progress" | "completed" }
 
 /** One queued message as the phone shows it; `id` is the phone's clientMsgId. */
-export interface QueuedMessage { id: string; text: string; attachments: number; at: number; /** why sending it failed; the queue is held */ error?: string }
+export interface QueuedMessage { id: string; text: string; attachments: number; at: number; /** Why it failed or is waiting; only queueHeld requires explicit resume. */ error?: string }
 
 export interface ModelOption { model: string; name: string; provider: string; efforts: Effort[]; usable: boolean }
 export interface ProviderGroup { provider: string; label: string; usable: boolean; models: ModelOption[] }
 
 export interface FolderEntry { path: string; name: string; lastUsed?: number; model?: string }
+/** One row in a session folder's read-only listing; `path` is relative to the session folder. */
+export interface SessionFolderEntry { name: string; path: string; dir: boolean; bytes: number | null; /** a symlink that leads outside the folder: shown, not opened */ blocked?: boolean }
+export interface FolderListing { path: string; parent: string | null; entries: SessionFolderEntry[]; truncated: boolean }
+/** One small file from a session folder, base64. Larger files are refused, never truncated. */
+export interface FolderFile { path: string; name: string; mediaType: string; bytes: number; data: string }
 
 /**
  * `desktopProblem`: why sends, approvals and live state for Claude app (Mac) sessions cannot work
@@ -248,14 +383,24 @@ export interface FolderEntry { path: string; name: string; lastUsed?: number; mo
 export interface HostInfo { name: string; version: string; routerOk: boolean; routerProblem?: string; desktopProblem?: string;
   /** The host keeps queued messages (ReqOp enqueue/queue_*); an older host leaves the queue to the phone. */
   queue?: boolean;
-  capabilities?: { sessionFiles: boolean };
+  capabilities?: { sessionFiles: boolean;
+    /** read-only session folder listing and small-file reads */ folderFiles?: boolean;
+    /** `op: "diff"` takes a `scope`, so the diff pane can switch between uncommitted work and the
+     * branch. Absent on an older host, which always answers with its own order. */
+    diffScope?: boolean;
+    /** `op: "effort_auto"` can write the mod's host-wide automatic effort. Absent on an older
+     * host: phones must leave the Auto option out then. */
+    effortAuto?: boolean;
+    /** This host reads a client's `slowHeartbeat` feature and sizes its stale/visible windows for
+     * the SLOW_PING_MS cadence. Absent on an older host: clients keep PING_MS. */
+    slowHeartbeat?: boolean };
   /** the mod's mode, effort range and provider limits; absent on older hosts or when the router is down */
   ripple?: RippleStatus }
 
 // ---- client → host --------------------------------------------------------------------
 
 /** Per-connection opt-in. Missing/non-array lists mean no features; unknown entries are ignored. */
-export const CLIENT_FEATURES = ["settingsResult", "scopedAlways", "sessionFiles"] as const;
+export const CLIENT_FEATURES = ["settingsResult", "scopedAlways", "sessionFiles", "chunkedFrames", "folderFiles", "slowHeartbeat"] as const;
 export type ClientFeature = typeof CLIENT_FEATURES[number];
 
 export type ClientMsg =
@@ -264,7 +409,8 @@ export type ClientMsg =
   /** `afterSeq` 0 or absent with no epoch: send the tail page. */
   | { t: "attach"; session: string; epoch?: string; afterSeq?: number }
   | { t: "detach"; session: string }
-  | { t: "history"; session: string; beforeSeq: number; reqId: string }
+  /** The cursor belongs to epoch; omitted by older clients. */
+  | { t: "history"; session: string; beforeSeq: number; reqId: string; epoch?: string }
   | { t: "create"; clientMsgId: string; cwd: string; model: string; effort: Effort | null; text: string; permissionMode?: PermissionMode; isolation?: Isolation; baseBranch?: string }
   /** The phone is looking at this session now; clears its attention (a permission request stays). */
   | { t: "seen"; session: string }
@@ -284,6 +430,9 @@ export type ClientMsg =
 
 export type ReqOp =
   | { op: "models" }
+  /** The mod's host-wide automatic effort on this Mac. Answers `{ effortAuto: boolean }` with the
+   * value now stored; every phone hears the new state at once through the usual `host` frame. */
+  | { op: "effort_auto"; on: boolean }
   | { op: "upload"; session: string; uploadId: string; offset: number; data: string; done: boolean }
   | { op: "folders" }
   | { op: "browse"; path?: string; hidden?: boolean }
@@ -294,10 +443,16 @@ export type ReqOp =
   | { op: "blob"; session: string; id: string; offset?: number }
   | { op: "sub"; session: string; sub: string; afterSeq?: number }
   /** What changed in this session's own folder; the host reads the folder from the session, never
-   * from the phone. Read-only: a scope, a base branch, and one patch per file (see DiffView). */
-  | { op: "diff"; session: string }
+   * from the phone. Read-only: a scope, a base branch, and one patch per file (see DiffView).
+   * `scope` picks the comparison (`auto` is the host's own order); hosts that do not know it answer
+   * as `auto`, and the answer's own `scope` is what was actually shown. */
+  | { op: "diff"; session: string; scope?: DiffScope }
   /** Slash command names (no "/") the session accepts, for the composer's "/" menu. */
   | { op: "commands"; session: string }
+  /** Read-only listing of a session folder; `path` is relative to it. */
+  | { op: "folder_list"; session: string; path?: string }
+  /** One small file from that listing, base64; refuses anything larger. */
+  | { op: "folder_file"; session: string; path: string }
   /** Queue a message for when the running turn ends; attachments are uploads, as for `send`. A
    * session that is not busy takes it at once. Answers `{ queued: true }`; a resent id is a no-op. */
   | { op: "enqueue"; session: string; clientMsgId: string; text: string; attachments?: Attachment[] }
@@ -364,17 +519,34 @@ export interface DiffFile {
   removed: number;
   /** the unified diff text; empty for binary files and for a file the limits cut away */
   patch: string;
+  /** This file's patch is not all of it: a size limit, a deadline or the frame budget stopped it.
+   * Absent when the patch (or its absence, for a binary) is complete. */
+  cut?: boolean;
 }
+
+/** Which comparison a diff view makes. `auto` is the host's own order: uncommitted work first,
+ * else the branch against its base. The other two ask for one of them, even when it is empty. */
+export type DiffScope = "auto" | "uncommitted" | "branch";
 
 // ---- host → client --------------------------------------------------------------------
 
+/**
+ * One slice of a host frame too large for FRAME_CAP, sent only to a client whose hello listed
+ * `chunkedFrames`. `data` is base64 of the original frame's UTF-8 bytes at `index` of `total`;
+ * `bytes` is the whole original length, the same on every slice. The shared Link assembles these
+ * before any other handling (chunks.ts), so the app never sees this type.
+ */
+export interface ChunkFrame { t: "chunk"; id: string; index: number; total: number; bytes: number; data: string }
+
 export type HostMsg =
+  | ChunkFrame
   | { t: "ready"; host: HostInfo; sessions: SessionSummary[]; groups?: string[] | undefined }
   | { t: "pong"; n: number }
   | { t: "denied"; reason: "token" }
   /** Events after the client's seq. `more` means another frame follows at once. `tail` means older events exist before `events[0]`. */
   | { t: "events"; session: string; epoch: string; events: SessionEvent[]; more: boolean; tail?: { hasOlder: boolean } }
-  | { t: "history"; session: string; reqId: string; events: SessionEvent[]; hasOlder: boolean }
+  /** Epoch actually read; absent on older hosts. A mismatched request gets no page and a fresh tail. */
+  | { t: "history"; session: string; reqId: string; epoch?: string; events: SessionEvent[]; hasOlder: boolean }
   | { t: "sessions"; sessions: SessionSummary[]; groups?: string[] | undefined }
   | { t: "host"; host: HostInfo }
   | { t: "ack"; clientMsgId: string; session: string }

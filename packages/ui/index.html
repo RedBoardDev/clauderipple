@@ -28,17 +28,29 @@
     <header class="page-header"><div><h1 data-i18n="health.title">Status</h1><p class="page-subtitle" data-i18n="health.subtitle"></p></div></header>
     <!-- Drawn only inside the ClaudeRipple app, which can repair or switch the connection (window.rippleApp). -->
     <div class="conn" id="health-connection" hidden></div>
-    <section class="section" id="health-desktop-section">
-      <div class="section-head"><h2 class="section-title" data-i18n="health.desktop">Claude Desktop connection</h2></div>
-      <div class="group" id="health-desktop"></div>
+    <!-- The overview: two tiles in one surface. Inside the app the connection card above replaces the first. -->
+    <div class="section group stat-tiles">
+      <section class="stat-tile" id="health-desktop-section">
+        <h2 class="stat-label" data-i18n="health.desktop">Claude Desktop connection</h2>
+        <div id="health-desktop"></div>
+      </section>
+      <section class="stat-tile">
+        <h2 class="stat-label" data-i18n="health.requests">Requests (since router start)</h2>
+        <div id="health-requests"></div>
+      </section>
+    </div>
+    <!-- What is in the way and what to do about it; drawn only when the router reports something. -->
+    <section class="section" id="health-diagnostics-section" hidden>
+      <div class="section-head">
+        <h2 class="section-title" data-i18n="health.diagnostics">Diagnostics</h2>
+        <button class="btn secondary compact" id="diagnostics-copy" type="button" data-i18n="health.copyDiagnostics">Copy diagnostics</button>
+      </div>
+      <div class="group" id="health-diagnostics"></div>
+      <p class="group-footer" data-i18n="health.diagnosticsHelp"></p>
     </section>
     <section class="section">
       <div class="section-head"><h2 class="section-title" data-i18n="health.providers">Providers</h2></div>
       <div class="group" id="health-providers"></div>
-    </section>
-    <section class="section">
-      <div class="section-head"><h2 class="section-title" data-i18n="health.requestCount">Request count</h2></div>
-      <div class="group" id="health-requests"></div>
     </section>
   </section>
 
@@ -74,6 +86,7 @@
 
   <section id="view-clients" class="view">
     <header class="page-header"><div><h1 data-i18n="clients.title">Clients</h1><p class="page-subtitle" data-i18n="clients.subtitle"></p></div></header>
+    <p class="load-status" id="clients-status" role="status" hidden></p>
 
     <section class="section">
       <div class="section-head"><h2 class="section-title" data-i18n="clients.desktop.title">Claude Desktop</h2><span class="small" id="client-picker-msg" role="status"></span></div>
@@ -90,11 +103,23 @@
       <div class="group"><div class="model-checklist" id="client-picker-models"></div></div>
       <p class="group-footer" data-i18n="slots.pickerModelsHelp"></p>
     </section>
+    <section class="section" id="client-picker-order-card" hidden>
+      <div class="section-head"><h2 class="section-title" data-i18n="slots.pickerOrder">Order in the picker</h2></div>
+      <div class="group"><ol class="picker-order" id="client-picker-order"></ol></div>
+      <p class="group-footer" data-i18n="slots.pickerOrderHelp"></p>
+    </section>
 
     <section class="section">
       <div class="section-head"><h2 class="section-title" data-i18n="slots.modelSlots">Claude Code's own model slots</h2></div>
       <div class="group" id="client-model-slots"></div>
       <p class="group-footer" data-i18n="slots.modelSlotsHelp"></p>
+    </section>
+
+    <section class="section">
+      <div class="section-head"><h2 class="section-title" data-i18n="classifier.title">Auto mode classifier</h2></div>
+      <div class="group" id="client-auto-classifier"></div>
+      <p class="group-footer" data-i18n="classifier.help"></p>
+      <p class="group-footer" id="client-auto-classifier-note" data-i18n="classifier.claudeNeedsPool" hidden></p>
     </section>
 
     <section class="section">
@@ -161,16 +186,13 @@
     <header class="page-header">
       <div><h1 data-i18n="logs.title">Logs</h1></div>
       <div class="logs-tabs" role="tablist">
-        <button class="logs-tab active" id="logs-requests-tab" type="button" role="tab" aria-selected="true" data-i18n="logs.requests">Requests</button>
-        <button class="logs-tab" id="logs-raw-tab" type="button" role="tab" aria-selected="false" data-i18n="logs.raw">Raw logs</button>
+        <button class="logs-tab active" id="logs-requests-tab" type="button" role="tab" aria-selected="true" aria-controls="logs-requests-panel" data-i18n="logs.requests">Requests</button>
+        <button class="logs-tab" id="logs-raw-tab" type="button" role="tab" aria-selected="false" aria-controls="logs-raw-panel" data-i18n="logs.raw">Raw logs</button>
       </div>
     </header>
-    <div id="logs-requests-panel" role="tabpanel">
+    <div id="logs-requests-panel" role="tabpanel" aria-labelledby="logs-requests-tab">
       <section class="section">
-        <div class="logs-header-row">
-          <div><h2 class="section-title" data-i18n="logs.usage">Usage</h2><span class="small" id="logs-range-caption"></span></div>
-          <label class="logs-filter"><span data-i18n="logs.provider">Provider</span><select id="logs-provider"><option value="" data-i18n="logs.all">All</option></select></label>
-        </div>
+        <!-- One toolbar for what the numbers and the list below cover: the period, then the provider. -->
         <div class="logs-period-row">
           <div class="segmented logs-period" id="logs-period" role="radiogroup" data-i18n-title="logs.period"></div>
           <div class="logs-custom" id="logs-custom" hidden>
@@ -178,21 +200,30 @@
             <span class="logs-custom-dash" aria-hidden="true">–</span>
             <input type="date" id="logs-to" data-i18n-title="logs.customTo" />
           </div>
+          <label class="logs-filter"><span data-i18n="logs.provider">Provider</span><select id="logs-provider"><option value="" data-i18n="logs.all">All</option></select></label>
+        </div>
+        <div class="logs-header-row">
+          <div><h2 class="section-title" data-i18n="logs.usage">Usage</h2><span class="small" id="logs-range-caption"></span></div>
+          <span class="load-status" id="logs-updating" role="status" hidden><span class="spinner" aria-hidden="true"></span><span data-i18n="common.loading">Loading…</span></span>
         </div>
         <div class="group logs-summary" id="logs-summary"></div>
+        <div class="group empty-card" id="logs-usage-error" role="alert" hidden data-i18n="common.loadFailed">Could not load.</div>
+        <div class="logs-cost-note" id="logs-cost-note" hidden></div>
       </section>
       <section class="section">
         <div class="logs-header-row"><h2 class="section-title" data-i18n="logs.byModel">Usage by model</h2></div>
-        <div class="group logs-table-card"><table id="models-table"><thead><tr><th data-i18n="logs.th.models">Model</th><th data-i18n="logs.th.count">Requests</th><th data-i18n="logs.th.input">Input</th><th data-i18n="logs.th.output">Output</th><th data-i18n="logs.th.avg">Avg. duration</th></tr></thead><tbody></tbody></table></div>
+        <div class="group logs-table-card"><table id="models-table"><thead><tr><th data-i18n="logs.th.models">Model</th><th data-i18n="logs.th.count">Requests</th><th data-i18n="logs.th.input">Input</th><th data-i18n="logs.th.output">Output</th><th data-i18n="logs.th.cost">Cost</th><th data-i18n="logs.th.avg">Avg. duration</th></tr></thead><tbody></tbody></table></div>
         <div class="group empty-card" id="models-empty" hidden data-i18n="logs.modelsEmpty">No usage in this period.</div>
+        <div class="group empty-card" id="models-error" role="alert" hidden data-i18n="common.loadFailed">Could not load.</div>
       </section>
       <section class="section">
         <div class="logs-header-row"><div><h2 class="section-title" data-i18n="logs.recent">Recent requests</h2><span class="small" data-i18n="logs.recentNote">Last 200</span></div></div>
         <div class="group logs-table-card"><table id="requests-table"><thead><tr><th data-i18n="logs.th.time">Time</th><th data-i18n="logs.th.models">Model</th><th data-i18n="logs.th.effort">effort</th><th data-i18n="logs.th.input">Input</th><th data-i18n="logs.th.output">Output</th><th data-i18n="logs.th.duration">Duration</th><th data-i18n="logs.th.status">Status</th></tr></thead><tbody></tbody></table></div>
         <div class="group empty-card" id="requests-empty" hidden data-i18n="logs.empty">No requests yet.</div>
+        <div class="group empty-card" id="requests-error" role="alert" hidden data-i18n="common.loadFailed">Could not load.</div>
       </section>
     </div>
-    <div id="logs-raw-panel" role="tabpanel" hidden>
+    <div id="logs-raw-panel" role="tabpanel" aria-labelledby="logs-raw-tab" hidden>
       <div class="raw-toolbar"><span class="small" data-i18n="logs.rawPolling">Updates every 3s · last 200 lines</span><label class="check"><input type="checkbox" id="logs-autoscroll" checked /><span data-i18n="logs.autoscroll">Auto-scroll</span></label></div>
       <div class="group"><pre id="logbox"></pre></div>
     </div>
@@ -200,8 +231,18 @@
 
   <section id="view-about" class="view">
     <header class="page-header"><div><h1 data-i18n="about.title">About</h1></div></header>
+    <!-- Who this is first: the mark, the name, the licence and the trademark notice (keep the notice). -->
     <section class="section">
-      <div class="group" id="health-details"></div>
+      <div class="group about-card">
+        <div class="about-id">
+          <img class="about-mark" src="favicon.svg" alt="" width="44" height="44" />
+          <div><h2 class="about-name">ClaudeRipple</h2><p class="about-license" data-i18n="about.license">License: GPL-3.0</p></div>
+        </div>
+        <p class="about-body" data-i18n="about.body">ClaudeRipple is an independent open-source project, not affiliated with Anthropic or OpenAI. Claude and Claude Code are trademarks of Anthropic, PBC.</p>
+      </div>
+    </section>
+    <section class="section">
+      <div class="group about-details" id="health-details"></div>
     </section>
     <section class="section narrow-only">
       <div class="group">
@@ -210,9 +251,6 @@
           <div class="cell-value"><select class="lang-select" id="lang-about" data-i18n-title="lang.label"></select></div>
         </div>
       </div>
-    </section>
-    <section class="section">
-      <div class="group about-text"><p data-i18n="about.body">ClaudeRipple is an independent open-source project, not affiliated with Anthropic or OpenAI. Claude and Claude Code are trademarks of Anthropic, PBC.</p><p class="small" data-i18n="about.license">License: GPL-3.0</p></div>
     </section>
   </section>
 </main>

@@ -5,6 +5,7 @@
 // ephemeral breakpoint requested by the ingress contract.
 
 import crypto from "node:crypto";
+import { ToolTranslation } from "./tools.ts";
 
 // Anthropic requires max_tokens; OpenAI clients (Codex included) usually omit it. 16k is safe for every current Claude model.
 export const DEFAULT_MAX_TOKENS = 16384;
@@ -74,6 +75,65 @@ function imageFromPart(part: Json): AnthropicContent | null {
   return { type: "image", source: { type: "url", url: value } };
 }
 
+function isTextPart(value: unknown): boolean {
+  const type = object(value)?.type;
+  return type === "input_text" || type === "output_text" || type === "text" || type === "refusal";
+}
+
+function validToolImage(image: AnthropicContent | null): boolean {
+  if (image?.type !== "image" || image.source.type !== "base64") return false;
+  const { media_type, data } = image.source;
+  if (!/^image\/(png|jpeg|gif|webp)$/.test(media_type)) return false;
+  // Buffer accepts malformed base64; check its alphabet, padding and canonical round trip.
+  if (!data.length || data.length % 4 !== 0 || data.length > Math.ceil(5 * 1024 * 1024 / 3) * 4) return false;
+  if (!/^[A-Za-z0-9+/]+={0,2}$/.test(data)) return false;
+  const decoded = Buffer.from(data, "base64");
+  return decoded.length <= 5 * 1024 * 1024 && decoded.toString("base64") === data && hasImageSignature(media_type, decoded);
+}
+
+/** The declared format's file signature: bytes that are not that image would fail the whole turn upstream. */
+function hasImageSignature(mediaType: string, bytes: Buffer): boolean {
+  const starts = (...sig: number[]): boolean => sig.every((byte, i) => bytes[i] === byte);
+  if (mediaType === "image/png") return starts(0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a);
+  if (mediaType === "image/jpeg") return starts(0xff, 0xd8, 0xff);
+  if (mediaType === "image/gif") return bytes.subarray(0, 6).toString("latin1") === "GIF87a" || bytes.subarray(0, 6).toString("latin1") === "GIF89a";
+  return bytes.subarray(0, 4).toString("latin1") === "RIFF" && bytes.subarray(8, 12).toString("latin1") === "WEBP";
+}
+
+function toolResultContent(value: unknown, nativeImages: boolean): string | AnthropicContent[] {
+  // Keep the pre-image translator's exact string (including newlines and empty text) for cache reuse.
+  if (!Array.isArray(value) || value.every(isTextPart)) return contentText(value);
+  return value.flatMap((raw): AnthropicContent[] => {
+    const part = object(raw);
+    if (!part) return [{ type: "text", text: "[content omitted: unsupported type]" }];
+    if (part.type === "input_image" || part.type === "image_url") {
+      if (!nativeImages) return [{ type: "text", text: "[image omitted: this model does not take images]" }];
+      const image = imageFromPart(part);
+      return image && validToolImage(image)
+        ? [image]
+        : [{ type: "text", text: "[image omitted: unsupported source]" }];
+    }
+    return [{ type: "text", text: isTextPart(part) ? contentText([part]) : "[content omitted: unsupported type]" }];
+  });
+}
+
+/**
+ * Codex records a second `*_tool_call_output` for one call id when a running exec later reports
+ * progress through `notify()` (issue #124). Anthropic rejects a second `tool_result` for the same
+ * `tool_use`, so a later output joins the first block instead of becoming its own: two strings are
+ * joined by a blank line (an empty or identical later string adds nothing), and anything with
+ * blocks keeps both sides as blocks in their original order. Nothing is dropped.
+ */
+function mergeToolOutput(current: string | AnthropicContent[], next: string | AnthropicContent[]): string | AnthropicContent[] {
+  if (typeof current === "string" && typeof next === "string") {
+    if (!current) return next;
+    return !next || next === current ? current : `${current}\n\n${next}`;
+  }
+  const blocks = (content: string | AnthropicContent[]): AnthropicContent[] =>
+    typeof content === "string" ? (content ? [{ type: "text", text: content }] : []) : content;
+  return [...blocks(current), ...blocks(next)];
+}
+
 function messageContent(value: unknown): AnthropicContent[] {
   if (typeof value === "string") return value ? [{ type: "text", text: value }] : [];
   if (!Array.isArray(value)) return [];
@@ -93,6 +153,19 @@ function messageContent(value: unknown): AnthropicContent[] {
   return out;
 }
 
+function customInputFromArguments(value: string): string {
+  let decoded: unknown;
+  try {
+    decoded = JSON.parse(value) as unknown;
+  } catch {
+    // JSON.parse errors can quote the tool's private input. Keep it out of router diagnostics.
+    throw new Error("Custom tool response contains invalid JSON");
+  }
+  const input = object(decoded)?.input;
+  if (typeof input !== "string") throw new Error("Custom tool response must contain a string input");
+  return input;
+}
+
 function parseArguments(value: unknown): unknown {
   if (typeof value !== "string" || value === "") return {};
   try {
@@ -102,37 +175,26 @@ function parseArguments(value: unknown): unknown {
   }
 }
 
-function normalizeSchema(value: unknown): Record<string, unknown> {
-  const source = object(value);
-  const out = source ? structuredClone(source) : {};
-  if (out.type !== "object") out.type = "object";
-  if (!object(out.properties)) out.properties = {};
-  return out;
-}
+/**
+ * Codex's remote compaction asks for a summary by appending the control item
+ * `{"type":"compaction_trigger"}` after the transcript, which it calls "request controls, not durable
+ * response items" (codex-rs protocol/src/models.rs at rust-v0.164.0-alpha.11.1; the transcript is
+ * pushed first and the trigger last in core/src/compact_remote_v2_attempt.rs). The wrapped transcript
+ * therefore still ends with the assistant's last turn, and Anthropic rejects that shape for models
+ * that take no assistant prefill (issue #104: "This model does not support assistant message
+ * prefill"). A summary is the answer to a request, so the trigger becomes the user turn that asks
+ * for it; every item before it is passed through unchanged.
+ */
+const COMPACTION_REQUEST = "Summarize this conversation so the work can continue from the summary alone: what the user asked for, what was done and decided, the constraints and preferences that still apply, and what is left to do.";
 
-function mapTools(value: unknown): AnthropicTool[] {
-  if (!Array.isArray(value)) return [];
-  const tools: AnthropicTool[] = value.flatMap((raw): AnthropicTool[] => {
-    const tool = object(raw);
-    if (!tool || string(tool.type) !== "function") return [];
-    // Responses uses function fields directly; Chat Completions nests them under `function`.
-    const fn = object(tool.function) ?? tool;
-    const name = string(fn.name);
-    if (!name) return [];
-    const description = string(fn.description);
-    return [{ name, ...(description ? { description } : {}), input_schema: normalizeSchema(fn.parameters) }];
-  });
-  if (tools.length) tools[tools.length - 1]!.cache_control = EPHEMERAL;
-  return tools;
-}
-
-function mapToolChoice(value: unknown): AnthropicIngressRequest["tool_choice"] | undefined {
-  if (value === "auto") return { type: "auto" };
-  if (value === "required") return { type: "any" };
-  if (value === "none") return { type: "none" };
-  const choice = object(value);
-  if (choice?.type === "function" && typeof choice.name === "string") return { type: "tool", name: choice.name };
-  return undefined;
+/**
+ * OpenAI clients have no prefill: a transcript that ends with the assistant asks for the next turn,
+ * while Anthropic reads it as prefill and some models refuse it outright (issue #104). One short user
+ * turn is the same request in the shape Anthropic accepts; nothing in the transcript is rewritten.
+ */
+function endWithUserTurn(messages: AnthropicMessage[]): void {
+  if (messages.at(-1)?.role !== "assistant") return;
+  messages.push({ role: "user", content: [{ type: "text", text: "Continue." }] });
 }
 
 function applyMessageCache(messages: AnthropicMessage[]): void {
@@ -147,23 +209,68 @@ function applyMessageCache(messages: AnthropicMessage[]): void {
   }
 }
 
-function responseItems(value: unknown): AnthropicMessage[] {
+// Router-owned opaque replay format, NOT encryption or an OpenAI-compatible ciphertext.
+const COMPACTION_PREFIX = "clauderipple:compaction:v1:";
+
+export function hasCompactionTrigger(body: Json): boolean {
+  return Array.isArray(body.input) && body.input.some((item) => object(item)?.type === "compaction_trigger");
+}
+
+function restoreCompaction(value: unknown, onIgnored: () => void): string | null {
+  if (typeof value !== "string" || !value.startsWith(COMPACTION_PREFIX)) {
+    onIgnored();
+    return null;
+  }
+  const encoded = value.slice(COMPACTION_PREFIX.length);
+  // Buffer's base64 decoder is permissive; require our canonical encoding before parsing.
+  const decoded = Buffer.from(encoded, "base64");
+  if (decoded.toString("base64") !== encoded) throw new Error("Invalid ClaudeRipple compaction encoding");
+  const payload = object(JSON.parse(decoded.toString("utf8")) as unknown);
+  if (typeof payload?.summary !== "string" || !payload.summary.trim()) throw new Error("Invalid ClaudeRipple compaction summary");
+  return `Summary of the earlier conversation: ${payload.summary}`;
+}
+
+function responseItems(value: unknown, onIgnoredCompaction: () => void, translation: ToolTranslation, nativeImages: boolean): AnthropicMessage[] {
   if (typeof value === "string") return value ? [{ role: "user", content: [{ type: "text", text: value }] }] : [];
   if (!Array.isArray(value)) return [];
   const messages: AnthropicMessage[] = [];
+  // One tool_result per call id: Codex can record two outputs for a single call (issue #124), and
+  // Anthropic rejects the second ("each tool_use must have a single result"). The map holds the
+  // emitted block so a later output extends it where it already sits.
+  const toolResults = new Map<string, Extract<AnthropicContent, { type: "tool_result" }>>();
   for (const raw of value) {
     const item = object(raw);
     if (!item) continue;
     const type = string(item.type);
     if (type === "reasoning") continue;
-    if (type === "function_call") {
+    if (type === "function_call" || type === "custom_tool_call") {
       const callId = string(item.call_id) ?? string(item.id) ?? `call_${crypto.randomUUID().replaceAll("-", "")}`;
-      messages.push({ role: "assistant", content: [{ type: "tool_use", id: callId, name: string(item.name) ?? "tool", input: parseArguments(item.arguments) }] });
+      const name = translation.toWire({ name: string(item.name) ?? "tool", kind: type === "custom_tool_call" ? "custom" : "function", ...(typeof item.namespace === "string" ? { namespace: item.namespace } : {}) });
+      messages.push({ role: "assistant", content: [{ type: "tool_use", id: callId, name, input: type === "custom_tool_call" ? { input: string(item.input) ?? "" } : parseArguments(item.arguments) }] });
       continue;
     }
-    if (type === "function_call_output") {
+    if (type === "function_call_output" || type === "custom_tool_call_output") {
       const callId = string(item.call_id) ?? "";
-      if (callId) messages.push({ role: "user", content: [{ type: "tool_result", tool_use_id: callId, content: contentText(item.output) }] });
+      if (callId) {
+        const content = toolResultContent(item.output, nativeImages);
+        const seen = toolResults.get(callId);
+        if (seen) seen.content = mergeToolOutput(seen.content, content);
+        else {
+          // A first output keeps the exact shape (and property order) it had before merging existed.
+          const block = { type: "tool_result" as const, tool_use_id: callId, content };
+          toolResults.set(callId, block);
+          messages.push({ role: "user", content: [block] });
+        }
+      }
+      continue;
+    }
+    if (type === "compaction") {
+      const text = restoreCompaction(item.encrypted_content, onIgnoredCompaction);
+      if (text !== null) messages.push({ role: "user", content: [{ type: "text", text }] });
+      continue;
+    }
+    if (type === "compaction_trigger") {
+      messages.push({ role: "user", content: [{ type: "text", text: COMPACTION_REQUEST }] });
       continue;
     }
     if (type !== "message") continue;
@@ -211,16 +318,17 @@ function placeInstructions(prefix: string | undefined, instructions: string[], m
   return text ? [{ type: "text", text, cache_control: EPHEMERAL }] : undefined;
 }
 
-export function responsesToAnthropic(body: Json, targetModel: string, systemPrefix?: string): AnthropicIngressRequest {
+export function responsesToAnthropic(body: Json, targetModel: string, systemPrefix?: string, onIgnoredCompaction: () => void = () => {}, translation = new ToolTranslation(body, !!systemPrefix), nativeImages = false): AnthropicIngressRequest {
   const instructions = string(body.instructions);
-  const messages = responseItems(body.input);
+  const messages = responseItems(body.input, onIgnoredCompaction, translation, nativeImages);
+  endWithUserTurn(messages);
   const system = placeInstructions(systemPrefix, instructions ? [instructions] : [], messages);
   applyMessageCache(messages);
-  const tools = mapTools(body.tools);
+  const tools = translation.tools;
   const maxTokens = typeof body.max_output_tokens === "number" && Number.isFinite(body.max_output_tokens) ? Math.max(1, Math.floor(body.max_output_tokens)) : undefined;
   const temperature = typeof body.temperature === "number" && Number.isFinite(body.temperature) ? body.temperature : undefined;
   const effort = effortFromRequest(body.reasoning);
-  const toolChoice = mapToolChoice(body.tool_choice);
+  const toolChoice = translation.choice;
   return {
     model: targetModel,
     ...(system ? { system } : {}),
@@ -234,7 +342,7 @@ export function responsesToAnthropic(body: Json, targetModel: string, systemPref
   };
 }
 
-function chatMessageToAnthropic(raw: unknown): AnthropicMessage[] {
+function chatMessageToAnthropic(raw: unknown, translation: ToolTranslation): AnthropicMessage[] {
   const message = object(raw);
   if (!message) return [];
   const role = string(message.role);
@@ -254,13 +362,13 @@ function chatMessageToAnthropic(raw: unknown): AnthropicMessage[] {
     const fn = call && object(call.function);
     const id = call && string(call.id);
     const name = fn && string(fn.name);
-    if (id && name) content.push({ type: "tool_use", id, name, input: parseArguments(fn.arguments) });
+    if (id && name) content.push({ type: "tool_use", id, name: translation.toWire({ name, kind: "function" }), input: parseArguments(fn.arguments) });
   }
   return content.length ? [{ role: mappedRole, content }] : [];
 }
 
 /** Convert OpenAI Chat Completions request to an Anthropic Messages request. */
-export function chatToAnthropic(body: Json, targetModel: string, systemPrefix?: string): AnthropicIngressRequest {
+export function chatToAnthropic(body: Json, targetModel: string, systemPrefix?: string, translation = new ToolTranslation(body, !!systemPrefix)): AnthropicIngressRequest {
   const rawMessages = Array.isArray(body.messages) ? body.messages : [];
   const systems: string[] = [];
   const messages: AnthropicMessage[] = [];
@@ -272,15 +380,16 @@ export function chatToAnthropic(body: Json, targetModel: string, systemPrefix?: 
       if (text) systems.push(text);
       continue;
     }
-    messages.push(...chatMessageToAnthropic(raw));
+    messages.push(...chatMessageToAnthropic(raw, translation));
   }
+  endWithUserTurn(messages);
   const system = placeInstructions(systemPrefix, systems, messages);
   applyMessageCache(messages);
-  const tools = mapTools(body.tools);
+  const tools = translation.tools;
   const maxTokensValue = body.max_completion_tokens ?? body.max_tokens;
   const maxTokens = typeof maxTokensValue === "number" && Number.isFinite(maxTokensValue) ? Math.max(1, Math.floor(maxTokensValue)) : undefined;
   const temperature = typeof body.temperature === "number" && Number.isFinite(body.temperature) ? body.temperature : undefined;
-  const toolChoice = mapToolChoice(body.tool_choice);
+  const toolChoice = translation.choice;
   return {
     model: targetModel,
     ...(system ? { system } : {}),
@@ -316,26 +425,57 @@ export class ResponsesEventMapper {
   private emittedCreated = false;
   private completed = false;
   private outputIndex = 0;
-  private readonly toolNameFromWire: (name: string) => string;
+  private readonly translation: ToolTranslation | undefined;
 
-  constructor(model: string, toolNameFromWire: (name: string) => string = (name) => name) {
+  private summary = "";
+  private readonly compaction: boolean;
+
+  constructor(model: string, translation?: ToolTranslation, compaction = false) {
     this.model = model;
-    this.toolNameFromWire = toolNameFromWire;
+    this.translation = translation;
+    this.compaction = compaction;
   }
 
   response(status: "in_progress" | "completed" = "in_progress"): Json {
     return { id: this.responseId, object: "response", created_at: this.created, status, model: this.model, output: this.output, usage: this.usage };
   }
 
+  private sequenceNumber = 0;
+
+  private number(events: Json[]): Json[] {
+    return events.map((event) => structuredClone(event.sequence_number === undefined ? { ...event, sequence_number: this.sequenceNumber++ } : event));
+  }
+
   start(): Json[] {
     if (this.emittedCreated) return [];
     this.emittedCreated = true;
-    return [{ type: "response.created", response: this.response() }];
+    return this.number([{ type: "response.created", response: this.response() }]);
   }
 
   feed(event: Json): Json[] {
+    return this.number(this.feedEvent(event));
+  }
+
+  private feedEvent(event: Json): Json[] {
     const out = this.start();
     const type = string(event.type) ?? "";
+    if (this.compaction) {
+      if (type === "content_block_start") {
+        if (object(event.content_block)?.type === "tool_use") throw new Error("Compaction returned a tool call instead of a summary");
+        return out;
+      }
+      if (type === "content_block_delta") {
+        const delta = object(event.delta);
+        if (delta?.type === "text_delta") this.summary += string(delta.text) ?? "";
+        return out;
+      }
+      if (type === "content_block_stop") return out;
+      if (type === "message_delta") {
+        const reason = object(event.delta)?.stop_reason;
+        if (reason && reason !== "end_turn") throw new Error(`Compaction did not finish: ${String(reason)}`);
+      }
+      if (type === "error") throw new Error("Compaction upstream returned an error");
+    }
     if (type === "message_start") {
       const message = object(event.message);
       this.usage = usageFromAnthropic(message?.usage);
@@ -353,7 +493,11 @@ export class ResponsesEventMapper {
         out.push({ type: "response.output_item.added", output_index: this.outputIndex++, item });
       } else if (blockType === "tool_use") {
         const callId = string(block.id) ?? id("call");
-        const item: OutputItem = { id: id("fc"), type: "function_call", call_id: callId, name: this.toolNameFromWire(string(block.name) ?? "tool"), arguments: "", status: "in_progress" };
+        const wireName = string(block.name) ?? "tool";
+        const identity = this.translation?.callableFromWire(wireName);
+        if (this.translation && !identity) throw new Error("Upstream returned an unknown tool name");
+        const custom = identity?.kind === "custom";
+        const item: OutputItem = { id: id(custom ? "ctc" : "fc"), type: custom ? "custom_tool_call" : "function_call", call_id: callId, name: identity?.name ?? wireName, ...(identity?.namespace !== undefined ? { namespace: identity.namespace } : {}), ...(custom ? { input: "" } : { arguments: "" }), status: "in_progress" };
         this.output.push(item);
         this.blocks.set(index, { kind: "tool", item, arguments: "" });
         out.push({ type: "response.output_item.added", output_index: this.outputIndex++, item });
@@ -376,8 +520,12 @@ export class ResponsesEventMapper {
       } else if (state.kind === "tool" && deltaType === "input_json_delta") {
         const text = string(delta.partial_json) ?? "";
         state.arguments += text;
-        state.item.arguments = state.arguments;
-        out.push({ type: "response.function_call_arguments.delta", item_id: state.item.id, output_index: this.output.indexOf(state.item), delta: text });
+        // Custom input is JSON-wrapped upstream. Buffer it until it can be decoded without
+        // leaking JSON escapes or the wrapper into the Responses string-input protocol.
+        if (state.item.type === "function_call") {
+          state.item.arguments = state.arguments;
+          out.push({ type: "response.function_call_arguments.delta", item_id: state.item.id, output_index: this.output.indexOf(state.item), delta: text });
+        }
       }
       return out;
     }
@@ -385,7 +533,12 @@ export class ResponsesEventMapper {
       const index = typeof event.index === "number" ? event.index : -1;
       const state = this.blocks.get(index);
       if (!state) return out;
-      if (state.kind === "tool") out.push({ type: "response.function_call_arguments.done", item_id: state.item.id, output_index: this.output.indexOf(state.item), arguments: state.arguments });
+      if (state.kind === "tool" && state.item.type === "custom_tool_call") {
+        const input = customInputFromArguments(state.arguments);
+        state.item.input = input;
+        out.push({ type: "response.custom_tool_call_input.delta", item_id: state.item.id, output_index: this.output.indexOf(state.item), delta: input });
+        out.push({ type: "response.custom_tool_call_input.done", item_id: state.item.id, output_index: this.output.indexOf(state.item), input });
+      } else if (state.kind === "tool") out.push({ type: "response.function_call_arguments.done", item_id: state.item.id, output_index: this.output.indexOf(state.item), arguments: state.arguments });
       state.item.status = "completed";
       out.push({ type: "response.output_item.done", output_index: this.output.indexOf(state.item), item: state.item });
       this.blocks.delete(index);
@@ -395,7 +548,7 @@ export class ResponsesEventMapper {
       this.usage = usageFromAnthropic(event.usage);
       return out;
     }
-    if (type === "message_stop") return [...out, ...this.finish()];
+    if (type === "message_stop") return [...out, ...this.finish(true)];
     if (type === "error") {
       const error = object(event.error);
       return [...out, { type: "error", error: { message: string(error?.message) ?? "Anthropic upstream error", type: string(error?.type) ?? "api_error", code: null } }];
@@ -403,8 +556,27 @@ export class ResponsesEventMapper {
     return out;
   }
 
-  finish(): Json[] {
+  finish(upstreamCompleted = false): Json[] {
+    return this.number(this.finishEvents(upstreamCompleted));
+  }
+
+  private finishEvents(upstreamCompleted: boolean): Json[] {
     if (this.completed) return [];
+    if (this.compaction) {
+      if (!upstreamCompleted || !this.summary.trim()) throw new Error("Compaction ended without a complete summary");
+      const item: OutputItem = {
+        id: id("cmp"), type: "compaction",
+        encrypted_content: COMPACTION_PREFIX + Buffer.from(JSON.stringify({ summary: this.summary }), "utf8").toString("base64"),
+      };
+      this.output.push(item);
+      this.completed = true;
+      return [
+        { type: "response.output_item.added", output_index: 0, item },
+        { type: "response.output_item.done", output_index: 0, item },
+        { type: "response.completed", response: this.response("completed") },
+      ];
+    }
+    if ([...this.blocks.values()].some((state) => state.item.type === "custom_tool_call")) throw new Error("Custom tool response ended before its input was complete");
     this.completed = true;
     for (const state of this.blocks.values()) {
       state.item.status = "completed";

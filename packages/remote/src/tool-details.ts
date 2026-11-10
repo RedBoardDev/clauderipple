@@ -80,7 +80,7 @@ export function changeCount(name: string, input: Record<string, unknown> | null)
 }
 
 export interface ActivityTool extends ToolCall { result?: { ok: boolean } }
-export type SummaryRow = { type: "tool"; tool: ActivityTool } | { type: "subagent"; status: "running" | "done" | "failed" };
+export type SummaryRow = { type: "tool"; tool: ActivityTool } | { type: "subagent"; status: "running" | "done" | "failed" | "stopped" };
 // The kinds and their words follow the Claude desktop app's transcript bundle (read 2026-10-24),
 // as the desktop mod's Agents pane does (packages/mod/hooks/ui/tools.ts `runSummary`). A Write is
 // "created": a call's result does not tell a file it replaced.

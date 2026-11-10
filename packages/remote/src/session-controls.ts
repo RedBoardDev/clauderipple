@@ -1,4 +1,4 @@
-// Durable settings writes. A timed-out caller stops waiting, not the serialized operation.
+// Durable settings receipts. The session lane owns execution and its deadline.
 // Orphans after a restart are read as unknown and are NEVER submitted again.
 import { readJson, writeFileAtomic } from "./fsutil.ts";
 import type { SettingsResult } from "./protocol.ts";
@@ -17,11 +17,9 @@ export class SessionSettings {
   private records = new Map<string, Operation>();
   private waiting = new Map<string, Promise<SettingsResult>>();
   private file: string;
-  private timeoutMs: number;
 
-  constructor(file: string, timeoutMs = 15_000) {
+  constructor(file: string) {
     this.file = file;
-    this.timeoutMs = timeoutMs;
     const saved = readJson<Operation[]>(file) ?? [];
     if (!Array.isArray(saved)) throw new Error("Invalid session settings journal");
     for (const record of saved) {
@@ -65,30 +63,20 @@ export class SessionSettings {
     }
     const record: Operation = { session, reqId, fingerprint, field };
     this.save(key, record); // Before entering the lane, let alone sending a write.
-    let timedOut = false;
-    let timer: ReturnType<typeof setTimeout>;
-    const unknown = new Promise<SettingsResult>(resolve => {
-      timer = setTimeout(() => {
-        timedOut = true;
-        const result: SettingsResult = { status: "unknown" };
-        publish(result);
-        resolve(result);
-      }, this.timeoutMs);
-    });
-    const finished = Promise.resolve().then(work).catch((error: unknown) => {
+    // The work starts now, not a microtask later: a change joins its session's lane as it arrives,
+    // so a message right behind it (even in the same read) is ordered after it.
+    const finished = (async () => work())().catch((error: unknown) => {
       if (error instanceof OutcomeUnknownError) return { status: "unknown" } satisfies SettingsResult;
       const message = error instanceof Error ? error.message : String(error);
       this.save(key, { ...record, error: message });
-      if (timedOut) publish({ status: "unknown", errors: { [field]: message } });
       throw error;
     }).then(result => {
       this.save(key, { ...record, result });
-      if (!timedOut || result.status !== "unknown") publish(result);
+      publish(result);
       return result;
-    }).finally(() => { clearTimeout(timer); this.waiting.delete(key); });
-    const response = Promise.race([finished, unknown]);
-    this.waiting.set(key, response);
-    return response;
+    }).finally(() => { this.waiting.delete(key); });
+    this.waiting.set(key, finished);
+    return finished;
   }
 }
 

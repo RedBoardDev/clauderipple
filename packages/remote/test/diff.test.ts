@@ -130,6 +130,60 @@ test("a clean folder that is not ahead of the base is clean", async t => {
   assert.deepEqual(view, { scope: "clean", base: null, branch: "main", files: [], truncated: false });
 });
 
+test("the requested scope picks the comparison, even when the other one has work", async t => {
+  // A branch with its own commit, and uncommitted work on top of it.
+  const dir = repo(t, { "a.txt": "one\n" });
+  gitIn(dir, "switch", "-q", "-c", "feature");
+  write(dir, { "a.txt": "one\ncommitted\n" });
+  gitIn(dir, "commit", "-qam", "work");
+  write(dir, { "a.txt": "one\ncommitted\nloose\n", "loose.txt": "fresh\n" });
+
+  // Today's order: uncommitted work is the question being asked.
+  const auto = await diffView(dir);
+  assert.equal(auto.scope, "uncommitted");
+  assert.deepEqual(auto.files.map(file => file.path), ["a.txt", "loose.txt"]);
+  assert.equal((await diffView(dir, { scope: "auto" })).scope, "uncommitted");
+  assert.equal((await diffView(dir, { scope: "uncommitted" })).scope, "uncommitted");
+
+  // The branch is measured against its base and does not include the working tree's loose lines.
+  const branch = await diffView(dir, { scope: "branch" });
+  assert.equal(branch.scope, "branch");
+  assert.equal(branch.base, "main");
+  assert.equal(branch.branch, "feature");
+  assert.deepEqual(branch.files.map(file => file.path), ["a.txt"]);
+  assert.match(branch.files[0]!.patch, /^\+committed$/m);
+  assert.doesNotMatch(branch.files[0]!.patch, /loose/);
+
+  // A value this host does not know is not a scope: it falls back to the host's own order.
+  assert.equal((await diffView(dir, { scope: "everything" as never })).scope, "uncommitted");
+});
+
+test("an empty uncommitted view stays empty instead of falling through to the branch", async t => {
+  const dir = repo(t, { "a.txt": "one\n" });
+  gitIn(dir, "switch", "-q", "-c", "feature");
+  write(dir, { "a.txt": "one\ntwo\n" });
+  gitIn(dir, "commit", "-qam", "work");
+
+  const view = await diffView(dir, { scope: "uncommitted" });
+  assert.deepEqual(view, { scope: "clean", base: null, branch: "feature", files: [], truncated: false });
+  // The branch is still one request away, and says what it is.
+  const branch = await diffView(dir, { scope: "branch" });
+  assert.equal(branch.scope, "branch");
+  assert.deepEqual(branch.files.map(file => file.path), ["a.txt"]);
+});
+
+test("a file says it was cut, while a file beside it that fits does not", async t => {
+  const dir = repo(t, { "big.txt": "small\n", "small.txt": "a\n" });
+  write(dir, { "big.txt": `${"x".repeat(300 * 1024)}\n`, "small.txt": "a\nb\n" });
+  const view = await diffView(dir);
+  assert.equal(byPath(view, "big.txt").cut, true, "a patch past the per-file limit is marked on its file");
+  assert.equal(byPath(view, "small.txt").cut, undefined, "a complete patch is not marked");
+  assert.equal(view.truncated, true);
+  // A binary has no patch at all, which is its whole story: it is not "cut".
+  write(dir, { "bin.dat": Buffer.from([0, 1, 2]) });
+  assert.equal(byPath(await diffView(dir), "bin.dat").cut, undefined);
+});
+
 test("a folder that is not a git repository is refused", async t => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ripple-plain-"));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
@@ -303,4 +357,18 @@ test("the diff op answers through the server for the session's own folder", asyn
   const missing = frames.find(frame => frame.t === "res" && frame.reqId === "d2");
   assert.ok(missing && missing.t === "res");
   assert.equal(missing.ok, false);
+
+  // A scope the phone asked for reaches the reader: this folder is not ahead of main, so asking for
+  // the branch is an honest empty answer rather than the uncommitted work it just showed.
+  send({ t: "req", reqId: "d3", op: { op: "diff", session: id, scope: "branch" } });
+  await waitFor(() => frames.some(frame => frame.t === "res" && frame.reqId === "d3"));
+  const scoped = frames.find(frame => frame.t === "res" && frame.reqId === "d3");
+  assert.ok(scoped && scoped.t === "res");
+  assert.equal(scoped.ok, true);
+  assert.equal((scoped.data as DiffView).scope, "clean");
+
+  // The host advertises the choice, so a phone only draws the switch on a host that understands it.
+  const ready = frames.find(frame => frame.t === "ready");
+  assert.ok(ready && ready.t === "ready");
+  assert.equal(ready.host.capabilities?.diffScope, true);
 });

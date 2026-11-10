@@ -5,7 +5,10 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { homeDir, type Config } from "../../router/src/config.ts";
 import { isJudgeOnlyModel } from "../../router/src/model-policy.ts";
+import { withFileLock } from "../../router/src/locked-file.ts";
+import { type Ownership, normalizeHome, ownerOf } from "./ownership.ts";
 
 const START = "# >>> ClaudeRipple Codex provider >>>";
 const END = "# <<< ClaudeRipple Codex provider <<<";
@@ -15,7 +18,14 @@ const CATALOG_START = "# >>> ClaudeRipple Codex model catalog >>>";
 const CATALOG_END = "# <<< ClaudeRipple Codex model catalog <<<";
 const OPENAI_START = "# >>> ClaudeRipple OpenAI route >>>";
 const OPENAI_END = "# <<< ClaudeRipple OpenAI route <<<";
+/** Which installation wrote the block below it; a port alone cannot tell two homes with one port apart. */
+const HOME_MARK = "# clauderipple-home:";
 export const CODEX_PROVIDER_MARKER = START;
+
+/** The OpenAI-compatible ingress port this installation's router serves Codex on. */
+export function ingressPort(cfg: Pick<Config, "listen">): number {
+  return cfg.listen.openaiPort ?? cfg.listen.port + 2;
+}
 
 /** A model ClaudeRipple serves to Codex (Claude or an Anthropic-compatible provider's model). */
 export type CatalogModel = { id: string; name?: string; provider: string; effortLevels: string[] };
@@ -54,13 +64,19 @@ function appendBlock(content: string, block: string): string {
   return `${base}${base ? "\n\n" : ""}${block}\n`;
 }
 
-function providerBlock(port: number): string {
+function homeMarker(home: string): string {
+  const normalized = normalizeHome(home);
+  // A newline would end the comment and inject TOML; no real home has one, so skip the marker.
+  return /[\r\n\0]/.test(normalized) ? "" : `${HOME_MARK} ${normalized}\n`;
+}
+
+function providerBlock(port: number, ownerHome: string): string {
   return `${START}
 [model_providers.clauderipple]
 name = "ClaudeRipple local ingress"
 base_url = "http://127.0.0.1:${port}/v1"
 wire_api = "responses"
-${END}`;
+${homeMarker(ownerHome)}${END}`;
 }
 
 function catalogFile(home = codexHome()): string {
@@ -198,17 +214,44 @@ function withoutDanglingSelection(content: string): string {
   return head.replace(selectsUs, "").replace(/^[ \t]*model[ \t]*=[ \t]*(["'])[^\n]*\1[ \t]*\r?\n?/m, "") + rest;
 }
 
+/** The `base_url` port of the provider block, or null when there is no block or no readable port. */
+function providerBlockPort(home: string): number | null {
+  const text = configText(home);
+  const block = text === null ? null : ownedBlock(text, START, END);
+  if (block === null) return null;
+  const port = Number(/^\s*base_url\s*=\s*"http:\/\/127\.0\.0\.1:(\d+)\/v1"/m.exec(block)?.[1]);
+  return Number.isSafeInteger(port) && port > 0 ? port : null;
+}
+
+/**
+ * An unmarked block is this installation's by explicit evidence only: its `base_url` is exactly
+ * this installation's ingress port, and the caller proved that this home's service definition was
+ * the one registered when it asked (`legacyIngressPort` is passed only then — uninstall), or the
+ * user ran `codex off` here. A port alone never authorizes anything on `install` or `codex on`
+ * (B03, B24, 2026-10-25).
+ */
+function legacyBlockIsOurs(home: string, installationHome: string, legacyIngressPort: number | undefined): boolean {
+  if (legacyIngressPort === undefined) return false;
+  return codexOwner(home, installationHome).state === "unknown" && providerBlockPort(home) === legacyIngressPort;
+}
+
 export type CodexEdit = { changed: boolean; backup?: string; profileBackup?: string; config: string; profile: string };
 
 /** Install provider in config.toml plus selection in the dedicated `clauderipple` profile. */
-export function codexOn(port: number, home = codexHome(), models: CatalogModel[] = []): CodexEdit {
+export function codexOn(port: number, home = codexHome(), models: CatalogModel[] = [], installationHome = homeDir()): CodexEdit {
+  return withFileLock(configFile(home), () => codexOnLocked(port, home, models, installationHome));
+}
+
+function codexOnLocked(port: number, home: string, models: CatalogModel[], installationHome: string): CodexEdit {
+  const owner = codexOwner(home, installationHome);
+  if (owner.state === "other") throw new Error(`Codex settings belong to another ClaudeRipple installation (${owner.home}); refusing to replace them`);
   fs.mkdirSync(home, { recursive: true, mode: 0o700 });
   const config = configFile(home);
   const profile = profileFile(home);
   const beforeConfig = fs.existsSync(config) ? fs.readFileSync(config, "utf8") : "";
   const beforeProfile = fs.existsSync(profile) ? fs.readFileSync(profile, "utf8") : "";
   const catalog = models.length ? writeCodexCatalog(models, home) : undefined;
-  const nextConfig = withOpenAiRoute(withCatalog(appendBlock(withoutOwnedBlock(beforeConfig, START, END), providerBlock(port)), catalog), port);
+  const nextConfig = withOpenAiRoute(withCatalog(appendBlock(withoutOwnedBlock(beforeConfig, START, END), providerBlock(port, installationHome)), catalog), port);
   const nextProfile = appendBlock(withoutOwnedBlock(beforeProfile, PROFILE_START, PROFILE_END), profileBlock());
   if (nextConfig === beforeConfig && nextProfile === beforeProfile) return { changed: false, config, profile };
   const configBackup = backup(config);
@@ -219,7 +262,22 @@ export function codexOn(port: number, home = codexHome(), models: CatalogModel[]
 }
 
 /** Remove only blocks with our exact sentinels. Keeps all user config and profile values. */
-export function codexOff(home = codexHome()): CodexEdit {
+export function codexOff(home = codexHome(), installationHome = homeDir(), opts: { legacyIngressPort?: number } = {}): CodexEdit {
+  return withFileLock(configFile(home), () => {
+    const owner = codexOwner(home, installationHome);
+    if (owner.state === "other") throw new Error(`Codex settings belong to another ClaudeRipple installation (${owner.home}); refusing to remove them`);
+    if (owner.state === "unknown") {
+      // The user asked here, and the block names exactly this installation's ingress: an older
+      // version's block is taken over and removed. Otherwise nothing identifies it (B24).
+      if (!legacyBlockIsOurs(home, installationHome, opts.legacyIngressPort)) throw new Error("Codex settings do not record an installation and do not name this installation's ingress; refusing to remove them");
+      return codexOffLocked(home);
+    }
+    if (owner.state === "absent") return { changed: false, config: configFile(home), profile: profileFile(home) };
+    return codexOffLocked(home);
+  });
+}
+
+function codexOffLocked(home: string): CodexEdit {
   const config = configFile(home);
   const profile = profileFile(home);
   const beforeConfig = fs.existsSync(config) ? fs.readFileSync(config, "utf8") : "";
@@ -237,21 +295,6 @@ export function codexOff(home = codexHome()): CodexEdit {
   return { changed: true, ...(configBackup ? { backup: configBackup } : {}), ...(profileBackup ? { profileBackup } : {}), config, profile };
 }
 
-/** The router port our provider block points at, or null when there is no block. */
-export function codexPort(home = codexHome()): number | null {
-  let text: string;
-  try {
-    text = fs.readFileSync(configFile(home), "utf8");
-  } catch {
-    return null;
-  }
-  const startAt = text.indexOf(START);
-  const endAt = startAt < 0 ? -1 : text.indexOf(END, startAt);
-  if (endAt < 0) return null;
-  const port = /base_url\s*=\s*"http:\/\/127\.0\.0\.1:(\d+)\//.exec(text.slice(startAt, endAt))?.[1];
-  return port ? Number(port) : null;
-}
-
 /** True when `codex on` is in effect for this Codex home. */
 export function codexEnabled(home = codexHome()): boolean {
   try {
@@ -260,4 +303,61 @@ export function codexEnabled(home = codexHome()): boolean {
   } catch {
     return false;
   }
+}
+
+function configText(home: string): string | null {
+  try {
+    return fs.readFileSync(configFile(home), "utf8");
+  } catch {
+    return null;
+  }
+}
+
+/** The text between one pair of our sentinels, or null when that block is absent. */
+function ownedBlock(text: string, start: string, end: string): string | null {
+  const startAt = text.indexOf(start);
+  if (startAt < 0) return null;
+  const endAt = text.indexOf(end, startAt);
+  if (endAt < 0) return null;
+  return text.slice(startAt, endAt);
+}
+
+/**
+ * Which installation wrote the Codex blocks this machine has (B03).
+ *
+ * A port is not identity: two installations can be configured for the same one, and a block from
+ * an older version recorded nothing else. So only the home marker written since 0.12.15 makes a
+ * block ours; an unmarked block is "unknown" and is preserved, never removed, whatever port it
+ * names. Running `codex on` from this installation rewrites the block with the marker, which is
+ * the explicit way to take a legacy block over (D5, 2026-10-25).
+ */
+export function codexOwner(home = codexHome(), installationHome = homeDir()): Ownership {
+  const text = configText(home);
+  if (text === null) return { state: "absent", home: null };
+  const block = ownedBlock(text, START, END);
+  if (block !== null) {
+    const recorded = new RegExp(`^${HOME_MARK}\\s*(.+)$`, "m").exec(block)?.[1]?.trim();
+    return recorded ? ownerOf(recorded, installationHome) : { state: "unknown", home: null };
+  }
+  // No provider block, but one of our other blocks is still there: an interrupted state whose
+  // owner cannot be named, so it is preserved rather than removed.
+  if (text.includes(OPENAI_START) || text.includes(CATALOG_START) || text.includes(PROFILE_START)) return { state: "unknown", home: null };
+  return { state: "absent", home: null };
+}
+
+export type CodexRemoval = { result: "removed" | "absent" | "other-installation" | "ownership-unknown"; owner: Ownership; changed: boolean };
+
+/** Removes `codex on` only when these blocks are this installation's (uninstall path). */
+export function codexRemove(home = codexHome(), opts: { installationHome?: string; legacyIngressPort?: number } = {}): CodexRemoval {
+  return withFileLock(configFile(home), () => {
+    const installationHome = opts.installationHome ?? homeDir();
+    const owner = codexOwner(home, installationHome);
+    if (owner.state === "absent") return { result: "absent", owner, changed: false };
+    if (owner.state === "other") return { result: "other-installation", owner, changed: false };
+    if (owner.state === "unknown") {
+      if (!legacyBlockIsOurs(home, installationHome, opts.legacyIngressPort)) return { result: "ownership-unknown", owner, changed: false };
+      return { result: "removed", owner, changed: codexOffLocked(home).changed };
+    }
+    return { result: "removed", owner, changed: codexOffLocked(home).changed };
+  });
 }

@@ -47,6 +47,70 @@ test("a 401 is a login problem; the refused token is not sent again until the ke
   assert.equal(calls, 2);
 });
 
+// A login that cannot be read at all (no keychain item, unreadable account) used to be asked for
+// on every request: the first read left no login cached, and that forced the next read. Twenty
+// polls at one moment meant twenty keychain child processes, and none of them was throttled.
+test("a login that cannot be read is read once per 30 s, and each request is given that same error", async () => {
+  let now = 1_000_000, reads = 0, calls = 0;
+  const failure = new BridgeAuthError("이 컴퓨터의 Claude 로그인 정보를 읽을 수 없습니다.");
+  const same = (error: unknown) => error === failure;
+  const client = new BridgeClient({ now: () => now, auth: () => { reads++; throw failure; }, fetch: async () => { calls++; return Response.json({ worker_status: "idle" }); } });
+  for (const result of await Promise.allSettled(Array.from({ length: 20 }, () => client.session("bridge")))) {
+    assert.ok(result.status === "rejected" && same(result.reason), "every one meets the read's own error");
+  }
+  assert.equal(reads, 1, "twenty sessions at one moment are one failed read");
+  for (let i = 0; i < 10; i++) { now += 2000; await assert.rejects(client.session("bridge"), same); }
+  assert.equal(reads, 1, "no second read inside the window");
+  assert.equal(calls, 0, "nothing is sent without a login");
+  now += AUTH_REREAD_MS;
+  await assert.rejects(client.session("bridge"), same);
+  assert.equal(reads, 2, "read again once the window is up");
+});
+
+test("a failed read recovers at the next read 30 s later, and the new login is reused", async () => {
+  let now = 1_000_000, reads = 0;
+  let stored: BridgeAuth | null = null;
+  const failure = new BridgeAuthError(LOGIN_EXPIRED);
+  const client = new BridgeClient({ now: () => now, auth: () => { reads++; if (!stored) throw failure; return stored; },
+    fetch: async (url, options) => { assert.equal(new Headers(options?.headers).get("authorization"), "Bearer fresh"); return Response.json({ worker_status: "idle" }); } });
+  await assert.rejects(client.session("bridge"), error => error === failure);
+  stored = { accessToken: "fresh", organizationUuid: "org", expiresAt: now + 3_600_000 };
+  now += AUTH_REREAD_MS - 1;
+  await assert.rejects(client.session("bridge"), error => error === failure);
+  assert.equal(reads, 1, "a login written sooner is not seen before the window is up");
+  now += 1;
+  assert.deepEqual(await client.session("bridge"), { worker_status: "idle" });
+  assert.equal(reads, 2);
+  for (let i = 0; i < 5; i++) await client.session("bridge");
+  assert.equal(reads, 2, "the fresh login is reused while it is good");
+});
+
+test("a usable login is read once and reused for every request", async () => {
+  let now = 1_000_000, reads = 0, calls = 0;
+  const client = new BridgeClient({ now: () => now, auth: () => { reads++; return { accessToken: "good", organizationUuid: "org", expiresAt: now + 3_600_000 }; },
+    fetch: async () => { calls++; return Response.json({ worker_status: "idle" }); } });
+  await Promise.all(Array.from({ length: 20 }, () => client.session("bridge")));
+  now += 60_000;
+  await client.session("bridge");
+  assert.equal(reads, 1, "one read, not one per request");
+  assert.equal(calls, 21, "but every request is sent");
+});
+
+test("a 401 whose read is 30 s old reads the login again at the next request, not 30 s later", async () => {
+  let now = 1_000_000, reads = 0, calls = 0, status = 200;
+  const client = new BridgeClient({ now: () => now, auth: () => { reads++; return { accessToken: `token-${reads}`, organizationUuid: "org", expiresAt: now + 3_600_000 }; },
+    fetch: async () => { calls++; return status === 200 ? Response.json({ worker_status: "idle" }) : new Response("", { status }); } });
+  await client.session("bridge");
+  now += AUTH_REREAD_MS;
+  status = 401;
+  await assert.rejects(client.session("bridge"), (error: Error) => error instanceof BridgeAuthError && error.message === LOGIN_REFUSED);
+  assert.equal(reads, 1, "the refused token is not read again inside the request that was refused");
+  status = 200;
+  assert.deepEqual(await client.session("bridge"), { worker_status: "idle" });
+  assert.equal(reads, 2, "the next request reads the login at once");
+  assert.equal(calls, 3);
+});
+
 function fixture(t: import("node:test").TestContext) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-login-test-"));
   const projects = path.join(root, "projects");

@@ -7,6 +7,13 @@ import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { homeDir } from "../../router/src/config.ts";
+import { type AgentRemove, type AgentRestart, type AgentStart, type AgentStop, type Ownership, ownerOf, unitEnvironment } from "./ownership.ts";
+import { type IdentityWait, type RouterIdentity, awaitIdentity, routerIdentity } from "./router-state.ts";
+import { withServiceFile } from "./service-definition.ts";
+
+/** Whose router answers this installation's admin port. Injected in tests that must not probe. */
+export type IdentityCheck = (expectedPid: number | null) => RouterIdentity;
 
 const HEADER = "[Unit]\nDescription=ClaudeRipple local model router\n";
 
@@ -60,7 +67,10 @@ WantedBy=default.target
 `;
 }
 
-function systemctl(args: string[]): { ok: boolean; out: string } {
+/** One `systemctl --user` invocation. Injected so tests never reach the user manager. */
+export type Systemctl = (args: string[]) => { ok: boolean; out: string };
+
+const realSystemctl: Systemctl = (args) => {
   try {
     const out = execFileSync("systemctl", ["--user", ...args], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout: 150_000 });
     return { ok: true, out };
@@ -68,47 +78,103 @@ function systemctl(args: string[]): { ok: boolean; out: string } {
     const err = e as { stderr?: Buffer | string; message?: string };
     return { ok: false, out: err.stderr?.toString().trim() || err.message || "systemctl failed" };
   }
-}
+};
 
-function mustSystemctl(args: string[]): void {
-  const r = systemctl(args);
+function mustSystemctl(args: string[], run: Systemctl = realSystemctl): void {
+  const r = run(args);
   if (!r.ok) throw new Error(`systemctl --user ${args.join(" ")} failed: ${r.out}`);
 }
 
-export function installAgent(opts: { program: string; args?: string[]; home: string; env?: Record<string, string> }): string {
-  // No user manager (an ssh login without lingering, a container) means nothing would ever start
-  // the router: fail here, before any file is written.
-  mustSystemctl(["show-environment"]);
-  const file = unitPath();
-  if (fs.existsSync(file) && !fs.readFileSync(file, "utf8").startsWith(HEADER)) {
-    throw new Error(`${file} exists and is not ClaudeRipple's; refusing to replace it`);
+/** Who the unit registered under this name belongs to (B01). */
+export function unitOwnership(home: string = homeDir()): Ownership {
+  let text: string;
+  try {
+    text = fs.readFileSync(unitPath(), "utf8");
+  } catch (error) {
+    // A missing unit is "absent"; anything else (permissions, I/O) is unknown, never absent: an
+    // "absent" answer would let install replace a unit it could not read.
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return { state: "absent", home: null };
+    return { state: "unknown", home: null };
   }
-  fs.mkdirSync(path.dirname(file), { recursive: true });
-  fs.writeFileSync(file, renderUnit(opts), { mode: 0o600 });
-  mustSystemctl(["daemon-reload"]);
-  mustSystemctl(["enable", unitName()]);
-  return file;
+  return ownerOf(unitEnvironment(text).CLAUDERIPPLE_HOME ?? null, home);
 }
 
-export function removeAgent(): boolean {
-  const file = unitPath();
-  if (!fs.existsSync(file)) return false;
-  mustSystemctl(["disable", "--now", unitName()]);
-  fs.unlinkSync(file);
-  mustSystemctl(["daemon-reload"]);
-  return true;
+export function installAgent(opts: { program: string; args?: string[]; home: string; env?: Record<string, string> }, run: Systemctl = realSystemctl, identity: IdentityCheck = expectedPid => routerIdentity(opts.home, { expectedPid })): string {
+  return withServiceFile(unitPath(), run, guard => {
+    run = guard.run;
+    // No user manager (an ssh login without lingering, a container) means nothing would ever start
+    // the router: fail here, before any file is written.
+    mustSystemctl(["show-environment"], run);
+    const file = unitPath();
+    if (fs.existsSync(file)) {
+      let text: string;
+      try {
+        text = fs.readFileSync(file, "utf8");
+      } catch (error) {
+        throw new Error(`${file} could not be read (${(error as Error).message}); refusing to replace it`);
+      }
+      if (!text.startsWith(HEADER)) {
+        throw new Error(`${file} exists and is not ClaudeRipple's; refusing to replace it`);
+      }
+    }
+    const owner = unitOwnership(opts.home);
+    if (owner.state === "other") {
+      throw new Error(`${file} belongs to another ClaudeRipple installation (${owner.home}); remove it with that installation's uninstall, or use its own unit name for this one`);
+    }
+    if (owner.state === "unknown") {
+      throw new Error(`${file} does not record an installation, so it cannot be identified; refusing to replace it`);
+    }
+    if (owner.state === "ours") {
+      const pid = agentPid(run);
+      if (pid !== null && identity(pid) !== "ours") throw new Error("running systemd instance identity is unknown; unit left untouched");
+    }
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    guard.write(renderUnit(opts));
+    mustSystemctl(["daemon-reload"], run);
+    mustSystemctl(["enable", unitName()], run);
+    return file;
+  });
 }
 
-export function agentState(): "running" | "loaded" | "not-loaded" {
-  const r = systemctl(["show", unitName(), "--property=ActiveState", "--value"]);
-  if (r.ok && r.out.trim() === "active") return "running";
+export function removeAgent(home: string = homeDir(), run: Systemctl = realSystemctl, identity: IdentityCheck = (expectedPid) => routerIdentity(home, { expectedPid })): AgentRemove {
+  return withServiceFile(unitPath(), run, guard => {
+    run = guard.run;
+    const file = unitPath();
+    const owner = unitOwnership(home);
+    if (owner.state === "absent") return "absent";
+    if (owner.state === "other") return "other-installation";
+    if (owner.state === "unknown") return "ownership-unknown";
+    // `disable --now` terminates the unit's process. The unit file can have been replaced under a
+    // running instance, so a running unit is only stopped when its own id proves it is ours.
+    const pid = agentPid(run);
+    if (pid !== null) {
+      const who = identity(pid);
+      if (who === "other") return "other-installation";
+      if (who !== "ours") return "identity-unknown";
+    }
+    const definition = fs.readFileSync(file, "utf8");
+    mustSystemctl(["disable", "--now", unitName()], run);
+    if (unitOwnership(home).state !== "ours" || fs.readFileSync(file, "utf8") !== definition) return "ownership-unknown";
+    guard.remove();
+    mustSystemctl(["daemon-reload"], run);
+    return "removed";
+  });
+}
+
+export function agentState(run: Systemctl = realSystemctl): "running" | "loaded" | "not-loaded" {
+  const r = run(["show", unitName(), "--property=ActiveState", "--value"]);
+  if (!r.ok) throw new Error(`systemd state lookup failed: ${r.out}`);
+  if (r.out.trim() === "active") return "running";
   return fs.existsSync(unitPath()) ? "loaded" : "not-loaded";
 }
 
-export function agentPid(): number | null {
-  const r = systemctl(["show", unitName(), "--property=MainPID", "--value"]);
-  const pid = Number(r.out.trim());
-  return r.ok && Number.isSafeInteger(pid) && pid > 0 ? pid : null;
+export function agentPid(run: Systemctl = realSystemctl): number | null {
+  const r = run(["show", unitName(), "--property=MainPID", "--value"]);
+  const text = r.out.trim();
+  if (!r.ok || !/^\d+$/.test(text)) throw new Error(`systemd PID lookup failed: ${r.out}; no control operation performed`);
+  const pid = Number(text);
+  if (!Number.isSafeInteger(pid)) throw new Error(`invalid systemd PID: ${text}`);
+  return pid > 0 ? pid : null;
 }
 
 /**
@@ -116,26 +182,68 @@ export function agentPid(): number | null {
  * `systemctl start` returns once the unit is activated — a service that exits at once is still
  * "started" at that point — so the MainPID is waited for, as on Windows (#80).
  */
-export function startAgent(opts: { waitMs?: number } = {}): "already-running" | "started" | "failed" {
-  if (agentState() === "running") return "already-running";
-  if (!systemctl(["start", unitName()]).ok) return "failed";
-  return waitForPid(opts.waitMs ?? START_BUDGET_MS) ? "started" : "failed";
+export function startAgent(home: string = homeDir(), opts: { waitMs?: number } = {}, run: Systemctl = realSystemctl): AgentStart {
+  return withServiceFile(unitPath(), run, guard => {
+    run = guard.run;
+    const owner = unitOwnership(home);
+    if (owner.state === "other") return "other-installation";
+    if (owner.state === "unknown") return "ownership-unknown";
+    if (agentState(run) === "running") return "already-running";
+    if (!run(["start", unitName()]).ok) return "failed";
+    return waitForPid(opts.waitMs ?? START_BUDGET_MS, run) ? "started" : "failed";
+  });
 }
 
-export function stopAgent(): boolean {
-  return systemctl(["stop", unitName()]).ok;
+export function stopAgent(home: string = homeDir(), opts: Record<string, never> = {}, run: Systemctl = realSystemctl, identity: IdentityCheck = (expectedPid) => routerIdentity(home, { expectedPid })): AgentStop {
+  return withServiceFile(unitPath(), run, guard => {
+    run = guard.run;
+    const owner = unitOwnership(home);
+    if (owner.state === "absent") return "not-loaded";
+    if (owner.state === "other") return "other-installation";
+    if (owner.state === "unknown") return "ownership-unknown";
+    // Stopping terminates the unit's process; require the running instance to prove it is ours.
+    const pid = agentPid(run);
+    if (pid !== null) {
+      const who = identity(pid);
+      if (who === "other") return "other-installation";
+      if (who !== "ours") return "identity-unknown";
+    }
+    return run(["stop", unitName()]).ok ? "stopped" : "not-loaded";
+  });
 }
 
 /**
  * systemd sends the SIGTERM, waits for the process to exit (up to TimeoutStopSec) and then starts
  * a new one, so the drain is never cut the way `launchctl kickstart -k` cut it.
  */
-export function restartAgent(opts: { waitMs?: number; onProgress?: (msg: string) => void } = {}): "drained" | "failed" {
-  opts.onProgress?.("waiting for in-flight model calls to finish (up to 120s)…");
-  if (!systemctl(["restart", unitName()]).ok) return "failed";
-  // The restart command returned; the successor still has to appear. A unit that cannot start
-  // answers "failed" here rather than being reported as a restart (2026-10-22, #80).
-  return waitForPid(START_BUDGET_MS) ? "drained" : "failed";
+export function restartAgent(home: string = homeDir(), opts: { waitMs?: number; onProgress?: (msg: string) => void; identityWait?: IdentityWait } = {}, run: Systemctl = realSystemctl, identity: IdentityCheck = (expectedPid) => routerIdentity(home, { expectedPid })): AgentRestart {
+  return withServiceFile(unitPath(), run, guard => {
+    run = guard.run;
+    const owner = unitOwnership(home);
+    if (owner.state === "other") return "other-installation";
+    if (owner.state === "unknown") return "ownership-unknown";
+    // `systemctl restart` stops the running unit first: a running instance must prove it is ours.
+    const pid = agentPid(run);
+    if (pid !== null) {
+      const who = identity(pid);
+      if (who === "other") return "other-installation";
+      if (who !== "ours") return "identity-unknown";
+    }
+    opts.onProgress?.("waiting for in-flight model calls to finish (up to 120s)…");
+    if (!run(["restart", unitName()]).ok) return "failed";
+    // The restart command returned; the successor still has to appear. A unit that cannot start
+    // answers "failed" here rather than being reported as a restart (2026-10-22, #80).
+    if (!waitForPid(START_BUDGET_MS, run)) return "failed";
+    const again = unitOwnership(home);
+    if (again.state === "other") return "other-installation";
+    if (again.state !== "ours") return "ownership-unknown";
+    const successor = agentPid(run);
+    if (successor === null) return "identity-unknown";
+    // The successor has only just started and may not answer yet: wait for its answer instead of
+    // reporting the restart as unverifiable (the launchd defect of 2026-10-26, same code path).
+    const answer = awaitIdentity(identity, successor, () => agentPid(run), opts.identityWait);
+    return answer.state === "ours" ? "drained" : answer.state === "other" ? "other-installation" : "identity-unknown";
+  });
 }
 
 /** How long a unit systemd accepted is given to produce a process before it counts as a failure. */
@@ -145,11 +253,11 @@ function sleepSync(ms: number): void {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
 
-function waitForPid(budgetMs: number, pollMs = 500): boolean {
+function waitForPid(budgetMs: number, run: Systemctl = realSystemctl, pollMs = 500): boolean {
   const deadline = Date.now() + budgetMs;
   while (Date.now() < deadline) {
-    if (agentPid() !== null) return true;
+    if (agentPid(run) !== null) return true;
     sleepSync(pollMs);
   }
-  return agentPid() !== null;
+  return agentPid(run) !== null;
 }

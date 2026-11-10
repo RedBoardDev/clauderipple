@@ -7,14 +7,17 @@ import os from "node:os";
 import path from "node:path";
 import { DEFAULTS, type Config, type ProviderModel } from "../src/config.ts";
 import { Logger } from "../src/log.ts";
-import { backfillContextWindows, effortLevelsForModel, googleHealth, measureUnsettledModels, parseUpdateCheck, startAdmin, type AdminDeps } from "../src/admin.ts";
+import { backfillContextWindows, effortLevelsForModel, googleHealth, measureUnsettledModels, parseUpdateCheck, startAdmin, type AdminDeps, type LimitsProvider } from "../src/admin.ts";
 import type { ChatGptAccountStatus, ImageRequest } from "../src/providers/chatgpt/index.ts";
-import type { LimitsProvider } from "../src/admin.ts";
 import type { GoogleAccountStatus } from "../src/providers/google/index.ts";
+import type { QuotaGroup } from "../src/providers/google/usage.ts";
+import { OpenCodeUsage, type OpenCodeWindow } from "../src/providers/opencode-usage.ts";
+import { MiniMaxUsage } from "../src/providers/minimax-usage.ts";
 import { RequestLog } from "../src/requestlog.ts";
 import { PRESETS } from "../src/presets.ts";
 import { saveClaudeAuthFile, saveClaudeOAuthFile } from "../src/providers/anthropic-token-file.ts";
-import { listClaudeAccounts, markClaudeAccountNeedsReauth, readClaudeAccountsFile, saveClaudeOAuthAccount, setPreferredClaudeAccount, subjectHash } from "../src/providers/anthropic-accounts.ts";
+import { listClaudeAccounts, markClaudeAccountNeedsReauth, readClaudeAccountsFile, readClaudeOAuthAccounts, saveClaudeOAuthAccount, setCurrentClaudeAccountPaused, setPreferredClaudeAccount, subjectHash } from "../src/providers/anthropic-accounts.ts";
+import { PinnedAgentSync, syncAgentFiles } from "../src/agents.ts";
 import { ObservedClaudeCodeAuth } from "../src/providers/anthropic-observed.ts";
 import type { ModOptions } from "../src/admin.ts";
 import type { ModSettingsSnapshot } from "../src/mod-settings.ts";
@@ -36,7 +39,10 @@ async function withAdmin(
     clearCredentialCooldown?: NonNullable<AdminDeps["clearCredentialCooldown"]>;
     claudeClearCooldown?: NonNullable<AdminDeps["claudeClearCooldown"]>;
     providerHealth?: NonNullable<AdminDeps["providerHealth"]>;
+    modelHealth?: NonNullable<AdminDeps["modelHealth"]>;
+    processPriority?: NonNullable<AdminDeps["processPriority"]>;
     shutdown?: () => void;
+    instance?: NonNullable<AdminDeps["instance"]>;
     runCli?: (args: string[], timeout?: number) => Promise<{ ok: boolean; output: string }>;
     startCliDetached?: (args: string[], log: string) => void;
     claudeOAuthFetch?: (url: string, init: RequestInit) => Promise<Response>;
@@ -46,13 +52,16 @@ async function withAdmin(
     measureFetch?: (url: string, init: RequestInit) => Promise<Response>;
     modelCatalog?: () => Promise<unknown>;
     modelScoresFetch?: typeof fetch;
+    configErrors?: NonNullable<AdminDeps["configErrors"]>;
     chatgpt?: NonNullable<AdminDeps["chatgpt"]>;
     google?: NonNullable<AdminDeps["google"]>;
     opencodeUsage?: NonNullable<AdminDeps["opencodeUsage"]>;
+    minimaxUsage?: NonNullable<AdminDeps["minimaxUsage"]>;
     claudeUsage?: NonNullable<AdminDeps["claudeUsage"]>;
     claudeIdentity?: NonNullable<AdminDeps["claudeIdentity"]>;
     googleOAuthFetch?: (url: string, init?: RequestInit) => Promise<Response>;
     googleOAuthPort?: number;
+    agentsChanged?: () => void;
   } = {},
 ): Promise<void> {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "cr-admin-"));
@@ -138,6 +147,108 @@ for (const kind of ["chatgpt", "claude", "google"]) {
   });
 }
 
+// Pinned worker files are named and pinned from the stored accounts, so the admin endpoints that
+// change an account re-derive them instead of waiting for a restart or a config save. The
+// regeneration is a `PinnedAgentSync`, whose notify is what resyncs remote hosts over the tunnels
+// (index.ts wires it to `tunnels.assetsChanged`), so the dashboard path is covered end to end here.
+test("relabelling or removing a Claude account re-derives the generated workers and notifies the tunnels", async () => {
+  let sync: PinnedAgentSync | undefined;
+  let notified = 0;
+  await withAdmin(makeCfg(), async ({ port, home }) => {
+    sync = new PinnedAgentSync({
+      config: makeCfg,
+      home,
+      dir: path.join(home, "agents"),
+      manifestPath: path.join(home, "generated-agents.json"),
+      notify: () => { notified++; },
+    });
+    const id = saveClaudeOAuthAccount(home, { accessToken: "t", refreshToken: "r", expiresAt: Date.now() + 3_600_000, accountId: "upstream" }).id;
+    const patch = await fetch(`${base()}:${port}/api/claude-accounts/${id}`, {
+      method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify({ label: "renamed" }),
+    });
+    assert.equal(patch.status, 200);
+    assert.equal(notified, 1, "a relabel regenerates and tells the tunnels");
+    const del = await fetch(`${base()}:${port}/api/claude-accounts/${id}`, { method: "DELETE" });
+    assert.equal(del.status, 200);
+    assert.equal(notified, 2, "a removal regenerates and tells the tunnels");
+  }, { agentsChanged: () => sync!.regenerate() });
+});
+
+test("mod-options lists a pinned Claude worker with the account it runs on", async () => {
+  const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "cr-pinned-mod-"));
+  const cfg = makeCfg({ providers: { anthropic: { type: "anthropic", auth: "claude-code", accountPool: true, models: [{ id: "claude-opus-5-5", name: "Claude Opus 5.5" }] } } });
+  try {
+    await withAdmin(cfg, async ({ port, home }) => {
+      const account = saveClaudeOAuthAccount(home, { accessToken: "t", refreshToken: "r", expiresAt: Date.now() + 3_600_000, accountId: "upstream", email: "mambo20211@example.test" });
+      syncAgentFiles(cfg, agentDir, undefined, {
+        manifestPath: path.join(home, "generated-agents.json"),
+        pinnedAccounts: () => readClaudeOAuthAccounts(home),
+      });
+      const options = await (await fetch(`${base()}:${port}/api/mod-options`)).json() as ModOptions;
+      const pinned = options.agents.find((agent) => agent.name === `claude-opus-5-5-${account.id.slice(0, 8)}`);
+      assert.ok(pinned, "the pinned worker is a ladder choice");
+      assert.deepEqual([pinned.model, pinned.provider, pinned.account], ["claude-opus-5-5", "anthropic", "mambo20211"]);
+      assert.equal(options.providers.find((provider) => provider.name === "anthropic")?.usable, true, "a stored account keeps the Claude provider usable");
+    }, { agentDir });
+  } finally {
+    fs.rmSync(agentDir, { recursive: true, force: true });
+  }
+});
+
+// The mod settings' account tabs say "계정 n" for the account the limits call "Claude n": the app
+// login is 1, the stored accounts follow in saved order, and one the limits leave out (paused) still
+// gets a number after them so its pinned workers can be shown.
+test("mod-options numbers a pinned worker's account as the limits do", async () => {
+  const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "cr-pinned-number-"));
+  const cfg = makeCfg({ providers: { anthropic: { type: "anthropic", auth: "claude-code", accountPool: true, models: [{ id: "claude-opus-5-5", name: "Claude Opus 5.5" }] } } });
+  try {
+    await withAdmin(cfg, async ({ port, home }) => {
+      const first = saveClaudeOAuthAccount(home, { accessToken: "t1", refreshToken: "r1", expiresAt: Date.now() + 3_600_000, accountId: "one", email: "first@example.test" });
+      const second = saveClaudeOAuthAccount(home, { accessToken: "t2", refreshToken: "r2", expiresAt: Date.now() + 3_600_000, accountId: "two", email: "second@example.test" });
+      syncAgentFiles(cfg, agentDir, undefined, { manifestPath: path.join(home, "generated-agents.json"), pinnedAccounts: () => readClaudeOAuthAccounts(home) });
+      const read = async () => {
+        const options = await (await fetch(`${base()}:${port}/api/mod-options`)).json() as ModOptions;
+        const number = (id: string) => options.agents.find((agent) => agent.name === `claude-opus-5-5-${id.slice(0, 8)}`)?.accountNumber;
+        return { first: number(first.id), second: number(second.id), bare: options.agents.find((agent) => agent.name === "claude-opus-5-5")?.accountNumber, accounts: options.providers.find((provider) => provider.name === "anthropic")?.accounts };
+      };
+      const before = await read();
+      assert.deepEqual([before.first, before.second, before.bare], [2, 3, undefined], "the app login is account 1; an ordinary worker has no number");
+      assert.deepEqual(before.accounts?.map((account) => account.number), [1, 2, 3]);
+      assert.equal(before.accounts?.[1]?.label, accountLabel(home, first.id));
+      const paused = await fetch(`${base()}:${port}/api/claude-accounts/${first.id}`, { method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify({ paused: true }) });
+      assert.equal(paused.status, 200);
+      const after = await read();
+      assert.deepEqual([after.first, after.second], [3, 2], "a paused account leaves the limits' numbering and follows the numbered ones");
+      setCurrentClaudeAccountPaused(home, true);
+      const noCurrent = await read();
+      assert.deepEqual([noCurrent.first, noCurrent.second], [2, 1], "pausing the app login leaves no gap or replacement by its cached identity");
+      assert.deepEqual(noCurrent.accounts?.map((account) => account.number), [1, 2]);
+      assert.equal(noCurrent.accounts?.[0]?.label, accountLabel(home, second.id));
+    }, { agentDir, claudeIdentity: async () => ({ email: "current@example.test", subjectHash: subjectHash("current")! }) });
+  } finally {
+    fs.rmSync(agentDir, { recursive: true, force: true });
+  }
+});
+
+function accountLabel(home: string, id: string): string | undefined {
+  const account = listClaudeAccounts(home).find((entry) => entry.id === id);
+  if (!account) return undefined;
+  return account.email && account.email !== account.label ? `${account.label} · ${account.email}` : account.label;
+}
+
+for (const existing of [false, true]) {
+  test(`PUT /api/config writes ${existing ? "an existing 0644" : "a fresh"} config owner-only`, { skip: process.platform === "win32" }, async () => {
+    const cfg = makeCfg();
+    await withAdmin(cfg, async ({ port, configFile }) => {
+      if (existing) fs.chmodSync(configFile, 0o644);
+      else fs.unlinkSync(configFile);
+      const res = await fetch(`${base()}:${port}/api/config`, { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify(cfg) });
+      assert.equal(res.status, 200);
+      assert.equal(fs.statSync(configFile).mode & 0o777, 0o600);
+    });
+  });
+}
+
 test("PUT /api/config persists credential control flags and refuses invalid or duplicate preferences", async () => {
   const cfg = makeCfg({ providers: { p: { type: "anthropic-compatible", url: "http://127.0.0.1:1", credentials: [{ id: "a", headers: {}, preferred: true, paused: true }] } } });
   await withAdmin(cfg, async ({ port, configFile }) => {
@@ -177,6 +288,26 @@ test("credential cooldown HTTP endpoint clears one key and status exposes all th
   }, { credentials: () => ({ p: pool.report("p", entries) }), clearCredentialCooldown: (provider, id) => pool.clear(provider, id) });
 });
 
+test('status and ladder options expose retirement without disabling sibling models (#94)', async () => {
+  const { ModelHealth, modelDeprecation } = await import('../src/health.ts');
+  const health = new ModelHealth();
+  health.observe('p', 'retired', modelDeprecation(410, 'ModelDeprecated', 100));
+  assert.equal(modelDeprecation(410, 'endpoint gone'), undefined);
+  assert.equal(modelDeprecation(429, 'ModelDeprecated'), undefined);
+  assert.equal(modelDeprecation(404, 'thread_not_found'), undefined);
+  assert.equal(modelDeprecation(404, 'model_not_found'), undefined, 'a key without access is not a retirement');
+  assert.equal(modelDeprecation(404, 'Model x has been deprecated.')?.reason, 'model_deprecated');
+  const cfg = makeCfg({ providers: { p: { type: 'anthropic-compatible', url: 'http://127.0.0.1:1', models: [{ id: 'retired' }, { id: 'active' }] } } });
+  await withAdmin(cfg, async ({ port }) => {
+    const options = await (await fetch(`${base()}:${port}/api/mod-options`)).json() as ModOptions;
+    assert.equal(options.providers[0]?.usable, true);
+    assert.deepEqual(options.providers[0]?.models, { retired: { reason: 'model_deprecated', exhaustedAt: 100 } });
+    const status = await (await fetch(`${base()}:${port}/api/status`)).json() as { providers: Record<string, { models: unknown }> };
+    assert.deepEqual(status.providers.p?.models, { retired: { usable: false, reason: 'model_deprecated', at: 100 } });
+  }, { modelHealth: () => health.snapshot(), modelScoresFetch: async () => new Response('{}') });
+  assert.deepEqual(new ModelHealth().snapshot(), {}, 'a router restart clears retirement');
+});
+
 test("mod options and status expose runtime provider exhaustion and clear it on recovery", async () => {
   const { ProviderHealth, providerExhaustion } = await import('../src/health.ts');
   const health = new ProviderHealth();
@@ -195,6 +326,90 @@ test("mod options and status expose runtime provider exhaustion and clear it on 
     assert.equal(recovered.providers[0]?.usable, true);
     assert.equal(recovered.providers[0]?.reason, undefined);
   }, { providerHealth: () => health.snapshot(), modelScoresFetch: async () => new Response('{}') });
+});
+
+test("mod options leave an OpenCode Go provider out only while every key's plan is spent (#95)", async () => {
+  const cfg = makeCfg({ providers: {
+    go: {
+      type: "openai-compatible", preset: "opencode-go", url: "https://opencode.ai/zen/go/v1",
+      headers: { authorization: "Bearer hidden-default-key" },
+      credentials: [
+        { id: "key-a", headers: { authorization: "Bearer hidden-a" } },
+        { id: "key-b", headers: { authorization: "Bearer hidden-b" } },
+      ],
+      models: [{ id: "deepseek-v4.1-flash" }],
+    },
+  } });
+  const weekly = (percent: number, resetAt: number): OpenCodeWindow => ({ kind: "seven_day", used_percent: percent, window_minutes: 10080, reset_at: resetAt });
+  const soon = Math.round((Date.now() + 3_600_000) / 1000);
+  const later = Math.round((Date.now() + 7_200_000) / 1000);
+  // keyed by the credential id the router's own `/api/limits` read uses.
+  let windows: Record<string, OpenCodeWindow[]> = {};
+  await withAdmin(cfg, async ({ port }) => {
+    const go = async () => ((await (await fetch(`${base()}:${port}/api/mod-options`)).json()) as ModOptions).providers.find((p) => p.name === "go")!;
+    // One key still has room: rotation serves the work, so the provider stays in the ladder.
+    windows = { "key-a": [weekly(100, soon)], "key-b": [weekly(40, later)] };
+    assert.equal((await go()).usable, true);
+    assert.equal((await go()).reason, undefined);
+    // Every key is spent: the provider leaves the ladder until the first key's window resets.
+    windows = { "key-a": [weekly(100, soon), { kind: "five_hour", used_percent: 20, window_minutes: 300 }], "key-b": [weekly(100, later)] };
+    const out = await go();
+    assert.equal(out.usable, false);
+    assert.equal(out.reason, "quota_exhausted");
+    const back = out.exhaustedUntil ?? 0;
+    assert.ok(back > Date.now() && back <= Date.now() + 3_600_000 + 5_000, `key-a's weekly reset lifts it first (${back - Date.now()} ms)`);
+    // A spent five-hour window alone is just as final as the weekly one.
+    windows = { "key-a": [{ kind: "five_hour", used_percent: 100, window_minutes: 300, reset_at: soon }], "key-b": [weekly(100, later)] };
+    assert.equal((await go()).usable, false);
+    // A window whose reset already passed is no evidence: the next read will carry the new percent.
+    windows = { "key-a": [weekly(100, Math.round((Date.now() - 60_000) / 1000))], "key-b": [weekly(100, later)] };
+    assert.equal((await go()).usable, true);
+    // Unknown usage — an empty answer, or one key's read missing — keeps today's answer.
+    windows = {};
+    assert.equal((await go()).usable, true);
+    windows = { "key-a": [weekly(100, soon)] };
+    assert.equal((await go()).usable, true);
+  }, { opencodeUsage: async (_name: string, credentialId?: string) => windows[credentialId ?? ""] ?? [], modelScoresFetch: async () => new Response("{}") });
+});
+
+test("mod options leave a MiniMax provider out while its plan's windows are spent", async () => {
+  const cfg = makeCfg({ providers: {
+    mini: {
+      type: "anthropic-compatible", preset: "minimax", url: "https://api.minimax.io/anthropic",
+      headers: { "x-api-key": "hidden-default-key" },
+      credentials: [
+        { id: "key-a", headers: { "x-api-key": "hidden-a" } },
+        { id: "key-b", headers: { "x-api-key": "hidden-b" } },
+      ],
+      models: [{ id: "MiniMax-M3.1-Flash" }],
+    },
+  } });
+  const weekly = (percent: number, resetAt: number): OpenCodeWindow => ({ kind: "seven_day", used_percent: percent, window_minutes: 10080, reset_at: resetAt });
+  const soon = Math.round((Date.now() + 3_600_000) / 1000);
+  const later = Math.round((Date.now() + 7_200_000) / 1000);
+  let windows: Record<string, OpenCodeWindow[]> = {};
+  await withAdmin(cfg, async ({ port }) => {
+    const mini = async () => ((await (await fetch(`${base()}:${port}/api/mod-options`)).json()) as ModOptions).providers.find((p) => p.name === "mini")!;
+    // One key still has room: rotation serves the work, so the provider stays in the ladder.
+    windows = { "key-a": [weekly(100, soon)], "key-b": [weekly(40, later)] };
+    assert.equal((await mini()).usable, true);
+    assert.equal((await mini()).reason, undefined);
+    // Every key is spent: the provider leaves the ladder until the first key's window resets.
+    windows = { "key-a": [weekly(100, soon)], "key-b": [weekly(100, later)] };
+    const out = await mini();
+    assert.equal(out.usable, false);
+    assert.equal(out.reason, "quota_exhausted");
+    const back = out.exhaustedUntil ?? 0;
+    assert.ok(back > Date.now() && back <= Date.now() + 3_600_000 + 5_000, `key-a's weekly reset lifts it first (${back - Date.now()} ms)`);
+    // A window whose reset already passed is no evidence: the next read will carry the new percent.
+    windows = { "key-a": [weekly(100, Math.round((Date.now() - 60_000) / 1000))], "key-b": [weekly(100, later)] };
+    assert.equal((await mini()).usable, true);
+    // Unknown usage — an empty answer, or one key's read missing — keeps today's answer.
+    windows = {};
+    assert.equal((await mini()).usable, true);
+    windows = { "key-a": [weekly(100, soon)] };
+    assert.equal((await mini()).usable, true);
+  }, { minimaxUsage: async (_name: string, credentialId?: string) => windows[credentialId ?? ""] ?? [], modelScoresFetch: async () => new Response("{}") });
 });
 
 test("mod options count a stored Claude account as signed in when Claude Code's own login is not seen", async () => {
@@ -319,7 +534,8 @@ test("admin mod-settings keeps ten exact previous files and refuses unsupported 
       if (process.platform !== "win32") assert.equal(fs.statSync(backup).mode & 0o777, 0o600);
     }
     const final = fs.readFileSync(file, "utf8");
-    for (const schemaVersion of [undefined, 0, 2, "1", null]) {
+    // 1 is a mod from before the review ladder: its save would drop `domainRules.review`.
+    for (const schemaVersion of [undefined, 0, 1, 3, "2", null]) {
       assert.equal((await putModSettings(port, { schemaVersion, settings: {}, revision: 13 })).status, 426);
     }
     assert.equal((await putModSettings(port, { settings: {}, revision: 0 })).status, 409);
@@ -521,6 +737,70 @@ test("admin mod-settings refuses to overwrite corrupt persistence", async () => 
     assert.equal((await putModSettings(port, { settings: {} })).status, 500);
     assert.equal(fs.readFileSync(file, "utf8"), "{");
   });
+});
+
+test("admin mod-settings renames a rung and an allow-list entry saved under the 0.12.18 worker name (#111)", async () => {
+  const agents = fs.mkdtempSync(path.join(os.tmpdir(), "cr-agent-renames-"));
+  const cfg = makeCfg({ providers: { deepseek: { type: "anthropic-compatible", url: "http://127.0.0.1:9", models: [{ id: "deepseek-ai/DeepSeek-V4.1-Flash-1017" }] } } });
+  const old = "deepseek-ai--eep-eek--4-1--lash-1017";
+  const now = "deepseek-ai-deepseek-v4-1-flash-1017";
+  try {
+    await withAdmin(cfg, async ({ port, home }) => {
+      const steps = (agent: string) => [{ target: { agent }, effort: "high" }];
+      const saved = {
+        rules: { general: { mode: "ladder", rungs: { light: steps(old), standard: steps("gpt-6-1-sol") } } },
+        modes: [{ id: "saved", name: "Saved mode", rungs: { hard: steps(old) }, delegation: "normal", until: "none" }],
+        allow: [old, "gpt-6-1-sol"],
+        allowKnown: [old, "gpt-6-1-sol"],
+      };
+      fs.writeFileSync(path.join(home, "mod-settings.json"), JSON.stringify({ revision: 3, settings: normalizeSettings(saved) }));
+
+      const response = await fetch(`${base()}:${port}/api/mod-settings`);
+      assert.equal(response.status, 200);
+      const settings = ((await response.json()) as ModSettingsSnapshot).settings;
+      assert.deepEqual(settings.rules.general.rungs.light, steps(now), "the renamed worker, not a missing one");
+      assert.deepEqual(settings.rules.general.rungs.standard, steps("gpt-6-1-sol"), "a name that did not change is left alone");
+      assert.deepEqual(settings.modes[0]!.rungs.hard, steps(now), "a saved mode's rung too");
+      assert.deepEqual(settings.allow, [now, "gpt-6-1-sol"], "the ticked worker keeps its tick");
+      assert.deepEqual(settings.allowKnown, [now, "gpt-6-1-sol"]);
+    }, { agentDir: agents });
+  } finally {
+    fs.rmSync(agents, { recursive: true, force: true });
+  }
+});
+
+test("admin mod-settings leaves a hand-written worker at a 0.12.18 name, and every entry naming it, alone", async () => {
+  const agents = fs.mkdtempSync(path.join(os.tmpdir(), "cr-agent-hand-rename-"));
+  // Never generated by the router: a person's own file that happens to carry the name 0.12.18 gave
+  // Vendor/Model, so a saved rung or tick naming it means that worker, not a stale generated one.
+  const legacy = "-endor--odel";
+  const hand = `---\nname: ${legacy}\nmodel: unrelated-model\n---\nMy hand-written worker\n`;
+  fs.writeFileSync(path.join(agents, `${legacy}.md`), hand);
+  const cfg = makeCfg({ providers: { vendor: { type: "anthropic-compatible", url: "http://127.0.0.1:9", models: [{ id: "Vendor/Model" }] } } });
+  try {
+    await withAdmin(cfg, async ({ port, home }) => {
+      const steps = (agent: string) => [{ target: { agent }, effort: "high" }];
+      const saved = normalizeSettings({ rules: { general: { mode: "ladder", rungs: { light: steps(legacy) } } }, allow: [legacy], allowKnown: [legacy] });
+      const store = path.join(home, "mod-settings.json");
+      fs.writeFileSync(store, JSON.stringify({ revision: 3, settings: saved }));
+      const before = fs.readFileSync(store, "utf8");
+
+      const read = ((await (await fetch(`${base()}:${port}/api/mod-settings`)).json()) as ModSettingsSnapshot).settings;
+      assert.deepEqual(read.rules.general.rungs.light, steps(legacy), "the rung keeps the hand worker");
+      assert.deepEqual(read.allow, [legacy], "and so does the tick");
+      assert.equal(fs.readFileSync(store, "utf8"), before, "reading persists no migration");
+
+      assert.equal((await putModSettings(port, { settings: saved, revision: 3 })).status, 200);
+      const stored = (JSON.parse(fs.readFileSync(store, "utf8")) as { settings: ModSettingsSnapshot["settings"] }).settings;
+      assert.deepEqual(stored.rules.general.rungs.light, steps(legacy), "saving keeps it too");
+      assert.deepEqual(stored.allow, [legacy]);
+      const again = ((await (await fetch(`${base()}:${port}/api/mod-settings`)).json()) as ModSettingsSnapshot).settings;
+      assert.deepEqual(again, stored, "a repeated migration is idempotent");
+      assert.equal(fs.readFileSync(path.join(agents, `${legacy}.md`), "utf8"), hand, "the hand file is untouched");
+    }, { agentDir: agents });
+  } finally {
+    fs.rmSync(agents, { recursive: true, force: true });
+  }
 });
 
 test("admin mod-options offers owned workers, every provider model, judge candidates and attributed AA scores", async () => {
@@ -729,6 +1009,133 @@ test("Claude account admin endpoints expose no secrets and rename or remove only
   });
 });
 
+test("the current Claude login can be paused and resumed, but no other account field is writable", async () => {
+  const observed = new ObservedClaudeCodeAuth();
+  observed.observe(["authorization", "Bearer current-login-token"]);
+  await withAdmin(makeCfg(), async ({ port }) => {
+    const endpoint = `${base()}:${port}/api/claude-accounts`;
+    const patch = (body: unknown) => fetch(`${endpoint}/current`, { method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+    const current = async () => (await (await fetch(endpoint)).json() as { current: { paused: boolean; state: string; inUse: boolean } }).current;
+    assert.deepEqual(await current(), { id: "current", label: "Current Claude login", source: "observed", external: true, paused: false, preferred: false, state: "ready", inUse: true });
+    assert.equal((await patch({ paused: true })).status, 200);
+    assert.equal((await current()).paused, true);
+    assert.equal((await current()).state, "paused");
+    assert.equal((await current()).inUse, false);
+    for (const invalid of [null, [], true, {}, { paused: null }, { paused: 1 }, { paused: "true" }]) {
+      const response = await patch(invalid);
+      assert.equal(response.status, 400);
+      assert.deepEqual(await response.json(), { error: "expected {paused: boolean}" });
+    }
+    for (const change of [{ label: "mine" }, { preferred: true }, { clearCooldown: true }, { paused: false, other: true }]) {
+      const response = await patch(change);
+      assert.equal(response.status, 409);
+      assert.deepEqual(await response.json(), { error: "the current Claude login is managed by Claude Code or Claude Desktop" });
+    }
+    const malformed = await fetch(`${endpoint}/current`, { method: "PATCH", headers: { "content-type": "application/json" }, body: "{" });
+    assert.equal(malformed.status, 400);
+    assert.deepEqual(await malformed.json(), { error: "invalid JSON" });
+    assert.equal((await fetch(`${endpoint}/current`, { method: "DELETE" })).status, 409);
+    assert.equal((await current()).paused, true, "rejected edits never resume the login");
+    assert.equal((await patch({ paused: false })).status, 200);
+    assert.equal((await current()).paused, false);
+    assert.equal((await current()).state, "ready");
+    assert.equal((await current()).inUse, true);
+  }, { observedClaudeCodeAuth: observed });
+});
+
+// The paused flag is the live pool state. The usage cache keeps a paused account's last figures for a while,
+// so the flag must not wait for that cache to change.
+test("a paused Claude login or stored account is flagged in status at once, even while the usage cache still holds its figures", async () => {
+  const observed = new ObservedClaudeCodeAuth();
+  observed.observe(["authorization", "Bearer current-login-token"]);
+  const cfg = makeCfg({ providers: { anthropic: { type: "anthropic", auth: "claude-code", accountPool: true } } });
+  const now = Date.now();
+  const quota = { at: now, rate_limits: { primary: { used_percent: 81, window_minutes: 300 } } };
+  let usage: Record<string, Record<string, unknown>> = {};
+  await withAdmin(cfg, async ({ port, home }) => {
+    const stored = saveClaudeOAuthAccount(home, { accessToken: "stored-access", refreshToken: "stored-refresh", expiresAt: now + 3_600_000, accountId: "stored-account" });
+    usage = { current: quota, [stored.id]: quota };
+    const status = async () => (await (await fetch(`${base()}:${port}/api/status`)).json()) as { claude: { accounts: { id: string; label?: string; quota: Record<string, unknown>; paused?: boolean; inUse?: boolean }[] } };
+    const patch = (paused: boolean) => fetch(`${base()}:${port}/api/claude-accounts/${stored.id}`, { method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify({ paused }) });
+    assert.deepEqual((await status()).claude.accounts.map((a) => [a.id, a.paused ?? false]), [["current", false], [stored.id, false]]);
+
+    setCurrentClaudeAccountPaused(home, true);
+    assert.equal((await patch(true)).status, 200);
+    assert.ok(usage.current && usage[stored.id], "the usage cache still holds both accounts' figures");
+    assert.deepEqual((await status()).claude.accounts, [
+      { id: "current", label: "Current Claude login", quota: {}, paused: true },
+      { id: stored.id, label: listClaudeAccounts(home)[0]!.label, quota: {}, paused: true },
+    ]);
+
+    setCurrentClaudeAccountPaused(home, false);
+    assert.equal((await patch(false)).status, 200);
+    const resumed = (await status()).claude.accounts;
+    assert.deepEqual(resumed.map((a) => [a.id, a.paused ?? false]), [["current", false], [stored.id, false]]);
+    assert.deepEqual(resumed[0]!.quota, quota, "resumed, the figures come back from the usage");
+  }, { observedClaudeCodeAuth: observed, claudeUsage: async () => usage, modelScoresFetch: async () => new Response("{}") });
+});
+
+test("a paused machine with no Claude login lists no current login, not even the cache's figures for it", async () => {
+  const now = Date.now();
+  const cfg = makeCfg({ providers: { anthropic: { type: "anthropic", auth: "claude-code", accountPool: true } } });
+  const quota = { at: now, rate_limits: { primary: { used_percent: 81, window_minutes: 300 } } };
+  await withAdmin(cfg, async ({ port, home }) => {
+    setCurrentClaudeAccountPaused(home, true);
+    const status = await (await fetch(`${base()}:${port}/api/status`)).json() as { claude: { accounts: { id: string }[] } };
+    assert.deepEqual(status.claude.accounts, []);
+  }, { claudeUsage: async () => ({ current: quota }), modelScoresFetch: async () => new Response("{}") });
+});
+
+// A shared machine's login need not be stored to exclude it from workers, probes and plan figures.
+test("a paused current Claude login is unavailable to workers and probes and leaves the limits' numbering", async () => {
+  const observed = new ObservedClaudeCodeAuth();
+  observed.observe(["authorization", "Bearer current-login-token"]);
+  const cfg = makeCfg({ providers: { anthropic: { type: "anthropic", auth: "claude-code", accountPool: true } } });
+  const quota = { at: Date.now(), rate_limits: { primary: { used_percent: 81, window_minutes: 300 } } };
+  let usage: Record<string, typeof quota> = { current: quota };
+  await withAdmin(cfg, async ({ port, home }) => {
+    const usable = async () => (await (await fetch(`${base()}:${port}/api/mod-options`)).json() as ModOptions).providers[0]!.usable;
+    const probe = async () => (await (await fetch(`${base()}:${port}/api/providers/probe`, {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ type: "anthropic", auth: "claude-code" }),
+    })).json()) as { ok: boolean; auth: string };
+    // Legacy readers consume plan windows; extra paused/unknown cards carry none.
+    const limits = async () => (await (await fetch(`${base()}:${port}/api/limits`)).json() as { providers: LimitsProvider[] }).providers
+      .map((provider) => ({ ...provider, accounts: provider.accounts.filter((account) => account.windows.length > 0) }))
+      .filter((provider) => provider.accounts.length > 0);
+    const status = async () => (await (await fetch(`${base()}:${port}/api/status`)).json()) as { claude: { accounts: { id: string; inUse?: boolean }[] } };
+    assert.equal(await usable(), true);
+    assert.equal((await probe()).ok, true);
+    setCurrentClaudeAccountPaused(home, true);
+    assert.equal(await usable(), false);
+    const missing = await probe();
+    assert.equal(missing.ok, false);
+    assert.equal(missing.auth, "missing");
+    assert.deepEqual(await limits(), []);
+    const paused = await status();
+    assert.deepEqual(paused.claude.accounts, [{ id: "current", label: "Current Claude login", quota: {}, paused: true }], "the paused login is flagged, and the band gets no cached usage of it");
+    const own = saveClaudeOAuthAccount(home, { accessToken: "own-access", refreshToken: "own-refresh", expiresAt: Date.now() + 3_600_000, accountId: "own" });
+    usage = { current: quota, [own.id]: { ...quota, rate_limits: { primary: { used_percent: 15, window_minutes: 300 } } } };
+    assert.equal(await usable(), true);
+    assert.equal((await probe()).ok, true);
+    const numbered = await limits();
+    assert.deepEqual(numbered[0]!.accounts.map((a) => [a.account, a.inUse, a.windows[0]!.used_percent]), [[0, true, 15]]);
+    // Like a paused stored preference, choosing the current login does not put it back in rotation.
+    const preferred = await fetch(`${base()}:${port}/api/claude-accounts`, { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ preferred: "current" }) });
+    assert.equal(preferred.status, 200);
+    assert.equal((await status()).claude.accounts.find((a) => a.inUse)?.id, own.id);
+    const patchOwn = (paused: boolean) => fetch(`${base()}:${port}/api/claude-accounts/${own.id}`, { method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify({ paused }) });
+    assert.equal((await patchOwn(true)).status, 200);
+    assert.equal(await usable(), false, "a paused stored account cannot keep the paused login's provider usable");
+    assert.equal((await probe()).ok, false);
+    assert.deepEqual(await limits(), []);
+    assert.equal((await patchOwn(false)).status, 200);
+
+    setCurrentClaudeAccountPaused(home, false);
+    assert.equal((await status()).claude.accounts.find((a) => a.inUse)?.id, "current");
+    assert.deepEqual((await limits())[0]!.accounts.map((a) => a.account), [0, 1]);
+  }, { observedClaudeCodeAuth: observed, claudeUsage: async () => usage, modelScoresFetch: async () => new Response("{}") });
+});
+
 test("/api/claude-accounts marks a stored copy of the current Claude login, by subject hash or by email", async () => {
   const uuid = "current-login-uuid";
   await withAdmin(makeCfg(), async ({ port, home }) => {
@@ -799,6 +1206,22 @@ test("/readyz separates readiness from liveness and names each problem", async (
   });
 });
 
+// G-D14: the first read adopts an invalid config so the router can serve the fix, but that is not
+// a healthy router: readiness said "ready" over a config whose routes could not exist.
+test("a config that failed validation is reported as a problem, with its errors", async () => {
+  const errors = ["route x: fallback 0 names unknown provider \"q\""];
+  await withAdmin(makeCfg(), async ({ port }) => {
+    const status = (await (await fetch(`${base()}:${port}/api/status`)).json()) as {
+      readiness: { ready: boolean; problems: string[] }; config: { errors: string[] };
+    };
+    assert.equal(status.readiness.ready, false);
+    assert.ok(status.readiness.problems.includes("config"), status.readiness.problems.join(","));
+    assert.deepEqual(status.config.errors, errors);
+    const ready = await fetch(`${base()}:${port}/readyz`);
+    assert.equal(ready.status, 503);
+  }, { configErrors: () => errors });
+});
+
 test("GET /api/status returns a snapshot", async () => {
   await withAdmin(makeCfg({ providers: { p: { type: "anthropic-compatible", url: "http://127.0.0.1:1" } } }), async ({ port }) => {
     const res = await fetch(`${base()}:${port}/api/status`);
@@ -810,9 +1233,10 @@ test("GET /api/status returns a snapshot", async () => {
     const providers = body.providers as Record<string, { reachable: boolean }>;
     assert.ok("p" in providers);
     assert.equal(providers.p?.reachable, false); // nothing listening on :1
+    assert.deepEqual(body.processPriority, { supported: false, setting: "normal", current: null });
     assert.equal(typeof body.settings, "object");
     assert.equal(typeof body.cliVersion, "string");
-  });
+  }, { processPriority: () => ({ supported: false, setting: "normal", current: null }) });
 });
 
 // The Clients screen labels a model the router cannot search through, and only the router knows
@@ -895,6 +1319,7 @@ test("GET /api/claude-models uses named entries from code and ccd picker surface
   fs.writeFileSync(configFile, JSON.stringify(cfg));
   const log = new Logger(null, 1_000_000, 1, false);
   const admin = await startAdmin({
+    claudeCodeCredentialReaders: noClaudeCodeCredentialReaders,
     config: () => cfg,
     configFile,
     log,
@@ -925,6 +1350,7 @@ test("POST /api/image answers with the image bytes, and refuses a bad request be
   fs.writeFileSync(configFile, JSON.stringify(cfg));
   const asked: ImageRequest[] = [];
   const admin = await startAdmin({
+    claudeCodeCredentialReaders: noClaudeCodeCredentialReaders,
     config: () => cfg,
     configFile,
     log: new Logger(null, 1_000_000, 1, false),
@@ -1030,6 +1456,24 @@ test("PUT /api/config accepts a valid config and saves it atomically", async () 
     const dir = fs.readdirSync(path.dirname(configFile));
     assert.ok(!dir.some((f) => f.includes(".tmp-")));
     setCfg(next);
+  });
+});
+
+test("PUT /api/config warns when accepted rules name an ingress-only provider", async () => {
+  await withAdmin(makeCfg(), async ({ port }) => {
+    const next = makeCfg({
+      providers: { native: { type: "anthropic", auth: "claude-code" } },
+      routes: { slot: { provider: "native", model: "claude-sonnet-5" } },
+      direct: [{ prefix: "native-", provider: "native" }],
+    });
+    const res = await fetch(`${base()}:${port}/api/config`, { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify(next) });
+    assert.equal(res.status, 200);
+    const body = await res.json() as { ok: boolean; warning?: string };
+    assert.equal(body.ok, true);
+    assert.equal(body.warning, [
+      'route "slot" names "native", which serves the OpenAI ingress only; requests for it pass through to Anthropic',
+      'direct rule "native-" names "native", which serves the OpenAI ingress only; requests it matches pass through to Anthropic',
+    ].join("\n"));
   });
 });
 
@@ -1174,6 +1618,7 @@ test("POST /api/providers/probe sends Anthropic API-key headers and treats a mod
   const configFile = path.join(home, "config.json");
   fs.writeFileSync(configFile, JSON.stringify(cfg));
   const admin = await startAdmin({
+    claudeCodeCredentialReaders: noClaudeCodeCredentialReaders,
     config: () => cfg, configFile, log: new Logger(null, 1_000_000, 1, false),
     stats: () => ({ inFlight: 0, messagesInFlight: 0, started: 0, completed: 0, failed: 0 }), health: () => 0, version: "test",
     requests: new RequestLog(path.join(home, "logs", "requests.jsonl")),
@@ -1364,6 +1809,7 @@ test("POST /api/providers/probe reads context_window only when context_length is
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ type: "openai-compatible", url: origin, headers: { authorization: "Bearer k" }, modelsUrl: `${origin}/models`, modelsAuthHeader: "authorization-bearer" }),
       });
+      assert.equal(res.status, 200);
       assert.deepEqual(await res.json(), {
         ok: true,
         auth: "ok",
@@ -1377,6 +1823,50 @@ test("POST /api/providers/probe reads context_window only when context_length is
         ],
       });
     });
+  } finally {
+    await new Promise<void>((resolveP, reject) => upstream.close((error) => error ? reject(error) : resolveP()));
+  }
+});
+
+// A provider being added is filled the same way, because what the form saves is what the probe
+// returned: Hive's `/models` names its models and nothing else.
+test("POST /api/providers/probe fills a window the vendor did not state from the model's catalogue entry", async () => {
+  const upstream = http.createServer((req, res) => {
+    if (req.url === "/v3/models") {
+      res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ object: "list", data: [
+        { id: "deepseek-ai/deepseek-v4.1-flash-1017", object: "model", created: 1, owned_by: "deepseek-ai", shutdown_date: null },
+        { id: "jev-1.13", object: "model", created: 1, owned_by: "jev", shutdown_date: null },
+      ] }));
+      return;
+    }
+    if (req.url === "/v3/chat/completions") {
+      res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ choices: [] }));
+      return;
+    }
+    res.writeHead(404).end();
+  });
+  await new Promise<void>((resolveP) => upstream.listen(0, "127.0.0.1", resolveP));
+  const address = upstream.address();
+  assert.ok(address && typeof address === "object");
+  const origin = `http://127.0.0.1:${address.port}/v3`;
+  const modelCatalog = async (): Promise<unknown> => ({
+    "opencode-go": { models: { "deepseek-v4.1-flash": { limit: { context: 1000000 } } } },
+    scaleway: { models: { "deepseek-v4.1-flash": { limit: { context: 256000 } } } },
+  });
+  try {
+    await withAdmin(makeCfg(), async ({ port }) => {
+      const res = await fetch(`${base()}:${port}/api/providers/probe`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ type: "openai-compatible", url: origin, headers: { authorization: "Bearer secret-key" }, modelsUrl: `${origin}/models`, modelsAuthHeader: "authorization-bearer" }),
+      });
+      assert.equal(res.status, 200);
+      const body = await res.json() as { models: { id: string; contextWindow?: number }[] };
+      assert.deepEqual(body.models.map((model) => [model.id, model.contextWindow]), [
+        ["deepseek-ai/deepseek-v4.1-flash-1017", 256000],
+        ["jev-1.13", undefined],
+      ]);
+    }, { modelCatalog });
   } finally {
     await new Promise<void>((resolveP, reject) => upstream.close((error) => error ? reject(error) : resolveP()));
   }
@@ -1516,6 +2006,7 @@ test("Codex and Claude subscription endpoints invoke the matching CLI command", 
   const configFile = path.join(home, "config.json");
   fs.writeFileSync(configFile, JSON.stringify(cfg));
   const admin = await startAdmin({
+    claudeCodeCredentialReaders: noClaudeCodeCredentialReaders,
     config: () => cfg,
     configFile,
     log: new Logger(null, 1_000_000, 1, false),
@@ -1585,16 +2076,101 @@ test("GET /api/requests filters newest records and returns a summary", async () 
     const reloaded = new RequestLog(path.join(home, "logs", "requests.jsonl"));
     const cfg = makeCfg({ admin: { port: 0 } });
     const log = new Logger(null, 1_000_000, 1, false);
-    const extra = await startAdmin({ config: () => cfg, configFile: path.join(home, "extra-config.json"), log, stats: () => ({ inFlight: 0, messagesInFlight: 0, started: 0, completed: 0, failed: 0 }), health: () => 0, version: "test", requests: reloaded });
+    const extra = await startAdmin({ claudeCodeCredentialReaders: noClaudeCodeCredentialReaders, config: () => cfg, configFile: path.join(home, "extra-config.json"), log, stats: () => ({ inFlight: 0, messagesInFlight: 0, started: 0, completed: 0, failed: 0 }), health: () => 0, version: "test", requests: reloaded });
     try {
       const list = await fetch(`${base()}:${extra.port}/api/requests?n=5&kind=messages`);
       assert.deepEqual((await list.json() as { requests: { id: string }[] }).requests.map((r) => r.id), ["older"]);
       const summary = await fetch(`${base()}:${extra.port}/api/requests/summary?since=3600`);
       const body = await summary.json() as { total: { count: number; ok: number; failed: number; cached: number } };
-      assert.deepEqual(body.total, { count: 2, ok: 1, failed: 1, input: 20, cached: 80, cacheWrite: 0, output: 7, cacheHitPercent: 80, avgMs: 200 });
+      assert.deepEqual(body.total, { count: 2, ok: 1, failed: 1, input: 20, cached: 80, cacheWrite: 0, output: 7, cacheHitPercent: 80, avgMs: 200, conversationTokens: 107, ungroupedRequests: 1, costUsd: 0, unpricedRequests: 1, estimatedRequests: 0 });
     } finally {
       extra.close();
     }
+  });
+});
+
+test("GET /api/requests resolves account names at read time without changing the stored records", async () => {
+  await withAdmin(makeCfg(), async ({ home }) => {
+    const chatgpt = await import("../src/providers/chatgpt/accounts.ts");
+    const google = await import("../src/providers/google/accounts.ts");
+    const expiresAt = Date.now() + 3_600_000;
+    const claude = saveClaudeOAuthAccount(home, { accessToken: "test-claude-token", refreshToken: "test-claude-refresh", expiresAt, email: "claude@example.test" });
+    const gpt = chatgpt.saveChatGptAccount(home, { accessToken: "test-gpt-token", accountId: "test-workspace", expiresAt });
+    chatgpt.updateChatGptAccount(home, gpt.id, { label: "Work ChatGPT" });
+    const gemini = google.saveGoogleAccount(home, { accessToken: "test-google-token", projectId: "test-project", email: "google@example.test", expiresAt });
+    const removed = chatgpt.saveChatGptAccount(home, { accessToken: "removed-token", accountId: "removed-workspace", expiresAt });
+    chatgpt.removeChatGptAccount(home, removed.id);
+    const requests = new RequestLog(path.join(home, "logs", "requests.jsonl"));
+    const old = { id: "old", at: new Date().toISOString(), ms: 100, status: 200, ok: true, kind: "messages" as const, source: "model", target: "model", provider: "claude", stream: true, credential: "#1" };
+    requests.add(old);
+    requests.add({ ...old, id: "borrowed", provider: "borrowed-gpt", account: "codex" });
+    requests.add({ ...old, id: "current-again", account: "current" });
+    requests.add({ ...old, id: "snapshot", provider: "claude", account: "current", accountEmail: "was@example.test" });
+    requests.add({ ...old, id: "codex-only", provider: "codex-login", account: "codex" });
+    requests.add({ ...old, id: "codex-snapshot", provider: "borrowed-gpt", account: "codex", borrowedLabel: "earlier@example.test" });
+    for (const [provider, account] of [["claude", claude.id], ["claude", "current"], ["gpt", gpt.id], ["google", gemini.id], ["gpt", removed.id]] as const) {
+      requests.add({ ...old, id: account, provider, account });
+    }
+    const persisted = fs.readFileSync(path.join(home, "logs", "requests.jsonl"), "utf8");
+    const cfg = makeCfg({ providers: {
+      claude: { type: "anthropic", auth: "claude-code", accountPool: true },
+      gpt: { type: "chatgpt", auth: "own" },
+      "borrowed-gpt": { type: "chatgpt", auth: "borrow-codex" },
+      google: { type: "google", auth: "antigravity" },
+    } });
+    const extra = await startAdmin({ claudeCodeCredentialReaders: noClaudeCodeCredentialReaders, config: () => cfg, configFile: path.join(home, "extra-config.json"), log: new Logger(null, 1_000_000, 1, false), stats: () => ({ inFlight: 0, messagesInFlight: 0, started: 0, completed: 0, failed: 0 }), health: () => 0, version: "test", requests,
+      // Today's login is another person: the rows that were written before the switch must not take its name.
+      claudeIdentity: async () => ({ email: "today@example.test", subjectHash: "test-subject" }),
+      chatgpt: () => ({ quota: {}, auth: {}, accounts: () => ({ "borrowed-gpt": [
+        { id: "codex", label: "codex@example.test", email: "codex@example.test", source: "codex", expiresAt, needsReauth: false, paused: false, preferred: false, state: "ready", inUse: true, active: true, quota: null },
+      ] }) }),
+      google: () => ({ accounts: () => ({ google: [
+        { ...gemini, label: "Runtime Google", state: "ready", inUse: true, active: true },
+      ] }) }),
+    });
+    try {
+      const rows = async () => (await (await fetch(`${base()}:${extra.port}/api/requests`)).json() as { requests: { id: string; accountLabel?: string }[] }).requests;
+      let records = await rows();
+      const label = (id: string) => records.find((row) => row.id === id)?.accountLabel;
+      assert.equal(label(claude.id), "claude@example.test");
+      // A row written before the snapshot existed names nobody, and never today's login.
+      assert.equal(label("current"), undefined);
+      assert.equal(label("current-again"), undefined);
+      assert.equal(label("snapshot"), "was@example.test", "the email that answered is the one kept");
+      assert.equal(label(gpt.id), "Work ChatGPT");
+      assert.equal(label(gemini.id), "Runtime Google", "the same live summary as the accounts tab");
+      // A borrowed Codex row is named by the login it answered as (`borrowedLabel`), never by today's login
+      // (codex@example.test here). A row written before that was kept shows only the owner id.
+      assert.equal(label("codex-snapshot"), "earlier@example.test", "the login that answered keeps its name after a switch");
+      assert.equal(label("borrowed"), "codex", "a borrowed row without a snapshot names no person");
+      assert.equal(label("codex-only"), "codex", "a borrowed row without a snapshot names no person, whatever the provider");
+      assert.equal(label(removed.id), removed.id.slice(0, 8));
+      assert.deepEqual(records.find((row) => row.id === "old"), old, "an old record gains no fields");
+      chatgpt.updateChatGptAccount(home, gpt.id, { label: "Renamed ChatGPT" });
+      records = await rows();
+      assert.equal(label(gpt.id), "Renamed ChatGPT");
+      assert.equal(label("snapshot"), "was@example.test", "a later login does not move the row");
+      assert.equal(requests.list(10).some((record) => "accountLabel" in record), false, "the in-memory records are not enriched in place");
+      assert.equal(fs.readFileSync(path.join(home, "logs", "requests.jsonl"), "utf8"), persisted);
+      assert.doesNotMatch(persisted, /claude@example\.test|google@example\.test|codex@example\.test|today@example\.test|test-claude-token|test-gpt-token|test-workspace|test-google-token|test-project/);
+    } finally { extra.close(); }
+  });
+});
+
+test("GET /api/requests names a borrowed Codex row by the login it answered as, and never by a login later signed in", async () => {
+  await withAdmin(makeCfg({ providers: { claude: { type: "anthropic", auth: "claude-code", accountPool: true } } }), async ({ home }) => {
+    const requests = new RequestLog(path.join(home, "logs", "requests.jsonl"));
+    const old = { id: "codex-row", at: new Date().toISOString(), ms: 100, status: 200, ok: true, kind: "messages" as const, source: "gpt", target: "gpt", provider: "codex-login", stream: true, account: "codex" };
+    requests.add({ ...old, borrowedLabel: "answered@example.test" });
+    requests.add({ ...old, id: "codex-before-snapshot" });
+    // Nothing here reads today's Codex login: the snapshot is the only name a Codex row can have.
+    const extra = await startAdmin({ claudeCodeCredentialReaders: noClaudeCodeCredentialReaders, config: () => makeCfg({ providers: { claude: { type: "anthropic", auth: "claude-code", accountPool: true } } }), configFile: path.join(home, "extra-config.json"), log: new Logger(null, 1_000_000, 1, false), stats: () => ({ inFlight: 0, messagesInFlight: 0, started: 0, completed: 0, failed: 0 }), health: () => 0, version: "test", requests,
+      chatgpt: () => ({ quota: {}, auth: {}, accounts: () => ({}) }) });
+    try {
+      const response = await (await fetch(`${base()}:${extra.port}/api/requests`)).json() as { requests: { id: string; accountLabel?: string }[] };
+      assert.equal(response.requests.find((row) => row.id === "codex-row")?.accountLabel, "answered@example.test");
+      assert.equal(response.requests.find((row) => row.id === "codex-before-snapshot")?.accountLabel, "codex", "only the owner id, never a person");
+    } finally { extra.close(); }
   });
 });
 
@@ -1607,7 +2183,7 @@ test("GET /api/requests takes a comma-separated kind list", async () => {
     const reloaded = new RequestLog(path.join(home, "logs", "requests.jsonl"));
     const cfg = makeCfg({ admin: { port: 0 } });
     const log = new Logger(null, 1_000_000, 1, false);
-    const extra = await startAdmin({ config: () => cfg, configFile: path.join(home, "extra-config.json"), log, stats: () => ({ inFlight: 0, messagesInFlight: 0, started: 0, completed: 0, failed: 0 }), health: () => 0, version: "test", requests: reloaded });
+    const extra = await startAdmin({ claudeCodeCredentialReaders: noClaudeCodeCredentialReaders, config: () => cfg, configFile: path.join(home, "extra-config.json"), log, stats: () => ({ inFlight: 0, messagesInFlight: 0, started: 0, completed: 0, failed: 0 }), health: () => 0, version: "test", requests: reloaded });
     try {
       const ids = async (query: string): Promise<string[]> =>
         ((await (await fetch(`${base()}:${extra.port}/api/requests?n=10&${query}`)).json()) as { requests: { id: string }[] }).requests.map((r) => r.id);
@@ -1630,7 +2206,7 @@ test("GET /api/requests/summary?from=&to= answers any period from hourly usage",
     const reloaded = new RequestLog(path.join(home, "logs", "requests.jsonl"));
     const cfg = makeCfg({ admin: { port: 0 } });
     const log = new Logger(null, 1_000_000, 1, false);
-    const extra = await startAdmin({ config: () => cfg, configFile: path.join(home, "extra-config.json"), log, stats: () => ({ inFlight: 0, messagesInFlight: 0, started: 0, completed: 0, failed: 0 }), health: () => 0, version: "test", requests: reloaded });
+    const extra = await startAdmin({ claudeCodeCredentialReaders: noClaudeCodeCredentialReaders, config: () => cfg, configFile: path.join(home, "extra-config.json"), log, stats: () => ({ inFlight: 0, messagesInFlight: 0, started: 0, completed: 0, failed: 0 }), health: () => 0, version: "test", requests: reloaded });
     try {
       const from = Date.parse("2026-10-20T00:00:00.000Z");
       const to = Date.parse("2026-10-21T00:00:00.000Z");
@@ -1751,6 +2327,50 @@ test("POST /api/shutdown reports 501 when the router supplied no drain hook", as
     const res = await fetch(`${base()}:${port}/api/shutdown`, { method: "POST" });
     assert.equal(res.status, 501);
   });
+});
+
+test("POST /api/shutdown refuses another installation's id, accepts its own and an older CLI", async () => {
+  let called = 0;
+  const ours = "a".repeat(32);
+  await withAdmin(
+    makeCfg(),
+    async ({ port, home }) => {
+      // A file rewritten while the process runs must not change what this process is.
+      fs.writeFileSync(path.join(home, "installation-id"), `${"d".repeat(32)}\n`, { mode: 0o600 });
+      const post = (id?: string) => fetch(`${base()}:${port}/api/shutdown`, { method: "POST", ...(id ? { headers: { "x-clauderipple-install-id": id } } : {}) });
+
+      const foreign = await post("b".repeat(32));
+      assert.equal(foreign.status, 409);
+      assert.equal(called, 0, "another installation's request never drains this router");
+      const disk = await post("d".repeat(32));
+      assert.equal(disk.status, 409, "the id captured at start, not the file on disk, decides");
+
+      const own = await post(ours);
+      assert.equal(own.status, 202);
+      assert.equal(called, 1);
+
+      // A CLI from before the id existed sends no header; it keeps working as it did.
+      const legacy = await post();
+      assert.equal(legacy.status, 202);
+      assert.equal(called, 2);
+    },
+    { shutdown: () => void called++, instance: { installId: ours, pid: 4242 } },
+  );
+});
+
+test("status reports the identity this process captured at start", async () => {
+  const ctx = { installId: "c".repeat(32), pid: 5150 };
+  await withAdmin(makeCfg(), async ({ port, home }) => {
+    const read = async () => (await (await fetch(`${base()}:${port}/api/status`)).json()) as { installId?: unknown; pid?: unknown };
+    const before = await read();
+    assert.equal(before.installId, ctx.installId);
+    assert.equal(before.pid, ctx.pid);
+    // The file changing later is not this process's identity.
+    fs.writeFileSync(path.join(home, "installation-id"), `${"e".repeat(32)}\n`, { mode: 0o600 });
+    const after = await read();
+    assert.equal(after.installId, ctx.installId);
+    assert.equal(after.pid, ctx.pid);
+  }, { instance: ctx });
 });
 
 test("admin rejects rebinding Hosts and foreign write Origins but accepts dashboard and tray requests", async () => {
@@ -1885,6 +2505,7 @@ test("GET /api/claude-models de-duplicates surfaces and drops our own injected i
     { id: "gpt-5.6-terra", name: "GPT-5.6 Terra" },
   ];
   const admin = await startAdmin({
+    claudeCodeCredentialReaders: noClaudeCodeCredentialReaders,
     config: () => cfg,
     configFile,
     log: new Logger(null, 1_000_000, 1, false),
@@ -1901,6 +2522,42 @@ test("GET /api/claude-models de-duplicates surfaces and drops our own injected i
   try {
     const body = (await (await fetch(`${base()}:${admin.port}/api/claude-models`)).json()) as { source: string; models: { id: string }[] };
     assert.equal(body.source, "picker");
+    assert.deepEqual(body.models.map((m) => m.id), ["claude-opus-5", "claude-sonnet-5"]);
+  } finally {
+    admin.close();
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("GET /api/claude-models keeps a Claude model ticked for the picker: only what was injected is ours", async () => {
+  // Ticking Opus 5 for the picker puts it in extraModels, but the app lists it already and nothing
+  // is injected for it. Dropping it by config hid it from the mapping sources.
+  const cfg = makeCfg({ cli: { extraModels: [{ model: "claude-opus-5", name: "Opus 5" }, { model: "gpt-5.6-terra", name: "GPT-5.6 Terra" }] } });
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "cr-picker-native-"));
+  const configFile = path.join(home, "config.json");
+  fs.writeFileSync(configFile, JSON.stringify(cfg));
+  const entries = [
+    { id: "claude-opus-5", name: "Opus 5" },
+    { id: "claude-sonnet-5", name: "Sonnet 5" },
+    { id: "gpt-5.6-terra", name: "GPT-5.6 Terra" },
+  ];
+  const admin = await startAdmin({
+    claudeCodeCredentialReaders: noClaudeCodeCredentialReaders,
+    config: () => cfg,
+    configFile,
+    log: new Logger(null, 1_000_000, 1, false),
+    stats: () => ({ inFlight: 0, messagesInFlight: 0, started: 0, completed: 0, failed: 0 }),
+    health: () => 0,
+    version: "0.0.0-test",
+    requests: new RequestLog(path.join(home, "logs", "requests.jsonl")),
+    picker: () => ({
+      enabled: true,
+      hosts: ["claude.ai"],
+      last: { surfaces: [{ id: "code", entries, injected: ["gpt-5.6-terra"] }, { id: "ccd", entries, injected: ["gpt-5.6-terra"] }] },
+    }),
+  });
+  try {
+    const body = (await (await fetch(`${base()}:${admin.port}/api/claude-models`)).json()) as { source: string; models: { id: string }[] };
     assert.deepEqual(body.models.map((m) => m.id), ["claude-opus-5", "claude-sonnet-5"]);
   } finally {
     admin.close();
@@ -2547,7 +3204,8 @@ test("backfillContextWindows fills only models without a window, leaving a set o
           preset: "opencode-go",
           headers: { authorization: "Bearer sk-test" },
           models: [
-            { id: "muse-spark-1.3-contributor", name: "Muse" },
+            // A saved null is blank too: the live config carried `"contextWindow": null` (2026-10-28).
+            { id: "muse-spark-1.3-contributor", name: "Muse", contextWindow: null as unknown as number },
             { id: "deepseek-v4.1-flash", name: "DeepSeek", contextWindow: 123 },
             { id: "not-listed", name: "Unlisted" },
           ],
@@ -2573,6 +3231,79 @@ test("backfillContextWindows fills only models without a window, leaving a set o
   } finally {
     fs.rmSync(home, { recursive: true, force: true });
   }
+});
+
+// Hive's `/models` states `object, created, owned_by, shutdown_date` and nothing else, and models.dev
+// has no block for it: the window comes from the same model filed under a provider it does know.
+test("backfillContextWindows fills a provider with no catalogue block from the same model's entry elsewhere", async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "cr-window-"));
+  try {
+    const cfg = makeCfg({
+      providers: {
+        hive: {
+          type: "openai-compatible",
+          url: "https://api-cdn.thehive.ai/api/v3",
+          headers: { authorization: "Bearer sk-test" },
+          models: [
+            { id: "deepseek-ai/deepseek-v4.1-flash-1017", name: "DeepSeek V4.1 Flash" },
+            { id: "zai-org/glm-5.3-flash", name: "GLM-5.3 Flash", contextWindow: 111 },
+            { id: "jev-1.13", name: "JEV" },
+          ],
+        },
+      },
+    });
+    const configFile = path.join(home, "config.json");
+    fs.writeFileSync(configFile, JSON.stringify(cfg, null, 2));
+    const lines: string[] = [];
+    const log = new Logger(null, 1_000_000, 1, false);
+    log.info = (msg: string) => { lines.push(msg); };
+    const modelCatalog = async (): Promise<unknown> => ({
+      "opencode-go": { models: { "deepseek-v4.1-flash": { limit: { context: 1000000 } }, "glm-5.3-flash": { limit: { context: 1000000 } } } },
+      scaleway: { models: { "deepseek-v4.1-flash": { limit: { context: 256000 } } } },
+    });
+    const deps = { config: () => cfg, configFile, log, modelCatalog } as unknown as AdminDeps;
+    assert.deepEqual(await backfillContextWindows(deps), ["hive/deepseek-ai/deepseek-v4.1-flash-1017"]);
+    const models = (JSON.parse(fs.readFileSync(configFile, "utf8")) as Config).providers.hive!.models!;
+    assert.equal(models.find((m) => m.id === "deepseek-ai/deepseek-v4.1-flash-1017")?.contextWindow, 256000, "the smallest window the catalogue states");
+    assert.equal(models.find((m) => m.id === "zai-org/glm-5.3-flash")?.contextWindow, 111, "the operator's own window stands");
+    assert.equal("contextWindow" in (models.find((m) => m.id === "jev-1.13") ?? {}), false, "a model the catalogue does not list stays blank");
+    assert.ok(lines.some((line) => line === "admin: hive/deepseek-ai/deepseek-v4.1-flash-1017 context window 256000 (catalogue)"), `expected the catalogue log line, got ${JSON.stringify(lines)}`);
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+// The same fold on the measurement path, which is what a provider saved by hand goes through.
+test("measurement gives a provider with no catalogue block the window its model has elsewhere", async () => {
+  const cfg = makeCfg({
+    providers: {
+      hive: {
+        type: "openai-compatible",
+        url: "https://api-cdn.thehive.ai/api/v3",
+        wire: "chat",
+        headers: { authorization: "Bearer sk-test" },
+        models: [
+          { id: "deepseek-ai/deepseek-v4.1-flash-1017", name: "DeepSeek V4.1 Flash" },
+          { id: "zai-org/glm-5.3-flash", name: "GLM-5.3 Flash", contextWindow: 777 },
+        ],
+      },
+    },
+  });
+  const modelCatalog = async (): Promise<unknown> => ({
+    "opencode-go": { models: { "deepseek-v4.1-flash": { limit: { context: 1000000 } }, "glm-5.3-flash": { limit: { context: 1000000 } } } },
+    scaleway: { models: { "deepseek-v4.1-flash": { limit: { context: 256000 } } } },
+  });
+  const measureFetch = async (): Promise<Response> => new Response("{}", { status: 200 });
+  await withAdmin(cfg, async ({ port, configFile }) => {
+    const started = await fetch(`${base()}:${port}/api/providers/measure`, {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ provider: "hive", models: ["deepseek-ai/deepseek-v4.1-flash-1017", "zai-org/glm-5.3-flash"] }),
+    });
+    const job = await pollMeasure(port, ((await started.json()) as { jobId: string }).jobId);
+    assert.equal(job.state, "done");
+    const models = (JSON.parse(fs.readFileSync(configFile, "utf8")) as Config).providers.hive!.models!;
+    assert.equal(models.find((m) => m.id === "deepseek-ai/deepseek-v4.1-flash-1017")?.contextWindow, 256000);
+    assert.equal(models.find((m) => m.id === "zai-org/glm-5.3-flash")?.contextWindow, 777, "a window already set is not overwritten");
+  }, { measureFetch, modelCatalog });
 });
 
 test("a model the plan refuses is still reported when the catalogue lists it", async () => {
@@ -2802,6 +3533,94 @@ test("measureUnsettledModels: discovers effort for a ladderless provider's unset
   }
 });
 
+// Ollama states a model's thinking levels and context length in its own `/api/show`. Its
+// OpenAI-compatible surface reports ids alone and ignores an unknown `reasoning_effort`, which a
+// probe measured as "no effort" — an empty ladder that then looked settled (Discord, 0.12.14).
+test("an Ollama model's effort and context come from /api/show, and an empty ladder is filled", async () => {
+  const cfg = makeCfg({
+    providers: {
+      "ollama-cloud": {
+        type: "openai-compatible",
+        url: "https://ollama.com/v1",
+        headers: { authorization: "Bearer key" },
+        caps: { reasoning: "none", effortLevels: [] },
+        models: [
+          { id: "gpt-oss:120b", name: "GPT-OSS 120B", effortLevels: [] },
+          { id: "qwen3:235b", name: "Qwen3 235B", effortLevels: ["low"] },
+        ],
+      },
+    },
+  });
+  const calls: { url: string; body: Record<string, unknown> }[] = [];
+  const measureFetch = async (url: string, init: RequestInit): Promise<Response> => {
+    const body = init.body ? JSON.parse(String(init.body)) as Record<string, unknown> : {};
+    calls.push({ url, body });
+    if (!url.endsWith("/api/show")) return new Response("{}", { status: 200 });
+    return new Response(JSON.stringify(body.model === "gpt-oss:120b"
+      ? { thinking: { values: ["low", "medium", "high"] }, model_info: { "gptoss.context_length": 1048576 } }
+      : { model_info: { "qwen3.context_length": 262144 } }), { status: 200 });
+  };
+  await withAdmin(cfg, async ({ port, configFile }) => {
+    const started = await fetch(`${base()}:${port}/api/providers/measure`, {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ provider: "ollama-cloud", models: ["gpt-oss:120b", "qwen3:235b"] }),
+    });
+    const job = await pollMeasure(port, ((await started.json()) as { jobId: string }).jobId);
+    assert.equal(job.state, "done");
+    assert.deepEqual(calls.filter((c) => c.url === "https://ollama.com/api/show").map((c) => c.body.model), ["gpt-oss:120b", "qwen3:235b"]);
+    assert.equal(calls.some((c) => "reasoning_effort" in c.body), false, "no ladder probing: the vendor states it");
+    const models = (JSON.parse(fs.readFileSync(configFile, "utf8")) as Config).providers["ollama-cloud"]!.models!;
+    assert.deepEqual(models.find((m) => m.id === "gpt-oss:120b")?.effortLevels, ["low", "medium", "high"], "an empty ladder is a blank on Ollama");
+    assert.equal(models.find((m) => m.id === "gpt-oss:120b")?.contextWindow, 1048576);
+    assert.deepEqual(models.find((m) => m.id === "qwen3:235b")?.effortLevels, ["low"], "a ladder someone set stands");
+    assert.equal(models.find((m) => m.id === "qwen3:235b")?.contextWindow, 262144);
+  }, { measureFetch });
+});
+
+test("measureUnsettledModels re-measures Ollama's empty ladders, and leaves an empty one elsewhere", async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "cr-ollama-"));
+  try {
+    const cfg = makeCfg({
+      providers: {
+        ollama: {
+          type: "openai-compatible",
+          url: "http://127.0.0.1:11434/v1",
+          preset: "ollama",
+          caps: { reasoning: "none", effortLevels: [] },
+          models: [{ id: "llama3.3" }, { id: "qwen3", effortLevels: [] }, { id: "settled", effortLevels: ["low"] }],
+        },
+        // Same empty ladder, but not Ollama: there an empty ladder is a decision and stands.
+        groq: { type: "openai-compatible", url: "http://127.0.0.1:9/v1", wire: "chat", caps: { reasoning: "none", effortLevels: [] }, models: [{ id: "llama-4", effortLevels: [] }, { id: "blank" }] },
+      },
+    });
+    const configFile = path.join(home, "config.json");
+    fs.writeFileSync(configFile, JSON.stringify(cfg, null, 2));
+    const asked: string[] = [];
+    const measureFetch = async (url: string, init: RequestInit): Promise<Response> => {
+      const model = (JSON.parse(String(init.body)) as { model: string }).model;
+      asked.push(model);
+      if (!url.endsWith("/api/show")) return new Response("{}", { status: 200 });
+      return new Response(JSON.stringify({ thinking: { values: ["low", "high"] }, model_info: { "qwen3.context_length": 131072 } }), { status: 200 });
+    };
+    const deps = { config: () => cfg, configFile, log: new Logger(null, 1_000_000, 1, false), measureFetch } as unknown as AdminDeps;
+    assert.equal(measureUnsettledModels(deps), 2, "the Ollama provider and the ladderless one");
+    let onDisk: Config | undefined;
+    const models = () => onDisk?.providers.ollama?.models ?? [];
+    for (let i = 0; i < 200 && !(models().find((m) => m.id === "llama3.3")?.effortLevels?.length && models().find((m) => m.id === "qwen3")?.contextWindow); i++) {
+      await new Promise((resolveP) => setTimeout(resolveP, 5));
+      onDisk = JSON.parse(fs.readFileSync(configFile, "utf8")) as Config;
+    }
+    assert.deepEqual(models().find((m) => m.id === "llama3.3")?.effortLevels, ["low", "high"], "an unset ladder is stated now");
+    assert.deepEqual(models().find((m) => m.id === "qwen3")?.effortLevels, ["low", "high"], "the empty ladder is replaced");
+    assert.equal(models().find((m) => m.id === "qwen3")?.contextWindow, 131072);
+    assert.deepEqual(models().find((m) => m.id === "settled")?.effortLevels, ["low"], "a ladder someone set stands");
+    assert.deepEqual(onDisk?.providers.groq?.models?.[0]?.effortLevels, [], "an empty ladder elsewhere is still a decision");
+    assert.ok(!asked.includes("settled"), `a settled model is not measured: ${JSON.stringify(asked)}`);
+    assert.ok(!asked.includes("llama-4"), `a non-Ollama empty ladder is not measured: ${JSON.stringify(asked)}`);
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
 test("POST /api/providers/probe[grok] lists the proxy's models with the headers live traffic sends, and warns", async () => {
   const grokHomeDir = fs.mkdtempSync(path.join(os.tmpdir(), "cr-grok-probe-"));
   fs.writeFileSync(path.join(grokHomeDir, "auth.json"), JSON.stringify({ "https://auth.x.ai::u": { key: "grok-session-secret", expires_at: new Date(Date.now() + 5 * 3600_000).toISOString() } }));
@@ -2913,7 +3732,7 @@ test("limits lists every Claude and ChatGPT account with identity, activity, pre
     { id: "gpt-work", label: "Work", email: "work@example.test", source: "own", expiresAt: now + 3600_000, needsReauth: false, paused: false, preferred: false, state: "cooling", cooldownSeconds: 60, active: true, inUse: false, quota },
     { id: "gpt-personal", label: "Personal", source: "own", expiresAt: now + 3600_000, needsReauth: false, paused: false, preferred: true, state: "ready", active: false, inUse: true, quota: null },
   ];
-  await withAdmin(makeCfg({ providers: { claude: { type: "anthropic", auth: "claude-code" }, gpt: { type: "chatgpt" } } }), async ({ port, home }) => {
+  await withAdmin(makeCfg({ providers: { claude: { type: "anthropic", auth: "claude-code", accountPool: true }, gpt: { type: "chatgpt" } } }), async ({ port, home }) => {
     const stored = saveClaudeOAuthAccount(home, { accessToken: "test-access", refreshToken: "test-refresh", expiresAt: now - 1, accountId: "other-test-account", email: "other@example.test" });
     setPreferredClaudeAccount(home, stored.id);
     const body = await (await fetch(`${base()}:${port}/api/limits`)).json() as { providers: LimitsProvider[] };
@@ -2964,22 +3783,86 @@ test("limits lists every Claude and ChatGPT account with identity, activity, pre
   });
 });
 
-test("GET /api/limits gives the mod's legacy windows to the upstream pool's selected Claude account only", async () => {
+test("GET /api/limits enriches every Claude account and follows the upstream pool's inUse mark", async () => {
   const now = Date.now();
   const quota = (five: number) => ({ at: now, rate_limits: { primary: { used_percent: five, window_minutes: 300, reset_at: (now + 3600_000) / 1000 } } });
   let active = "current";
-  await withAdmin(makeCfg({ providers: { claude: { type: "anthropic", auth: "claude-code" } } }), async ({ port, home }) => {
+  await withAdmin(makeCfg({ providers: { claude: { type: "anthropic", auth: "claude-code", accountPool: true } } }), async ({ port, home }) => {
     const stored = saveClaudeOAuthAccount(home, { accessToken: "legacy-access", refreshToken: "legacy-refresh", expiresAt: now + 3600_000, accountId: "legacy-account", email: "legacy@example.test" });
     const read = async () => ((await (await fetch(`${base()}:${port}/api/limits`)).json()) as { providers: LimitsProvider[] }).providers[0]!.accounts;
     const first = await read();
-    assert.deepEqual(first.map((a) => a.windows.length > 0), [true, false]);
+    assert.deepEqual(first.map((a) => a.windows[0]?.used_percent), [3, 22], "every account keeps its own legacy windows");
     assert.deepEqual(first.map((a) => a.usageWindows?.fiveHour?.usedPercent), [3, 22], "the Status page still sees every account");
+    assert.deepEqual(first.map((a) => a.inUse === true), [true, false]);
     active = stored.id;
-    assert.deepEqual((await read()).map((a) => a.windows.length > 0), [false, true]);
+    const switched = await read();
+    assert.deepEqual(switched.map((a) => a.windows[0]?.used_percent), [3, 22], "selection never hides another account's windows");
+    assert.deepEqual(switched.map((a) => a.inUse === true), [false, true]);
   }, {
     claudeUsage: async () => ({ current: quota(3), [listClaudeAccounts(process.env.CLAUDERIPPLE_HOME!)[0]!.id]: quota(22) }),
     credentials: () => ({ claude: [{ id: "current", state: "ready", failures: 0, inUse: active === "current" }, ...listClaudeAccounts(process.env.CLAUDERIPPLE_HOME!).map((account) => ({ id: account.id, state: "ready", failures: 0, inUse: account.id === active }))] }),
   });
+});
+
+test("GET /api/limits keeps Argon weekly separate from Gemini and hides only unselected 3P windows", async () => {
+  const now = Date.now();
+  const resetAt = Math.floor((now + 7 * 86_400_000) / 1000);
+  const resetTime = new Date(resetAt * 1000).toISOString();
+  const bucket = (bucketId: string, window: string, remainingFraction: number) => ({ bucketId, displayName: window, window, remainingFraction, resetTime });
+  const gemini: QuotaGroup = { displayName: "Gemini Models", buckets: [bucket("gemini-5h", "5h", 0.87), bucket("gemini-weekly", "weekly", 0.76)] };
+  const argon: QuotaGroup = { displayName: "Gemini 4 Argon", buckets: [bucket("gemini-argon-wtu-weekly", "weekly", 0.35)] };
+  const thirdParty: QuotaGroup = { displayName: "Claude and GPT models", buckets: [bucket("3p-5h", "5h", 0.45), bucket("3p-weekly", "weekly", 0.25)] };
+  const account = (id: string, state: GoogleAccountStatus["state"] = "ready"): GoogleAccountStatus => ({
+    id, label: id, projectId: `project-${id}`, expiresAt: now + 3_600_000, needsReauth: state === "needs-login",
+    paused: state === "paused", preferred: false, inUse: id === "a", state, active: id === "a",
+  });
+  const groups: Record<string, QuotaGroup[]> = {
+    a: [gemini, thirdParty, argon],
+    // Missing Argon stays unknown, not a copy of this account's general Gemini windows.
+    b: [gemini, thirdParty],
+    c: [argon],
+    paused: [gemini, thirdParty, argon],
+    login: [gemini, thirdParty, argon],
+  };
+  const cfg = makeCfg({ providers: { gem: { type: "google", auth: "antigravity", models: [{ id: "gemini-4-argon" }] } } });
+  const generalWindows = [
+    { kind: "five_hour", used_percent: 13, window_minutes: 300, reset_at: resetAt },
+    { kind: "seven_day", used_percent: 24, window_minutes: 10080, reset_at: resetAt },
+  ];
+  const argonWindow = { kind: "scoped", label: "Argon weekly", used_percent: 65, window_minutes: 10080, reset_at: resetAt };
+  const thirdPartyWindows = [
+    { kind: "scoped", label: "3P", used_percent: 55, window_minutes: 300, reset_at: resetAt },
+    { kind: "scoped", label: "3P", used_percent: 75, window_minutes: 10080, reset_at: resetAt },
+  ];
+  await withAdmin(cfg, async ({ port, setCfg }) => {
+    const read = async () => {
+      const response = await fetch(`${base()}:${port}/api/limits`);
+      assert.equal(response.status, 200);
+      const body = await response.json() as { providers: LimitsProvider[] };
+      assert.deepEqual(body.providers.map(p => [p.provider, p.type, p.title]), [["gem", "google", "Gemini"]]);
+      return body.providers[0]!.accounts;
+    };
+    // Selecting no models, Argon alone, or any other Gemini model never makes Argon a 3P quota.
+    for (const ids of [[], ["gemini-4-argon"], ["gemini-3.8-flash"], ["gemini-3.8-flash", "gemini-4-argon"]]) {
+      setCfg({ ...cfg, providers: { gem: { type: "google", auth: "antigravity", models: ids.map(id => ({ id })) } } });
+      const accounts = await read();
+      assert.deepEqual(accounts.map(a => a.account), [0, 1, 2], "paused and needs-login accounts are omitted");
+      assert.deepEqual(accounts.map(a => a.windows), [
+        [...generalWindows, argonWindow], generalWindows, [argonWindow],
+      ], `Gemini and Argon remain independent with ${JSON.stringify(ids)} selected`);
+    }
+    // Either supported third-party family enables its windows without relabeling Argon or Gemini.
+    for (const id of ["claude-sonnet-5-5-low", "gpt-oss-120b-medium"]) {
+      setCfg({ ...cfg, providers: { gem: { type: "google", auth: "antigravity", models: [{ id: "gemini-4-argon" }, { id }] } } });
+      const accounts = await read();
+      assert.deepEqual(accounts.map(a => a.windows), [
+        [...generalWindows, ...thirdPartyWindows, argonWindow], [...generalWindows, ...thirdPartyWindows], [argonWindow],
+      ]);
+    }
+  }, { google: () => ({
+    accounts: () => ({ gem: [account("paused", "paused"), account("a"), account("login", "needs-login"), account("b"), account("c")] }),
+    usage: async (name: string) => { assert.equal(name, "gem"); return groups; },
+  }) });
 });
 
 test("GET /api/limits assembles every readable provider and honours limits:false", async () => {
@@ -3035,4 +3918,295 @@ test("GET /api/limits assembles every readable provider and honours limits:false
       { kind: "window", used_percent: 92, window_minutes: 43200, reset_at: future },
     ] : [],
   });
+});
+
+test("GET /api/limits lists a MiniMax plan's five-hour and weekly windows", async () => {
+  const now = Date.now();
+  const future = Math.floor((now + 3_600_000) / 1000);
+  const cfg = makeCfg({ providers: {
+    mini: {
+      type: "anthropic-compatible", preset: "minimax", url: "https://api.minimax.io/anthropic",
+      headers: { "x-api-key": "hidden-key" },
+      credentials: [
+        { id: "key-a", label: "A", headers: { "x-api-key": "hidden-a" } },
+        { id: "key-b", headers: { "x-api-key": "hidden-b" } },
+      ],
+    },
+    // A MiniMax key that is on no plan answers nothing: no row at all.
+    payg: { type: "anthropic-compatible", url: "https://api.minimax.io/anthropic", headers: { "x-api-key": "hidden-key" } },
+    quiet: { type: "anthropic-compatible", preset: "minimax", url: "https://api.minimax.io/anthropic", limits: false },
+  } });
+  await withAdmin(cfg, async ({ port }) => {
+    const res = await fetch(`${base()}:${port}/api/limits`);
+    assert.equal(res.status, 200);
+    const body = (await res.json()) as { providers: LimitsProvider[] };
+    assert.deepEqual(body.providers.map((p) => [p.provider, p.type, p.title]), [["mini", "minimax", "MiniMax"]]);
+    // One account per key, in the configured order, each with its own plan windows.
+    assert.deepEqual(body.providers[0]!.accounts.map((a) => [a.account, a.label]), [[0, "A"], [1, undefined]]);
+    assert.deepEqual(body.providers[0]!.accounts[0]!.windows.map((w) => [w.kind, w.used_percent, w.window_minutes]), [
+      ["five_hour", 9, 300],
+      ["seven_day", 1, 10080],
+    ]);
+    assert.equal(body.providers[0]!.accounts[0]!.windows[0]!.reset_at, future);
+    // The forecast's series key is internal: no account row carries a credential id.
+    assert.equal(body.providers[0]!.accounts.some((a) => "id" in a), false);
+  }, {
+    minimaxUsage: async (name: string, credentialId?: string) => name === "mini" && credentialId === "key-a" ? [
+      { kind: "five_hour", used_percent: 9, window_minutes: 300, reset_at: future },
+      { kind: "seven_day", used_percent: 1, window_minutes: 10080, reset_at: future },
+    ] : [],
+  });
+});
+
+test("GET /api/limits forecasts a window whose average pace reaches 100% before its reset, and no other", async () => {
+  const now = Date.now();
+  const nowS = Math.floor(now / 1000);
+  const cfg = makeCfg({ providers: {
+    mini: { type: "anthropic-compatible", preset: "minimax", url: "https://api.minimax.io/anthropic", credentials: [{ id: "key-a", label: "A", headers: { "x-api-key": "hidden-a" } }] },
+  } });
+  await withAdmin(cfg, async ({ port }) => {
+    const body = (await (await fetch(`${base()}:${port}/api/limits`)).json()) as { providers: LimitsProvider[] };
+    const [fiveHour, weekly] = body.providers[0]!.accounts[0]!.windows;
+    // 60% after one hour of a five-hour window: 40 more minutes to 100%, well before its reset.
+    assert.ok(Math.abs(fiveHour!.exhaust_at! - (nowS + 2400)) <= 5, `five-hour exhaust_at ${fiveHour!.exhaust_at}`);
+    // The projection is the share at the reset at the average pace: 60% after an hour of five is 300%.
+    assert.equal(fiveHour!.projected_percent, 300);
+    // 54% with 57.6 h to the reset of a week: the average pace never reaches 100% in time, so no field.
+    assert.equal("exhaust_at" in weekly!, false);
+    // ...but it is 54% after 110.4 h of 168, so the week is projected at 82% for its reset.
+    assert.equal(weekly!.projected_percent, 82);
+  }, {
+    minimaxUsage: async (name: string, credentialId?: string) => name === "mini" && credentialId === "key-a" ? [
+      { kind: "five_hour", used_percent: 60, window_minutes: 300, reset_at: nowS + 4 * 3600 },
+      { kind: "seven_day", used_percent: 54, window_minutes: 10080, reset_at: nowS + Math.round(57.6 * 3600) },
+    ] : [],
+  });
+});
+
+test("GET /api/limits judges a cached reading at the time it was taken, so a later poll does not move exhaust_at", async (t) => {
+  const start = Date.parse("2026-11-10T00:00:00Z");
+  let clock = start;
+  t.mock.method(Date, "now", () => clock);
+  const startS = start / 1000;
+  // 60% of the five-hour window after one hour: 40 more minutes at that pace, so exhaust_at is 2400 s after the reading.
+  const resetS = startS + 4 * 3600;
+  let opencodeFetches = 0;
+  const opencode = new OpenCodeUsage({
+    fetch: (async () => {
+      opencodeFetches++;
+      return Response.json({ usage: { rolling: { status: "ok", percent: 60, resetsAt: new Date(resetS * 1000).toISOString() } } });
+    }) as unknown as typeof fetch,
+    now: () => clock,
+    ttlMs: 300_000,
+    warn: () => {},
+  });
+  const minimax = new MiniMaxUsage({
+    fetch: (async () => Response.json({
+      model_remains: [{ model_name: "general", end_time: resetS * 1000, current_interval_remaining_percent: 40, weekly_end_time: (startS + 6 * 86400) * 1000, current_weekly_remaining_percent: 99 }],
+      base_resp: { status_code: 0, status_msg: "success" },
+    })) as unknown as typeof fetch,
+    now: () => clock,
+    ttlMs: 300_000,
+    warn: () => {},
+  });
+  const cfg = makeCfg({ providers: {
+    go: { type: "openai-compatible", url: "https://opencode.ai/zen/go/v1", preset: "opencode-go" },
+    mini: { type: "anthropic-compatible", preset: "minimax", url: "https://api.minimax.io/anthropic" },
+  } });
+  await withAdmin(cfg, async ({ port }) => {
+    const limits = async () => (await (await fetch(`${base()}:${port}/api/limits`)).json()) as { providers: LimitsProvider[] };
+    const exhaustOf = (body: { providers: LimitsProvider[] }) => body.providers.map((p) => [p.provider, p.accounts[0]!.windows[0]!.exhaust_at]);
+    const first = await limits();
+    assert.deepEqual(exhaustOf(first), [["go", startS + 2400], ["mini", startS + 2400]]);
+    clock = start + 4 * 60_000;
+    const later = await limits();
+    assert.deepEqual(exhaustOf(later), exhaustOf(first), "the cached reading keeps its exhaust_at four minutes later");
+    assert.equal(opencodeFetches, 1, "the second poll is served from the cache");
+    // The internal read time never reaches the response.
+    assert.equal(later.providers.every((p) => p.accounts.every((a) => a.windows.every((w) => !("read_at" in w)))), true);
+  }, {
+    opencodeUsage: (name: string) => opencode.windows(name, "https://opencode.ai/zen/go/v1", { authorization: "Bearer key" }),
+    minimaxUsage: (name: string) => minimax.windows(name, "https://api.minimax.io/anthropic", { "x-api-key": "key" }),
+  });
+});
+
+test("GET /api/limits and /api/status follow the Claude account the pool is using now", async () => {
+  const now = Date.now();
+  const cfg = makeCfg({ providers: { anthropic: { type: "anthropic", auth: "claude-code", accountPool: true } } });
+  const quota = (used: number) => ({ at: now, rate_limits: {
+    primary: { used_percent: used, window_minutes: 300 },
+    secondary: { used_percent: used, window_minutes: 10080, reset_at: Math.floor((now + 3_600_000) / 1000) },
+  } });
+  let reports: ReturnType<NonNullable<AdminDeps["credentials"]>> = {};
+  let usage: Awaited<ReturnType<NonNullable<AdminDeps["claudeUsage"]>>> = {};
+  await withAdmin(cfg, async ({ port, home }) => {
+    const stored = saveClaudeOAuthAccount(home, { accessToken: "stored-access", refreshToken: "stored-refresh", expiresAt: now + 3_600_000, accountId: "stored-account" });
+    usage = { current: quota(81), [stored.id]: quota(15) };
+    const read = async () => {
+      const limits = await (await fetch(`${base()}:${port}/api/limits`)).json() as { providers: LimitsProvider[] };
+      const status = await (await fetch(`${base()}:${port}/api/status`)).json() as { claude: { accounts: { id: string; inUse?: boolean; quota?: { rate_limits: { primary: { used_percent: number } } } }[] } };
+      // Every account with usage is listed; the in-use one carries the flag (none when none is marked).
+      const marked = limits.providers[0]!.accounts.filter((a) => a.inUse === true);
+      assert.ok(marked.length <= 1, "at most one account is in use");
+      return { limits: marked[0]?.windows.map((w) => w.used_percent) ?? [], listed: limits.providers[0]!.accounts.filter((a) => a.windows.length > 0).map((a) => a.windows[0]!.used_percent), accounts: status.claude.accounts };
+    };
+    // No declared credential pool: the stored accounts themselves name the preferred one.
+    assert.equal(setPreferredClaudeAccount(home, stored.id), true);
+    let got = await read();
+    assert.deepEqual(got.limits, [15, 15], "the preferred stored account's plan windows, not the login's");
+    assert.deepEqual(got.listed, [81, 15], "the login is still listed, unmarked");
+    assert.equal(got.accounts.find((a) => a.id === stored.id)?.inUse, true);
+    assert.equal(got.accounts.find((a) => a.id === stored.id)?.quota?.rate_limits.primary.used_percent, 15);
+    assert.equal(got.accounts.find((a) => a.id === "current")?.inUse, undefined);
+
+    // The live proxy's pool report says the login answers now.
+    reports = { anthropic: [{ id: "current", state: "ready", failures: 0, inUse: true }] };
+    got = await read();
+    assert.deepEqual(got.limits, [81, 81]);
+    assert.equal(got.accounts.find((a) => a.id === "current")?.inUse, true);
+    assert.equal(got.accounts.find((a) => a.id === stored.id)?.inUse, undefined);
+
+    // A report with no row in use marks none (a reader keeps the login, as before the flag existed).
+    reports = { anthropic: [{ id: "current", state: "ready", failures: 0, inUse: false }] };
+    got = await read();
+    assert.deepEqual(got.limits, []);
+    assert.deepEqual(got.listed, [81, 15]);
+    assert.equal(got.accounts.some((a) => a.inUse === true), false);
+
+    // The stored account answers but its usage is not known yet: the login is listed unmarked, never as the one in use.
+    reports = { anthropic: [
+      { id: "current", state: "ready", failures: 0, inUse: false },
+      { id: stored.id, state: "ready", failures: 0, inUse: true },
+    ] };
+    usage = { current: quota(81) };
+    const limits = await (await fetch(`${base()}:${port}/api/limits`)).json() as { providers: LimitsProvider[] };
+    assert.deepEqual(limits.providers[0]!.accounts.filter((a) => a.windows.length > 0).map((a) => [a.account, a.inUse, a.windows[0]!.used_percent]), [[0, undefined, 81]]);
+    assert.equal(limits.providers[0]!.accounts.find((a) => a.id === stored.id)?.unknown, true);
+    assert.equal(limits.providers[0]!.accounts.some((a) => a.inUse), false, "unknown usage never marks another account's figures as selected");
+    const status = await (await fetch(`${base()}:${port}/api/status`)).json() as { claude: { accounts: { id: string; inUse?: boolean; quota?: Record<string, unknown> }[] } };
+    assert.deepEqual(status.claude.accounts.find((a) => a.inUse === true), { id: stored.id, label: listClaudeAccounts(home)[0]!.label, quota: {}, inUse: true });
+
+    // The login answers but its usage is not known: it is listed empty, not left for a stored row to stand in.
+    reports = { anthropic: [{ id: "current", state: "ready", failures: 0, inUse: true }] };
+    usage = { [stored.id]: quota(15) };
+    const empty = await (await fetch(`${base()}:${port}/api/status`)).json() as { claude: { accounts: { id: string; inUse?: boolean; quota?: Record<string, unknown> }[] } };
+    assert.deepEqual(empty.claude.accounts[0], { id: "current", label: "Current Claude login", quota: {}, inUse: true });
+  }, { credentials: () => reports, claudeUsage: async () => usage });
+});
+
+test("GET /api/limits lists every Claude account with usage, in a stable order, with labels and the in-use mark", async () => {
+  const now = Date.now();
+  const cfg = makeCfg({ providers: {
+    anthropic: { type: "anthropic", auth: "claude-code", accountPool: true },
+    chatgpt: { type: "chatgpt" },
+  } });
+  const quota = (used: number) => ({ at: now, rate_limits: { primary: { used_percent: used, window_minutes: 300 } } });
+  let reports: ReturnType<NonNullable<AdminDeps["credentials"]>> = {};
+  let usage: Awaited<ReturnType<NonNullable<AdminDeps["claudeUsage"]>>> = {};
+  type Row = { account: number; label?: string; inUse?: boolean; used: number };
+  await withAdmin(cfg, async ({ port, home }) => {
+    const work = saveClaudeOAuthAccount(home, { accessToken: "work-access", refreshToken: "work-refresh", expiresAt: now + 3_600_000, accountId: "work", email: "work@example.com" });
+    const spare = saveClaudeOAuthAccount(home, { accessToken: "spare-access", refreshToken: "spare-refresh", expiresAt: now + 3_600_000, accountId: "spare", email: "spare@example.com" });
+    const read = async () => {
+      const body = await (await fetch(`${base()}:${port}/api/limits`)).json() as { providers: LimitsProvider[] };
+      const rows = (type: string): Row[] => (body.providers.find((p) => p.type === type)?.accounts ?? []).filter((a) => a.windows.length > 0).map((a) => ({ account: a.account, ...(a.label !== undefined ? { label: a.label } : {}), ...(a.inUse !== undefined ? { inUse: a.inUse } : {}), used: a.windows[0]!.used_percent }));
+      return { claude: rows("anthropic"), gpt: rows("chatgpt"), providers: body.providers.map((p) => p.type) };
+    };
+
+    // The live login first, then stored accounts in saved order; only the selected account is marked.
+    usage = { current: quota(81), [work.id]: quota(15), [spare.id]: quota(40) };
+    reports = { anthropic: [
+      { id: "current", state: "ready", failures: 0, inUse: false },
+      { id: work.id, state: "ready", failures: 0, inUse: true },
+    ] };
+    let got = await read();
+    assert.deepEqual(got.providers, ["anthropic", "chatgpt"], "one Claude provider entry holds every account");
+    assert.deepEqual(got.claude, [
+      { account: 0, label: "Current Claude login", used: 81 },
+      { account: 1, label: "work@example.com", inUse: true, used: 15 },
+      { account: 2, label: "spare@example.com", used: 40 },
+    ]);
+    // ChatGPT accounts carry their label and the in-use mark the same way.
+    assert.deepEqual(got.gpt, [{ account: 0, label: "A", used: 23 }, { account: 1, label: "B", inUse: true, used: 7 }]);
+
+    // An account without usage is left out, and the others keep their numbers.
+    usage = { current: quota(81), [spare.id]: quota(40) };
+    got = await read();
+    assert.deepEqual(got.claude, [{ account: 0, label: "Current Claude login", used: 81 }, { account: 2, label: "spare@example.com", used: 40 }], "no entry is marked while the in-use account's usage is unknown");
+
+    // The login in use.
+    usage = { current: quota(81), [work.id]: quota(15) };
+    reports = { anthropic: [{ id: "current", state: "ready", failures: 0, inUse: true }] };
+    got = await read();
+    assert.deepEqual(got.claude, [{ account: 0, label: "Current Claude login", inUse: true, used: 81 }, { account: 1, label: "work@example.com", used: 15 }]);
+  }, {
+    credentials: () => reports,
+    claudeUsage: async () => usage,
+    chatgpt: () => ({
+      quota: {}, auth: {},
+      accounts: () => ({
+        chatgpt: [
+          { id: "a", label: "A", paused: false, state: "ready", quota: { at: now, rate_limits: { primary: { used_percent: 23, window_minutes: 300 } } }, active: false, inUse: false },
+          { id: "b", label: "B", paused: false, state: "ready", quota: { at: now, rate_limits: { primary: { used_percent: 7, window_minutes: 300 } } }, active: true, inUse: true },
+        ] as never,
+      }),
+    }),
+  });
+});
+
+test("GET /api/limits names each account by the id /api/status lists it under, and marks a refused Claude reading stale", async () => {
+  const now = Date.now();
+  const cfg = makeCfg({ providers: {
+    anthropic: { type: "anthropic", auth: "claude-code", accountPool: true },
+    chatgpt: { type: "chatgpt" },
+  } });
+  const quota = (used: number, extra: Record<string, unknown> = {}) => ({ at: now, rate_limits: { primary: { used_percent: used, window_minutes: 300 } }, ...extra });
+  let usage: Awaited<ReturnType<NonNullable<AdminDeps["claudeUsage"]>>> = {};
+  await withAdmin(cfg, async ({ port, home }) => {
+    const work = saveClaudeOAuthAccount(home, { accessToken: "work-access", refreshToken: "work-refresh", expiresAt: now + 3_600_000, accountId: "work", email: "work@example.com" });
+    usage = { current: quota(81), [work.id]: quota(15, { stale: true, failed_at: now, failed_status: 429 }) };
+    const limits = await (await fetch(`${base()}:${port}/api/limits`)).json() as { providers: LimitsProvider[] };
+    const claude = limits.providers.find((p) => p.type === "anthropic")!;
+    // The refused refresh keeps its last reading, marked stale; the login's reading is current.
+    assert.deepEqual(claude.accounts.map((a) => [a.id, a.stale ?? false]), [["current", false], [work.id, true]]);
+    assert.deepEqual(limits.providers.find((p) => p.type === "chatgpt")!.accounts.map((a) => a.id), ["a", "b"]);
+    const status = await (await fetch(`${base()}:${port}/api/status`)).json() as { claude: { accounts: { id: string }[] } };
+    assert.ok(claude.accounts.every((a) => status.claude.accounts.some((s) => s.id === a.id)), "every id is one /api/status lists");
+  }, {
+    credentials: () => ({}),
+    claudeUsage: async () => usage,
+    chatgpt: () => ({
+      quota: {}, auth: {},
+      accounts: () => ({
+        chatgpt: [
+          { id: "a", label: "A", paused: false, state: "ready", quota: { at: now, rate_limits: { primary: { used_percent: 23, window_minutes: 300 } } }, active: false, inUse: false },
+          { id: "b", label: "B", paused: false, state: "ready", quota: { at: now, rate_limits: { primary: { used_percent: 7, window_minutes: 300 } } }, active: true, inUse: true },
+        ] as never,
+      }),
+    }),
+  });
+});
+
+test("a Claude login without an account pool reports the app login's limits, whatever a stored account prefers", async () => {
+  const now = Date.now();
+  const observed = new ObservedClaudeCodeAuth();
+  observed.observe(["authorization", "Bearer current-login-token"]);
+  const cfg = makeCfg({ providers: { anthropic: { type: "anthropic", auth: "claude-code" } } });
+  const quota = (used: number) => ({ at: now, rate_limits: { primary: { used_percent: used, window_minutes: 300 } } });
+  let usage: Awaited<ReturnType<NonNullable<AdminDeps["claudeUsage"]>>> = {};
+  await withAdmin(cfg, async ({ port, home }) => {
+    const stored = saveClaudeOAuthAccount(home, { accessToken: "stored-access", refreshToken: "stored-refresh", expiresAt: now + 3_600_000, accountId: "stored-account" });
+    usage = { current: quota(81), [stored.id]: quota(15) };
+    assert.equal(setPreferredClaudeAccount(home, stored.id), true);
+    const limits = await (await fetch(`${base()}:${port}/api/limits`)).json() as { providers: LimitsProvider[] };
+    assert.deepEqual(limits.providers[0]!.accounts.map((a) => [a.account, a.inUse, a.windows[0]!.used_percent]), [[0, true, 81], [1, undefined, 15]]);
+    const status = await (await fetch(`${base()}:${port}/api/status`)).json() as { claude: { accounts: { id: string; inUse?: boolean }[] } };
+    assert.equal(status.claude.accounts.find((a) => a.inUse === true)?.id, "current");
+    setCurrentClaudeAccountPaused(home, true);
+    const paused = await (await fetch(`${base()}:${port}/api/status`)).json() as { claude: { accounts: { id: string; inUse?: boolean; paused?: boolean }[] } };
+    assert.deepEqual(paused.claude.accounts.filter((a) => a.id === "current" || a.inUse).map((a) => [a.id, a.paused ?? false, a.inUse ?? false]), [["current", true, false]], "the paused login is flagged and not in use");
+    const pausedLimits = await (await fetch(`${base()}:${port}/api/limits`)).json() as typeof limits;
+    assert.deepEqual(pausedLimits.providers[0]!.accounts.map((a) => [a.id, a.account, a.inUse]), [[stored.id, 0, undefined], ["current", 1, undefined]]);
+    assert.deepEqual(pausedLimits.providers[0]!.accounts.find((a) => a.id === "current")?.windows, [], "the paused card cannot expose its cached figures");
+  }, { claudeUsage: async () => usage, observedClaudeCodeAuth: observed });
 });

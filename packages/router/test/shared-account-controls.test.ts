@@ -70,7 +70,7 @@ function fixture(kind: string, home: string, now: () => number): Fixture {
 }
 
 for (const kind of ["chatgpt", "claude", "google", "api-key"]) {
-  test(`${kind}: preferred is for new conversations, returns after reset, and never steals a sticky conversation`, () => {
+  test(`${kind}: choosing a preferred account moves held conversations, it returns after reset, and a reset alone moves nothing`, () => {
     const home = fs.mkdtempSync(path.join(os.tmpdir(), "cr-controls-"));
     try {
       let time = Date.now();
@@ -82,7 +82,8 @@ for (const kind of ["chatgpt", "claude", "google", "api-key"]) {
       assert.equal(owner(pool.pick(kind, f.credentials(), "old")), a);
       assert.equal(f.update(b, { preferred: true }), true);
       assert.equal(owner(pool.pick(kind, f.credentials(), "new")), b);
-      assert.equal(owner(pool.pick(kind, f.credentials(), "old")), a);
+      // The owner chose b: a conversation held by a moves there too (2026-11-04).
+      assert.equal(owner(pool.pick(kind, f.credentials(), "old")), b);
       const runtimeB = f.credentials().find((credential) => owner(credential) === b)!;
       pool.penalise(kind, runtimeB.id, 429, 5_000);
       assert.equal(owner(pool.pick(kind, f.credentials(), "during-rest")), a);
@@ -97,6 +98,25 @@ for (const kind of ["chatgpt", "claude", "google", "api-key"]) {
       assert.equal(owner(pool.pick(kind, f.credentials(), "newer")), a);
       assert.equal(f.update(a, { preferred: false }), true);
       assert.equal(owner(pool.pick(kind, f.credentials(), "no-flags")), a);
+    } finally { fs.rmSync(home, { recursive: true, force: true }); }
+  });
+
+  test(`${kind}: clearing the preferred account moves held conversations back to the configured order`, () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "cr-controls-"));
+    try {
+      const pool = new CredentialPool();
+      const f = fixture(kind, home, Date.now);
+      const a = f.add("a");
+      const b = f.add("b");
+      assert.equal(f.update(b, { preferred: true }), true);
+      assert.equal(owner(pool.pick(kind, f.credentials(), "held")), b);
+      // A retry's list leaves out the credential it tried: that is not the owner clearing the flag.
+      assert.equal(owner(pool.pick(kind, f.credentials().filter((c) => owner(c) !== b), "other")), a);
+      assert.equal(owner(pool.pick(kind, f.credentials(), "held")), b);
+      // The owner clears it (2026-11-05: conversations stayed on the account just un-preferred).
+      assert.equal(f.update(b, { preferred: false }), true);
+      assert.equal(owner(pool.pick(kind, f.credentials(), "held")), a);
+      assert.equal(owner(pool.pick(kind, f.credentials(), "held")), a, "and stays there");
     } finally { fs.rmSync(home, { recursive: true, force: true }); }
   });
 

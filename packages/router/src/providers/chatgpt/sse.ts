@@ -7,6 +7,7 @@ export class SseParser {
 
   /** Feed a chunk; returns the parsed JSON objects of complete events (non-JSON data is skipped). */
   feed(chunk: string): Record<string, unknown>[] {
+    if (this.sawDone) return [];
     this.buf += chunk;
     const out: Record<string, unknown>[] = [];
     let idx: number;
@@ -18,8 +19,12 @@ export class SseParser {
         .filter((l) => l.startsWith("data:"))
         .map((l) => l.slice(5).replace(/^ /, ""))
         .join("\n");
-      if (data === "[DONE]") this.sawDone = true;
-      if (!data || data === "[DONE]") continue;
+      if (data === "[DONE]") {
+        this.sawDone = true;
+        this.buf = "";
+        break;
+      }
+      if (!data) continue;
       try {
         out.push(JSON.parse(data) as Record<string, unknown>);
       } catch {

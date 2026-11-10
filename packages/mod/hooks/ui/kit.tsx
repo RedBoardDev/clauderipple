@@ -21,18 +21,23 @@
 
 import type { RenderNode } from 'claude-code'
 
+import { filled } from './parts'
 import type { Els } from './parts'
 import type { Face } from './ripple'
 import type { Frame } from './view'
-import { CELL_PX, CLOSE_PX, CONTROL_PX, ROW_PX, SVG_MAX_PX, SWITCH_H, SWITCH_W, WELL_PX, labelPx } from './art'
+import { CELL_PX, CLOSE_PX, CONTROL_PX, CURRENT_PX, ROW_PX, SVG_MAX_PX, SWITCH_H, SWITCH_W, WELL_PX, labelPx } from './art'
 import type { Glyph, PillLook, Sea, Tone } from './art'
 import { lookOf } from './look'
 import { chOf } from './theme'
 
-/** Width of one U+00A0 in the host's 12 px button font, px, taken a little wide. */
-const NBSP_PX = 3.6
-/** The host's padding either side of a plain Button's label, px. */
-const BUTTON_PAD = 6
+/**
+ * Width of one U+00A0 in the host's button font, px, and the host's padding either side of a plain
+ * Button's label, px, both taken wide of the cell they are counted against (CELL_PX). The desktop's
+ * newer type (2026-10-25) set a cell at ~8.8 px and a no-break space past 4.4 px, so labels counted
+ * at 3.6 px and 6 px ran past their buttons and each control showed the host's ink "…".
+ */
+const NBSP_PX = 5.2
+const BUTTON_PAD = 7
 
 /**
  * The props that light a Box under the pointer the way `lit` lights a control: the skin's light
@@ -41,11 +46,6 @@ const BUTTON_PAD = 6
 export function hoverLight(frame: Frame, scope?: string): Record<string, unknown> {
   const look = lookOf(frame).lit
   return { ...look, hover: { ...look.hover, ...(scope ? { scope } : {}) } }
-}
-
-/** Cells a run of px takes, rounded up. */
-function cellsOf(px: number): number {
-  return Math.ceil(px / CELL_PX)
 }
 
 /** Rows a run of px takes, unrounded (the host takes fractions of a row). */
@@ -89,10 +89,10 @@ export function lift(el: Els): RenderNode {
  */
 const QUIET_ALT = 'ClaudeRipple'
 
-/** A picture, `width` × `height` px, in a Box of its own that never shrinks. */
+/** A picture, `width` × `height` px where a cell is CELL_PX, filling its cells (parts.tsx `filled`). */
 export function pic(el: Els, key: string, source: string, alt: string, width: number, height: number): RenderNode {
   if (!('Svg' in el)) return ''
-  const { Box, Svg } = el
+  const { Box } = el
   if (!alt.trim()) alt = QUIET_ALT
   if (width > SVG_MAX_PX || height > SVG_MAX_PX) {
     // Crop the same drawing, not separately generated seas: gradients, corners and motion retain
@@ -110,18 +110,15 @@ export function pic(el: Els, key: string, source: string, alt: string, width: nu
         const cropped = root.replace(/\bwidth="[^"]*"/, 'width="' + w + '"')
           .replace(/\bheight="[^"]*"/, 'height="' + tileHeight + '"')
           .replace(/viewBox="[^"]*"/, 'viewBox="' + [vx + x * vw / width, vy + y * vh / height, w * vw / width, tileHeight * vh / height].join(' ') + '"')
-        tiles.push(<Svg key={key + '-' + x + '-' + y} source={cropped + source.slice(root.length)} alt={x === 0 && y === 0 ? alt : QUIET_ALT} width={w} height={tileHeight} />)
+        tiles.push(filled(el, key + '-' + x + '-' + y, cropped + source.slice(root.length), x === 0 && y === 0 ? alt : QUIET_ALT, w))
       }
       rows.push(<Box key={'row-' + y} flexDirection="row" flexShrink={0} columnGap={0} alignItems="flex-start">{tiles}</Box>)
     }
-    // Let images supply the pixel heights directly. Rounding a tile to host rows leaves seams.
+    // Let images supply their heights, each tile filling its cells as one picture would: rounding a
+    // tile to host rows leaves seams.
     return <Box key={'pic-' + key} flexDirection="column" flexShrink={0} rowGap={0} alignItems="flex-start">{rows}</Box>
   }
-  return (
-    <Box key={'pic-' + key} flexShrink={0} alignItems="center">
-      <Svg source={source} alt={alt} width={width} height={height} />
-    </Box>
-  )
+  return filled(el, 'pic-' + key, source, alt, width)
 }
 
 /**
@@ -131,12 +128,7 @@ export function pic(el: Els, key: string, source: string, alt: string, width: nu
  */
 export function ripple(el: Els, frame: Frame, key: string, face: Face, alt: string, size: number, percent?: number, dim = false): RenderNode {
   if (!('Svg' in el)) return ''
-  const { Box, Svg } = el
-  return (
-    <Box key={'ripple-' + key} flexShrink={0}>
-      <Svg source={lookOf(frame).art.mascot(face, size, percent, dim)} alt={alt} width={size} height={size} />
-    </Box>
-  )
+  return filled(el, 'ripple-' + key, lookOf(frame).art.mascot(face, size, percent, dim), alt, size)
 }
 
 /**
@@ -166,7 +158,7 @@ function extraHover(el: Els, frame: Frame, cells: number): RenderNode[] {
  * A capsule: a Box in the skin's edge and colour, the skin's backdrop (the deep's sea; flat has
  * none) painted behind it from its top left, and everything it holds in one positioned layer above
  * that. `rows` is about how tall it draws; the backdrop is taken taller and wider than that, and
- * the capsule clips it.
+ * the capsule clips it. A work current, where the skin paints one, is placed at its true bottom.
  */
 export function capsule(el: Els, frame: Frame, c: { key: string; sea: Omit<Sea, 'at'> & { at?: Sea['at'] }; rows: number; paddingX?: number; paddingY?: number; gap?: number; children: RenderNode[] }): RenderNode {
   const { Box } = el
@@ -179,6 +171,12 @@ export function capsule(el: Els, frame: Frame, c: { key: string; sea: Omit<Sea, 
   const height = visible + 220
   const at = c.sea.at ?? { x: padX * CELL_PX + 12, y: padY * ROW_PX * 0.5 + 13 }
   const sea = look.art.sea(width, height, { ...c.sea, at, visible })
+  // Work going on is a current along the capsule's true bottom, a picture of its own below the sea:
+  // the sea is drawn taller than the capsule, so a floor inside it sat at the picture's estimated
+  // height and crossed the limits' words when the host's rows measured differently (2026-10-25).
+  // The placed Box takes its height from the picture (as `press` and the cards' fade do): a `height`
+  // of 0.084 rows is no whole row to the host, and the Box it was given painted over the whole band.
+  const current = c.sea.current ? look.art.current(width) : ''
   return (
     <Box key={c.key} position="relative" flexDirection="column" paddingX={0} paddingY={0} overflow="hidden" width="100%" minWidth={0} {...look.capsule}>
       {sea ? (
@@ -190,6 +188,11 @@ export function capsule(el: Els, frame: Frame, c: { key: string; sea: Omit<Sea, 
         {lift(el)}
         {c.children}
       </Box>
+      {current ? (
+        <Box key={c.key + '-current'} position="absolute" bottom={0} left={0}>
+          {pic(el, c.key + '-current', current, 'ClaudeRipple', width, CURRENT_PX)}
+        </Box>
+      ) : null}
     </Box>
   )
 }
@@ -210,7 +213,7 @@ export function pill(el: Els, frame: Frame, key: string, label: string, look: Pi
 }
 
 /** Cells the way out takes. */
-export const CLOSE_CELLS = cellsOf(CLOSE_PX + 4)
+export const CLOSE_CELLS = (CLOSE_PX + 4) / CELL_PX
 
 /**
  * The way out: a soft disc with a ×, `label` its name for a reader that cannot see it. The disc is

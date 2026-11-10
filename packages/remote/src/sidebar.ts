@@ -132,7 +132,14 @@ export class DesktopSidebar {
     // Archived rows must reach the phone's archive; hidden sections are a separate exclusion.
     for (const r of rows) if (!result.sessions.has(r.cliSessionId)) result.sessions.set(r.cliSessionId, { ...r, ...(!r.archived ? { hidden: true } : {}) });
   }
-  join(sessions: SessionSummary[], cliId: (id: string) => string): SessionSummary[] {
+  /** The activity time of a row the app still lists as unread, for a phone that has just read it;
+   * undefined when the app already counts it read (focused since) or does not list it at all. */
+  unreadActivity(cliId: string): number | undefined {
+    const row = this.read().sessions.get(cliId);
+    return row?.unread ? row.activity : undefined;
+  }
+
+  join(sessions: SessionSummary[], cliId: (id: string) => string, pendingAppSession: (id: string) => boolean = () => false): SessionSummary[] {
     const sidebar = this.read();
     if (!sidebar.groups.length) return sessions;
     return sessions.flatMap(s => {
@@ -142,9 +149,9 @@ export class DesktopSidebar {
       // (2026-10-13: 클로드리플 and 클로드리플2 each listed twice, the old half stuck at "42 min").
       // A /clear moves on without naming the old id (2026-10-23: 맘보2 twice, the old half at "1 hour"):
       // an app session's record that no app session holds now is not in the app's sidebar either.
-      if (!row && (sidebar.superseded.has(cliId(s.id)) || s.desktopBridge)) return [];
+      if (!row && (sidebar.superseded.has(cliId(s.id)) || s.desktopBridge && !pendingAppSession(s.id))) return [];
       if (!row) return [{ ...s, group: s.origin === "desktop" ? UNGROUPED : PHONE_GROUP }];
-      return [{ ...s, ...(row.archived ? { archived: true } : {}), title: row.title || s.title, unread: row.unread, group: row.group, order: row.order, updatedAt: row.activity }];
+      return [{ ...s, ...(row.archived ? { archived: true } : {}), title: row.title.trim() || s.title, unread: row.unread, group: row.group, order: row.order, updatedAt: row.activity }];
     });
   }
 }

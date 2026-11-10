@@ -15,7 +15,7 @@ import { CELL_PX, ROW_PX } from './art'
 import { DISPLAY, displayText } from './display'
 import { lookOf } from './look'
 import type { Sea } from './art'
-import { capsule, closeButton, pill, ripple, well } from './kit'
+import { capsule, closeButton, pill, ripple, segmented, well } from './kit'
 import { action, actions, canDraw, dismiss, speak } from './parts'
 import type { Els } from './parts'
 import { FACE_TONE } from './ripple'
@@ -102,15 +102,19 @@ export function cardOf(frame: Frame, alert: AlertView, a: AlertActions): Card {
       }
     case 'result':
       return resultCard(frame, alert, a)
-    case 'compactNote':
+    case 'compactNote': {
+      // The tidy-up is on unless the person turned it off; its switch sits quiet beside Compact.
+      const tidy: Choice = { key: 'tidy', label: t(L, 'alerts.tidyFirst', { state: t(L, alert.tidy ? 'band.on' : 'band.off') }), hotkey: 't', onPress: a.toggleTidy }
       return {
         key: 'note',
         face: 'asking',
         title: t(L, 'alerts.compactTitle'),
-        body: t(L, 'alerts.compactBody'),
+        body: t(L, 'alerts.compactBody') + (alert.pick === 'session' && alert.cold ? '\n' + t(L, 'alerts.compactCold') : ''),
+        quiet: [tidy],
         main: { ...compact, onPress: () => a.compact(alert.draft) },
         close: cancel,
       }
+    }
     case 'clear':
       return {
         key: 'clear',
@@ -131,6 +135,9 @@ function resultCard(frame: Frame, alert: Extract<AlertView, { kind: 'result' }>,
       return { key: 'result', face: 'going', title: t(L, 'alerts.handingOff'), body: (alert.detail === undefined ? undefined : displayText(alert.detail)) ?? t(L, 'alerts.quickProgress') }
     case 'handoffDone':
       return { key: 'result', face: 'pleased', title: t(L, 'alerts.handoffDone'), body: (alert.detail === undefined ? undefined : displayText(alert.detail)) ?? t(L, 'alerts.summaryReady'), quiet: [{ key: 'copy', label: t(L, 'alerts.copyAgain'), hotkey: 'y', onPress: a.copy }], close }
+    case 'tidying':
+      // Put away while it runs: the turn is in the chat, and the compaction follows it either way.
+      return { key: 'result', face: 'working', title: t(L, 'alerts.tidying'), body: (alert.detail === undefined ? undefined : displayText(alert.detail)) ?? t(L, 'alerts.tidyingBody'), close }
     case 'compacting':
       return { key: 'result', face: 'squeezing', title: t(L, 'alerts.compacting'), body: (alert.detail === undefined ? undefined : displayText(alert.detail)) ?? t(L, 'alerts.compactingBody') }
     case 'compacted':
@@ -145,6 +152,7 @@ function extras(el: Els, frame: Frame, alert: AlertView, a: AlertActions): Rende
   if (alert.kind === 'compactNote' && 'Input' in el) {
     const Field = el.Input
     return [
+      ...('Select' in el && alert.models.length > 1 ? [<Box key="compact-model-row" flexDirection="row" alignItems="center" columnGap={2}><el.Text dimColor>{t(frame.lang, 'alerts.compactModel')}</el.Text><el.Select key="compact-model" options={alert.models} value={alert.pick} onSelect={(value: string) => a.pickCompactModel(value)} /></Box>] : []),
       <Field
         key="note"
         label={t(frame.lang, 'alerts.keep')}
@@ -186,7 +194,7 @@ function seaOf(card: Card, alert: AlertView): Omit<Sea, 'at'> {
       return { tone: 'violet', weather: 'sparkles', ripples: 'calm' }
     default: {
       const stage = alert.kind === 'result' ? alert.stage : 'failed'
-      if (stage === 'handingOff' || stage === 'compacting') return { tone: 'violet', ripples: 'busy', current: true }
+      if (stage === 'handingOff' || stage === 'compacting' || stage === 'tidying') return { tone: 'violet', ripples: 'busy', current: true }
       if (stage === 'failed') return { tone: 'red', weather: 'static' }
       return { tone: 'green', tick: true, weather: 'sparkles' }
     }
@@ -206,6 +214,9 @@ function drawnExtras(el: Els, frame: Frame, alert: AlertView, a: AlertActions): 
     // The field's own label would take the host's ink; its name is ours, beside its well.
     const cells = Math.max(20, frame.columns - Math.ceil(CARD_FACE / CELL_PX) - Math.ceil(chOf(name)) - 10)
     return [
+      // Drawn, as the settings' own pickers are: the host's Select takes the host's ink, which a light
+      // theme leaves dark on this dark card (2026-10-31). The dashboard keeps the choices to five.
+      ...(alert.models.length > 1 ? [<Box key="compact-model-row" flexDirection="row" alignItems="center" columnGap={2} flexWrap="wrap"><Text {...k.sub}>{t(frame.lang, 'alerts.compactModel')}</Text>{segmented(el, frame, 'compact-model', alert.models, alert.pick, value => a.pickCompactModel(value))}</Box>] : []),
       <Box key="note-row" flexDirection="row" alignItems="center" columnGap={2} width="100%" minWidth={0}>
         <Text {...k.sub}>{name}</Text>
         {well(el, frame, 'note', cells, (
@@ -278,7 +289,7 @@ function drawnAlert(el: Els, frame: Frame, alert: AlertView, a: AlertActions): R
       {actionsBelow ? null : buttons}
     </Box>
   )
-  const rows = oneRow ? 2 : 4 + (more.length ? 3.2 : 0) + (actionsBelow ? 2 : 0) + (frame.columns < 60 ? 3 : 0)
+  const rows = oneRow ? 2 : 4 + (more.length ? 3.2 + (more.length - 1) * 2 : 0) + (actionsBelow ? 2 : 0) + (frame.columns < 60 ? 3 : 0)
   return capsule(el, frame, {
     key: 'alert-' + card.key,
     // The light comes from 리플이: on the title's line in one row, at the card's middle beside more.
@@ -300,7 +311,7 @@ export function renderAlert(el: Els, frame: Frame, alert: AlertView, a: AlertAct
   const buttons = [card.main ? press(card.main, true) : '', ...(card.quiet ?? []).map(c => press(c)), rich ? '' : close]
   // The terminal has no face: a text mark says it instead (work going on, done, failed or broken,
   // a warning, a question).
-  const mark = card.face === 'squeezing' || card.face === 'going' ? '…' : tone === 'ok' ? '✓' : tone === 'bad' ? '✕' : tone === 'warn' ? '▲' : '◉'
+  const mark = card.face === 'squeezing' || card.face === 'going' || card.face === 'working' ? '…' : tone === 'ok' ? '✓' : tone === 'bad' ? '✕' : tone === 'warn' ? '▲' : '◉'
   return speak(el, frame, {
     key: 'alert-' + card.key,
     face: card.face,

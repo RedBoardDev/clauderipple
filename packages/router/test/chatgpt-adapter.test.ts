@@ -7,9 +7,11 @@ import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 import { ChatGptAdapter, rateLimitsFromHeaders, rateLimitsFromUsage, streamHold } from "../src/providers/chatgpt/index.ts";
+import { saveChatGptAccount, updateChatGptAccount } from "../src/providers/chatgpt/accounts.ts";
 import { Logger } from "../src/log.ts";
 import { decodeEnvelope, encodeEnvelope } from "../src/reasoning.ts";
 import type { AnthropicRequest } from "../src/providers/chatgpt/translate.ts";
+import { requestKind } from "../src/routing.ts";
 
 const home = fs.mkdtempSync(path.join(os.tmpdir(), "cr-gpt-"));
 fs.writeFileSync(path.join(home, "chatgpt-auth.json"), JSON.stringify({ accessToken: "tok_test", accountId: "acct_test", expiresAt: Date.now() + 3600_000, source: "own" }));
@@ -165,7 +167,8 @@ const front = http.createServer((req, res) => {
   req.on("data", (c: Buffer) => chunks.push(c));
   req.on("end", () => {
     const json = JSON.parse(Buffer.concat(chunks).toString()) as AnthropicRequest;
-    void adapter.handle(req, res, req.url ?? "/v1/messages", json, "gpt-5.6-terra", "high");
+    const requestPath = (req.url ?? "/v1/messages").split("?")[0] ?? "/v1/messages";
+    void adapter.handle(req, res, req.url ?? "/v1/messages", json, "gpt-5.6-terra", "high", { kind: requestKind(json, requestPath) });
   });
 });
 
@@ -225,6 +228,15 @@ test("streaming: headers, request body, and translated Anthropic SSE", async () 
   assert.equal(adapter.lastRateLimits?.plan_type, "prolite");
 });
 
+test("an Auto mode classifier's Responses instructions stay exactly as sent", async () => {
+  mode = "stream";
+  const system = "You are a security monitor for autonomous AI coding agents.\n\nJudge this action.";
+  const classifier: AnthropicRequest = { model: "claude-haiku-5-5", stream: true, system, messages: [{ role: "user", content: "check" }] };
+  const response = await call(classifier);
+  assert.equal(response.status, 200);
+  assert.equal(seen.at(-1)?.body.instructions, system);
+});
+
 test("hosted web search sends the measured Responses tool and extracts cited results", async () => {
   mode = "search";
   const outcome = await adapter.webSearch("gpt-5.6-terra", 5).search({
@@ -243,6 +255,8 @@ test("hosted web search sends the measured Responses tool and extracts cited res
   }]);
   assert.deepEqual(outcome.hits, [{ title: "Node.js downloads", url: "https://nodejs.org/en/download/current" }]);
   assert.equal(outcome.text, "Node 24.21.0 is current.");
+  // The search spends the account's quota, so the tokens it read travel with the outcome.
+  assert.deepEqual(outcome.usage, { input: 100, cached: 0, output: 10 });
 });
 
 test("image generation sends the hosted tool with references and returns the decoded image", async () => {
@@ -256,6 +270,8 @@ test("image generation sends the hosted tool with references and returns the dec
   const s = seen.at(-1)!;
   assert.equal(s.path, "/codex/responses");
   assert.equal(s.body.tool_choice, "required");
+  // The image tool reads an outer reasoning effort as its complexity and refuses it (issue #129).
+  assert.equal("reasoning" in s.body, false);
   // No size or quality: the backend ignores both, so the shape travels in the prompt.
   assert.deepEqual(s.body.tools, [{ type: "image_generation", output_format: "png", background: "transparent" }]);
   const content = (s.body.input as { content: Record<string, unknown>[] }[])[0]!.content;
@@ -551,6 +567,72 @@ test("a refusal naming the replayed reasoning is retried once without it", async
   assert.equal(response.status, 200, "the retry answered, the refusal did not reach the user");
   const attempts = seen.slice(-2).map((s) => JSON.stringify(s.body).includes("encrypted_content"));
   assert.deepEqual(attempts, [true, false], "the second ask carried no reasoning");
+});
+
+// A pinned worker names a stored account on its route; the adapter must use it before its usual
+// order, fall back when it cannot, and keep honouring it first on an in-turn retry.
+test("a pinned ChatGPT worker runs on its stored account, falling back in the ordinary order", async (t) => {
+  const pinnedHome = fs.mkdtempSync(path.join(os.tmpdir(), "cr-gpt-pinned-"));
+  t.after(() => fs.rmSync(pinnedHome, { recursive: true, force: true }));
+  const grant = (token: string, accountId: string) => ({ accessToken: token, refreshToken: `rt-${token}`, accountId, expiresAt: Date.now() + 3_600_000 });
+  const a = saveChatGptAccount(pinnedHome, grant("tok-a", "acct-a"));
+  const b = saveChatGptAccount(pinnedHome, grant("tok-b", "acct-b"));
+
+  const auths: string[] = [];
+  let refuseB = false;
+  const pinnedBackend = http.createServer((req, res) => {
+    req.resume();
+    req.on("end", () => {
+      const authorization = String(req.headers.authorization ?? "");
+      auths.push(authorization);
+      if (refuseB && authorization === "Bearer tok-b") {
+        res.writeHead(429, { "content-type": "application/json", "retry-after": "300" }).end("{}");
+        return;
+      }
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      res.end(sse(happy));
+    });
+  });
+  await listen(pinnedBackend);
+  const port = (pinnedBackend.address() as { port: number }).port;
+  const pinnedLog = new Logger(path.join(pinnedHome, "router.log"), 1_000_000, 1, false);
+  const pinnedAdapter = new ChatGptAdapter("chatgpt", { type: "chatgpt", auth: "own", url: `http://127.0.0.1:${port}` }, pinnedHome, pinnedLog);
+  const ask = (pin: string) => pinnedAdapter.sendToAnAccount({
+    conversation: "pinned-chatgpt",
+    accountPin: pin,
+    path: "/codex/responses",
+    body: "{}",
+    signal: new AbortController().signal,
+    headers: () => ({}),
+  });
+  const pinB = b.id.slice(0, 8);
+  try {
+    const sent = await ask(pinB);
+    assert.ok(sent.kind === "ok", "the turn answered");
+    assert.equal(sent.credential.ownerId, b.id, "the pin wins over the configured order");
+    assert.equal(auths.at(-1), "Bearer tok-b");
+    await sent.upstream.body?.cancel().catch(() => {});
+    assert.match(fs.readFileSync(path.join(pinnedHome, "router.log"), "utf8"), new RegExp(`account-pin ${pinB}`), "the log names the pinned account");
+
+    updateChatGptAccount(pinnedHome, b.id, { paused: true });
+    const fallback = await ask(pinB);
+    assert.ok(fallback.kind === "ok");
+    assert.equal(fallback.credential.ownerId, a.id, "a paused pin falls back to the pool order");
+    await fallback.upstream.body?.cancel().catch(() => {});
+    assert.match(fs.readFileSync(path.join(pinnedHome, "router.log"), "utf8"), new RegExp(`account-pin fallback ${pinB} → ${a.id.slice(0, 8)}`));
+
+    // The pin first, then the ordinary order when it refuses: the retry is not the pin's fallback.
+    updateChatGptAccount(pinnedHome, b.id, { paused: false });
+    refuseB = true;
+    auths.length = 0;
+    const retried = await ask(pinB);
+    assert.ok(retried.kind === "ok");
+    assert.equal(retried.credential.ownerId, a.id);
+    assert.deepEqual(auths, ["Bearer tok-b", "Bearer tok-a"], "the pin answered first; the retry used the pool");
+    await retried.upstream.body?.cancel().catch(() => {});
+  } finally {
+    pinnedBackend.close();
+  }
 });
 
 test("cleanup", () => {

@@ -82,7 +82,7 @@ async function searchThrough(model: string, cfgFor: (backendUrl: string) => Part
       const events = [
         { type: "response.output_text.delta", delta: "Node.js 24 is current." },
         { type: "response.output_text.annotation.added", annotation: { type: "url_citation", title: "Node.js", url: "https://nodejs.org/en/download" } },
-        { type: "response.completed", response: { tool_usage: { web_search: { num_requests: 1 } } } },
+        { type: "response.completed", response: { tool_usage: { web_search: { num_requests: 1 } }, usage: { input_tokens: 100, input_tokens_details: { cached_tokens: 40 }, output_tokens: 10 } } },
       ];
       res.writeHead(200, { "content-type": "text/event-stream" });
       res.end(events.map((event) => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`).join(""));
@@ -164,7 +164,7 @@ async function searchThrough(model: string, cfgFor: (backendUrl: string) => Part
   }
 }
 
-function assertSearched(reply: SearchReply, target: string): void {
+function assertSearched(reply: SearchReply, model: string): void {
   const result = reply.message.content.find((block) => block.type === "web_search_tool_result");
   assert.deepEqual(result?.content, [{ type: "web_search_result", title: "Node.js", url: "https://nodejs.org/en/download" }]);
   assert.equal(reply.message.usage.server_tool_use.web_search_requests, 1);
@@ -174,9 +174,12 @@ function assertSearched(reply: SearchReply, target: string): void {
     external_web_access: true,
     filters: { allowed_domains: ["nodejs.org"] },
   });
-  assert.equal(reply.target, target);
+  // The row is the model that searched, not "<provider>/<model>", and the tokens the backend billed
+  // are recorded like any other request's (2026-10-26).
+  assert.equal(reply.target, model);
   assert.equal(reply.record?.purpose, "web-search");
   assert.equal(reply.record?.provider, "chatgpt");
+  assert.deepEqual(reply.record?.usage, { input: 60, cached: 40, output: 10 });
   assert.equal(reply.record?.upstreamCalled, undefined);
   assert.equal(reply.record?.refusal, undefined);
 }
@@ -186,7 +189,7 @@ test("the proxy serves a configured ChatGPT hosted search before model routing",
     providers: { chatgpt: { type: "chatgpt", auth: "own", url } },
     webSearch: { provider: "chatgpt", model: "gpt-5.6-terra", maxResults: 3 },
   }));
-  assertSearched(reply, "chatgpt/gpt-5.6-terra");
+  assertSearched(reply, "gpt-5.6-terra");
 });
 
 // A `smallFast` slot pointed at a ChatGPT model sends every search there. With no `webSearch` set,
@@ -195,7 +198,7 @@ test("a search routed to a ChatGPT provider is served by its own search without 
   const reply = await searchThrough("gpt-6-luna@low", (url) => ({
     providers: { chatgpt: { type: "chatgpt", auth: "own", url, models: [{ id: "gpt-6-luna" }] } },
   }));
-  assertSearched(reply, "chatgpt/gpt-6-luna");
+  assertSearched(reply, "gpt-6-luna");
 });
 
 // OpenCode Go serves its DeepSeek models on Chat Completions, which has no search, and its Anthropic

@@ -51,13 +51,14 @@ const { renderPlist, plistPath } = await import("../src/launchd.ts");
 const { renderUnit } = await import("../src/systemd.ts");
 const { renderLauncher, writeLauncher } = await import("../src/schtasks.ts");
 const { removeClientIntegrations } = await import("../src/integrations.ts");
+const { setStatusMod, setAgentTitleHook, applyProxyEnv } = await import("../src/settings.ts");
 const { withCommandHelp } = await import("../src/help-gate.ts");
 const { codexOn, codexEnabled } = await import("../src/codex.ts");
 const { launchdSupervisor, launcherProgram, plistProgramArguments, registration, targetsExist, unitExecStart } = await import("../src/registration.ts");
 const { classifyMode, cliProxyState, desktopProxyState, doctor, repair } = await import("../src/doctor.ts");
 const { directOn, directOff, directStatePath } = await import("../src/direct.ts");
 const { applyAppProxy, configLibraryDir, currentAppProxy } = await import("../src/picker.ts");
-const { installLauncher, uninstallLauncher, LAUNCHER_BUNDLE_ID } = await import("../src/launcher.ts");
+const { installLauncher, uninstallLauncher, macLauncherScript, LAUNCHER_BUNDLE_ID } = await import("../src/launcher.ts");
 const { writeBundle } = await import("../src/bundle.ts");
 type SupervisorOps = import("../src/registration.ts").SupervisorOps;
 type SupervisorView = import("../src/registration.ts").SupervisorView;
@@ -115,7 +116,7 @@ function fakeLaunchctl(opts: { loaded?: boolean; running?: boolean } = {}) {
 function fakeSupervisor(view: Partial<SupervisorView>, opts: { start?: "already-running" | "started" | "failed"; register?: () => string } = {}) {
   const calls: string[] = [];
   const ops: SupervisorOps = {
-    inspect: () => ({ registered: true, program: process.execPath, args: [], programExists: true, state: "running", pid: 1, current: true, ...view }),
+    inspect: () => ({ registered: true, program: process.execPath, args: [], programExists: true, state: "running", pid: 1, current: true, installedHome: null, ...view }),
     register: () => {
       calls.push("register");
       return opts.register ? opts.register() : "/fake/definition";
@@ -155,8 +156,8 @@ test("uninstall clears picker and Codex settings before purge, even if trust rem
   const oldCodex = process.env.CODEX_HOME;
   process.env.CLAUDERIPPLE_HOME = ctx.home;
   process.env.CODEX_HOME = path.join(ctx.home, "codex");
-  applyAppProxy(ctx.proxyUrl);
-  codexOn(18791);
+  applyAppProxy(ctx.proxyUrl, ctx.home);
+  codexOn(18791, undefined, [], ctx.home);
   try {
     const modDir = path.join(ctx.home, "mod");
     const otherMod = path.join(ctx.home, "other-plugin");
@@ -164,7 +165,10 @@ test("uninstall clears picker and Codex settings before purge, even if trust rem
       fs.mkdirSync(path.join(dir, ".claude-plugin"), { recursive: true });
       fs.writeFileSync(path.join(dir, ".claude-plugin", "plugin.json"), JSON.stringify({ name }));
     }
-    fs.writeFileSync(ctx.settings, JSON.stringify({ env: { CLAUDE_CODE_PLUGIN_DIRS: [modDir, otherMod].join(path.delimiter), KEEP: "1" } }));
+    fs.writeFileSync(ctx.settings, JSON.stringify({ env: { CLAUDE_CODE_PLUGIN_DIRS: otherMod, KEEP: "1" } }));
+    // Registered by this installation (a record exists), so its uninstall may remove it; an entry
+    // with no record would be preserved (B02).
+    setStatusMod(true, modDir, { home: ctx.home });
     const agents = path.join(path.dirname(ctx.settings), "agents");
     syncAgentFiles({ ...DEFAULTS, providers: { test: { type: "openai-compatible", url: "http://unused", models: [{ id: "owned-worker" }] } } }, agents, undefined, { manifestPath: path.join(ctx.home, "generated-agents.json") });
     fs.writeFileSync(path.join(agents, "manual.md"), "hand-written worker");
@@ -173,9 +177,11 @@ test("uninstall clears picker and Codex settings before purge, even if trust rem
       assert.equal(ca, ctx.ca);
       untrusted = true;
       throw new Error("confirmation declined");
-    }, { modDir, agentDir: agents });
+    }, { modDir, agentDir: agents, defaultHome: ctx.home });
     assert.deepEqual(JSON.parse(fs.readFileSync(ctx.settings, "utf8")).env, { CLAUDE_CODE_PLUGIN_DIRS: otherMod, KEEP: "1" });
-    assert.equal(fs.existsSync(path.join(agents, "owned-worker.md")), false);
+    // This home's manifest records the worker and no other home does: its uninstall takes it. A
+    // hand-written file beside it stays (B02, 2026-10-25).
+    assert.equal(fs.existsSync(path.join(agents, "owned-worker.md")), false, "this home's own generated worker goes with it");
     assert.equal(fs.readFileSync(path.join(agents, "manual.md"), "utf8"), "hand-written worker");
     assert.equal(currentAppProxy().egressProxyUrl, null);
     assert.equal(codexEnabled(), false);
@@ -197,26 +203,28 @@ test("uninstalling a second home leaves the default install's proxy, Codex provi
   const check = scratch({ listen: { host: "127.0.0.1", port: 18890 } });
   const oldCodex = process.env.CODEX_HOME;
   process.env.CODEX_HOME = path.join(real.home, "codex");
-  applyAppProxy(real.proxyUrl);
-  codexOn(18791);
+  applyAppProxy(real.proxyUrl, real.home);
+  codexOn(18791, undefined, [], real.home);
   try {
     const agents = path.join(path.dirname(check.settings), "agents");
     const worker = { ...DEFAULTS, providers: { test: { type: "openai-compatible" as const, url: "http://unused", models: [{ id: "shared-worker" }] } } };
     syncAgentFiles(worker, agents, undefined, { manifestPath: path.join(real.home, "generated-agents.json") });
     syncAgentFiles(worker, agents, undefined, { manifestPath: path.join(check.home, "generated-agents.json") });
     let sweep: boolean | undefined;
+    // The check's uninstall succeeds while leaving the real install's proxy, Codex provider and
+    // workers: those are another installation's recorded claim, not an unconfirmed removal.
     assert.equal(removeClientIntegrations(check.home, (_ca, opts) => { sweep = opts.sweep; return true; }, { agentDir: agents, defaultHome: real.home }), true);
     assert.equal(currentAppProxy().egressProxyUrl, real.proxyUrl);
     assert.equal(codexEnabled(), true);
-    assert.equal(fs.existsSync(path.join(agents, "shared-worker.md")), true);
+    assert.equal(fs.existsSync(path.join(agents, "shared-worker.md")), true, "the default home still records this worker");
     assert.equal(sweep, false, "only the check's own CA, by fingerprint");
 
-    // The same call from the default home still removes all of it, and sweeps leftover CAs.
+    // The default home's own uninstall takes what only it records; nothing was shared with it.
     assert.equal(removeClientIntegrations(real.home, (_ca, opts) => { sweep = opts.sweep; return true; }, { agentDir: agents, defaultHome: real.home }), true);
     assert.equal(currentAppProxy().egressProxyUrl, null);
     assert.equal(codexEnabled(), false);
     assert.equal(fs.existsSync(path.join(agents, "shared-worker.md")), false);
-    assert.equal(sweep, true);
+    assert.equal(sweep, false);
   } finally {
     if (oldCodex === undefined) delete process.env.CODEX_HOME;
     else process.env.CODEX_HOME = oldCodex;
@@ -306,7 +314,7 @@ test("doctor: shape, mode and proxies on a healthy install", async () => {
   assert.deepEqual(d, {
     mode: "ripple",
     router: { responding: true, version: "9.9.9", pid: 77, url: proxyUrl, adminUrl: "http://127.0.0.1:18792" },
-    supervisor: { registered: true, program: process.execPath, programExists: true, state: "running" },
+    supervisor: { registered: true, program: process.execPath, programExists: true, state: "running", installedHome: null },
     desktop: { proxy: "ripple", url: proxyUrl },
     cli: { proxy: "ripple", url: proxyUrl },
     problems: [],
@@ -394,7 +402,7 @@ test("doctor and repair accept the shared router/tray launcher after a package v
 
 test("repair leaves a router that answers alone even when its entry names another installation", async () => {
   const { home } = scratch();
-  const { ops, calls } = fakeSupervisor({ current: false, program: process.execPath });
+  const { ops, calls } = fakeSupervisor({ current: false, program: process.execPath, installedHome: "/tmp/other-installation" });
   const r = await repair({ home, version: "1.0.0", supervisor: ops, routerStatus: answering("1.0.0"), sleep: noSleep, remoteHostInstalled: () => false });
   assert.deepEqual(calls, []);
   assert.equal(r.ok, true);
@@ -423,7 +431,7 @@ test("repair without an installation says so and does nothing", async () => {
 test("repair moves Claude settings that are ours on an old port, and only those", async () => {
   const { home, settings, proxyUrl, ca } = scratch();
   fs.writeFileSync(settings, JSON.stringify({ env: { HTTPS_PROXY: "http://127.0.0.1:9999", NODE_EXTRA_CA_CERTS: ca, KEEP: "1" }, model: "opus" }));
-  applyAppProxy("http://127.0.0.1:9999");
+  applyAppProxy("http://127.0.0.1:9999", home);
   const { ops } = fakeSupervisor({});
   const r = await repair({ home, version: "1.0.0", supervisor: ops, routerStatus: answering("1.0.0"), sleep: noSleep, remoteHostInstalled: () => false });
   assert.ok(r.steps.some((s) => s.name === "cli-proxy" && s.ok));
@@ -452,14 +460,16 @@ function directSetup() {
   fs.mkdirSync(configLibraryDir(), { recursive: true });
   fs.writeFileSync(path.join(configLibraryDir(), "prev.json"), JSON.stringify({ egressProxyUrl: "http://corp:3128" }));
   fs.writeFileSync(path.join(configLibraryDir(), "_meta.json"), JSON.stringify({ appliedId: "prev", other: true }));
-  applyAppProxy(ctx.proxyUrl);
-  const settingsObj = {
-    env: { HTTPS_PROXY: ctx.proxyUrl, NODE_EXTRA_CA_CERTS: ctx.ca, ANTHROPIC_SMALL_FAST_MODEL: "deepseek-v4.1-flash", ANTHROPIC_MODEL: "claude-opus-5-5", CLAUDE_CODE_PLUGIN_DIRS: "/mod", KEEP: "1" },
+  applyAppProxy(ctx.proxyUrl, ctx.home);
+  // The state after `install`: the user's own model choice and unrelated keys, plus the values
+  // install wrote (proxy, CA and the routed slot, which install now owns through its record).
+  fs.writeFileSync(ctx.settings, JSON.stringify({
+    env: { ANTHROPIC_MODEL: "claude-opus-5-5", CLAUDE_CODE_PLUGIN_DIRS: "/mod", KEEP: "1" },
     model: "opus",
     hooks: { PreToolUse: [{ matcher: "Agent|Task", _clauderipple: "agent-title" }] },
-  };
-  fs.writeFileSync(ctx.settings, JSON.stringify(settingsObj, null, 2));
-  return { ...ctx, settingsObj };
+  }, null, 2));
+  applyProxyEnv({ proxyUrl: ctx.proxyUrl, caPath: ctx.ca, force: false, home: ctx.home, models: { smallFast: "deepseek-v4.1-flash" } });
+  return { ...ctx, settingsObj: JSON.parse(fs.readFileSync(ctx.settings, "utf8")) as Record<string, unknown> };
 }
 
 test("direct on then off: only our values leave, other keys stay, and everything comes back exactly", async () => {
@@ -569,7 +579,10 @@ test("Windows PowerShell launcher files carry a UTF-8 BOM and preserve Korean pa
   const { home } = scratch();
   const rt = { ...fakeRuntime(path.join(root, "홍길동", "runtime")), packaged: false };
   const router = writeLauncher({ home, program: rt.node, args: [rt.router] });
-  installLauncher({ rt, home, version: "1", platform: "win32", powershell: () => "" });
+  installLauncher({ rt, home, version: "1", platform: "win32", powershell: (script) => script.includes("ConvertTo-Json") ? JSON.stringify([
+    { path: "start.lnk", exists: false, target: "", args: "", description: "" },
+    { path: "desktop.lnk", exists: false, target: "", args: "", description: "" },
+  ]) : "" });
   for (const file of [router, path.join(home, "clauderipple-tray.ps1")]) {
     const bytes = fs.readFileSync(file);
     assert.deepEqual([...bytes.subarray(0, 3)], [0xef, 0xbb, 0xbf]);
@@ -593,18 +606,27 @@ test("macOS launcher opens the native app without writing a bundle, even from an
     ok: false, paths: [], detail: "Install the menu-bar app: apps/macos/build.sh install",
   });
 
-  // Neither the native bundle nor another app is overwritten, removed or quit.
+  // The native bundle opens by identity but is never overwritten, removed or quit.
   fs.mkdirSync(path.join(app, "Contents"), { recursive: true });
   const plist = path.join(app, "Contents", "Info.plist");
-  for (const id of ["com.clauderipple.mac", "com.clauderipple.app"]) {
+  const native = "<key>CFBundleIdentifier</key><string>com.clauderipple.mac</string>";
+  fs.writeFileSync(plist, native);
+  assert.equal(installLauncher(options).ok, true);
+  assert.equal(uninstallLauncher(options).ok, false);
+  assert.equal(fs.readFileSync(plist, "utf8"), native);
+  assert.equal(opens, 3);
+  // An unrelated bundle and an id-only legacy bundle have no current-home evidence.
+  for (const id of ["com.clauderipple.app", LAUNCHER_BUNDLE_ID]) {
     const content = `<key>CFBundleIdentifier</key><string>${id}</string>`;
     fs.writeFileSync(plist, content);
-    assert.equal(installLauncher(options).ok, true);
+    assert.equal(installLauncher(options).ok, false);
     assert.equal(uninstallLauncher(options).ok, false);
     assert.equal(fs.readFileSync(plist, "utf8"), content);
+    assert.equal(opens, 3);
   }
-  // Removal remains available for the old generated shell launcher only.
-  fs.writeFileSync(plist, `<key>CFBundleIdentifier</key><string>${LAUNCHER_BUNDLE_ID}</string>`);
+  // Removal remains available only for an old shell launcher that records this home.
+  fs.mkdirSync(path.join(app, "Contents", "MacOS"));
+  fs.writeFileSync(path.join(app, "Contents", "MacOS", "ClaudeRipple"), macLauncherScript(rt, home));
   assert.deepEqual(uninstallLauncher(options).paths, [app]);
   assert.equal(fs.existsSync(app), false);
   assert.deepEqual(uninstallLauncher(options).paths, []);
@@ -622,12 +644,16 @@ test("Linux launcher: a desktop entry; Windows: shortcuts through a hidden Power
   const scripts: string[] = [];
   const powershell = (s: string) => {
     scripts.push(s);
+    if (s.includes("ConvertTo-Json")) return JSON.stringify([
+      { path: "start.lnk", exists: false, target: "", args: "", description: "" },
+      { path: "desktop.lnk", exists: false, target: "", args: "", description: "" },
+    ]);
     return `${path.join(process.env.CLAUDERIPPLE_LAUNCHER_DIR!, "Start Menu", "ClaudeRipple.lnk")}\r\n`;
   };
   const win = installLauncher({ rt, home, version: "1", platform: "win32", powershell });
   assert.equal(win.ok, true);
   assert.match(scripts[0]!, /WScript\.Shell/);
-  assert.match(scripts[0]!, /conhost\.exe/);
+  assert.match(scripts[1]!, /conhost\.exe/);
   assert.ok(scripts[0]!.includes(path.join(process.env.CLAUDERIPPLE_LAUNCHER_DIR!, "Desktop", "ClaudeRipple.lnk")));
   const trayScript = fs.readFileSync(path.join(home, "clauderipple-tray.ps1"), "utf8");
   assert.match(trayScript, /tray --ensure/);
@@ -684,15 +710,21 @@ test("CLI: doctor, direct on/off and app print one JSON object each and exit 0",
   assert.ok(used.length > 0 && used.every((l) => l.startsWith("print ") && l.endsWith(`/${label}`)), used.join("\n"));
 });
 
-test("CLI: uninstall turns picker mode off before it stops the router", { skip: os.type() !== "Darwin" }, async () => {
+test("CLI: uninstall cleans owned picker integrations after checking the router service", { skip: os.type() !== "Darwin" }, async () => {
   const ctx = directSetup();
+  // directSetup intentionally keeps an unproven marked hook. A successful uninstall instead
+  // needs an actual hook this home recorded; marker-only hooks must continue to block cleanup.
+  const settings = JSON.parse(fs.readFileSync(ctx.settings, "utf8"));
+  delete settings.hooks;
+  fs.writeFileSync(ctx.settings, JSON.stringify(settings));
+  setAgentTitleHook(true, { node: process.execPath, script: path.join(ctx.home, "agent-title.js") }, { home: ctx.home });
   generateCerts(ctx.home, "example.invalid");
   const fingerprint = new crypto.X509Certificate(fs.readFileSync(ctx.ca)).fingerprint.replace(/:/g, "");
   const bin = path.join(root, "uninstall-bin");
   const calls = path.join(root, "uninstall-calls.log");
   fs.mkdirSync(bin, { recursive: true });
   // Stand-ins for the login keychain and launchd, logging to one file so their order shows.
-  fs.writeFileSync(path.join(bin, "security"), `#!/bin/sh\necho "security $*" >> "${calls}"\nexit 0\n`, { mode: 0o755 });
+  fs.writeFileSync(path.join(bin, "security"), `#!/bin/sh\necho "security $*" >> "${calls}"\ncase "$1" in\n  find-certificate) printf 'SHA-1 hash: ${fingerprint}\\n' ;;\n  trust-settings-export) printf '<key>${fingerprint}</key>\\n' ;;\nesac\nexit 0\n`, { mode: 0o755 });
   fs.writeFileSync(path.join(bin, "launchctl"), `#!/bin/sh\necho "launchctl $*" >> "${calls}"\nexit 113\n`, { mode: 0o755 });
   const env: NodeJS.ProcessEnv = { ...process.env, CLAUDERIPPLE_HOME: ctx.home, CLAUDERIPPLE_LAUNCHCTL: path.join(bin, "launchctl"), CODEX_HOME: path.join(ctx.home, "codex"), PATH: `${bin}${path.delimiter}${process.env.PATH ?? ""}` };
   delete env.NODE_OPTIONS;
@@ -700,13 +732,18 @@ test("CLI: uninstall turns picker mode off before it stops the router", { skip: 
   const resolved = await promisify(execFile)("/bin/sh", ["-c", "command -v security"], { env });
   assert.equal(resolved.stdout.trim(), path.join(bin, "security"));
 
+  // A current-home definition makes service checks observable; the stand-in reports it unloaded.
+  // Without a definition the supervisor correctly returns absent without invoking launchctl.
+  fs.mkdirSync(path.dirname(plistPath()), { recursive: true });
+  fs.writeFileSync(plistPath(), renderPlist({ home: ctx.home, program: process.execPath, stdoutLog: path.join(ctx.home, "router.log") }));
   const cli = path.resolve(import.meta.dirname, "../src/index.ts");
   await promisify(execFile)(process.execPath, [cli, "uninstall"], { env, timeout: 60_000 });
 
   const used = fs.readFileSync(calls, "utf8").trim().split("\n");
   const firstLaunchctl = used.findIndex((l) => l.startsWith("launchctl "));
-  assert.ok(firstLaunchctl > 0, used.join("\n"));
-  assert.ok(used.slice(0, firstLaunchctl).some((l) => l.startsWith(`security delete-certificate -Z ${fingerprint}`)), used.join("\n"));
+  assert.ok(firstLaunchctl >= 0, used.join("\n"));
+  const trustRemoval = used.findIndex((l) => l.startsWith(`security delete-certificate -Z ${fingerprint}`));
+  assert.ok(trustRemoval > firstLaunchctl, "service stop/ownership checks precede client and trust cleanup: " + used.join("\n"));
   assert.ok(used.every((l) => !l.startsWith("security delete-certificate -c ")), "a second home must never sweep CAs by name");
   assert.equal(meta().appliedId, "prev", "the entry picker mode replaced is applied again");
   const config = path.join(ctx.home, "config.json");

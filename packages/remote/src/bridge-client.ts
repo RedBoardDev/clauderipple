@@ -26,7 +26,17 @@ type SettingRequest = { subtype: "set_model"; model: string }
   | { subtype: "set_permission_mode"; mode: PermissionMode };
 interface ControlWaiter { sessionId: string; fingerprint: string; promise: Promise<void>; resolve: () => void; reject: (error: Error) => void }
 
-export const DESKTOP_BLOCKED = "Claude 앱에서 열려 있는 세션에 지금은 보낼 수 없습니다.";
+export const DESKTOP_BLOCKED = "Claude 앱에서 이 세션의 Remote Control을 켜거나 세션을 종료한 뒤 다시 보내 주세요. 대화 기록 충돌을 방지하기 위해 전송하지 않았습니다.";
+export const DESKTOP_WAITING = "Claude 앱에서 이 세션의 Remote Control을 켜거나 세션을 종료해 주세요. 전송할 수 있게 되면 대기 중인 메시지가 자동으로 전송됩니다.";
+/** The desktop still owns the transcript, but exposes no client transport. Never start a second writer. */
+export class DesktopBlockedError extends Error {
+  constructor() { super(DESKTOP_BLOCKED); }
+}
+export const DESKTOP_BUSY = "Claude 앱에서 이 세션의 작업이 진행 중입니다. 작업이 완료되면 대기 중인 메시지가 자동으로 전송됩니다.";
+/** The app is running a turn in a session the host may otherwise resume: wait, never write beside it. */
+export class DesktopBusyError extends DesktopBlockedError {
+  constructor() { super(); this.message = DESKTOP_BUSY; }
+}
 export const LOGIN_EXPIRED = "이 컴퓨터의 Claude 로그인이 만료되었습니다. Claude 앱을 한 번 열어 주십시오.";
 export const LOGIN_REFUSED = "이 컴퓨터의 Claude 로그인이 거절되었습니다 (401). Claude 앱을 한 번 열어 주십시오.";
 // The Claude Code CLI has no login of its own. The host starts the CLI through the Agent SDK and
@@ -37,7 +47,15 @@ export const CLI_NOT_LOGGED_IN = "이 컴퓨터의 Claude Code에 로그인되�
 export function isCliNotLoggedIn(text: string): boolean {
   return /^\s*not\s+logged\s+in\b/i.test(text);
 }
-export interface BridgeAuth { accessToken: string; organizationUuid: string; expiresAt: number }
+/**
+ * The CLI's words when its own login cannot be used, wherever they land in a longer message (a
+ * result's `errors` are joined): "Not logged in · Please run /login", and the expired-OAuth line,
+ * both of which tell the person to run /login.
+ */
+export function isLoginRefusal(text: string): boolean {
+  return isCliNotLoggedIn(text) || /please\s+run\s+\/login\b/i.test(text);
+}
+export interface BridgeAuth { accessToken: string; organizationUuid: string; accountUuid?: string; expiresAt: number }
 class BridgeNetworkError extends Error {}
 class BridgeHttpError extends Error {
   status: number;
@@ -45,6 +63,10 @@ class BridgeHttpError extends Error {
 }
 export function bridgeWriteUnknown(error: unknown): boolean {
   return error instanceof BridgeNetworkError || error instanceof BridgeHttpError && error.status >= 500;
+}
+/** Only an unavailable login or an explicit client error proves a session was not created. */
+export function bridgeCreateNotCreated(error: unknown): boolean {
+  return error instanceof BridgeAuthError || error instanceof BridgeHttpError && error.status >= 400 && error.status < 500;
 }
 /**
  * This Mac's Claude login cannot be used (expired, unreadable, or refused): nothing reaches any
@@ -122,19 +144,22 @@ export function loadBridgeAuth(options: BridgeAuthOptions = {}): BridgeAuth {
   const userHome = options.userHome ?? os.homedir();
   const read = options.readFile ?? ((file: string) => fs.readFileSync(file, "utf8"));
   let organizationUuid: string;
+  let accountUuid: string | undefined;
   try {
     const account = object(object(JSON.parse(read(path.join(userHome, ".claude.json"))))?.oauthAccount);
     if (typeof account?.organizationUuid !== "string") throw new Error();
     organizationUuid = account.organizationUuid;
+    if (typeof account.accountUuid === "string" && account.accountUuid) accountUuid = account.accountUuid;
   } catch { throw new BridgeAuthError("이 컴퓨터의 Claude 로그인 정보를 읽을 수 없습니다."); }
   // The CLI's own login: the macOS keychain item, or the credentials file Windows keeps.
   const cli = options.cli ? options.cli() : platform === "darwin" ? keychainCredentials() : windowsCredentials(read, userHome);
   // The CLI's login while it is good; else the one the Claude app is working with; else the
   // CLI's expired one, so the phone is told it expired.
-  if (cli && cli.expiresAt - now > 5 * 60_000) return { ...cli, organizationUuid };
+  const identity = { organizationUuid, ...(accountUuid ? { accountUuid } : {}) };
+  if (cli && cli.expiresAt - now > 5 * 60_000) return { ...cli, ...identity };
   const observed = options.observed ? options.observed(now) : loadObservedAuth(now);
-  if (observed) return { ...observed, organizationUuid };
-  if (cli) return { ...cli, organizationUuid };
+  if (observed) return { ...observed, ...identity };
+  if (cli) return { ...cli, ...identity };
   throw new BridgeAuthError(LOGIN_EXPIRED);
 }
 export interface BridgeFrame { event: string; data: Record<string, unknown> }
@@ -150,6 +175,8 @@ export class BridgeClient {
   private loadAuth: () => BridgeAuth;
   private cached: BridgeAuth | null = null;
   private readAt = 0;
+  /** What the last read threw, kept with `readAt` so the same failure answers requests for one window. */
+  private readFailure: { error: unknown } | null = null;
   private now: () => number;
   constructor(options: { fetch?: typeof fetch; auth?: () => BridgeAuth; now?: () => number } = {}) {
     this.fetchFn = options.fetch ?? fetch;
@@ -161,21 +188,41 @@ export class BridgeClient {
    * event loop under the 3 s state poll until relay pings timed out (2026-10-12). Kept in memory
    * and reread only near expiry or after a 401 (Claude Code refreshes the token on its own) — and
    * near or past expiry at most every AUTH_REREAD_MS: an expired login otherwise meant one keychain
-   * read per request, every poll, for as long as it stayed expired (2026-10-15).
+   * read per request, every poll, for as long as it stayed expired (2026-10-15). A read that fails
+   * outright is kept the same way — its time and the error it threw — so twenty sessions failing at
+   * the same moment read the login once and each is given that error: no invented login, and no
+   * second keychain read until the window is up (2026-10-25). A login written later (Claude Code
+   * refreshing its own, or a restarted host with a new client) is read at the next request at or
+   * after the window; a 401 drops the kept failure so the next request reads it at once.
    */
   private auth(): BridgeAuth {
     const now = this.now();
     const stale = !this.cached || this.refused || this.cached.expiresAt - now < 5 * 60_000;
-    if (stale && (!this.cached || now - this.readAt >= AUTH_REREAD_MS)) {
-      this.readAt = now;
+    // The first read is forced; after that only the window decides, including while the read fails.
+    if (stale && ((!this.cached && !this.readFailure) || now - this.readAt >= AUTH_REREAD_MS)) this.read(now);
+    if (this.readFailure) throw this.readFailure.error;
+    return this.cached!;
+  }
+  /** One read of this host's login, and the outcome kept as this client's; it is never shared. */
+  private read(now: number): void {
+    this.readAt = now;
+    this.readFailure = null;
+    try {
       this.cached = this.loadAuth();
       this.refused = false;
+    } catch (error) {
+      this.cached = null;
+      this.readFailure = { error };
     }
-    return this.cached!;
+  }
+  /** Forget the read so the next request reads the login again at once (the 401 path). */
+  private forget(): void {
+    this.cached = null;
+    this.readFailure = null;
   }
   /** The API answered 401 to the token in `cached`; cleared when the keychain is read again. */
   private refused = false;
-  private async request(id: string, suffix: string, options: RequestInit): Promise<Response> {
+  private async request(id: string | null, suffix: string, options: RequestInit): Promise<Response> {
     const auth = this.auth();
     if (this.refused) throw new BridgeAuthError(LOGIN_REFUSED);
     if (auth.expiresAt <= this.now()) throw new BridgeAuthError(LOGIN_EXPIRED);
@@ -184,7 +231,7 @@ export class BridgeClient {
       // The bridge treats a prompt as the user's own only from a person's app platform
       // (ios, android, web_claude_ai, desktop_app in CLI 2.1.296); any claude_code_* platform
       // is demoted to "a message from another Claude session". These prompts are typed on a phone.
-      response = await this.fetchFn(`https://api.anthropic.com/v1/code/sessions/${encodeURIComponent(id)}${suffix}`, {
+      response = await this.fetchFn(`https://api.anthropic.com/v1/code/sessions${id === null ? "" : `/${encodeURIComponent(id)}`}${suffix}`, {
         ...options, redirect: "error", headers: { Authorization: `Bearer ${auth.accessToken}`, "anthropic-version": "2023-06-01", "anthropic-client-platform": "ios", "x-organization-uuid": auth.organizationUuid, "Content-Type": "application/json", "User-Agent": "RippleRemote/0.8.10" },
       });
     } catch { throw new BridgeNetworkError("Claude 앱과 연결하지 못했습니다."); }
@@ -193,7 +240,7 @@ export class BridgeClient {
       if (response.status === 401) {
         // Refused: the keychain is read again (Claude Code may have refreshed it) — at once if the
         // last read is AUTH_REREAD_MS old, else then; until then requests fail here without a call.
-        if (this.now() - this.readAt >= AUTH_REREAD_MS) this.cached = null;
+        if (this.now() - this.readAt >= AUTH_REREAD_MS) this.forget();
         else this.refused = true;
         throw new BridgeAuthError(LOGIN_REFUSED);
       }
@@ -201,6 +248,22 @@ export class BridgeClient {
       throw new BridgeHttpError(response.status);
     }
     return response;
+  }
+  /** The organization used by the next bridge request; no credential leaves this client. */
+  identity(): Pick<BridgeAuth, "organizationUuid" | "accountUuid"> {
+    const { organizationUuid, accountUuid } = this.auth();
+    return { organizationUuid, ...(accountUuid ? { accountUuid } : {}) };
+  }
+
+  /** A lost response does not prove a POST did nothing (ARCHITECTURE.md:1760). Never retry it. */
+  async createEnvironmentSession(environmentId: string, title: string): Promise<string> {
+    const response = await this.request(null, "", { method: "POST", body: JSON.stringify({ title, events: [], environment_id: environmentId, config: { sources: [] } }), signal: AbortSignal.timeout(15_000) });
+    let body: Record<string, unknown> | null;
+    try { body = object(await response.json()); }
+    catch { throw new Error("Claude app session creation response could not be read."); }
+    const id = object(body?.session)?.id ?? body?.id;
+    if (typeof id !== "string" || !/^cse_[\w-]+$/.test(id)) throw new Error("Claude app session creation response has no valid session id.");
+    return id;
   }
   async post(id: string, payload: Record<string, unknown>): Promise<void> {
     const response = await this.request(id, "/events", { method: "POST", body: JSON.stringify({ session_id: id, events: [{ payload }] }), signal: AbortSignal.timeout(15_000) });

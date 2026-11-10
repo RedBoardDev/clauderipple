@@ -16,6 +16,7 @@ import { applyAppProxy, currentAppProxy } from "./picker.ts";
 import { applyProxyEnv, settingsEnv } from "./settings.ts";
 import type { AgentState } from "./supervisor.ts";
 import type { SupervisorOps, SupervisorView } from "./registration.ts";
+import { sameHome } from "./ownership.ts";
 
 export type Mode = "ripple" | "direct" | "mixed";
 export type ProxyState = "ripple" | "none" | "other";
@@ -24,7 +25,7 @@ export type Problem = { code: string; message: string };
 export type DoctorReport = {
   mode: Mode;
   router: { responding: boolean; version: string | null; pid: number | null; url: string; adminUrl: string };
-  supervisor: { registered: boolean; program: string | null; programExists: boolean; state: AgentState };
+  supervisor: { registered: boolean; program: string | null; programExists: boolean; state: AgentState; installedHome: string | null };
   desktop: { proxy: ProxyState; url: string | null };
   cli: { proxy: ProxyState; url: string | null };
   problems: Problem[];
@@ -147,12 +148,20 @@ async function snapshot(deps: RecoveryDeps): Promise<Snapshot> {
   const problems: Problem[] = [];
   const add = (code: string, message: string): void => void problems.push({ code, message });
   if (!installed) add("not-installed", `ClaudeRipple is not installed here (no ${configFile(deps.home)}). Run: clauderipple install`);
-  if (!view.registered) add("supervisor-missing", "The router is not registered to start at login, so nothing starts it. Repair registers it again.");
+  // A service manager that cannot be asked says nothing about whether the service is there: say
+  // only what failed, and never offer "repair" as if the entry were missing (D7, 2026-10-25).
+  if (view.lookupError) add("supervisor-state-unknown", `The router's startup service could not be inspected (${view.lookupError}). It was not started, stopped or replaced.`);
+  else if (!view.registered) add("supervisor-missing", "The router is not registered to start at login, so nothing starts it. Repair registers it again.");
+  else if (view.installedHome !== null && !sameHome(view.installedHome, deps.home)) add("supervisor-other-install", `The router's startup entry belongs to another ClaudeRipple installation (${view.installedHome}). This installation cannot start, stop or repair it.`);
   else if (!view.programExists) add("supervisor-program-missing", `The router's startup entry points at a program that no longer exists (${view.program ?? "none"}). Repair points it at this installation.`);
-  else if (!view.current) add("supervisor-other-install", `The router's startup entry belongs to another ClaudeRipple installation (${view.program}).`);
+  else if (!view.current) {
+    if (view.installedHome === null) add("supervisor-other-install", `The router's startup entry does not record which installation it belongs to (${view.program}).`);
+    else if (sameHome(view.installedHome, deps.home)) add("supervisor-outdated", `The router's startup entry is out of date for this installation (${view.program}). Repair points it at the current files.`);
+    else add("supervisor-other-install", `The router's startup entry belongs to another ClaudeRipple installation (${view.program}).`);
+  }
   if (!status) {
     add("router-down", `The router is not answering on ${adminUrl}. ${mode === "direct" ? "Claude is on its default connection, so it is not affected." : "Claude Desktop and Claude Code cannot connect while it is down."}`);
-    if (view.registered && view.state !== "running") add("supervisor-not-running", "The router's background service is not running.");
+    if (view.registered && view.state !== "running" && view.state !== "unknown") add("supervisor-not-running", "The router's background service is not running.");
   } else if (status.version && status.version !== deps.version) {
     add("router-version-mismatch", `The running router is ${status.version}; this ClaudeRipple is ${deps.version}.`);
   }
@@ -172,7 +181,7 @@ async function snapshot(deps: RecoveryDeps): Promise<Snapshot> {
     report: {
       mode,
       router: { responding: status !== null, version: status?.version ?? null, pid: view.pid, url: proxyUrl, adminUrl },
-      supervisor: { registered: view.registered, program: view.program, programExists: view.programExists, state: view.state },
+      supervisor: { registered: view.registered, program: view.program, programExists: view.programExists, state: view.state, installedHome: view.installedHome },
       desktop: { proxy: desktop.proxy, url: desktop.url },
       cli: { proxy: cli.proxy, url: cli.url },
       problems,
@@ -210,8 +219,26 @@ export async function repair(deps: RecoveryDeps): Promise<RepairReport> {
 
   // A working router is never cut off for a definition that merely differs: re-registering unloads
   // the running job, which drains it and drops every Claude connection (ARCHITECTURE §5).
-  const mustRegister = !view.registered || !view.programExists || (!view.current && !responding);
-  if (mustRegister) {
+  // A definition that records another installation (or none) is not this one's to replace (B01).
+  // `current` already means byte-for-byte this installation's, so only a differing definition needs
+  // its owner read; an injected supervisor that reports `current` is accepted as this one's.
+  const foreign = view.registered && !view.current && view.installedHome !== null && !sameHome(view.installedHome, deps.home);
+  const unidentified = view.registered && !view.current && view.installedHome === null;
+  // A lookup that failed is not evidence of absence: registering now could overwrite a definition
+  // this installation could not read. Leave it and say what failed.
+  const uninspectable = !!view.lookupError;
+  const mustRegister = !uninspectable && !foreign && !unidentified && (!view.registered || !view.programExists || (!view.current && !responding));
+  if (uninspectable) {
+    steps.push({ name: "supervisor", ok: false, detail: `left as it is: the startup service could not be inspected (${view.lookupError})` });
+  } else if (foreign || unidentified) {
+    steps.push({
+      name: "supervisor",
+      ok: responding,
+      detail: foreign
+        ? `left as it is: the startup entry belongs to another ClaudeRipple installation (${view.installedHome}), so this one cannot stop or replace it`
+        : "left as it is: the startup entry does not record an installation, so its owner cannot be identified",
+    });
+  } else if (mustRegister) {
     try {
       const where = deps.supervisor.register();
       steps.push({ name: "supervisor", ok: true, detail: `registered for this installation: ${where}` });
@@ -228,26 +255,48 @@ export async function repair(deps: RecoveryDeps): Promise<RepairReport> {
 
   if (responding) {
     steps.push({ name: "start", ok: true, detail: "the router is already answering" });
+  } else if (uninspectable) {
+    steps.push({ name: "start", ok: false, detail: "not started: the startup service could not be inspected" });
+  } else if (foreign || unidentified) {
+    steps.push({ name: "start", ok: false, detail: "not started: the startup entry belongs to another installation" });
   } else {
-    const started = deps.supervisor.start();
-    steps.push({ name: "start", ok: started !== "failed", detail: started === "failed" ? "the supervisor could not start the router" : started === "already-running" ? "the supervisor reports it running" : "started" });
-    const adminUrl = before.report.router.adminUrl;
-    const budget = deps.healthBudgetMs ?? 20_000;
-    const t0 = Date.now();
-    let up = false;
-    while (!up) {
-      up = (await status(adminUrl, 3_000)) !== null;
-      if (up || Date.now() - t0 >= budget) break;
-      await sleep(1_000);
+    let started: ReturnType<SupervisorOps["start"]> | null = null;
+    let startError: string | null = null;
+    try {
+      started = deps.supervisor.start();
+    } catch (e) {
+      startError = (e as Error).message;
     }
-    steps.push({ name: "health", ok: up, detail: up ? `answering on ${adminUrl} after ${Math.round((Date.now() - t0) / 100) / 10}s` : `still not answering on ${adminUrl} after ${Math.round(budget / 1000)}s; see ${path.join(deps.home, "logs", "router.log")}` });
+    steps.push({
+      name: "start",
+      ok: startError === null && started !== "failed" && started !== "other-installation" && started !== "ownership-unknown",
+      detail:
+        startError !== null ? `the supervisor could not start the router: ${startError}`
+        : started === "failed" ? "the supervisor could not start the router"
+        : started === "other-installation" ? "not started: the startup entry belongs to another installation"
+        : started === "ownership-unknown" ? "not started: the startup entry does not record an installation"
+        : started === "already-running" ? "the supervisor reports it running"
+        : "started",
+    });
+    if (startError === null) {
+      const adminUrl = before.report.router.adminUrl;
+      const budget = deps.healthBudgetMs ?? 20_000;
+      const t0 = Date.now();
+      let up = false;
+      while (!up) {
+        up = (await status(adminUrl, 3_000)) !== null;
+        if (up || Date.now() - t0 >= budget) break;
+        await sleep(1_000);
+      }
+      steps.push({ name: "health", ok: up, detail: up ? `answering on ${adminUrl} after ${Math.round((Date.now() - t0) / 100) / 10}s` : `still not answering on ${adminUrl} after ${Math.round(budget / 1000)}s; see ${path.join(deps.home, "logs", "router.log")}` });
+    }
   }
 
   const proxyUrl = proxyUrlFor(before.cfg.listen.port);
   if (before.cliStale) {
     try {
       // Ours by our CA beside a loopback URL (cliProxyState), so replacing it is not overriding anyone.
-      const edit = applyProxyEnv({ proxyUrl, caPath: before.caPath, force: true });
+      const edit = applyProxyEnv({ proxyUrl, caPath: before.caPath, force: true, home: deps.home });
       steps.push({ name: "cli-proxy", ok: true, detail: `Claude Code now points at ${proxyUrl}${edit.backup ? ` (backup: ${edit.backup})` : ""}` });
     } catch (e) {
       steps.push({ name: "cli-proxy", ok: false, detail: (e as Error).message });
@@ -255,7 +304,7 @@ export async function repair(deps: RecoveryDeps): Promise<RepairReport> {
   }
   if (before.desktopStale) {
     try {
-      applyAppProxy(proxyUrl);
+      applyAppProxy(proxyUrl, deps.home);
       steps.push({ name: "desktop-proxy", ok: true, detail: `Claude Desktop now points at ${proxyUrl} (quit and reopen it to apply)` });
     } catch (e) {
       steps.push({ name: "desktop-proxy", ok: false, detail: (e as Error).message });

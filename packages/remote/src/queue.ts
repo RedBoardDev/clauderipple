@@ -13,13 +13,15 @@ import type { Attachment, QueuedMessage, SessionEvent } from "./protocol.ts";
 export const QUEUE_CAP = 20;
 
 export interface QueueAttachment { name: string; mediaType: string; file: string }
-export interface QueueItem { id: string; text: string; attachments: QueueAttachment[]; at: number; error?: string }
+export interface QueueItem { id: string; text: string; attachments: QueueAttachment[]; at: number; error?: string; claimedBy?: "mod" }
 interface Entry {
   items: QueueItem[];
   /** Attachments taken back to the composer; retained outside the timeline's rebase lifecycle. */
   editing?: { blob: string; file: string }[];
   /** After the phone's Stop: nothing goes on its own until the person sends or resumes. */
   held: boolean;
+  /** Distinguishes the person's Stop from an automatic failure, including across restart. */
+  heldBy?: "user" | "failure";
   /** The Claude app's session id, when it differs from the phone's; the mod finds its count by it. */
   desktopId?: string;
   /** The last message sent from here: the next waits until the turn it started has ended. */
@@ -41,7 +43,7 @@ export class SendQueue {
     for (const [session, entry] of Object.entries(saved)) {
       if (!entry || !Array.isArray(entry.items)) continue;
       const items = entry.items.filter(item => item && typeof item.id === "string" && typeof item.text === "string" && Array.isArray(item.attachments));
-      if (items.length || entry.awaiting || entry.editing?.length) queue.entries.set(session, { items, held: entry.held === true, ...(typeof entry.desktopId === "string" ? { desktopId: entry.desktopId } : {}), ...(entry.awaiting ? { awaiting: entry.awaiting } : {}), ...(entry.editing?.length ? { editing: entry.editing } : {}) });
+      if (items.length || entry.awaiting || entry.editing?.length) queue.entries.set(session, { items, held: entry.held === true, ...(entry.heldBy ? { heldBy: entry.heldBy } : {}), ...(typeof entry.desktopId === "string" ? { desktopId: entry.desktopId } : {}), ...(entry.awaiting ? { awaiting: entry.awaiting } : {}), ...(entry.editing?.length ? { editing: entry.editing } : {}) });
     }
     return queue;
   }
@@ -91,7 +93,7 @@ export class SendQueue {
     if (editing) {
       entry.editing = item!.attachments.map((a, index) => ({ blob: editing[index]!.blob, file: a.file }));
     } else for (const a of item!.attachments) fs.rmSync(path.join(this.blobs, a.file), { force: true });
-    if (!entry.items.length) entry.held = false;
+    if (!entry.items.length) { entry.held = false; delete entry.heldBy; }
     this.prune(session);
     this.save();
     return item!;
@@ -117,13 +119,59 @@ export class SendQueue {
     if (!item) return;
     item.error = error;
     this.entries.get(session)!.held = true;
+    this.entries.get(session)!.heldBy ??= "failure";
     this.save();
+  }
+
+  claimMod(session: string, id: string): boolean {
+    const item = this.entries.get(session)?.items.find(queued => queued.id === id);
+    if (!item || item.claimedBy) return false;
+    item.claimedBy = "mod";
+    this.save();
+    return true;
+  }
+
+  failMod(session: string, id: string, reason: string): void {
+    const item = this.entries.get(session)?.items.find(queued => queued.id === id);
+    if (!item?.claimedBy) return;
+    delete item.claimedBy;
+    try { this.fail(session, id, reason); }
+    catch (error) { item.claimedBy = "mod"; throw error; }
+  }
+
+  recoverMod(reason: string): void {
+    for (const [session, entry] of this.entries) {
+      for (const item of entry.items) if (item.claimedBy === "mod") this.failMod(session, item.id, reason);
+    }
+  }
+
+  /** A known pre-send obstacle is not a failed write: keep watching, with the reason visible. */
+  wait(session: string, id: string, reason: string): boolean {
+    const item = this.entries.get(session)?.items.find(item => item.id === id);
+    if (!item || item.error === reason) return false;
+    item.error = reason;
+    this.save();
+    return true;
+  }
+
+  /** Older hosts held these definite pre-send refusals forever. Never release an explicit Stop. */
+  retryFailures(error: string, reason: string): void {
+    let changed = false;
+    for (const entry of this.entries.values()) {
+      if (!entry.held || entry.heldBy === "user" || entry.items[0]?.error !== error) continue;
+      entry.held = false;
+      delete entry.heldBy;
+      entry.items[0].error = reason;
+      changed = true;
+    }
+    if (changed) this.save();
   }
 
   hold(session: string): boolean {
     const entry = this.entries.get(session);
-    if (!entry?.items.length || entry.held) return false;
+    if (!entry?.items.length || entry.heldBy === "user") return false;
     entry.held = true;
+    entry.heldBy = "user";
     this.save();
     return true;
   }
@@ -132,6 +180,7 @@ export class SendQueue {
     const entry = this.entries.get(session);
     if (!entry?.held) return false;
     entry.held = false;
+    delete entry.heldBy;
     for (const item of entry.items) delete item.error;
     this.save();
     return true;
@@ -148,14 +197,17 @@ export class SendQueue {
    * reports no result, and its state can read idle for a few seconds before the turn starts, so
    * the answer has to come first); or nothing at all for AWAIT_GIVE_UP_MS (the turn never started).
    */
-  settle(session: string, after: readonly SessionEvent[], now: number): boolean {
+  /** `appIdle`: the Claude app runs this session and its own process reads idle right now. Its turns
+   * can start and end between two polls, leaving no state line here to settle on (2026-10-27). */
+  settle(session: string, after: readonly SessionEvent[], now: number, appIdle = false): boolean {
     const entry = this.entries.get(session);
     const awaiting = entry?.awaiting;
     if (!entry || !awaiting) return true;
     const answered = after.findIndex(e => e.kind === "assistant");
     const done = after.some(e => e.kind === "result")
       || answered >= 0 && after.slice(answered).some(e => e.kind === "state" && ["idle", "error", "stopped"].includes(e.state))
-      || answered < 0 && now - awaiting.at > AWAIT_GIVE_UP_MS;
+      || answered >= 0 && appIdle
+      || (answered < 0 || appIdle) && now - awaiting.at > AWAIT_GIVE_UP_MS;
     if (!done) return false;
     delete entry.awaiting;
     this.prune(session);

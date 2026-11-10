@@ -8,7 +8,7 @@ registerHooks({ resolve(specifier, context, next) {
   const source = context.parentURL?.includes('/packages/mod/hooks/')
   return next(source && /^\.\.?\//.test(specifier) && !/\.[a-z]+$/.test(specifier) ? `${specifier}.ts` : specifier, context)
 } })
-const { AUTO_DESCRIPTION, modelReason, withoutRouting, userSaid, readMarker, agentProvider, chatgptUsable,
+const { AUTO_DESCRIPTION, modelReason, ruleReason, withoutRouting, userSaid, readMarker, agentProvider, chatgptUsable,
   ladderPick, markerDomain, workerRule, routerModelOptions, zenJev, spawnModel, takesOver, claudeCandidates, allowed } = await import('../../packages/mod/hooks/workers.ts')
 const { agentModel, delegationPin, pinAllows, pinSaid, PIN_SAID_MAX, rivalProviders, userNamed } = await import('../../packages/mod/hooks/worker.ts')
 const candidates: WorkerCandidate[] = [
@@ -21,7 +21,7 @@ const verdict: WorkerVerdict = { domain: 'backend', level: 'standard', effort: '
 const pick = (s: Settings = DEFAULTS, v = verdict, workers = candidates, usable = true) => ladderPick(v, s.rules.general, s, workers, usable, 'en', s.allow)
 
 test('ripple:auto asks the session for the tier and domain, and for a model only with its source', () => {
-  for (const marker of ['[[ripple: light]]', '[[ripple: standard]]', '[[ripple: hard]]', '[[ripple: max]]', '[[ripple: standard ui]]']) assert.ok(AUTO_DESCRIPTION.includes(marker))
+  for (const marker of ['[[ripple: light]]', '[[ripple: standard]]', '[[ripple: hard]]', '[[ripple: max]]', '[[ripple: standard ui]]', '[[ripple: hard review]]']) assert.ok(AUTO_DESCRIPTION.includes(marker))
   assert.match(AUTO_DESCRIPTION, /Model reason: user/)
   assert.match(AUTO_DESCRIPTION, /Model reason: rule/)
   assert.match(AUTO_DESCRIPTION, /never carry a model over from an earlier task/)
@@ -38,6 +38,12 @@ test('a model reason names its source and the user\'s quoted words; the worker n
   assert.equal(withoutRouting('[[ripple: standard ui]]\nFix the sheet.'), 'Fix the sheet.')
 })
 
+test('a rule reason needs a concrete file and a non-empty rule; an empty one names nothing', () => {
+  for (const text of ['memory/translation-pipeline-scope.md — 번역 초안은 Opus', 'rules/workers.md — UI copy runs on Astra', 'CLAUDE.md - always', 'docs/2026-10-12-worker-tiers.md — tiers', 'C:\\rules\\x.md — windows path', 'x/md: a path']) assert.equal(ruleReason(text), true, text)
+  // No file, no rule, or a bare word where the file belongs.
+  for (const text of ['', 'CLAUDE.md', 'rules/workers.md —', '— always', 'translation runs on Opus', 'docs file.md', 'CLAUDE.md.']) assert.equal(ruleReason(text), false, text)
+})
+
 test('a quote counts only when the user said it, whitespace and case aside, and is not a lone word', () => {
   const words = ['번역은  오푸스로 해줘', 'Then ask Gemini for a review']
   assert.equal(userSaid('번역은 오푸스로', words), true)
@@ -51,6 +57,8 @@ test('markers and frontmatter provider retain existing parsing semantics', () =>
   assert.deepEqual(readMarker('context\n[[ ripple : GPT-6.1-SOL @ HIGH ]]'), { name: 'gpt-6.1-sol', level: 'high' })
   assert.equal(agentProvider('---\ndescription: Executor via chatgpt.\n---\n'), 'chatgpt')
   assert.equal(agentProvider('description: via chatgpt.'), undefined)
+  // The router's account-pinned worker (agents.ts fileContent) keeps "via <provider>." first.
+  assert.equal(agentProvider('---\nname: claude-haiku-4-5-f952fac6\ndescription: claude-haiku-4-5 via anthropic. Runs on mambo20211 (account f952fac6). Set effort with [[ripple: claude-haiku-4-5-f952fac6@<level>]] on the first line.\nmodel: anthropic#f952fac6:claude-haiku-4-5\n---\n'), 'anthropic')
 })
 test('account readiness and all windows decide availability; unknown is not exhaustion', () => {
   const status = (accounts: unknown[]) => ({ chatgpt: { accounts: { chatgpt: accounts } } })
@@ -71,20 +79,22 @@ test('every field uses the general ladder and a missing level climbs', () => {
   assert.equal(pick(DEFAULTS, { ...verdict, domain: 'design', level: 'deep' }).target?.agent, 'gpt-6-astra')
   assert.equal(pick(DEFAULTS, { ...verdict, level: 'light' }, candidates.slice(1)).target?.agent, 'gpt-6-1-sol')
 })
-test('domain ladders select UI for design/frontend, backend separately, otherwise this set\'s general', () => {
+test('domain ladders select UI for design/frontend, backend and review separately, otherwise this set\'s general', () => {
   const s = normalizeSettings({ domainRules: {
     ui: { mode: 'ladder', rungs: { standard: { target: { agent: 'deepseek-v4-1-flash' }, effort: 'max' } } },
     backend: { mode: 'ladder', rungs: { standard: { target: { agent: 'gpt-6-astra' }, effort: 'high' } } },
+    review: { mode: 'ladder', rungs: { standard: { target: { agent: 'claude-sonnet-5-5' }, effort: 'high' } } },
   } })
-  for (const domain of ['design', 'frontend', 'backend', 'general', 'docs', 'research', 'ops'] as const) {
+  for (const domain of ['design', 'frontend', 'backend', 'review', 'general', 'docs', 'research', 'ops'] as const) {
     const { rule, ladder } = workerRule(domain, s)
-    const expected = domain === 'design' || domain === 'frontend' ? 'ui' : domain === 'backend' ? 'backend' : 'general'
+    const expected = domain === 'design' || domain === 'frontend' ? 'ui' : domain === 'backend' ? 'backend' : domain === 'review' ? 'review' : 'general'
     assert.equal(rule, expected)
     assert.equal(ladder, expected === 'general' ? s.rules.general : s.domainRules![expected])
     const resolved = ladderPick({ ...verdict, domain }, ladder, s, candidates, true, 'en')
-    assert.equal(resolved.target?.agent, expected === 'ui' ? 'deepseek-v4-1-flash' : expected === 'backend' ? 'gpt-6-astra' : 'gpt-6-1-sol')
+    assert.equal(resolved.target?.agent, expected === 'ui' ? 'deepseek-v4-1-flash' : expected === 'backend' ? 'gpt-6-astra' : expected === 'review' ? 'claude-sonnet-5-5' : 'gpt-6-1-sol')
   }
   assert.deepEqual(workerRule('backend', { ...s, domainRules: { ui: s.domainRules!.ui } }), { rule: 'general', ladder: s.rules.general })
+  assert.deepEqual(workerRule('review', { ...s, domainRules: { ui: s.domainRules!.ui, backend: s.domainRules!.backend } }), { rule: 'general', ladder: s.rules.general })
   // Unavailable domain rungs climb only within that ladder, not into the general one, nor onto the
   // session's own model.
   const blocked = ladderPick(verdict, s.domainRules!.backend!, s, candidates, false, 'en')
@@ -105,10 +115,11 @@ test('under a domain ladder light and ordinary work take the light row; hard wor
 test('a tier marker\'s domain word picks the ladder; no word is general', () => {
   assert.deepEqual(readMarker('[[ripple: standard ui]]\nWork.'), { name: 'standard', domain: 'ui' })
   assert.deepEqual(readMarker('[[ripple: hard  backend ]]\nWork.'), { name: 'hard', domain: 'backend' })
+  assert.deepEqual(readMarker('[[ripple: standard red-team]]\nWork.'), { name: 'standard', domain: 'red-team' })
   assert.deepEqual(readMarker('[[ripple: gemini-3-8-flash@high]]'), { name: 'gemini-3-8-flash', level: 'high' })
-  for (const [word, domain] of [['ui', 'frontend'], ['frontend', 'frontend'], ['design', 'design'], ['backend', 'backend'], ['server', 'backend'], [undefined, 'general'], ['docs', 'general']] as const) {
+  for (const [word, domain] of [['ui', 'frontend'], ['frontend', 'frontend'], ['design', 'design'], ['backend', 'backend'], ['server', 'backend'], ['review', 'review'], ['redteam', 'review'], ['red-team', 'review'], [undefined, 'general'], ['docs', 'general']] as const) {
     assert.equal(markerDomain(word), domain)
-    assert.equal(workerRule(markerDomain(word), normalizeSettings({ domainRules: { ui: DEFAULTS.rules.general, backend: DEFAULTS.rules.general } })).rule, domain === 'frontend' || domain === 'design' ? 'ui' : domain)
+    assert.equal(workerRule(markerDomain(word), normalizeSettings({ domainRules: { ui: DEFAULTS.rules.general, backend: DEFAULTS.rules.general, review: DEFAULTS.rules.general } })).rule, domain === 'frontend' || domain === 'design' ? 'ui' : domain)
   }
 })
 
@@ -410,9 +421,44 @@ test('quota/off never chooses the blocked provider: the ladder moves up, then no
   assert.equal(pick(pinnedModel).target, undefined)
 })
 
+test('duplicate Gemini workers keep their own provider and skip only the exhausted source', async () => {
+  const { ladderOptionsFrom, candidateUsable } = await import('../../packages/mod/hooks/workers.ts')
+  const id = 'gemini-4-argon'
+  const providers = { 'google-gemini': { usable: false, reason: 'quota_exhausted' }, 'opencode-go': { usable: true } }
+  const settings = normalizeSettings({ rules: { general: { mode: 'ladder', rungs: { standard: [
+    { target: { agent: id }, effort: 'high' }, { target: { agent: id + '-opencode-go' }, effort: 'high' },
+  ] } } } })
+  const workers: WorkerCandidate[] = [
+    { target: { agent: id }, model: 'google-gemini:' + id, provider: 'google-gemini' },
+    { target: { agent: id + '-opencode-go' }, model: 'opencode-go:' + id, provider: 'opencode-go' },
+  ]
+  const result = ladderPick(verdict, settings.rules.general, settings, workers, true, 'en', [], providers)
+  assert.deepEqual(result.target, { agent: id + '-opencode-go' })
+  assert.equal(result.position, 2)
+  assert.equal(result.skipped?.length, 1)
+  const out = { 'google-gemini': { usable: true, models: { [id]: { reason: 'quota_exhausted' } } }, 'opencode-go': { usable: true } }
+  assert.equal(candidateUsable(workers[0]!, settings, true, out), false)
+  assert.equal(candidateUsable(workers[1]!, settings, true, out), true)
+  assert.equal(spawnModel(result.target!, 'high', 'opencode-go:' + id + '@medium'), 'opencode-go:' + id + '@high')
+  const catalogue = routerModelOptions({ providers: { 'google-gemini': { models: [{ id }] }, 'opencode-go': { models: [{ id }] } } })
+  assert.deepEqual(catalogue.map(m => [m.value, m.provider]), [['google-gemini:' + id, 'google-gemini'], ['opencode-go:' + id, 'opencode-go']])
+  const options = ladderOptionsFrom({ providers: Object.entries(providers).map(([name, state]) => ({ name, ...state })), agents: workers.map(w => ({ name: w.target.agent, model: id, provider: w.provider, efforts: ['high'] })) }, 0)
+  assert.equal(options.choices.find(c => c.target.agent === id + '-opencode-go')?.provider, 'opencode-go')
+  assert.equal(options.choices.some(c => c.target.agent === id), false)
+  assert.deepEqual(readMarker('[[ripple: opencode-go:gemini-4-argon@high]]'), { name: 'opencode-go:gemini-4-argon', level: 'high' })
+  const sources = workers.map(w => ({ model: w.model, provider: w.provider }))
+  for (const source of sources) {
+    const rivals = rivalProviders(source.model, sources)
+    assert.deepEqual(rivals, ['google-gemini', 'opencode-go'])
+    assert.equal(userNamed(source.model, [{ role: 'user', text: '오픈코드로 해' }], [], { ...source, providers: rivals }), false)
+    assert.equal(userNamed(source.model, [{ role: 'user', text: '아르곤을 오픈코드로 돌려' }], [], { ...source, providers: rivals }), source.provider === 'opencode-go')
+  }
+  assert.deepEqual(delegationPin({ role: 'user', text: '앞으로 아르곤을 오픈코드로 위임 고정' }, sources, sources), { model: 'opencode-go:' + id, provider: 'opencode-go' })
+})
+
 test('spawn suffix and takeover retain named-worker and fork boundaries', () => {
   assert.equal(spawnModel({ agent: 'sol' }, 'max', 'gpt-6.1-sol@medium'), 'gpt-6.1-sol@max')
-  assert.equal(spawnModel({ agent: 'general-purpose', model: 'sonnet' }, 'high'), 'sonnet')
+  assert.equal(spawnModel({ agent: 'general-purpose', model: 'sonnet' }, 'high'), 'claude-sonnet-5-5')
   assert.equal(takesOver({ subagentType: 'ripple:auto', fork: false }, DEFAULTS), true)
   assert.equal(takesOver({ subagentType: 'ripple:auto', fork: true }, DEFAULTS), false)
   // The tier agents are gone (2026-10-12): a stale session's ripple:low runs as Claude Code spawns it.
@@ -425,6 +471,20 @@ test('spawn suffix and takeover retain named-worker and fork boundaries', () => 
     assert.equal(takesOver({ subagentType, fork: true }, { ...DEFAULTS, agentAuto: 'all' }), false)
   }
   for (const subagentType of ['Explore', 'Plan', 'statusline-setup', 'claude-code-guide', 'plugin:worker']) assert.equal(takesOver({ subagentType, fork: false }, { ...DEFAULTS, agentAuto: 'all' }), false)
+})
+
+test('spawn models resolve every native family from the worker table without changing explicit selections', () => {
+  for (const candidate of claudeCandidates()) {
+    assert.equal(spawnModel(candidate.target, 'high'), candidate.model)
+    assert.equal(spawnModel({ agent: 'native' }, 'max', candidate.target.model), `${candidate.model}@max`)
+  }
+  for (const model of [undefined, 'inherit', 'claude-opus-4-6', 'claude-sonnet-5', 'claude-haiku-4-5-20251001', 'gpt-6.1-sol@high', 'custom', 'sonnet-custom']) {
+    assert.equal(spawnModel({ agent: 'general-purpose', ...(model ? { model } : {}) }, 'low'), model)
+  }
+  assert.equal(spawnModel({ agent: 'general-purpose', model: 'opus@high' }, 'low'), 'claude-opus-5-5@high')
+  for (const [model, expected] of [['opus[1m]', 'claude-opus-5-5[1m]'], ['sonnet[1m]@high', 'claude-sonnet-5-5[1m]@high'], ['claude-opus-4-6[1m]@high', 'claude-opus-4-6[1m]@high']]) {
+    assert.equal(spawnModel({ agent: 'general-purpose', model }, 'low'), expected)
+  }
 })
 
 test('allow-lists pick by worker agent, so one model from two providers is told apart; provider names still match', () => {

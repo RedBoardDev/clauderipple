@@ -3,6 +3,34 @@ import assert from "node:assert/strict";
 import { OpenAiStreamMapper, toOpenAiRequest, type ChatRequest, type ResponsesRequest } from "../src/providers/openai/translate.ts";
 import { toolNameForResponses, toolNameRestoreMap, type AnthropicRequest } from "../src/providers/chatgpt/translate.ts";
 import { decodeEnvelope, encodeEnvelope } from "../src/reasoning.ts";
+import { promptAdditions } from "../src/identity.ts";
+import { SseParser } from "../src/providers/chatgpt/sse.ts";
+
+test("the SSE terminal preserves preceding usage and ignores trailing frames across every chunk boundary", () => {
+  const usage = { choices: [], usage: { prompt_tokens: 40, completion_tokens: 5 } };
+  const source = `data: ${JSON.stringify(usage)}\r\n\r\ndata: [DONE]\r\n\r\ndata: {"error":{"message":"late"}}\n\n`;
+  for (let split = 0; split <= source.length; split++) {
+    const parser = new SseParser();
+    const events = [...parser.feed(source.slice(0, split)), ...parser.feed(source.slice(split))];
+    assert.deepEqual(events, [usage]);
+    assert.equal(parser.sawDone, true);
+    assert.deepEqual(parser.feed('data: {"error":{"message":"later"}}\n\n'), []);
+  }
+});
+
+for (const type of ["response.completed", "response.incomplete"]) {
+  test(`${type} finishes once with usage and ignores subsequent errors`, () => {
+    const mapper = new OpenAiStreamMapper("test");
+    const events = mapper.feed({ type, response: { usage: { input_tokens: 4, output_tokens: 2 }, ...(type === "response.incomplete" ? { incomplete_details: { reason: "max_output_tokens" } } : {}) } }, "responses");
+    assert.equal(mapper.isFinished, true);
+    assert.equal(events.filter((event) => event.event === "message_stop").length, 1);
+    assert.deepEqual(mapper.finish(), []);
+    assert.deepEqual(mapper.feed({ error: { message: "late", code: "server_is_overloaded" } }, "responses"), []);
+    assert.equal(mapper.failure, undefined);
+    assert.equal(mapper.stopReason, type === "response.completed" ? "end_turn" : "max_tokens");
+    assert.equal(mapper.usage.output_tokens, 2);
+  });
+}
 
 /** The signature this router puts on a Chat reasoning block, as its own adapter would write it. */
 function CHAT_SIG(field: "reasoning_content" | "reasoning", model = "x", provider = ""): string {
@@ -218,6 +246,16 @@ test("responses SSE mapper emits a max-token response", () => {
 test("identity false leaves the system prompt as the caller wrote it; the addendum still follows", () => {
   const out = toOpenAiRequest(request, { ...options, wire: "chat", identity: false, instructionsAppend: "Answer in Korean." }) as ChatRequest;
   assert.equal(out.messages[0]?.content, "You are a coding agent.\n\nAnswer in Korean.");
+});
+
+test("an Auto mode classifier's system text stays exactly as sent", () => {
+  const system = "You are a security monitor for autonomous AI coding agents.\n\nJudge this action.";
+  const classifier: AnthropicRequest = { model: "claude-haiku-5-5", system, messages: [{ role: "user", content: "check" }] };
+  const additions = promptAdditions("auto-mode-classifier", { instructionsAppend: "Answer in Korean." });
+  const chat = toOpenAiRequest(classifier, { model: "grok", wire: "chat", ...additions }) as ChatRequest;
+  const responses = toOpenAiRequest(classifier, { model: "grok", wire: "responses", ...additions }) as ResponsesRequest;
+  assert.equal(chat.messages[0]?.content, system);
+  assert.equal(responses.instructions, system);
 });
 
 test("a provider that takes no reasoning effort is not told one", () => {
@@ -530,8 +568,8 @@ test("replay: false puts back the request without any reasoning", () => {
 });
 
 // The response path hands the client a carrier block whose envelope holds exactly the vendor's item,
-// so the next turn can put it back untouched. An item the backend never sealed has nothing to resume.
-test("a Responses reasoning item is sealed into a carrier block; an unsealed one is not", () => {
+// so the next turn can put it back untouched. A summary without full reasoning is display text only.
+test("a Responses reasoning item is sealed into a carrier block; a summary-only one is not", () => {
   const mapper = new OpenAiStreamMapper("muse-spark-1.3-contributor", 0, new Map(), env);
   mapper.wire = "responses";
   const evs: Record<string, unknown>[] = [
@@ -569,6 +607,40 @@ test("a Responses reasoning item is sealed into a carrier block; an unsealed one
   assert.deepEqual(plain.content, [{ type: "thinking", thinking: "just a summary", signature: "" }]);
   assert.equal(plain.reasoningCount, 0);
 });
+
+for (const shape of ["sealed-index", "content", "text-deltas"] as const) {
+  test(`Responses ${shape} reasoning survives a text-free parallel tool turn (#109)`, () => {
+    const env = { p: "opencode-go", m: "deepseek-v4.1-flash" };
+    const mapper = new OpenAiStreamMapper(env.m, 0, new Map(), env);
+    const reasoning = shape === "sealed-index"
+      ? { type: "reasoning", id: "rs_109", summary: [], encrypted_content: "sealed-109", content: [] }
+      : { type: "reasoning", id: "rs_109", summary: [], content: [{ type: "reasoning_text", text: "  inspect both files\n" }] };
+    const events = [
+      { type: "response.output_item.added", output_index: 0, item: { type: "reasoning", id: "rs_109", content: [] } },
+      ...(shape === "text-deltas" ? [{ type: "response.reasoning_text.delta", output_index: 0, delta: "  inspect both files\n" }] : []),
+      { type: "response.output_item.done", output_index: 0, item: shape === "sealed-index"
+        ? { type: "reasoning", summary: [], encrypted_content: "sealed-109" }
+        : shape === "text-deltas" ? { type: "reasoning", id: "rs_109", summary: [] } : reasoning },
+      ...["a", "b"].flatMap((id, index) => [
+        { type: "response.output_item.added", output_index: index + 1, item: { type: "function_call", id, call_id: id, name: "Read", arguments: "{}" } },
+        { type: "response.output_item.done", item: { id } },
+      ]),
+      { type: "response.completed" },
+    ].flatMap((event) => mapper.feed(event, "responses"));
+    assert.equal(mapper.reasoningCount, 1);
+    const signature = events.find((event) => (event.data.delta as { type?: string })?.type === "signature_delta")?.data.delta as { signature: string };
+    assert.deepEqual(decodeEnvelope(signature.signature), { w: "responses", ...env, r: reasoning });
+    const content = mapper.message().content as AnthropicRequest["messages"][number]["content"];
+    const carried = { replayed: 0, undecodable: 0 };
+    const next = toOpenAiRequest({ model: "m", messages: [
+      { role: "assistant", content },
+      { role: "user", content: ["a", "b"].map((id) => ({ type: "tool_result", tool_use_id: id, content: "ok" })) },
+    ] }, { model: env.m, wire: "responses", env, carried }) as ResponsesRequest;
+    assert.deepEqual(next.input.map((item) => item.type), ["reasoning", "function_call", "function_call", "function_call_output", "function_call_output"]);
+    assert.deepEqual(next.input[0], reasoning);
+    assert.equal(carried.replayed, 1);
+  });
+}
 
 // A vendor whose preset measured that it seals reasoning on request is asked on every turn, the first
 // included — waiting until a conversation already carried some would never start one. Anyone else
@@ -651,12 +723,13 @@ test("Chat interleaved parallel call fragments emit one complete block per index
 test("token-limited tool calls finish as max_tokens on both OpenAI wires", () => {
   for (const wire of ["chat", "responses"] as const) {
     const mapper = new OpenAiStreamMapper("test");
-    if (wire === "chat") mapper.feed({ choices: [{ delta: { tool_calls: [{ index: 0, id: "a", function: { name: "Read", arguments: '{"path":' } }] }, finish_reason: "length" }] }, wire);
+    const events = [];
+    if (wire === "chat") events.push(...mapper.feed({ choices: [{ delta: { tool_calls: [{ index: 0, id: "a", function: { name: "Read", arguments: '{"path":' } }] }, finish_reason: "length" }] }, wire));
     else {
-      mapper.feed({ type: "response.output_item.added", item: { type: "function_call", id: "a", name: "Read" } }, wire);
-      mapper.feed({ type: "response.incomplete", response: { incomplete_details: { reason: "max_output_tokens" } } }, wire);
+      events.push(...mapper.feed({ type: "response.output_item.added", item: { type: "function_call", id: "a", name: "Read" } }, wire));
+      events.push(...mapper.feed({ type: "response.incomplete", response: { incomplete_details: { reason: "max_output_tokens" } } }, wire));
     }
-    const events = mapper.finish();
+    events.push(...mapper.finish());
     assert.equal((events.find((event) => event.event === "message_delta")!.data.delta as { stop_reason: string }).stop_reason, "max_tokens");
     assert.equal(mapper.message().stop_reason, "max_tokens");
   }
@@ -684,4 +757,12 @@ test("documents reach both OpenAI wires as text, native PDF files or an unsuppor
     { type: "input_file", filename: "document.pdf", file_data: "data:application/pdf;base64,UERG" },
   ]);
   assert.match(content[3]!.text!, /문서.*전달하지 못했습니다/);
+});
+
+test("a preset that keys its prompt cache on the conversation gets it on both wires, and nobody else does", () => {
+  const request: AnthropicRequest = { model: "m", max_tokens: 64, messages: [{ role: "user", content: "hi" }] };
+  for (const wire of ["chat", "responses"] as const) {
+    assert.equal((toOpenAiRequest(request, { model: "m", wire, promptCacheKey: "abc" }) as ChatRequest | ResponsesRequest).prompt_cache_key, "abc", wire);
+    assert.equal("prompt_cache_key" in toOpenAiRequest(request, { model: "m", wire }), false, `${wire}: a vendor that does not know the field may refuse it`);
+  }
 });

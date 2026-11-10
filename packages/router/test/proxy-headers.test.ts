@@ -48,8 +48,8 @@ async function forwardedHeaders(providerHeaders: Record<string, string>): Promis
 async function roundTrip(
   providerHeaders: Record<string, string>,
   reply: ProviderReply,
-  options: { provider?: Partial<Provider>; system?: unknown; body?: Record<string, unknown>; exhausted?: boolean } = {},
-): Promise<{ seen: http.IncomingHttpHeaders; seenBody: Record<string, unknown>; records: RequestRecord[]; clientStatus: number; clientBody: string; clientHeaders: http.IncomingHttpHeaders; providerCalls: number; health: Record<string, ProviderExhaustion> }> {
+  options: { provider?: Partial<Provider>; system?: unknown; body?: Record<string, unknown>; exhausted?: boolean; userAgent?: string } = {},
+): Promise<{ seen: http.IncomingHttpHeaders; seenBody: Record<string, unknown>; records: RequestRecord[]; clientStatus: number; clientBody: string; clientHeaders: http.IncomingHttpHeaders; providerCalls: number; health: Record<string, ProviderExhaustion>; models: Record<string, Record<string, { reason: string }>> }> {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "cr-proxy-headers-"));
   const ca = createCa({ cn: "clauderipple test" });
   fs.writeFileSync(path.join(home, "ca.pem"), ca.certPem);
@@ -109,6 +109,7 @@ async function roundTrip(
       `x-api-key: ${CLIENT_KEY}\r\n` +
       "anthropic-version: 2023-06-01\r\n" +
       "x-claude-code-session-id: 11111111-2222-4333-8444-555555555555\r\n" +
+      (options.userAgent === undefined ? "" : `user-agent: ${options.userAgent}\r\n`) +
       `content-length: ${Buffer.byteLength(body)}\r\n\r\n` +
       body,
   );
@@ -128,8 +129,19 @@ async function roundTrip(
   await new Promise<void>((r) => provider.close(() => r()));
   const records = requests.list(10);
   fs.rmSync(home, { recursive: true, force: true });
-  return { seen, seenBody, records, clientStatus, clientBody, clientHeaders, providerCalls, health: proxy.providerHealth.snapshot() };
+  return { seen, seenBody, records, clientStatus, clientBody, clientHeaders, providerCalls, health: proxy.providerHealth.snapshot(), models: proxy.modelHealth.snapshot() };
 }
+
+test("retired models are recorded per provider/model on compatible and translated wires (#94)", async () => {
+  for (const type of ['anthropic-compatible', 'openai-compatible', 'google'] as const) {
+    const result = await roundTrip({}, {
+      status: 410, headers: { 'content-type': 'application/json' },
+      body: Buffer.from('{"error":{"type":"ModelDeprecated","message":"Model some-model has been deprecated."}}'),
+    }, { provider: { type, apiKey: 'test-key', auth: 'api-key' } as Partial<Provider> });
+    assert.deepEqual(result.health, {}, 'other models on the provider must stay usable');
+    assert.equal(result.models.p?.['some-model']?.reason, 'model_deprecated');
+  }
+});
 
 test("routed 402 and billing 429 teach provider health, but transient 429 does not; success clears it", async () => {
   for (const [status, message, exhausted] of [[402, 'Insufficient Balance', true], [429, 'insufficient_quota', true], [429, 'rate_limit_exceeded', false]] as const) {
@@ -264,6 +276,15 @@ test("identity false leaves the system prompt alone, and the addendum still foll
   assert.equal(seenBody.system, "You are Claude Code.\n\nAnswer in Korean.");
 });
 
+test("an Auto mode classifier reaches an Anthropic-compatible provider unchanged", async () => {
+  const system = "You are a security monitor for autonomous AI coding agents.\n\nJudge this action.";
+  const { seenBody } = await roundTrip({ "x-api-key": "K" }, OK_REPLY, {
+    system,
+    provider: { instructionsAppend: "Answer in Korean." } as Partial<Provider>,
+  });
+  assert.equal(seenBody.system, system);
+});
+
 // A vendor that keys its prompt cache on a session header charges full price to anyone who omits
 // one. On this path the header has to be added where the provider's own headers are, and it must
 // never displace them.
@@ -306,4 +327,20 @@ test("a thread create still reaches an anthropic-compatible provider, without th
   assert.equal("thread" in r.seenBody, false);
   assert.equal("diagnostics" in r.seenBody, false);
   assert.deepEqual(r.seenBody.messages, [{ role: "user", content: "hi" }]);
+});
+
+// OpenCode Go's Anthropic wire sits behind the same Cloudflare edge as its chat wires (issue #132).
+// A caller that sends no User-Agent gets the preset's; one it sends is forwarded; a configured one wins.
+test("an OpenCode Go anthropic-wire request gets the preset's User-Agent only when the caller sent none", async () => {
+  const none = await roundTrip({ "x-api-key": "provider-key" }, OK_REPLY, { provider: { preset: "opencode-go" } as never });
+  assert.equal(none.seen["user-agent"], "opencode/2.2.6");
+
+  const forwarded = await roundTrip({ "x-api-key": "provider-key" }, OK_REPLY, { provider: { preset: "opencode-go" } as never, userAgent: "claude-cli/2.1.0 (external, cli)" });
+  assert.equal(forwarded.seen["user-agent"], "claude-cli/2.1.0 (external, cli)", "the caller's own User-Agent is forwarded as it is");
+
+  const configured = await roundTrip({ "x-api-key": "provider-key", "User-Agent": "mine/1" }, OK_REPLY, { provider: { preset: "opencode-go" } as never, userAgent: "claude-cli/2.1.0 (external, cli)" });
+  assert.equal(configured.seen["user-agent"], "mine/1", "the provider's configured User-Agent wins over the caller's");
+
+  const other = await roundTrip({ "x-api-key": "provider-key" }, OK_REPLY, { provider: { preset: "deepseek" } as never });
+  assert.equal(other.seen["user-agent"], undefined, "a preset without a declared User-Agent sends none");
 });

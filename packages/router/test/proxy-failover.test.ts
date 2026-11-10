@@ -72,7 +72,7 @@ type Rig = {
   home: string;
   config: Config;
   logs: () => string;
-  send: (opts?: { cancel?: boolean; conversation?: string }) => Promise<number>;
+  send: (opts?: { cancel?: boolean; conversation?: string; session?: string; agent?: string; prompt?: string; metadata?: false }) => Promise<number>;
   /** The same turn, keeping the whole answer so a test can assert on the body too. */
   sendDetailed: () => Promise<{ status: number; body: string }>;
   /** The same turn again, keeping the answer as bytes — a compressed body is not text. */
@@ -99,7 +99,7 @@ async function rig(providers: Config["providers"], routes: Config["routes"]): Pr
   });
   await proxy.listen();
 
-  const send = async (opts: { cancel?: boolean; conversation?: string } = {}): Promise<number> => {
+  const send = async (opts: { cancel?: boolean; conversation?: string; session?: string; agent?: string; prompt?: string; metadata?: false } = {}): Promise<number> => {
     const sock = net.connect(proxyPort, "127.0.0.1");
     await new Promise<void>((r) => sock.once("connect", () => r()));
     sock.write("CONNECT api.anthropic.com:443 HTTP/1.1\r\nHost: api.anthropic.com:443\r\n\r\n");
@@ -109,11 +109,12 @@ async function rig(providers: Config["providers"], routes: Config["routes"]): Pr
     const body = JSON.stringify({
       model: "claude-opus-4-8",
       max_tokens: 1,
-      metadata: { user_id: opts.conversation ?? "user-1" },
-      messages: [{ role: "user", content: "hi" }],
+      ...(opts.metadata === false ? {} : { metadata: { user_id: opts.conversation ?? "user-1" } }),
+      messages: [{ role: "user", content: opts.prompt ?? "hi" }],
     });
+    const identity = `${opts.session ? `x-claude-code-session-id: ${opts.session}\r\n` : ""}${opts.agent ? `x-claude-code-agent-id: ${opts.agent}\r\n` : ""}`;
     secure.write(
-      `POST /v1/messages HTTP/1.1\r\nHost: api.anthropic.com\r\ncontent-type: application/json\r\ncontent-length: ${Buffer.byteLength(body)}\r\n\r\n${body}`,
+      `POST /v1/messages HTTP/1.1\r\nHost: api.anthropic.com\r\n${identity}content-type: application/json\r\ncontent-length: ${Buffer.byteLength(body)}\r\n\r\n${body}`,
     );
     if (opts.cancel) {
       // What the client does when the user presses escape: drop the connection mid-turn.
@@ -198,6 +199,89 @@ const openaiPooled = (port: number): Extract<Provider, { type: "openai-compatibl
 });
 const chatAnswer = { status: 200, headers: { "content-type": "text/event-stream" }, body: 'data: {"choices":[{"delta":{"content":"answer"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n' };
 
+for (const type of ["anthropic-compatible", "openai-compatible"] as const) {
+  test(`${type}: issue #101 isolates shared-prefix workers and sessions while preserving affinity`, async () => {
+    const up = await upstream((n) => n === 1 ? { status: 429, body: '{}' } : type === "openai-compatible" ? chatAnswer : { status: 200 });
+    const provider = openaiPooled(up.port);
+    const r = await rig({ p: { ...provider, type } }, { "claude-opus-4-8": { provider: "p", model: "m" } });
+    const worker = { session: "session-a", agent: "worker-a", prompt: "shared context ".repeat(400) + "task A" };
+    try {
+      assert.equal(await r.send(worker), 200);
+      r.proxy.clearCredentialCooldown("p", "default");
+      assert.equal(await r.send(worker), 200, "recovery must not discard this worker's warm cache");
+      assert.equal(up.seen.at(-1)!.auth, "Bearer opaque-second-key");
+      for (const identity of [{ ...worker, agent: "worker-b" }, { ...worker, session: "session-b" }, { session: "main-a", prompt: worker.prompt }, { session: "main-b", prompt: worker.prompt }, { prompt: worker.prompt + "different tail" }]) {
+        assert.equal(await r.send(identity), 200);
+        assert.equal(up.seen.at(-1)!.auth, "Bearer opaque-first-key", "a distinct conversation starts at configured order");
+      }
+      assert.equal(await r.send({ ...worker, prompt: "compacted worker prompt" }), 200);
+      assert.equal(up.seen.at(-1)!.auth, "Bearer opaque-second-key", "agent identity survives compaction");
+    } finally { await r.stop(); await up.close(); }
+  });
+
+  test(`${type}: issue #101 distinguishes full first messages without session or agent headers`, async () => {
+    const up = await upstream((n) => n === 1 ? { status: 429, body: '{}' } : type === "openai-compatible" ? chatAnswer : { status: 200 });
+    const r = await rig({ p: { ...openaiPooled(up.port), type } }, { "claude-opus-4-8": { provider: "p", model: "m" } });
+    const prefix = "shared context ".repeat(400);
+    try {
+      assert.equal(await r.send({ prompt: prefix + "task A" }), 200);
+      r.proxy.clearCredentialCooldown("p", "default");
+      assert.equal(await r.send({ prompt: prefix + "task B" }), 200);
+      assert.equal(up.seen.at(-1)!.auth, "Bearer opaque-first-key");
+      assert.equal(await r.send({ prompt: prefix + "task A" }), 200);
+      assert.equal(up.seen.at(-1)!.auth, "Bearer opaque-second-key");
+    } finally { await r.stop(); await up.close(); }
+  });
+
+  test(`${type}: issue #101 records the actual responder, safe ordinal and selection reason`, async () => {
+    const up = await upstream((n) => n === 1 ? { status: 429, body: '{}' } : type === "openai-compatible" ? chatAnswer : { status: 200 });
+    const provider = openaiPooled(up.port);
+    delete provider.credentials![1]!.label;
+    // Runtime ids are opaque and may themselves contain secrets: never use them as log labels.
+    provider.credentials![1]!.id = "opaque-second-key";
+    const r = await rig({ p: { ...provider, type } }, { "claude-opus-4-8": { provider: "p", model: "m" } });
+    try {
+      assert.equal(await r.send(), 200);
+      r.proxy.clearCredentialCooldown("p", "default");
+      assert.equal(await r.send(), 200);
+      const file = path.join(r.home, "requests.jsonl");
+      const rows = new RequestLog(file).list(10);
+      assert.deepEqual(rows.map((row) => row.credential), ["#2", "#2"]);
+      assert.match(r.logs(), /credential=#2/);
+      assert.match(r.logs(), /reason=affinity/);
+      assert.match(r.logs(), /첫 번째.*cooling/);
+      for (const text of [r.logs(), fs.readFileSync(file, "utf8")]) assert.doesNotMatch(text, /opaque-(first|second)-key/);
+    } finally { await r.stop(); await up.close(); }
+  });
+
+  test(`${type}: issue #101 keeps metadata-less side requests on their shared cache class`, async () => {
+    const up = await upstream((n) => n === 1 ? { status: 429, body: '{}' } : type === "openai-compatible" ? chatAnswer : { status: 200 });
+    const provider = openaiPooled(up.port);
+    provider.credentials![1]!.label = "label opaque-second-key";
+    const r = await rig({ p: { ...provider, type } }, { "claude-opus-4-8": { provider: "p", model: "m" } });
+    try {
+      assert.equal(await r.send({ metadata: false, session: "session-a", prompt: "search one" }), 200);
+      r.proxy.clearCredentialCooldown("p", "default");
+      assert.equal(await r.send({ metadata: false, session: "session-b", prompt: "search two" }), 200);
+      assert.equal(up.seen.at(-1)!.auth, "Bearer opaque-second-key");
+      for (const text of [r.logs(), fs.readFileSync(path.join(r.home, "requests.jsonl"), "utf8")]) assert.doesNotMatch(text, /opaque-(first|second)-key/);
+    } finally { await r.stop(); await up.close(); }
+  });
+
+  test(`${type}: issue #101 Global regions 400 rests that workspace and retries once on another key`, async () => {
+    const body = JSON.stringify({ error: { type: "server_error", message: "Upstream request failed: This Go model requires Global regions. Select Global in your workspace's Privacy settings to use it." } });
+    const up = await upstream((n) => n === 1 ? { status: 400, headers: { "content-encoding": "gzip" }, body: zlib.gzipSync(Buffer.from(body)) } : type === "openai-compatible" ? chatAnswer : { status: 200 });
+    const r = await rig({ p: { ...openaiPooled(up.port), type } }, { "claude-opus-4-8": { provider: "p", model: "m" } });
+    try {
+      assert.equal(await r.send(), 200);
+      assert.deepEqual(up.seen.map((row) => row.auth), ["Bearer opaque-first-key", "Bearer opaque-second-key"]);
+      assert.deepEqual(r.proxy.credentialHealth().p!.map((row) => [row.state, row.failures]), [["cooling", 1], ["ready", 0]]);
+      assert.deepEqual(r.proxy.providerHealth.snapshot(), {});
+      assert.match(r.logs(), /answered 400/);
+    } finally { await r.stop(); await up.close(); }
+  });
+}
+
 test("OpenAI pools use generic validation and each model's auth convention", () => {
   const provider = openaiPooled(12345);
   const config: Config = { ...DEFAULTS, providers: { p: provider } };
@@ -213,6 +297,23 @@ test("OpenAI pools use generic validation and each model's auth convention", () 
   assert.equal(folded.type, "anthropic-compatible");
   assert.ok("credentials" in folded);
   assert.deepEqual(folded.credentials!.map((c) => c.headers), [{ "x-api-key": "opaque-first-key" }, { "x-api-key": "opaque-second-key" }]);
+  assert.equal(provider.credentials![0]!.headers.authorization, "Bearer opaque-first-key", "the config was not mutated");
+});
+
+test("a google-wire model keeps its provider's key pool when folded (#112)", () => {
+  const provider = openaiPooled(12345);
+  provider.models = [{ id: "g", wire: "google", url: "http://127.0.0.1:12345/inference/go/google" }];
+  const folded = providerFor(provider, "g");
+  if (folded.type !== "google") throw new Error(`expected a google provider, got ${folded.type}`);
+  assert.equal(folded.auth, "api-key");
+  assert.equal(folded.apiKey, "opaque-first-key", "the first key is still the provider's identity");
+  // Folding only `headers` left a many-key provider with one key on this wire, so its second key
+  // could never answer a spent first one (#112). Each key moves to the wire's own header.
+  assert.deepEqual(folded.credentials?.map((c) => c.headers), [
+    { "x-goog-api-key": "opaque-first-key" },
+    { "x-goog-api-key": "opaque-second-key" },
+  ]);
+  assert.deepEqual(folded.credentials?.map((c) => c.label), ["첫 번째", "두 번째"]);
   assert.equal(provider.credentials![0]!.headers.authorization, "Bearer opaque-first-key", "the config was not mutated");
 });
 

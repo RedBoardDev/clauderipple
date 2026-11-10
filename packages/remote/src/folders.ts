@@ -107,15 +107,23 @@ export async function recentFolders(sources: RecentSource[], limit = 12): Promis
 /**
  * The drive roots this Windows machine answers for (`C:\`, `E:\`, …). A: and B: are floppy letters
  * that can stall; a mapped drive that does not answer within a second is left out.
+ *
+ * Every browse shows the drives now, so this runs on each navigation: the answer is kept for half a
+ * minute rather than paying 22 stats per tap, and one dead mapped drive per second of them.
  */
+let driveCache: { at: number; roots: string[] } | null = null;
+const DRIVE_CACHE_MS = 30_000;
 export async function windowsDrives(platform: NodeJS.Platform = process.platform): Promise<string[]> {
   if (platform !== "win32") return [];
+  if (driveCache && Date.now() - driveCache.at < DRIVE_CACHE_MS) return driveCache.roots;
   const roots = "CDEFGHIJKLMNOPQRSTUVWXYZ".split("").map(letter => `${letter}:\\`);
   const found = await Promise.all(roots.map(root => Promise.race([
     isDirectory(root).then(ok => (ok ? root : null)),
     new Promise<null>(resolve => setTimeout(resolve, 1000, null).unref()),
   ])));
-  return found.filter((root): root is string => root !== null);
+  const live = found.filter((root): root is string => root !== null);
+  driveCache = { at: Date.now(), roots: live };
+  return live;
 }
 
 export async function browse(target: string | undefined, hidden = false, home = os.homedir(), drives: () => Promise<string[]> = windowsDrives): Promise<BrowseResult> {
@@ -129,9 +137,11 @@ export async function browse(target: string | undefined, hidden = false, home = 
   }
   names.sort((a, b) => a.localeCompare(b, undefined, { sensitivity: "base", numeric: true }));
   const parent = path.dirname(dir);
-  // A drive root has no parent to go up to, so on Windows the other drives are listed first: a
-  // project on E: was out of reach from a browse that starts in C:\Users (Discord, 2026-10-22).
-  const others = parent === dir ? (await drives()).filter(root => root.toLowerCase() !== dir.toLowerCase()) : [];
+  // The drives sit at the top of every Windows browse, not only at a drive root: from C:\Users a
+  // project on E: was still a trip back to the root to find (Discord, 2026-10-22); choosing another
+  // drive is wanted on the screen the folder is picked on (2026-10-25). The drive being browsed is
+  // left out — it is what the list already shows.
+  const others = (await drives()).filter(root => root.toLowerCase() !== dir.toLowerCase());
   const entries = [...others.map(root => ({ path: root, name: root })), ...names.slice(0, BROWSE_CAP).map((name) => ({ path: path.join(dir, name), name }))];
   return { path: dir, parent: parent === dir ? null : parent, home, entries, truncated: names.length > BROWSE_CAP };
 }

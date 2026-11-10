@@ -70,7 +70,12 @@ async function api(path, opts) {
 // The router writes `cli.models` to settings.json on this save (they only take effect there). If
 // that write could not happen it says so here — a slot that silently does nothing is the bug this
 // call used to be, so a failure must reach the screen rather than the router log.
-async function configRequest(next) {
+/**
+ * @param {Object} next
+ * @param {(fresh: Object, replay: () => Object) => Object} [rebase] Reapply an editor's atomic changes
+ *   on a conflict; `replay` is the default merge of this save's field changes onto `fresh`.
+ */
+async function configRequest(next, rebase) {
   // Older routers return a raw config without a revision: keep their existing PUT contract.
   const base = configSnapshots.get(next.configRevision);
   const arrayKeys = { models: "id", extraModels: "model", direct: "prefix", credentials: "id" };
@@ -79,17 +84,28 @@ async function configRequest(next) {
     try {
       const out = await api("/api/config", { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify(next) });
       if (out && out.configRevision !== undefined) next.configRevision = out.configRevision;
-      if (out && out.warning) toast(out.warning, true);
       return out;
     } catch (error) {
-      if (error.status !== 409 || !changes || attempt >= 3) throw error;
+      if (error.status !== 409 || (!changes && !rebase) || attempt >= 3) throw error;
       const fresh = await api("/api/config");
-      const rebased = modApply(fresh, changes, arrayKeys);
+      const replay = () => changes ? modApply(fresh, changes, arrayKeys) : clone(fresh);
+      const rebased = rebase ? rebase(fresh, replay) : replay();
       // Callers retain `next` as their saved copy, including everything the retry preserved.
       for (const key of Object.keys(next)) delete next[key];
       Object.assign(next, rebased);
     }
   }
+}
+
+/** Report one save outcome, never a success toast over a partial-success warning.
+ * @param {{warning?: string} | undefined} out
+ * @param {string} [message] Success text; omitted by editors with an inline saved status.
+ * @param {string} [warning] An additional caller warning, shown alongside the server's warning.
+ */
+function configSaved(out, message, warning) {
+  const warnings = [out && out.warning, warning].filter(Boolean);
+  if (warnings.length) toast(warnings.join("\n"), true);
+  else if (message) toast(message);
 }
 
 // A save sends the whole config, so it starts from what the router holds now rather than the copy
@@ -124,6 +140,38 @@ function uniqueName(name, providers, url) {
 function providerLabel(name, provider = currentConfig && currentConfig.providers && currentConfig.providers[name]) {
   return (provider && typeof provider.label === "string" && provider.label.trim()) || name;
 }
+/**
+ * A provider's name where a person scans a list of them (the Status screen): the name the user typed,
+ * else its preset's name ("OpenCode Go", without a "(local)" aside), else the service its type is
+ * ("Claude", "ChatGPT", "Gemini"), else a placeholder key ("provider") gives way to its host. The key
+ * itself is the last resort: it is a slug the user may never have chosen.
+ */
+const PROVIDER_TYPE_TITLES = { anthropic: "Claude", chatgpt: "ChatGPT", google: "Gemini", grok: "Grok" };
+function providerTitle(name, provider) {
+  const label = provider && typeof provider.label === "string" && provider.label.trim();
+  if (label) return label;
+  const preset = provider && provider.preset && presetById(provider.preset);
+  if (preset && preset.name) return preset.name.replace(/\s*\([^)]*\)\s*$/, "");
+  if (provider && PROVIDER_TYPE_TITLES[provider.type]) return PROVIDER_TYPE_TITLES[provider.type];
+  if (/^provider(?:-\d+)?$/.test(name) && provider && provider.url) {
+    try { return new URL(provider.url).hostname.replace(/^(?:api[\w-]*|www)\./, ""); } catch { /* not a URL: the key stays */ }
+  }
+  return name;
+}
+/**
+ * The vendor's hue for a provider's dot, as the mod's band colours them (packages/mod/hooks/ui/theme.ts
+ * providerColor): a known vendor keeps its own, any other a fixed pick from a palette with no status
+ * red, green or amber in it, so a dot is never read as a result.
+ */
+const PROVIDER_HUES = { anthropic: "#d97757", chatgpt: "#10a37f", google: "#4285f4", deepseek: "#4d6bfe", "opencode-go": "#9333ea", "opencode-zen": "#9333ea", minimax: "#e5484d", grok: "#a8a29e", "xai-grok": "#a8a29e" };
+const PROVIDER_PALETTE = ["#0891b2", "#db2777", "#7c3aed", "#0d9488", "#c026d3", "#4f46e5", "#0284c7", "#be185d"];
+function providerHue(name, provider) {
+  const known = PROVIDER_HUES[name] || (provider && (PROVIDER_HUES[provider.preset] || PROVIDER_HUES[provider.type]));
+  if (known) return known;
+  let hash = 0;
+  for (const char of name) hash = (hash * 31 + char.charCodeAt(0)) >>> 0;
+  return PROVIDER_PALETTE[hash % PROVIDER_PALETTE.length];
+}
 // The typed name is kept only when it says something the key does not; typing the key back clears it.
 function applyProviderLabel(provider, key, typedName) {
   const label = typedName.trim().slice(0, 60);
@@ -131,12 +179,59 @@ function applyProviderLabel(provider, key, typedName) {
   else delete provider.label;
   return provider;
 }
+/** A provider's entry as the pages read it: the config this page holds, else the one the Logs view read, else what the live status names. */
+function providerEntry(name) {
+  const config = (currentConfig && currentConfig.providers) || configuredProviders || {};
+  return config[name] || (status && status.providers && status.providers[name]) || undefined;
+}
+/** Every provider the pages can name: the keys of the config and of the live status. */
+function knownProviderNames() {
+  const config = (currentConfig && currentConfig.providers) || configuredProviders || {};
+  return [...new Set([...Object.keys(config), ...Object.keys((status && status.providers) || {})])];
+}
+/**
+ * A provider's name wherever a person reads one (Status, Logs, Providers, Model mapping, Clients, the mod):
+ * the name people know it by (providerTitle), with its key after it only when another provider would read the
+ * same ("ChatGPT (work)" beside "ChatGPT (personal)"), so two of a kind stay apart in a list or a menu.
+ */
+function providerDisplayName(name, provider = providerEntry(name)) {
+  const title = providerTitle(name, provider);
+  const clash = knownProviderNames().some((key) => key !== name && providerTitle(key, providerEntry(key)) === title);
+  return title !== name && clash ? `${title} (${name})` : title;
+}
+/**
+ * A saved provider's name field: the name it was given, else the name the pages show for it (its
+ * preset's or its service's), never its key — the field used to open on "opencode-go".
+ */
+function providerFormName(key, provider) {
+  return provider && typeof provider.label === "string" && provider.label.trim() ? provider.label.trim() : providerTitle(key, provider);
+}
+/** The name a form saves: a field left on the shown name of a provider that had none saves none, as leaving its key did. */
+function typedProviderName(typed, key, provider) {
+  const value = typed.trim();
+  return provider && !(typeof provider.label === "string" && provider.label.trim()) && value === providerTitle(key, provider) ? key : value;
+}
+/** The vendor's hue as a dot before a provider's name, as on the Status screen. */
+function vendorDot(name, provider) {
+  const dot = el("span", { class: "vendor-dot", "aria-hidden": "true" });
+  dot.style.color = providerHue(name, provider);
+  return dot;
+}
+// The router's `isTargetProvider` (packages/router/src/targets.ts), copied because the forms ask it of
+// providers not saved yet; `ui-targets.test.ts` keeps the two equal. A native Claude login becomes a
+// mapping target only after the explicit account-pool opt-in, and stays OpenAI-ingress-only without
+// it. An API key is a target, reached only by name: its `<model>-<provider>` workers, a slot or a rule.
+function isTargetProvider(provider) {
+  if (!provider) return false;
+  if (provider.type !== "anthropic") return true;
+  return provider.auth === "api-key" ? provider.accountPool !== true : provider.accountPool === true && provider.auth === "claude-code";
+}
 function groupedModels(config) {
   const groups = [];
   for (const [name, provider] of Object.entries(config.providers || {})) {
-    // A native Claude provider becomes a mapping target only after the explicit account-pool opt-in.
-    // API-key and legacy login providers remain OpenAI-ingress-only.
-    if (provider.type === "anthropic" && !provider.accountPool) continue;
+    // A Claude API key serves its `<model>-<provider>` workers only: a bare Claude id picked here
+    // would run on the app's own sign-in instead (targets.ts `bareOwners`).
+    if (!isTargetProvider(provider) || (provider.type === "anthropic" && provider.auth === "api-key")) continue;
     let models = modelsOf(provider);
     if (!models.length && provider.type === "chatgpt") models = CHATGPT_MODELS;
     if (models.length) groups.push({ name, provider, models });
@@ -179,8 +274,9 @@ function modelEffortTag(model) {
   if (!Array.isArray(model.effortLevels)) return null;
   return model.effortLevels.length ? t("providers.modelEffort") : t("providers.modelNoEffort");
 }
-// Routed models do not share a context window. ChatGPT's live effective window comes from the
-// router's shared resolver and is read-only; other providers keep the saved/discovered fallback.
+// Routed models do not share a context window. `windows` is the value the router resolved for each
+// model (a saved override included) and `catalogWindows` is the live Codex catalogue's own figure,
+// which the window editor prefills and annotates while no override is in effect.
 let pickerContextWindows = { windows: {}, catalogWindows: {} };
 function discoveredContextWindow(providerName, modelId) {
   const provider = currentConfig && currentConfig.providers && currentConfig.providers[providerName];
@@ -190,6 +286,18 @@ function discoveredContextWindow(providerName, modelId) {
 function savedContextWindow(modelId) {
   const entry = ((currentConfig && currentConfig.cli && currentConfig.cli.extraModels) || []).find((item) => item.model === modelId);
   return entry && Number.isFinite(entry.contextWindow) ? entry.contextWindow : undefined;
+}
+// A model whose window neither its provider nor the live Codex catalogue states runs on the global
+// fallback (`cli.autoCompactWindow`) — a number nobody measured for it. Saying so on the model's own
+// row is the only place it shows: Hive's `/models` lists ids and nothing else, and a silent fallback
+// is what made a 1M model compact at a quarter of its window.
+function modelWindowNote(model) {
+  if (Number.isFinite(model.contextWindow)) return null;
+  if (Number.isFinite(pickerContextWindows.catalogWindows[model.id])) return null;
+  const fallback = currentConfig && currentConfig.cli ? currentConfig.cli.autoCompactWindow : undefined;
+  return Number.isFinite(fallback)
+    ? t("providers.windowUnknown", { fallback: formatNumber(fallback) })
+    : t("providers.windowUnknownNoFallback");
 }
 
 let currentConfig = null;
@@ -252,7 +360,18 @@ function chevronIcon() { return svgIcon("0 0 8 13", ["M1.5 1.5l5 5-5 5"], "chevr
 
 function showView(name) {
   if (name !== "phone") { phoneGeneration++; hidePhoneQr(); }
-  for (const button of $all(".nav-btn")) button.classList.toggle("active", button.dataset.view === name);
+  for (const button of $all(".nav-btn")) {
+    const active = button.dataset.view === name;
+    button.classList.toggle("active", active);
+    // The style showed the current page; a screen reader was told nothing (G-D10).
+    if (active) button.setAttribute("aria-current", "page"); else button.removeAttribute("aria-current");
+    // On a phone the tab bar scrolls sideways (style.css, under 560px): the open page's tab is brought into it.
+    const list = button.parentElement;
+    if (active && list && list.scrollWidth > list.clientWidth) {
+      const offset = button.getBoundingClientRect().left - list.getBoundingClientRect().left;
+      list.scrollLeft += offset - (list.clientWidth - button.offsetWidth) / 2;
+    }
+  }
   for (const view of $all(".view")) view.classList.toggle("active", view.id === `view-${name}`);
   if (location.hash !== `#${name}`) history.replaceState(null, "", `#${name}`);
   applyOffline();
@@ -263,7 +382,7 @@ function showView(name) {
   if (name === "mac") queueMicrotask(() => void loadMac());
   if (name === "slots" && !slotsLoaded) void loadSlots();
   if (name === "providers" && !providersLoaded) void loadProviders();
-  if (name === "clients" && !clientsLoaded) void loadClients();
+  if (name === "clients" && !clientsLoaded) void openClients();
   if (name === "logs") queueMicrotask(() => void refreshRequests());
   // Read again on every visit: the bar's ⚙ panel saves the same settings.
   if (name === "mod") queueMicrotask(() => void loadMod());
@@ -300,83 +419,335 @@ async function loadCatalogs() {
 // ---- Status -------------------------------------------------------------------------
 
 let limitsSnapshot = null;
-let limitsFailed = false;
-async function refreshLimits() {
-  try { limitsSnapshot = await api("/api/limits"); limitsFailed = false; }
-  catch { limitsFailed = true; }
-  renderLimits();
+// Set when a read fails after a snapshot exists: its figures stay on screen, marked stale.
+let limitsSnapshotStale = false;
+// The read in flight, so a poll never starts another behind a slow provider.
+let limitsRead = null;
+// The mod's EXHAUST_URGENT_MS: an exhaust forecast this close is red.
+const LIMITS_EXHAUST_URGENT_MS = 60 * 60_000;
+
+/** The time left as the mod's limits pane writes it ("2h 10m", "2d 5h", "45m"), in the same units. */
+function limitsTimeLeft(ms) {
+  const minutes = Math.max(1, Math.ceil(ms / 60_000));
+  const days = Math.floor(minutes / 1440);
+  const hours = Math.floor((minutes % 1440) / 60);
+  const rest = minutes % 60;
+  if (days > 0) return hours > 0 ? t("units.dayHour", { d: days, h: hours }) : t("units.days", { n: days });
+  if (hours > 0) return rest > 0 ? t("units.hourMin", { h: hours, m: rest }) : t("units.hours", { n: hours });
+  return t("units.minutes", { n: rest });
+}
+
+/** Milliseconds until a window runs out at its pace, or null: no forecast, or that moment has passed. */
+function limitsExhaustLeft(window, now) {
+  if (!window || !Number.isFinite(window.exhaustAt) || window.exhaustAt <= now) return null;
+  return window.exhaustAt - now;
+}
+
+/**
+ * The mod's paceLevel: a window with no exhaust forecast says where its pace takes it at the reset,
+ * comfortable under 95% and tight from 95 to 100. Nothing when an exhaust forecast applies, the reset is
+ * missing or has passed, there is no projection, or the projection is above 100.
+ */
+function limitsPaceLevel(window, now) {
+  if (!window || limitsExhaustLeft(window, now) !== null) return null;
+  if (!Number.isFinite(window.resetAt) || window.resetAt <= now) return null;
+  if (!Number.isFinite(window.projectedPercent)) return null;
+  if (window.projectedPercent < 95) return "comfortable";
+  return window.projectedPercent <= 100 ? "tight" : null;
+}
+
+/** The mod's limitItemTone for an exhaust note: the share's tone, at least amber, red within the hour. */
+function limitsNoteTone(window, exhaustLeft) {
+  const share = window.usedPercent >= 95 ? "bad" : window.usedPercent >= 80 ? "warn" : "ink";
+  if (exhaustLeft === null || share === "bad") return share;
+  return exhaustLeft <= LIMITS_EXHAUST_URGENT_MS ? "bad" : "warn";
 }
 
 function limitsReset(window, weekly, now) {
   if (!window || !Number.isFinite(window.resetAt)) return t("limits.resetUnknown");
   const reset = new Date(window.resetAt);
+  // A reset that has passed has no time left to count down; the mod says so with its date instead.
+  if (window.resetAt <= now) return t("limits.passed", { date: reset.toLocaleString(undefined, { weekday: "short", month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit", hour12: false }) });
   if (weekly) return t("limits.resetsAt", { time: reset.toLocaleString(undefined, { weekday: "short", hour: "2-digit", minute: "2-digit", hour12: false }) });
-  const minutes = Math.max(0, Math.ceil((window.resetAt - now) / 60_000));
-  return t("limits.resetsIn", { hours: Math.floor(minutes / 60), minutes: minutes % 60 });
-}
-
-function limitsWindowRow(label, window, weekly, now) {
-  const known = window && Number.isFinite(window.usedPercent);
-  const percent = known ? `${Math.round(window.usedPercent * 10) / 10}%` : t("limits.unknown");
-  const reset = limitsReset(window, weekly, now);
-  const track = el("div", {
-    class: `limits-track${known ? "" : " unknown"}`, role: "progressbar", tabindex: "0",
-    "aria-label": label, "aria-valuemin": "0", "aria-valuemax": "100",
-    ...(known ? { "aria-valuenow": Math.max(0, Math.min(100, window.usedPercent)) } : {}),
-    "aria-valuetext": `${percent} · ${reset}`, title: `${label} · ${percent} · ${reset}`,
-  });
-  if (known) {
-    const fill = el("span", { class: "limits-fill", "aria-hidden": "true" });
-    fill.style.width = `${Math.max(0, Math.min(100, window.usedPercent))}%`;
-    track.appendChild(fill);
+  // Ceiled from a positive span, so the countdown is at least one minute and never reads 0.
+  const minutes = Math.ceil((window.resetAt - now) / 60_000);
+  const hours = Math.floor(minutes / 60);
+  // Under an hour the countdown is minutes alone ("34분 후 초기화", not "0시간 34분 후 초기화"): the
+  // sentence's hour figure and its unit are dropped, its own minutes unit and wording kept.
+  if (hours === 0) return t("limits.resetsIn").replace(/\{hours\}[^{]*?(?=\{minutes\})/, "").split("{minutes}").join(String(minutes));
+  // An exact hour is hours alone ("2시간 후 초기화", not "2시간 0분 후 초기화"): the minutes figure goes with
+  // its unit, the one units.minutes spells, and the sentence's hours and wording stay.
+  if (minutes % 60 === 0) {
+    const unit = t("units.minutes").replace("{n}", "").trim().replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const whole = t("limits.resetsIn").replace(new RegExp(`\\s*\\{minutes\\}\\s*${unit}`), "");
+    if (unit && !whole.includes("{minutes}")) return whole.split("{hours}").join(String(hours));
   }
-  return el("div", { class: "limits-window" }, [
-    el("div", { class: "limits-window-head" }, [el("span", { text: label }), el("span", { text: percent })]),
-    track,
-    el("div", { class: "limits-window-foot" }, [el("span", { text: reset })]),
+  return t("limits.resetsIn", { hours, minutes: minutes % 60 });
+}
+
+/**
+ * One window's row. The reset comes first; with no exhaust forecast the pace follows it as a label, muted
+ * when comfortable and amber when tight, as the mod's pane puts it. An exhaust forecast is a warning line
+ * under the row instead. A window whose reset has passed keeps its last share, so it is marked stale.
+ * `accountName` puts whose gauge it is into the accessible name.
+ */
+function limitsWindowRow(label, window, now, accountName = "") {
+  const percent = `${Math.round(window.usedPercent * 10) / 10}%`;
+  // A window of a day or more reads its reset as a weekday and clock; a shorter one as the time left.
+  const reset = limitsReset(window, window.kind === "seven_day" || window.windowMinutes >= 1440, now);
+  const name = accountName ? `${accountName} · ${label}` : label;
+  const exhaustLeft = limitsExhaustLeft(window, now);
+  const note = exhaustLeft === null ? "" : t("limits.exhaust", { time: limitsTimeLeft(exhaustLeft) });
+  const level = note ? null : limitsPaceLevel(window, now);
+  const pace = level ? t("limits.paceProjected", { percent: Math.round(window.projectedPercent) }) : "";
+  const passed = Number.isFinite(window.resetAt) && window.resetAt <= now;
+  // The bar and its figure take the mod's limitItemTone: amber from 80%, red from 95% or within the hour of running out.
+  const tone = limitsNoteTone(window, exhaustLeft);
+  const track = el("div", {
+    class: "limits-track meter", role: "progressbar", tabindex: "0",
+    "aria-label": name, "aria-valuemin": "0", "aria-valuemax": "100",
+    "aria-valuenow": Math.max(0, Math.min(100, window.usedPercent)),
+    "aria-valuetext": [percent, reset, pace, note].filter(Boolean).join(" · "), title: [name, percent, reset].join(" · "),
+  });
+  const fill = el("span", { class: "limits-fill meter-fill", "aria-hidden": "true" });
+  fill.style.width = `${Math.max(0, Math.min(100, window.usedPercent))}%`;
+  track.appendChild(fill);
+  const parts = [el("span", { text: reset })];
+  if (passed) parts.push(el("span", { class: "warn-text", text: t("limits.stale") }));
+  if (pace) parts.push(level === "tight" ? el("span", { class: "warn-text", text: pace }) : el("span", { text: pace }));
+  const foot = el("div", { class: "limits-window-foot" }, parts.flatMap((part, index) => (index ? [el("span", { class: "sep", text: " · " }), part] : [part])));
+  // One line of a table: the window's name, its bar and figure, then when it resets; an exhaust warning runs under the bar.
+  return el("div", { class: `limits-window${tone === "ink" ? "" : ` tone-${tone}`}` }, [
+    el("div", { class: "limits-window-head" }, [
+      el("span", { class: "limits-window-name", text: label, title: label }),
+      track,
+      el("span", { class: "limits-window-figure", text: percent }),
+    ]),
+    foot,
+    note ? el("div", { class: tone === "ink" ? "limits-window-note" : `limits-window-note ${tone}-text`, text: note }) : null,
   ]);
 }
 
-function limitsAccountRow(account, now) {
-  const badges = [];
-  if (account.active) badges.push(badge("first", t("limits.active")));
-  if (account.preferred) badges.push(badge("", t("limits.preferred")));
+/** The router's generic names for an account nobody named ("Claude account 2"): the pane says the number instead, as the mod does. */
+const LIMITS_PLACEHOLDER = /^(?:Claude|ChatGPT|Google) account(?: \d+)?$/i;
+
+/** A name as the limits pane shows it: control characters dropped, cut at `max` with an ellipsis (the mod's displayText). */
+function limitsDisplay(value, max) {
+  const clean = String(value ?? "").replace(/[\u0000-\u001f\u007f-\u009f]/g, "").trim();
+  return clean.length > max ? `${clean.slice(0, max - 1).trimEnd()}…` : clean;
+}
+
+/** A span of minutes in the mod's units: "30d", "5h", "45m" (its units.* wording). */
+function limitsSpanName(minutes) {
+  if (minutes % 1440 === 0) return t("units.days", { n: minutes / 1440 });
+  if (minutes % 60 === 0) return t("units.hours", { n: minutes / 60 });
+  return t("units.minutes", { n: minutes });
+}
+
+/**
+ * A window's name as the mod's limitItemName gives it: the 5-hour and weekly names, a scoped window's own
+ * label ("Fable", "Argon weekly"), else its span ("30d"). Only the windows the router reported are named.
+ */
+function limitsItemName(window) {
+  if (window.kind === "five_hour") return t("limits.fiveHour");
+  if (window.kind === "seven_day") return t("limits.weekly");
+  if (window.kind === "scoped") return limitsDisplay(window.label || window.kind, 120);
+  if (window.windowMinutes === 300) return t("limits.fiveHour");
+  if (window.windowMinutes === 10080) return t("limits.weekly");
+  if (window.windowMinutes > 0) return limitsSpanName(window.windowMinutes);
+  return limitsDisplay(window.label || String(window.kind ?? "").replace(/_/g, " "), 120);
+}
+
+/** A window's name in its account: its own, and its span after it when another window of the account shares the name (Gemini's two "3P" windows). */
+function limitsWindowName(windows, index) {
+  const window = windows[index];
+  const name = limitsItemName(window);
+  const twin = windows.some((other, j) => j !== index && limitsItemName(other) === name);
+  return twin && window.windowMinutes ? `${name} ${limitsItemName({ kind: "window", windowMinutes: window.windowMinutes })}` : name;
+}
+
+/** A window the router reported, as the pane reads it; null for a window with no share. */
+function limitsUsageWindow(window) {
+  if (!window || !Number.isFinite(window.used_percent)) return null;
+  return {
+    kind: window.kind,
+    ...(window.label ? { label: window.label } : {}),
+    usedPercent: window.used_percent,
+    ...(Number.isFinite(window.window_minutes) ? { windowMinutes: window.window_minutes } : {}),
+    // The API's reset and exhaust moments are in epoch seconds; the date helpers read milliseconds.
+    ...(Number.isFinite(window.reset_at) ? { resetAt: window.reset_at * 1000 } : {}),
+    ...(Number.isFinite(window.exhaust_at) ? { exhaustAt: window.exhaust_at * 1000 } : {}),
+    ...(Number.isFinite(window.projected_percent) ? { projectedPercent: window.projected_percent } : {}),
+  };
+}
+
+/** An account's name on the Status screen: the Claude login in the dashboard's language, else its label, else its provider's title and number. */
+function limitsAccountName(entry, account) {
+  // The router names the Claude app login in English ("Current Claude login"); the screen says it in its own language.
+  if (entry.type === "anthropic" && account.id === "current") return t("providers.anthropicCurrentLogin");
+  const label = limitsDisplay(account.label || account.email || "", 120);
+  if (label && !LIMITS_PLACEHOLDER.test(label)) return label;
+  return account.account === null || account.account === undefined ? entry.title : `${entry.title} ${account.account + 1}`;
+}
+
+/**
+ * Whether an account's row needs a name: a provider's only account, with no label of its own, would
+ * read as a made-up one ("Go 1" under "OpenCode Go"), so its windows stand under the provider instead.
+ * The Claude login has a name of its own; a provider with several accounts numbers them apart.
+ */
+function limitsAccountNamed(entry, account) {
+  if (!Array.isArray(entry.accounts) || entry.accounts.length !== 1) return true;
+  if (entry.type === "anthropic" && account.id === "current") return true;
+  const label = limitsDisplay(account.label || account.email || "", 120);
+  return Boolean(label && !LIMITS_PLACEHOLDER.test(label));
+}
+
+/**
+ * One account: its name with its state beside it, then a line per window. `credential` is the pool's entry
+ * for the same account, so a cooldown or a rejected sign-in sits on the account's own row rather than in a
+ * second list of the same accounts under the provider's name. The time of the figures is on the name's
+ * tooltip; it is spelt out only where it matters, beside a stale mark.
+ */
+function limitsAccountRow(entry, account, now, credential) {
   const health = account.health || {};
-  if (Number.isFinite(health.pausedUntil) && health.pausedUntil > now) {
-    badges.push(badge("warn", t("limits.pausedUntil", { time: new Date(health.pausedUntil).toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit", hour12: false }) })));
-  } else if (health.state === "paused") badges.push(badge("warn", t("limits.paused")));
-  else if (health.state === "needs-login") badges.push(badge("bad", t("limits.needsLogin")));
-  if (account.stale || limitsFailed) badges.push(badge("warn", t("limits.stale")));
-  const windows = account.usageWindows || {};
-  const fetched = Number.isFinite(account.fetchedAt) ? t("limits.fetchedAt", { time: new Date(account.fetchedAt).toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" }) }) : t("limits.notFetched");
-  return el("div", { class: "limits-account", "data-account-id": account.id }, [
-    el("div", { class: "limits-account-head" }, [
-      el("strong", { text: account.label || account.id }),
-      el("div", { class: "limits-badges" }, [...badges, el("span", { class: "limits-fetched", text: fetched })]),
-    ]),
-    el("div", { class: "limits-windows" }, [
-      limitsWindowRow(t("limits.fiveHour"), windows.fiveHour, false, now),
-      limitsWindowRow(t("limits.weekly"), windows.weekly, true, now),
-    ]),
+  const state = account.paused ? "paused" : account.state || health.state;
+  const cooldownSeconds = Number.isFinite(account.cooldownSeconds) ? account.cooldownSeconds : Number.isFinite(health.pausedUntil) ? Math.max(0, Math.ceil((health.pausedUntil - now) / 1000)) : undefined;
+  const cooling = state === "cooling" || state === "paused-until";
+  const unavailable = state === "paused" || state === "needs-login" || state === "quarantined";
+  const badges = [];
+  if (account.inUse && !unavailable) badges.push(badge("first", t("limits.active")));
+  if (account.preferred) badges.push(badge("", t("providers.preferBadge")));
+  // The additive health uses an epoch-millisecond deadline; the live status keeps its own state and countdown.
+  // A cooling account with no time left would read "available again in 0s"; once its countdown is over it shows as ready.
+  const cooledOff = cooling && !(cooldownSeconds > 0);
+  const stated = state && state !== "ready" && !cooledOff;
+  if (stated) badges.push(chatgptStateBadge({ ...account, state: cooling ? "cooling" : state, cooldownSeconds }));
+  // The pool's word on the account, unless the account's own state already says it.
+  else if (credential && credential.state === "quarantined") badges.push(badge("bad", t("pool.quarantined")));
+  else if (credential && credential.state === "cooling" && credential.cooldownSeconds > 0) badges.push(badge("warn", t("pool.coolingFor", { duration: durationText(credential.cooldownSeconds) })));
+  const read = !unavailable && Number.isFinite(account.at) && account.at > 0;
+  const fetched = read ? t("limits.fetchedAt", { time: new Date(account.at).toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit", hour12: false }) }) : t("limits.notFetched");
+  if (!unavailable && (entry.stale || account.stale || (account.quota && account.quota.stale))) {
+    badges.push(badge("warn", t("limits.stale")));
+    if (read) badges.push(el("span", { class: "limits-fetched", text: fetched }));
+  }
+  const named = limitsAccountNamed(entry, account);
+  const name = named ? limitsAccountName(entry, account) : "";
+  const windows = (unavailable ? [] : account.windows || []).map(limitsUsageWindow).filter(Boolean);
+  // One gauge per window the router reported; a window it did not report has no gauge, and an account with none has none.
+  // A nameless row's gauges are named by their provider, so a screen reader still hears whose they are.
+  const gauges = windows.map((window, index) => limitsWindowRow(limitsWindowName(windows, index), window, now, name || entry.title || ""));
+  // An account with no figures says why only when no state above already does ("paused" needs no "no usage yet" after it).
+  const empty = !gauges.length && !stated ? el("span", { class: "limits-empty", text: fetched }) : null;
+  return el("div", { class: named ? "limits-account" : "limits-account unnamed" }, [
+    named || badges.length ? el("div", { class: "limits-account-head" }, [
+      named ? el("strong", { text: name, title: `${name} · ${fetched}` }) : null,
+      badges.length ? el("div", { class: "limits-badges" }, badges) : null,
+    ]) : null,
+    gauges.length ? el("div", { class: "limits-windows", ...(named ? {} : { title: fetched }) }, gauges) : empty,
   ]);
 }
 
-/** The limits entry `/api/limits` gives one provider, when it reads that provider's accounts. */
+/**
+ * Claude rows come from limits, including the additive unavailable and unread cards. ChatGPT keeps all
+ * status accounts; only those in rotation are numbered. The status and the limits are two reads, so a
+ * figure never outlives the status it is shown beside: a row keeps its figures only while the status lists
+ * its account under the same id and not as paused or waiting for a sign-in. The status's view wins for
+ * whose account it is and whether it is in use; an absent Claude account keeps its card, not its figures.
+ * Status does not carry `limits`, so before the config loads a provider the limits leave out may be one
+ * saved with limits off: it keeps its text lines. Once the config says the provider has limits, a ChatGPT
+ * provider shows its accounts even without figures. Claude shows only the rows the limits list, so an
+ * unlisted Claude provider keeps its text lines too.
+ */
 function providerLimits(name) {
-  const entry = ((limitsSnapshot && limitsSnapshot.providers) || []).find((provider) => provider.provider === name);
-  return entry && (entry.type === "anthropic" || entry.type === "chatgpt") && entry.accounts.length ? entry : null;
-}
-/** Limits live in the Providers card: each subscription provider's row carries its accounts' gauges. */
-function renderLimits() {
-  if ($("#health-providers")) renderHealthProviders();
+  if (!limitsSnapshot || !Array.isArray(limitsSnapshot.providers) || !status) return null;
+  const configured = currentConfig && currentConfig.providers && currentConfig.providers[name];
+  const provider = configured || (status.providers && status.providers[name]);
+  if (!provider || provider.limits === false) return null;
+  if (provider.type === "anthropic" && provider.auth !== "claude-code" && !provider.authSource) return null;
+  const listed = limitsSnapshot.providers.find((item) => item.provider === name);
+  // A ChatGPT provider the config says has limits keeps its account rows without figures; any other provider the read does not list keeps its text lines.
+  if (!listed && (!configured || provider.type !== "chatgpt")) return null;
+  const live = status.providers && status.providers[name];
+  const entry = { ...(listed || { type: provider.type, title: "GPT", accounts: [] }),
+    stale: limitsSnapshotStale || (provider.type === "chatgpt" && Boolean(status.chatgpt && status.chatgpt.staleReason && status.chatgpt.staleReason[name])),
+  };
+  if (entry.type === "anthropic") {
+    // Without the status's account list there is nothing to check the limits against; keep them as they are.
+    const listedAccounts = status.claude && status.claude.accounts;
+    if (!Array.isArray(listedAccounts)) return entry.accounts.length ? entry : null;
+    const rows = entry.accounts.map((figures) => {
+      const listed = figures.id === undefined ? undefined : listedAccounts.find((item) => item.id === figures.id);
+      const health = figures.health || {};
+      // Status has a partial usage list: absence means no current figures or selection, not no saved card.
+      // A resumed account must not inherit the older limits read's paused state.
+      const state = listed ? listed.state || (listed.paused ? "paused" : health.state === "paused" ? "ready" : health.state) : health.state;
+      const readable = Boolean(listed && !listed.paused && state !== "paused" && state !== "needs-login" && state !== "quarantined");
+      return { ...figures, ...listed, state, inUse: Boolean(listed && listed.inUse === true),
+        windows: readable ? figures.windows : [], at: readable ? figures.at : 0, stale: readable && figures.stale === true };
+    });
+    return rows.length ? { ...entry, accounts: rows } : null;
+  }
+  if (entry.type === "chatgpt") {
+    const accounts = status.chatgpt && status.chatgpt.accounts && status.chatgpt.accounts[name];
+    if (!accounts) return entry.accounts.length ? entry : null;
+    let number = 0;
+    const rows = accounts.map((account) => {
+      const index = !account.paused && account.state !== "paused" && account.state !== "needs-login" ? number++ : null;
+      const figures = account.id === undefined ? null : entry.accounts.find((item) => item.id === account.id);
+      const readable = index !== null && figures;
+      return { ...figures, ...account, inUse: account.inUse === true, account: index, windows: readable ? figures.windows : [], at: readable ? figures.at : 0, stale: Boolean(readable && figures.stale) };
+    });
+    return rows.length ? { ...entry, accounts: rows } : null;
+  }
+  // Google, OpenCode Go, MiniMax and Grok: the status has no account list these rows can join by id, so each row stands as the
+  // read gave it. The read itself leaves out paused and signed-out Google accounts; a provider that needs a sign-in shows its text line.
+  if (live && live.needsLogin) return null;
+  return entry.accounts.length ? entry : null;
 }
 
+/**
+ * Reads /api/limits beside the status read, never ahead of it. A read still running is not doubled behind
+ * a slow provider, and a failed read keeps the last reading on screen, marked stale, instead of dropping
+ * its gauges. The screen is redrawn when the read lands.
+ */
+function refreshLimits() {
+  if (limitsRead) return limitsRead;
+  limitsRead = api("/api/limits").then((body) => {
+    limitsSnapshot = body;
+    limitsSnapshotStale = false;
+  }, () => {
+    limitsSnapshotStale = limitsSnapshot !== null;
+  }).finally(() => {
+    limitsRead = null;
+    if (status) renderHealthProviders();
+    if (status) refreshProviderUsage();
+  });
+  return limitsRead;
+}
+
+// Whether a status has been drawn: until one has, the tiles and the provider list show a skeleton or a failure line.
+let statusDrawn = false;
+/** Before the first status: bars where the two tiles and the provider list will be. */
+function showHealthLoading() {
+  if (statusDrawn) return;
+  $("#health-desktop").replaceChildren(el("span", { class: "skeleton-bar skeleton-stat", "aria-hidden": "true" }));
+  $("#health-requests").replaceChildren(el("span", { class: "skeleton-bar skeleton-stat", "aria-hidden": "true" }));
+  $("#health-providers").replaceChildren(skeletonLines(2));
+}
 async function refreshHealth() {
+  // The status is what the screen waits for; the limits are read beside it and fill their gauges when they land.
+  const statusRead = api("/api/status");
+  void refreshLimits();
   try {
-    const [nextStatus] = await Promise.all([api("/api/status"), refreshLimits()]);
-    status = nextStatus;
+    status = await statusRead;
+    statusDrawn = true;
   } catch (error) {
-    $("#health-desktop").replaceChildren(cell(t("health.connection"), badge("bad", t("health.disconnected"))));
+    if (!statusDrawn) {
+      $("#health-requests").replaceChildren(loadFailedLine("p"));
+      $("#health-providers").replaceChildren(loadFailedLine());
+    }
+    $("#health-desktop").replaceChildren(el("div", { class: "stat-value" }, [badge("bad", t("health.disconnected"))]));
     // Inside the app a router that does not answer is a state with a way out, not an error.
     if (APP && error.body && error.body.routerDown) setRouterDown(true);
     return;
@@ -387,26 +758,107 @@ async function refreshHealth() {
     if (loadedUiRevision === null) loadedUiRevision = status.uiRevision;
     else if (loadedUiRevision !== status.uiRevision && $("#modal-backdrop").hidden) location.reload();
   }
+  // The two overview tiles: whether Claude Desktop goes through the router, and how many requests it has handled.
   const desktop = $("#health-desktop");
-  desktop.replaceChildren(cell(
-    t("health.connection"),
-    status.settings.pointsAtRouter ? badge("ok", t("health.connected")) : badge("bad", t("health.notConnected")),
-    status.settings.pointsAtRouter ? t("health.connectedHelp") : t("health.notConnectedHelp"),
-  ));
-  $("#health-requests").replaceChildren(el("div", { class: "row" }, [el("span", { class: "k", text: t("health.requests") }), el("span", { class: "v", text: t("health.requestsFmt", Object.fromEntries(Object.entries(status.stats || {}).map(([key, value]) => [key, typeof value === "number" ? value.toLocaleString() : value]))) })]));
+  desktop.replaceChildren(
+    el("div", { class: "stat-value" }, [status.settings.pointsAtRouter ? badge("ok", t("health.connected")) : badge("bad", t("health.notConnected"))]),
+    el("p", { class: "stat-sub", text: status.settings.pointsAtRouter ? t("health.connectedHelp") : t("health.notConnectedHelp") }),
+  );
+  $("#health-requests").replaceChildren(el("div", { class: "stat-value", text: t("health.requestsFmt", Object.fromEntries(Object.entries(status.stats || {}).map(([key, value]) => [key, typeof value === "number" ? value.toLocaleString() : value]))) }));
   renderHealthProviders();
+  if (providerNamesStale()) void refreshProviderConfig();
+  renderDiagnostics();
   if (clientsLoaded) renderClients();
   if (modState.settings) renderModNotice();
   const details = $("#health-details");
+  // A start this page recorded is over once the router says so — a failure included — so the button
+  // is not left saying "running" with no way back (G-D07).
+  if (updateState.check && updateState.check.running && status.autoUpdate && status.autoUpdate.running === false) {
+    updateState.check = { ...updateState.check, running: false };
+  }
   modRedraw(details, [
     versionRow(),
     autoUpdateRow(),
+    priorityRow(),
     // Which files answer, and since when: the only way to see that an update actually replaced the router.
     ...(status.runtime ? [cell(t("health.runtime"), null, [el("span", { class: "cell-sub mono", text: status.runtime.router || "?" }), new Date(status.runtime.startedAt).toLocaleString()])] : []),
     el("div", { class: "row" }, [el("span", { class: "k", text: t("health.routes") }), el("span", { class: "v", text: String(status.routes) })]),
     el("div", { class: "row" }, [el("span", { class: "k", text: t("health.cli") }), el("span", { class: "v", text: status.cliVersion })]),
   ]);
 }
+
+// ---- Diagnostics: what the router says is in the way, and a copy that carries no secrets -------
+
+/** One readiness problem in words, with the action that clears it; an unknown code stays as it is. */
+function readinessProblemText(code) {
+  if (code === "settings") return t("health.diagnosticSettings");
+  if (code === "upstream") return t("health.diagnosticUpstream");
+  if (code === "picker-ca") return t("health.diagnosticPickerCa");
+  if (code === "picker-proxy") return t("health.diagnosticPickerProxy");
+  if (code === "config") return t("health.diagnosticConfig");
+  if (String(code).startsWith("provider:")) return t("health.diagnosticProvider", { name: String(code).slice(9) });
+  return String(code);
+}
+/**
+ * The problems the router reports, and the validation errors in its config: readiness once said
+ * "ready" while nothing could connect and did not say why the picker showed no models (G-D08), and a
+ * config the router could not read was adopted without a word (G-D14). A reason and its fix, or
+ * nothing at all.
+ */
+function renderDiagnostics() {
+  const box = $("#health-diagnostics");
+  const wrap = $("#health-diagnostics-section");
+  if (!box || !wrap || !status) return;
+  const problems = (status.readiness && Array.isArray(status.readiness.problems)) ? status.readiness.problems : [];
+  const configErrors = (status.config && Array.isArray(status.config.errors)) ? status.config.errors : [];
+  const envProxy = (status.envProxy && Array.isArray(status.envProxy.set)) ? status.envProxy.set : [];
+  wrap.hidden = problems.length === 0 && configErrors.length === 0 && envProxy.length === 0;
+  if (wrap.hidden) { box.replaceChildren(); return; }
+  const rows = problems.map((code) => cell(readinessProblemText(code), badge("warn", String(code))));
+  for (const error of configErrors) rows.push(cell(t("health.diagnosticConfig"), badge("bad", "config"), [el("span", { class: "cell-sub mono", text: String(error) })]));
+  // Not a fault: a proxy that is set but not needed changes nothing. Said anyway, because an
+  // upstream call that needed one would otherwise fail with no hint why (G-D11).
+  if (envProxy.length) rows.push(cell(t("health.diagnosticEnvProxy", { list: envProxy.join(", ") }), badge("warn", "env-proxy")));
+  box.replaceChildren(...rows);
+}
+/**
+ * What a person can paste into a report without handing over a credential: versions, readiness,
+ * config errors, proxy state (whether it points here, never the keys) and provider names with their
+ * connection state. Token values, headers, request bodies and file paths stay out (G-D15).
+ */
+function diagnosticBundle() {
+  const providers = Object.entries((status && status.providers) || {}).map(([name, entry]) => ({
+    name,
+    type: entry.type || null,
+    reachable: entry.reachable === undefined ? null : entry.reachable,
+    usable: entry.usable === undefined ? null : entry.usable,
+    needsLogin: Boolean(entry.needsLogin),
+  }));
+  return {
+    app: "ClaudeRipple",
+    version: status.version,
+    cli: status.cliVersion,
+    readiness: status.readiness || null,
+    config: status.config || null,
+    envProxy: status.envProxy || null,
+    settings: { pointsAtRouter: Boolean(status.settings && status.settings.pointsAtRouter) },
+    autoUpdate: status.autoUpdate ? { enabled: Boolean(status.autoUpdate.enabled), running: Boolean(status.autoUpdate.running), kind: status.autoUpdate.kind || null, failed: Boolean(status.autoUpdate.lastError) } : null,
+    listen: status.listen || null,
+    providers,
+  };
+}
+async function copyDiagnostics() {
+  if (!status) return;
+  if (!confirm(t("health.copyDiagnosticsConfirm"))) return;
+  try {
+    await navigator.clipboard.writeText(JSON.stringify(diagnosticBundle(), null, 2));
+    toast(t("health.copyDiagnosticsDone"));
+  } catch (error) {
+    toast(t("common.actionFailed"), true, error.message);
+  }
+}
+const diagnosticsCopy = $("#diagnostics-copy");
+if (diagnosticsCopy) diagnosticsCopy.addEventListener("click", () => void copyDiagnostics());
 
 // The update check runs on a click, not with the 5-second refresh: it asks the npm registry. What an
 // update means depends on how this copy was installed, so the router's CLI decides and runs it; the
@@ -427,10 +879,10 @@ async function toggleAutoUpdate(enabled) {
     // Do not use latestConfig's stale fallback for an automatic-install preference.
     const next = await api("/api/config");
     next.autoUpdate = enabled;
-    await configRequest(next);
+    const out = await configRequest(next);
     currentConfig = next;
     if (status.autoUpdate) status.autoUpdate.enabled = enabled;
-    toast(t("common.saved"));
+    configSaved(out, t("common.saved"));
   } catch (error) {
     toast(t("common.saveFailed"), true, error.message);
   } finally {
@@ -438,6 +890,46 @@ async function toggleAutoUpdate(enabled) {
     await refreshHealth();
     const current = document.querySelector('[data-key="auto-update"]');
     if (current) { current.disabled = !status.autoUpdate; current.checked = status.autoUpdate?.enabled !== false; }
+  }
+}
+
+// How much CPU priority the router and the phone host ask Windows for (config processPriority,
+// Normal unless set). Task Scheduler had started them below Normal, and a build holding every core
+// starved the router until an update could not reach it (2026-10-29). High puts ClaudeRipple ahead
+// of other programs, so choosing it asks first and the row says so while it is on.
+const PRIORITY_LABEL = { "below-normal": "priority.belowNormal", normal: "priority.normal", "above-normal": "priority.aboveNormal", high: "priority.high", idle: "priority.idle", realtime: "priority.realtime" };
+let prioritySaving = false;
+function priorityRow() {
+  const state = status.processPriority;
+  // Older routers do not report it, and only Windows has these levels.
+  if (!state || !state.supported) return null;
+  const items = ["below-normal", "normal", "above-normal", "high"].map((value) => ({ value, label: t(PRIORITY_LABEL[value]) }));
+  const select = modSelect("process-priority", items, state.setting, t("priority.label"), (value) => void savePriority(value, select));
+  select.disabled = prioritySaving;
+  const notes = [t("priority.help")];
+  if (state.setting === "high") notes.push(el("span", { class: "cell-sub warn-text", text: t("priority.highWarning") }));
+  // Task Manager or another program can change it underneath; say what is in effect.
+  if (state.current && state.current !== state.setting) notes.push(el("span", { class: "cell-sub warn-text", text: t("priority.current", { level: t(PRIORITY_LABEL[state.current]) }) }));
+  return cell(t("priority.label"), select, notes);
+}
+async function savePriority(value, select) {
+  const state = status.processPriority;
+  if (prioritySaving || !state || value === state.setting) return;
+  if (value === "high" && !confirm(t("priority.highConfirm"))) { select.value = state.setting; return; }
+  prioritySaving = true;
+  select.disabled = true;
+  try {
+    const next = await api("/api/config");
+    next.processPriority = value;
+    const out = await configRequest(next);
+    currentConfig = next;
+    state.setting = value;
+    configSaved(out, t("common.saved"));
+  } catch (error) {
+    toast(t("common.saveFailed"), true, error.message);
+  } finally {
+    prioritySaving = false;
+    await refreshHealth();
   }
 }
 function versionRow() {
@@ -458,6 +950,11 @@ function versionRow() {
     button.addEventListener("click", () => void (action ? startUpdate() : checkForUpdate()));
     if (check && !check.newer && !updateState.busy) note = t("update.latest");
   }
+  // An install that ran and failed is not "the latest version": the reason stays in reach, and the
+  // button is the retry (G-D07). The router's own text is shown, as it is the only detail there is.
+  const failed = status.autoUpdate && status.autoUpdate.lastError && !status.autoUpdate.running && !updateState.busy;
+  // A failure reads in the warning colour, so it is not taken for the version's ordinary note.
+  if (failed && button) note = el("span", { class: "cell-sub warn-text", text: `${t("update.lastFailed")} ${shortError(status.autoUpdate.lastError)}` });
   const row = cell(el("span", { class: "cell-label", text: `${t("health.version")} ${status.version}` }), button, note);
   row.id = "health-version-row";
   return row;
@@ -818,11 +1315,13 @@ async function startChatgptLogin(onChange, adding) {
  * Which of a provider's credentials are resting, and until when. Absent for a provider with one
  * credential: a row that can only ever say "ready" is noise. Ids and labels only — never a key.
  */
-function credentialLine(name) {
-  const pool = (status && status.credentials && status.credentials[name]) || [];
+function credentialLine(name, shown) {
+  // An account drawn as its own row below carries its state there (limitsAccountRow); the line keeps the rest.
+  const pool = ((status && status.credentials && status.credentials[name]) || []).filter((c) => !(shown && c.id !== undefined && shown.has(c.id)));
   if (!pool.length) return null;
   const parts = pool.map((c) => {
-    const who = c.label || c.id;
+    // The router names the Claude login in English ("Current Claude session") and an account nobody named "Claude account"; the screen says them in its language.
+    const who = c.id === "current" ? t("providers.anthropicCurrentLogin") : c.label === "Claude account" ? t("providers.claudeAccountDefault") : c.label || c.id;
     if (c.state === "quarantined") return `${who}: ${t("pool.quarantined")}`;
     if (c.state === "cooling") return `${who}: ${t("pool.cooling", { seconds: c.cooldownSeconds ?? 0 })}`;
     return `${who}: ${t("pool.ready")}`;
@@ -839,7 +1338,11 @@ function credentialLine(name) {
 function providerConnection(name) {
   const live = status && status.providers && status.providers[name];
   // A successful TCP probe (or an older model probe) cannot undo a real billing refusal.
-  if (live && live.exhaustion) return { level: "warn", text: `${live.exhaustion.reason.replace(/_/g, " ")} · ${new Date(live.exhaustion.until).toLocaleTimeString()}` };
+  if (live && live.exhaustion) {
+    // The router's reason is its own English word; the dashboard says it in its language, with the mod's wording (workers.ts unavailableReason).
+    const reasons = { insufficient_balance: "providerStatus.insufficientBalance", billing_exhausted: "providerStatus.billingExhausted", quota_exhausted: "providerStatus.quotaExhausted" };
+    return { level: "warn", text: `${t(reasons[live.exhaustion.reason] || "providerStatus.unavailable")} · ${new Date(live.exhaustion.until).toLocaleTimeString()}` };
+  }
   // Reaching the host is not the same as being able to use it. A ChatGPT provider with no
   // credentials would otherwise read "Connected" and send the user off believing it works.
   if (live && live.needsLogin) return { level: "warn", text: t("providerStatus.loginNeeded") };
@@ -866,30 +1369,55 @@ function providerState(name) {
   const verdict = providerConnection(name);
   return badge(verdict.level, verdict.text);
 }
+/**
+ * Whether the config this page holds names other providers than the router's live list does (one was
+ * added or removed since the config was read). Status follows the live list, so this asks for a re-read.
+ */
+function providerNamesStale() {
+  if (offline() || !status || !status.providers) return false;
+  if (!currentConfig) return true;
+  const saved = currentConfig.providers || {};
+  return Object.keys(status.providers).some((name) => !saved[name]) || Object.keys(saved).some((name) => !status.providers[name]);
+}
+let providerConfigRead = null;
+/** Reads the config again for the names and labels Status shows; one read at a time, and the list redraws with it. */
+function refreshProviderConfig() {
+  if (providerConfigRead) return providerConfigRead;
+  providerConfigRead = api("/api/config").then((config) => { currentConfig = config; }, () => { /* the live names stand */ })
+    .finally(() => { providerConfigRead = null; if (status) renderHealthProviders(); });
+  return providerConfigRead;
+}
 function renderHealthProviders() {
   const box = $("#health-providers");
-  const providers = Object.entries((currentConfig && currentConfig.providers) || (status && status.providers) || {});
-  if (!providers.length) {
+  // The router's live list decides which providers show: one added or removed elsewhere appears or goes on the
+  // next poll. The config supplies each provider's label and preset; one it does not have yet is drawn from the status.
+  const names = status && status.providers ? Object.keys(status.providers) : Object.keys((currentConfig && currentConfig.providers) || {});
+  if (!names.length) {
     box.replaceChildren(hint(t("health.noProviders")));
     return;
   }
-  box.replaceChildren(...providers.map(([name, provider]) => {
+  box.replaceChildren(...names.map((name) => {
     const live = status && status.providers && status.providers[name];
+    const provider = (currentConfig && currentConfig.providers && currentConfig.providers[name]) || live || {};
     const lines = [];
     const limits = providerLimits(name);
-    // Without `/api/limits` figures (an older router, a failed read) the text lines stand in for them.
-    const quota = limits ? null : quotaLine(name);
+    // Older routers and a never-read limits list keep the text lines; gauges replace them only where they show figures.
+    const figures = Boolean(limits && limits.accounts.some((account) => (account.windows || []).length));
+    const quota = figures ? null : quotaLine(name);
     if (quota) lines.push(el("span", { class: "cell-sub", text: quota }));
     // Claude subscription accounts, one line each: the current login and every account added here.
-    // Status owns these snapshots even before Providers loads the config or observed auth expires.
-    if (!limits && provider.type === "anthropic" && status && status.claude && status.claude.accounts && status.claude.accounts.length) {
+    // Before the config has loaded the rows come from the status, which names the sign-in source
+    // rather than the auth mode. The gauges replace these lines when limits are available.
+    if (!limits && provider.type === "anthropic" && (provider.auth === "claude-code" || (live && live.authSource))) {
       const usage = ((status && status.claude && status.claude.accounts) || [])
         .map((account) => ({ account, text: chatgptQuotaText(account.quota) }))
         .filter(({ text }) => text)
         .map(({ account, text }) => el("div", { text: `${claudeAccountLabel(account)} · ${text}` }));
       if (usage.length) lines.push(el("div", { class: "cell-sub account-usage" }, usage));
     }
-    const pool = limits ? null : credentialLine(name);
+    // A cooldown or quarantine is not in the gauges: an account with a row says it on that row, any other stays in the line.
+    const shown = limits ? new Set(limits.accounts.map((account) => account.id).filter((id) => id !== undefined)) : null;
+    const pool = credentialLine(name, shown);
     if (pool) lines.push(pool);
     if (live && live.needsLogin && provider.type === "chatgpt") {
       lines.push(el("div", { class: "cell-actions" }, [
@@ -897,16 +1425,21 @@ function renderHealthProviders() {
         chatgptLoginMessage ? el("span", { class: "small", text: chatgptLoginMessage }) : null,
       ]));
     }
-    // The row opens the provider's own page; a button inside it keeps its own click.
-    const row = cell(el("span", { class: "cell-label", text: providerLabel(name, provider) }), [providerState(name, provider), chevronIcon()], lines, "provider-status link");
+    // The row opens the provider's own page; a button inside it keeps its own click. The dot is the vendor's hue, as on the mod's band.
+    const dot = el("span", { class: "vendor-dot", "aria-hidden": "true" });
+    dot.style.color = providerHue(name, provider);
+    const title = el("span", { class: "cell-label provider-title" }, [dot, el("span", { text: providerDisplayName(name, provider) })]);
+    const row = cell(title, [providerState(name, provider), chevronIcon()], lines, "provider-status link");
     row.tabIndex = 0;
     const open = (event) => { if (!event.target.closest("button, a")) openProvider(name, provider); };
     row.addEventListener("click", open);
     row.addEventListener("keydown", (event) => { if (event.key === "Enter" && event.target === row) open(event); });
-    // The gauges sit under the row at full width; only the row (name and state) opens the provider.
+    // Only the header opens the provider; the accounts below take the card's full width.
     if (!limits) return row;
     const now = Date.now();
-    return el("div", { class: "provider-block" }, [row, el("div", { class: "provider-limits" }, limits.accounts.map((account) => limitsAccountRow(account, now)))]);
+    const credentials = (status && status.credentials && status.credentials[name]) || [];
+    const credentialOf = (account) => (account.id === undefined ? undefined : credentials.find((c) => c.id === account.id));
+    return el("div", { class: "provider-block" }, [row, el("div", { class: "provider-limits" }, limits.accounts.map((account) => limitsAccountRow(limits, account, now, credentialOf(account))))]);
   }));
 }
 
@@ -937,7 +1470,9 @@ function renderClients() {
     void togglePicker(!picker.enabled, true);
   };
   renderClientPickerModels(picker.enabled);
+  renderClientPickerOrder(picker.enabled);
   renderModelSlots();
+  renderAutoClassifier();
   const modEnabled = Boolean(status.statusMod);
   const modSwitch = $("#client-status-mod-toggle");
   modSwitch.checked = modEnabled;
@@ -949,20 +1484,62 @@ function renderClients() {
   toolsSwitch.onchange = () => { toolsSwitch.disabled = true; void toggleWorkerTools(!toolsLimited).finally(() => { toolsSwitch.disabled = false; }); };
   void renderCodexClient();
   const groups = groupedModels(currentConfig);
-  const mapped = Object.entries(currentConfig.routes || {}).map(([source, route]) => cell(
-    labelOf(claudeModels.find((model) => model.id === source) || { id: source }),
-    el("span", { text: labelOf((groups.find((group) => group.name === route.provider) || { models: [] }).models.find((model) => model.id === route.model) || { id: route.model }) }),
-  ));
+  const mapped = Object.entries(currentConfig.routes || {}).map(([source, route]) => {
+    const target = (groups.find((group) => group.name === route.provider) || { models: [] }).models.find((model) => model.id === route.model) || { id: route.model };
+    // Where a model goes when its provider cannot answer is part of what routes it: shown here, not
+    // only enforced by the router, and left to the config file rather than made a form (U36).
+    const fallbacks = (route.fallbacks || []).map((fallback) => {
+      const model = (groups.find((group) => group.name === fallback.provider) || { models: [] }).models.find((item) => item.id === fallback.model) || { id: fallback.model };
+      return `${labelOf(model)} · ${providerDisplayName(fallback.provider, currentConfig.providers[fallback.provider] || {})}`;
+    });
+    // Who answers behind its vendor's dot, as the mapping page draws it; the provider's name is the dot's tooltip.
+    const dot = vendorDot(route.provider, currentConfig.providers[route.provider]);
+    return cell(
+      labelOf(claudeModels.find((model) => model.id === source) || { id: source }),
+      el("span", { class: "route-target", title: providerDisplayName(route.provider, currentConfig.providers[route.provider] || {}) }, [dot, el("span", { text: labelOf(target) })]),
+      fallbacks.length ? el("span", { class: "cell-sub", text: t("slots.fallbacks", { list: fallbacks.join(" → ") }) }) : null,
+    );
+  });
   $("#client-claude-code-rows").replaceChildren(...(mapped.length ? mapped : [el("div", { class: "cell-note", text: t("slots.noChanges") })]));
 }
+// The five-second status poll re-runs the Clients screen. Rebuilding the model controls then would
+// replace a window field being typed in — losing the value and the focus — though the poll changes
+// nothing they are drawn from. Each render remembers what it drew and repeats only for different
+// data; the slot rows also read each provider's measured search ability, so that is part of their key.
+let pickerModelsDrawnFor = { key: null };
+let modelSlotsDrawnFor = { key: null };
+// A window field being typed into when a config or catalogue change rebuilds the rows: the text
+// and the caret stay, and the saved value does not overwrite them before the person is done (B20).
+const pickerWindowDrafts = new Map();
 function renderClientPickerModels(enabled) {
   const card = $("#client-picker-models-card");
   card.hidden = !enabled;
   if (!enabled) return;
   const box = $("#client-picker-models");
   const checked = new Set(((currentConfig.cli && currentConfig.cli.extraModels) || []).map((item) => item.model));
+  const groups = groupedModels(currentConfig);
+  const key = JSON.stringify([
+    [...checked].sort(),
+    groups.map((group) => [group.name, providerDisplayName(group.name, group.provider), group.models.map((model) => [
+      model.id, labelOf(model), discoveredContextWindow(group.name, model.id) ?? null,
+      savedContextWindow(model.id) ?? null, pickerContextWindows.catalogWindows[model.id] ?? null,
+      pickerContextWindows.windows[model.id] ?? null,
+    ])]),
+  ]);
+  // Typing in a window changes none of this, and the catalogue arrives once with the screen, so a
+  // repeat poll — or a save elsewhere on this screen — has nothing new to draw. Nor does a redraw
+  // while picker saves are open: it would show what the first of them stored and undo the ticks the
+  // waiting one is about to read.
+  if ((key === pickerModelsDrawnFor.key || pickerSavesOpen > 0) && box.childElementCount) return;
+  const typing = document.activeElement;
+  const typingModel = typing && typing.classList && typing.classList.contains("model-window") && box.contains(typing) ? typing.dataset.model : null;
+  const typingCaret = typingModel ? typing.selectionStart : null;
+  const known = new Set(groups.flatMap((group) => group.models.map((model) => model.id)));
+  for (const id of [...pickerWindowDrafts.keys()]) if (!known.has(id)) pickerWindowDrafts.delete(id);
   box.replaceChildren();
-  for (const group of groupedModels(currentConfig)) for (const model of group.models) {
+  for (const group of groups) for (const model of group.models) {
+    // Each provider's models under its name and vendor's dot, as on Status, instead of the provider repeated on every model.
+    if (model === group.models[0]) box.appendChild(el("div", { class: "picker-group-head" }, [vendorDot(group.name, group.provider), el("span", { text: providerDisplayName(group.name, group.provider) })]));
     const input = el("input", { type: "checkbox", checked: checked.has(model.id) });
     input.dataset.model = model.id;
     input.dataset.provider = group.name;
@@ -970,35 +1547,121 @@ function renderClientPickerModels(enabled) {
     const discovered = discoveredContextWindow(group.name, model.id);
     const saved = savedContextWindow(model.id);
     const catalogWindow = pickerContextWindows.catalogWindows[model.id];
-    // Blank means "use the fallback" except when the live catalogue owns the value.
+    // The catalogue's figure is the one in use while the router resolves exactly it; a saved
+    // override (or a route window) makes the two differ, and the field then shows the resolved value.
+    const catalogApplied = catalogWindow !== undefined && pickerContextWindows.windows[model.id] === catalogWindow;
+    const draft = pickerWindowDrafts.get(model.id);
+    // Always editable. It shows the number the router uses; emptying it, or typing the catalogue's
+    // own figure, saves no override and goes back to the official value (2026-10-30).
     const windowField = el("input", {
       type: "number", class: "model-window", min: "1", step: "1000",
-      value: catalogWindow !== undefined ? String(catalogWindow) : saved !== undefined ? String(saved) : "",
+      value: draft !== undefined ? draft : catalogApplied ? String(catalogWindow) : saved !== undefined ? String(saved) : "",
       placeholder: discovered !== undefined ? String(discovered) : t("slots.windowGlobal"),
-      title: t(catalogWindow !== undefined ? "slots.windowCodex" : "slots.windowHelp"),
-      readonly: catalogWindow !== undefined ? "" : undefined,
+      title: t(catalogApplied ? "slots.windowCodex" : "slots.windowHelp"),
     });
-    const windowNote = catalogWindow !== undefined ? el("small", { text: t("slots.windowCodex"), style: "grid-row: 3; grid-column: 1 / -1" }) : null;
+    const windowNote = catalogApplied ? el("small", { class: "pm-note", text: t("slots.windowCodex") }) : null;
     windowField.hidden = !input.checked;
     if (windowNote) windowNote.hidden = !input.checked;
     windowField.dataset.model = model.id;
+    windowField.addEventListener("input", () => pickerWindowDrafts.set(model.id, windowField.value));
     windowField.addEventListener("change", () => void saveClientPickerModels());
     input.addEventListener("change", () => {
       windowField.hidden = !input.checked;
       if (windowNote) windowNote.hidden = !input.checked;
       void saveClientPickerModels();
     });
-    // Two lines: the name owns the first — on one line it was the thing that collapsed, down to
-    // "GPT…" — and the provider and the window share the second. The field sits outside the
-    // <label>, because inside it every click toggles the checkbox instead of reaching the field.
+    // One line: the name, then the window field at the end; the catalogue note, when there is one,
+    // takes a line of its own (style.css places it: an inline style is dropped by the CSP). The
+    // provider is the group's head above. The field sits outside the <label>, because inside it every
+    // click toggles the checkbox instead of reaching the field.
     box.appendChild(el("div", { class: "picker-model", title: model.id }, [
       el("label", { class: "pm-main" }, [input, el("span", { text: labelOf(model) })]),
-      el("small", { text: providerLabel(group.name, group.provider) }),
       windowField,
       windowNote,
     ]));
   }
   if (!box.childElementCount) box.appendChild(hint(t("slots.noProviderModels")));
+  pickerModelsDrawnFor = { key };
+  // The person was typing here before the rows were rebuilt: the field has their text back, and the
+  // caret goes where it was so the next keystroke continues the number.
+  if (typingModel) {
+    const again = box.querySelector(`.model-window[data-model="${CSS.escape(typingModel)}"]`);
+    if (again && !again.hidden) {
+      again.focus();
+      if (typingCaret !== null) { try { again.setSelectionRange(typingCaret, typingCaret); } catch { /* number inputs have no selection */ } }
+    }
+  }
+}
+// The order the app picker lists the added models in: it shows them after Claude's own, in the
+// order `cli.extraModels` stores them (picker.ts appends them as stored). A reorder not yet saved is
+// `pickerOrderPending`; the list shows it at once, and the save that carries it clears it.
+let pickerOrderDrawnFor = { key: null };
+let pickerOrderPending = null;
+let pickerOrderFocus = null;
+/** The added models in picker order. Claude's own ids are left out: those keep their own place there. */
+function pickerOrderIds() {
+  const native = new Set(claudeModels.map((model) => model.id));
+  const known = allKnownModelIds(currentConfig);
+  const entries = orderPickerEntries((currentConfig.cli && currentConfig.cli.extraModels) || [], pickerOrderPending || []);
+  return [...new Set(entries.map((entry) => entry.model))].filter((id) => known.has(id) && !native.has(id));
+}
+function renderClientPickerOrder(enabled) {
+  const card = $("#client-picker-order-card");
+  const ids = enabled && currentConfig ? pickerOrderIds() : [];
+  // One model has no order to choose.
+  card.hidden = ids.length < 2;
+  if (card.hidden) { pickerOrderDrawnFor = { key: null }; return; }
+  const box = $("#client-picker-order");
+  const entries = (currentConfig.cli && currentConfig.cli.extraModels) || [];
+  const rows = ids.map((id) => {
+    const entry = entries.find((item) => item.model === id);
+    const owner = pickerOwner(currentConfig, id);
+    return { id, name: (entry && entry.name) || id, provider: owner ? providerDisplayName(owner, currentConfig.providers[owner] || {}) : "" };
+  });
+  const key = JSON.stringify(rows);
+  if (key === pickerOrderDrawnFor.key && box.childElementCount) return;
+  // An arrow that has focus when the list is rebuilt for any other reason (a poll, a failed save
+  // putting the old order back) keeps it the same way a move does.
+  const active = document.activeElement;
+  const activeKey = active && box.contains(active) ? active.getAttribute("data-key") : null;
+  if (!pickerOrderFocus && activeKey && activeKey.startsWith("picker-order:")) {
+    const at = activeKey.lastIndexOf(":");
+    pickerOrderFocus = { id: activeKey.slice("picker-order:".length, at), suffix: activeKey.slice(at + 1) };
+  }
+  box.replaceChildren(...rows.map((row, index) => {
+    const move = (delta, suffix) => {
+      const next = rows.map((item) => item.id);
+      [next[index], next[index + delta]] = [next[index + delta], next[index]];
+      pickerOrderPending = next;
+      pickerOrderFocus = { id: row.id, suffix };
+      renderClientPickerOrder(true);
+      void saveClientPickerModels(false);
+    };
+    const button = (suffix, text, labelKey, disabled, delta) => el("button", {
+      type: "button", class: "icon-btn po-move", "data-key": `picker-order:${row.id}:${suffix}`, text,
+      "aria-label": t(labelKey, { name: row.name }), title: t(labelKey, { name: row.name }),
+      ...(disabled ? { disabled: "" } : {}), onclick: () => move(delta, suffix),
+    });
+    return el("li", { class: "picker-order-item" }, [el("div", { class: "po-row", title: row.id }, [
+      el("span", { class: "po-name", text: row.name }),
+      row.provider ? el("small", { text: row.provider }) : null,
+      el("div", { class: "rung-actions" }, [
+        button("up", "↑", "slots.pickerMoveUp", index === 0, -1),
+        button("down", "↓", "slots.pickerMoveDown", index === rows.length - 1, 1),
+      ]),
+    ])]);
+  }));
+  pickerOrderDrawnFor = { key };
+  // The button just pressed is rebuilt with its row; keyboard focus follows the row, onto the other
+  // arrow once this one has reached the end.
+  if (pickerOrderFocus) {
+    const { id, suffix } = pickerOrderFocus;
+    pickerOrderFocus = null;
+    const find = (which) => box.querySelector(`[data-key="${CSS.escape(`picker-order:${id}:${which}`)}"]`);
+    const same = find(suffix);
+    const target = same && !same.disabled ? same : find(suffix === "up" ? "down" : "up");
+    if (target) target.focus();
+  }
 }
 // Claude Code picks these before a request exists, so routing cannot reach them: a search, a title
 // or a subagent goes wherever the CLI already decided. Left empty, Claude answers them — which is
@@ -1034,11 +1697,24 @@ function renderModelSlots() {
   // With a web search backend set, the search is intercepted before routing and never reaches
   // `smallFast`, so the "no web search here" label there would be false.
   const searchIntercepted = Boolean(currentConfig.webSearch);
+  const groups = groupedModels(currentConfig);
+  const key = JSON.stringify([
+    MODEL_SLOTS.map((slot) => chosen[slot] || ""),
+    searchIntercepted ? 1 : 0,
+    currentConfig.webSearch ? [currentConfig.webSearch.provider, currentConfig.webSearch.model] : null,
+    groups.map((group) => [group.name, providerDisplayName(group.name, group.provider), group.models.map((model) => [
+      model.id, labelOf(model), providerCannotSearch(group.name, model.id),
+      Boolean(currentConfig.providers[group.name] && currentConfig.providers[group.name].type === "anthropic"),
+    ])]),
+  ]);
+  // A provider's search ability is the only thing here the status poll can change; an unchanged key
+  // means the selects already show this pass. Replacing them would take the focus off one mid-use.
+  if (key === modelSlotsDrawnFor.key && rows.childElementCount) return;
   const nodes = MODEL_SLOTS.map((slot) => {
     const select = el("select", {});
     select.appendChild(el("option", { value: "", text: t("slots.slotDefault") }));
-    for (const group of groupedModels(currentConfig)) for (const model of group.models) {
-      const option = el("option", { value: model.id, text: `${labelOf(model)} · ${providerLabel(group.name, group.provider)}` });
+    for (const group of groups) for (const model of group.models) {
+      const option = el("option", { value: model.id, text: `${labelOf(model)} · ${providerDisplayName(group.name, group.provider)}` });
       if (chosen[slot] === model.id) option.selected = true;
       // `smallFast` is what a WebSearch runs on, so an inability to search is fatal there and
       // merely worth knowing everywhere else.
@@ -1060,6 +1736,7 @@ function renderModelSlots() {
   });
   nodes.push(renderWebSearchSlot());
   rows.replaceChildren(...nodes);
+  modelSlotsDrawnFor = { key };
 }
 
 // The backend `cfg.webSearch` names answers the search instead of the `smallFast` slot. Only the
@@ -1075,14 +1752,14 @@ function renderWebSearchSlot() {
     // A Claude account searches on its own when routed to, but `serveWebSearch` has no backend for
     // that provider kind: named here, the search would quietly fall back to `smallFast`.
     if (currentConfig.providers[group.name] && currentConfig.providers[group.name].type === "anthropic") continue;
-    const option = el("option", { value: webSearchChoice(group.name, model.id), text: `${labelOf(model)} · ${providerLabel(group.name, group.provider)}` });
+    const option = el("option", { value: webSearchChoice(group.name, model.id), text: `${labelOf(model)} · ${providerDisplayName(group.name, group.provider)}` });
     if (saved && saved.provider === group.name && saved.model === model.id) { option.selected = true; found = true; }
     select.appendChild(option);
   }
   // A backend the config names but no provider can run any more must not read as "follows the
   // small, fast model" — that would silently change where the search goes.
   if (saved && !found) {
-    const orphan = el("option", { value: webSearchChoice(saved.provider, saved.model), text: `${saved.provider} / ${saved.model} (?)` });
+    const orphan = el("option", { value: webSearchChoice(saved.provider, saved.model), text: `${providerDisplayName(saved.provider)} / ${saved.model} (?)` });
     orphan.selected = true;
     select.appendChild(orphan);
   }
@@ -1101,10 +1778,10 @@ async function saveWebSearch(value) {
   if (picked) next.webSearch = { provider: picked.provider, model: picked.model, ...(maxResults !== undefined ? { maxResults } : {}) };
   else delete next.webSearch;
   try {
-    await configRequest(next);
+    const out = await configRequest(next);
     currentConfig = next;
     renderModelSlots();
-    toast(t("slots.webSearchSaved"));
+    configSaved(out, t("slots.webSearchSaved"));
   } catch (error) { toast(t("common.saveFailed"), true, error.message); }
 }
 
@@ -1119,32 +1796,243 @@ async function saveModelSlots() {
   for (const select of $all("#client-model-slots select[data-slot]")) models[select.dataset.slot] = select.value;
   next.cli = { ...(next.cli || {}), models };
   try {
-    await configRequest(next);
+    const out = await configRequest(next);
     currentConfig = next;
     // Saying "saved" over a choice that will make every search fail is the same silent no-op this
     // screen was already guilty of once. The label on the option warns before the fact; this catches
     // a session that already had it selected. With a web search backend set the search never
     // reaches `smallFast`, so there is nothing to warn about.
-    const owners = models.smallFast && !next.webSearch ? providersOffering(next, models.smallFast) : [];
-    if (owners.length && providerCannotSearch(owners[0], models.smallFast)) toast(t("slots.noWebSearchWarn"), true);
-    else toast(t("slots.slotSaved"));
+    const savedModels = next.cli.models;
+    const owners = savedModels.smallFast && !next.webSearch ? providersOffering(next, savedModels.smallFast) : [];
+    const warning = owners.length && providerCannotSearch(owners[0], savedModels.smallFast) ? t("slots.noWebSearchWarn") : undefined;
+    configSaved(out, t("slots.slotSaved"), warning);
   } catch (error) { toast(t("common.saveFailed"), true, error.message); }
+}
+
+// ---- Auto mode classifier ---------------------------------------------------------------
+//
+// `autoModeClassifier` (ARCHITECTURE §2) takes Auto mode's security check off the model Claude Code
+// picked for it. The two rows are its two stages: the first stage's quick yes/no, and the second
+// stage together with every other classifier request. Each row is a provider and model, or Claude
+// Code's own choice. The config can spell the same two rows several ways, so the two functions
+// below are the only translation between them.
+
+/** The two rows a setting shows, `{ first, rest }`: each a target, or null for Claude Code's own. */
+function classifierRowsOf(settings) {
+  if (!settings || typeof settings !== "object") return { first: null, rest: null };
+  const pick = (target) => ({ provider: target.provider, model: target.model, ...(target.effort ? { effort: target.effort } : {}) });
+  const rest = settings.provider && settings.model ? pick(settings) : null;
+  const stage1 = settings.stage1;
+  // Without `stage1` the first stage follows the main target, so both rows show it.
+  if (stage1 === undefined) return { first: rest, rest };
+  return { first: stage1 && typeof stage1 === "object" ? pick(stage1) : null, rest };
+}
+/** The setting two rows save, or undefined when both are Claude Code's own and the field goes. */
+function classifierSettingOf(first, rest) {
+  if (!first && !rest) return undefined;
+  if (!rest) return { stage1: first };
+  if (!first) return { ...rest, stage1: "native" };
+  const same = first.provider === rest.provider && first.model === rest.model && (first.effort || "") === (rest.effort || "");
+  return same ? { ...rest } : { ...rest, stage1: first };
+}
+/** Whether either row of a setting names this provider. */
+function classifierNames(settings, provider) {
+  const rows = classifierRowsOf(settings);
+  return [rows.first, rows.rest].some((row) => row && row.provider === provider);
+}
+/** The setting once this provider is gone: a row that named it is Claude Code's own again, and the
+ * other row is kept. Undefined when neither row has a target left. */
+function classifierWithout(settings, provider) {
+  const rows = classifierRowsOf(settings);
+  const kept = (row) => (row && row.provider === provider ? null : row);
+  return classifierSettingOf(kept(rows.first), kept(rows.rest));
+}
+
+// Claude Code refuses these as its own classifier because the API's safeguards refuse the second
+// stage on them (CLI 2.1.310; measured for Sonnet 5.5, ARCHITECTURE §2). They answer the first.
+const CLASSIFIER_REFUSES_STAGE2 = new Set(["claude-sonnet-5-5", "claude-opus-5-5", "claude-opus-5"]);
+
+// A Claude account-pool provider answers with whatever the signed-in account can use, so one without
+// a model list is offered with the Claude catalogue. A list would make it the routing owner of those
+// ids for every request, not just this one, which is why a classifier's own provider has none.
+function classifierGroups(config) {
+  const groups = groupedModels(config);
+  for (const [name, provider] of Object.entries(config.providers || {})) {
+    if (provider.type !== "anthropic" || !isTargetProvider(provider) || modelsOf(provider).length) continue;
+    groups.push({ name, provider, models: claudeModels.map((model) => ({ id: model.id, name: labelOf(model) })) });
+  }
+  return groups;
+}
+
+function classifierRow(stage, saved, groups) {
+  const target = el("select", {});
+  target.appendChild(selectOption("", t("classifier.native")));
+  let found = false;
+  for (const group of groups) {
+    const optgroup = el("optgroup", { label: providerDisplayName(group.name, group.provider) });
+    for (const model of group.models) {
+      const option = selectOption(JSON.stringify([group.name, model.id]), labelOf(model));
+      if (stage === "rest" && CLASSIFIER_REFUSES_STAGE2.has(model.id)) option.textContent += ` (${t("classifier.refusesStage2")})`;
+      if (saved && saved.provider === group.name && saved.model === model.id) found = true;
+      optgroup.appendChild(option);
+    }
+    target.appendChild(optgroup);
+  }
+  // A target the config names but no provider offers any more must not read as Claude Code's own:
+  // saving the row unchanged would then quietly hand the check back.
+  if (saved && !found) target.appendChild(selectOption(JSON.stringify([saved.provider, saved.model]), `${providerDisplayName(saved.provider)} / ${saved.model} (?)`));
+  target.value = saved ? JSON.stringify([saved.provider, saved.model]) : "";
+
+  const effort = el("select", { class: "classifier-effort" });
+  // "" saves no effort, and the request keeps the effort Claude Code gave it. A saved level the
+  // catalogue does not list is kept on first draw, so opening the page never rewrites it.
+  const sync = (prior, keepUnlisted) => {
+    const picked = routeFromTarget(target.value);
+    const levels = picked ? effortLevelsFor(picked.provider, picked.model) : [];
+    const shown = keepUnlisted && prior && !levels.includes(prior) ? [...levels, prior] : levels;
+    effort.replaceChildren(selectOption("", t("classifier.effortDefault")), ...shown.map((level) => selectOption(level, level)));
+    effort.value = shown.includes(prior) ? prior : "";
+    effort.disabled = shown.length === 0;
+  };
+  sync(saved && saved.effort, true);
+  target.onchange = () => { sync(effort.value, false); void saveAutoClassifier(); };
+  effort.onchange = () => void saveAutoClassifier();
+  target.dataset.classifier = stage;
+  effort.dataset.classifierEffort = stage;
+  target.setAttribute("aria-label", t(`classifier.${stage}`));
+  effort.setAttribute("aria-label", t("slots.th.effort"));
+  return cell(t(`classifier.${stage}`), [target, effort], t(`classifier.${stage}Help`), "slot-row classifier-row");
+}
+
+function renderAutoClassifier() {
+  const box = $("#client-auto-classifier");
+  if (!box || !currentConfig) return;
+  const rows = classifierRowsShown();
+  const groups = classifierGroups(currentConfig);
+  box.replaceChildren(classifierRow("first", rows.first, groups), classifierRow("rest", rows.rest, groups));
+  const note = $("#client-auto-classifier-note");
+  const pool = Object.values(currentConfig.providers || {}).some((provider) => provider.type === "anthropic" && isTargetProvider(provider));
+  if (note) note.hidden = pool;
+}
+
+function classifierRowValue(stage) {
+  const target = $(`#client-auto-classifier select[data-classifier="${stage}"]`);
+  const effort = $(`#client-auto-classifier select[data-classifier-effort="${stage}"]`);
+  const picked = target ? routeFromTarget(target.value) : null;
+  if (!picked) return null;
+  return effort && effort.value ? { ...picked, effort: effort.value } : picked;
+}
+
+// A choice is read from the rows when it is made, before anything is awaited: a save that lands
+// redraws the rows from what it stored, so a later choice read after that would be the earlier one.
+// Saves run one at a time, and one that a newer choice has overtaken is dropped, so the last choice
+// is the one stored. Until it is stored the rows are drawn from it: the five-second status refresh
+// redraws them too, and drawn from the stored setting it would put the earlier value back in a row
+// that the next choice then reads and saves.
+let classifierSaveGeneration = 0;
+let classifierSaving = Promise.resolve();
+let classifierPending = null;
+function classifierRowsShown() {
+  return classifierRowsOf(classifierPending ? classifierPending.setting : currentConfig.autoModeClassifier);
+}
+function saveAutoClassifier() {
+  if (!currentConfig) return classifierSaving;
+  const setting = classifierSettingOf(classifierRowValue("first"), classifierRowValue("rest"));
+  classifierPending = { setting };
+  const generation = ++classifierSaveGeneration;
+  classifierSaving = classifierSaving.then(async () => {
+    if (generation !== classifierSaveGeneration) return;
+    try {
+      const next = clone(await latestConfig());
+      if (generation !== classifierSaveGeneration) return;
+      if (setting) next.autoModeClassifier = setting;
+      else delete next.autoModeClassifier;
+      await configRequest(next);
+      currentConfig = next;
+      if (generation !== classifierSaveGeneration) return;
+      classifierPending = null;
+      renderAutoClassifier();
+      toast(t("classifier.saved"));
+    } catch (error) {
+      if (generation === classifierSaveGeneration) classifierPending = null;
+      toast(t("common.saveFailed"), true, error.message);
+    }
+  });
+  return classifierSaving;
 }
 
 function clientPickerSelections() {
   return $all("#client-picker-models input[type=checkbox]:checked").map((input) => {
     const field = $(`#client-picker-models input.model-window[data-model="${CSS.escape(input.dataset.model)}"]`);
-    // A catalogue value is display-only, not a new override persisted by an unrelated checkbox.
-    const typed = field && !field.readOnly && field.value.trim() ? Number(field.value) : NaN;
-    const contextWindow = field && field.readOnly ? savedContextWindow(input.dataset.model)
-      : Number.isFinite(typed) && typed > 0 ? Math.floor(typed) : discoveredContextWindow(input.dataset.provider, input.dataset.model);
+    const catalogWindow = pickerContextWindows.catalogWindows[input.dataset.model];
+    const typed = field && field.value.trim() ? Number(field.value) : NaN;
+    const value = Number.isFinite(typed) && typed > 0 ? Math.floor(typed) : undefined;
+    // An empty field, or the catalogue's own figure, is no override for a catalogue-backed model:
+    // the entry stores no window and the router keeps following the catalogue. Another provider
+    // keeps its old fallback to the window its provider declares (2026-10-30).
+    const contextWindow = value !== undefined && value !== catalogWindow
+      ? value
+      : catalogWindow !== undefined ? undefined : discoveredContextWindow(input.dataset.provider, input.dataset.model);
     return { id: input.dataset.model, name: input.dataset.name, provider: input.dataset.provider, contextWindow };
   });
 }
-async function saveClientPickerModels() {
+// One picker save at a time, each built from the screen as it is when that save starts. Two quick
+// clicks used to race: the earlier save's conflict retry put back a tick the later one had removed.
+// A save asked for while one is waiting adds nothing, since the waiting one reads the newer screen;
+// and while any is open the checklist is not redrawn (renderClientPickerModels), so the screen it
+// reads is still the one the person clicked, not the copy the save before it stored.
+let pickerSaving = Promise.resolve();
+let pickerSaveWaiting = false;
+let pickerSavesOpen = 0;
+// Whether a tick or a window changed since the last save read them. A reorder alone leaves the list
+// as the router holds it: rebuilding it from this screen put back a model another window had removed.
+let pickerSelectionsChanged = false;
+function saveClientPickerModels(selectionsChanged = true) {
+  if (selectionsChanged) pickerSelectionsChanged = true;
+  if (pickerSaveWaiting) return pickerSaving;
+  pickerSaveWaiting = true;
+  pickerSavesOpen++;
+  pickerSaving = pickerSaving.catch(() => {})
+    .then(() => { pickerSaveWaiting = false; return saveClientPickerModelsNow(); })
+    .finally(() => { pickerSavesOpen--; });
+  return pickerSaving;
+}
+async function saveClientPickerModelsNow() {
   if (!currentConfig) return;
-  const next = applyPickerSelections(clone(await latestConfig()), clientPickerSelections());
-  try { await configRequest(next); currentConfig = next; toast(t("slots.saved")); } catch (error) { toast(t("common.saveFailed"), true, error.message); }
+  // A reorder rides on this save only when one is waiting; otherwise the stored order stands, even
+  // one another window saved since this screen last drew.
+  const pendingOrder = pickerOrderPending;
+  const selections = pickerSelectionsChanged ? clientPickerSelections() : null;
+  pickerSelectionsChanged = false;
+  const next = clone(await latestConfig());
+  if (selections) applyPickerSelections(next, selections);
+  if (pendingOrder) next.cli = { ...(next.cli || {}), extraModels: orderPickerEntries((next.cli && next.cli.extraModels) || [], pendingOrder) };
+  // A conflict retry merges this save's ticks and windows field by field, as every save does, and
+  // then puts the order back: an order is no field change, so the merge alone would drop it.
+  const rebase = pendingOrder ? (fresh, replay) => {
+    const merged = replay();
+    merged.cli = { ...(merged.cli || {}), extraModels: orderPickerEntries((merged.cli && merged.cli.extraModels) || [], pendingOrder) };
+    return merged;
+  } : undefined;
+  try {
+    const out = await configRequest(next, rebase);
+    currentConfig = next;
+    if (pickerOrderPending === pendingOrder) pickerOrderPending = null;
+    renderClientPickerOrder(pickerModeOn());
+    // The override changes which window the router resolves; the rows read that map to decide
+    // whether the catalogue is in effect, so read it again before the next redraw.
+    pickerContextWindows = await api("/api/context-windows").catch(() => pickerContextWindows);
+    // Everything the fields held, drafts included, is now the saved copy: there is nothing left to
+    // carry over the next rebuild.
+    pickerWindowDrafts.clear();
+    // A tick or a window applies to the next session; an order only once the app is reopened.
+    configSaved(out, t(pendingOrder ? "slots.pickerOrderSaved" : "slots.saved"));
+  } catch (error) {
+    // The order list goes back to what is saved rather than show an order the router never took.
+    if (pickerOrderPending === pendingOrder) pickerOrderPending = null;
+    renderClientPickerOrder(pickerModeOn());
+    toast(t("common.saveFailed"), true, error.message);
+  }
 }
 function pickerModeOn() {
   return Boolean(status && status.picker && status.picker.enabled);
@@ -1192,9 +2080,9 @@ async function toggleWorkerTools(enabled) {
   const next = clone(await latestConfig());
   next.cli = { ...(next.cli || {}), limitWorkerTools: enabled };
   try {
-    await configRequest(next);
+    const out = await configRequest(next);
     currentConfig = next;
-    toast(t("common.saved"));
+    configSaved(out, t("common.saved"));
   } catch (error) { toast(t("common.saveFailed"), true, error.message); }
   renderClients();
 }
@@ -1222,8 +2110,20 @@ async function toggleCodex(enabled) {
   catch (error) { toast(t("common.actionFailed"), true, error.message); }
   finally { codexBusy = false; $("#client-codex-msg").textContent = ""; void renderCodexClient(); }
 }
+showHealthLoading();
 void Promise.all([loadCatalogs(), refreshHealth()]);
 setInterval(refreshHealth, 5000);
+// Status names providers by the names people know (the one the user typed, a preset's name), which only
+// the config carries; read it once here unless another page already has. refreshHealth reads it again when
+// the router's live provider list names other providers than it does.
+if (!offline()) void api("/api/config").then((config) => { if (!currentConfig) { currentConfig = config; if (status) renderHealthProviders(); } }, () => { /* the status names stand */ });
+// The open accounts tab follows the router (each refresher returns at once when its list is not shown).
+setInterval(() => {
+  if (document.visibilityState !== "visible" || !$("#modal-backdrop").hidden || !selectedProviderName) return;
+  void refreshClaudeAccountPanel(selectedProviderName);
+  void refreshChatgptAccountPanel(selectedProviderName);
+  void refreshGoogleAccountPanel(selectedProviderName);
+}, 10_000);
 
 // ---- Phone --------------------------------------------------------------------------
 
@@ -1254,15 +2154,14 @@ async function showPhoneQr(button) {
   } catch { if (generation === phoneQrGeneration) toast(t("common.loadFailed"), true); }
   finally { button.disabled = false; }
 }
-// Ripple Remote in the stores. iPhone links to the storefront of the dashboard's language, as the
-// README headers do; Android is a closed test on Google Play, joined through Discord, so no Play link.
+// Ripple Remote in the stores, each in the dashboard's language, as the README headers link them.
 const REMOTE_STOREFRONT = { ko: "kr", en: "us", zh: "us", ja: "jp", es: "es", pt: "br" };
+const REMOTE_PLAY_LANG = { ko: "ko", en: "en", zh: "zh-CN", ja: "ja", es: "es", pt: "pt-BR" };
 /** Read when drawn, not at load: this block is also evaluated on its own by the phone tests. */
 function remoteAppStoreUrl() { return `https://apps.apple.com/${REMOTE_STOREFRONT[CURRENT_LANG] || "us"}/app/id6823063731`; }
-const COMMUNITY_URL = "https://discord.gg/R8ZgGSNHjw";
+function remotePlayUrl() { return `https://play.google.com/store/apps/details?id=com.clauderipple.remote&hl=${REMOTE_PLAY_LANG[CURRENT_LANG] || "en"}`; }
 function externalLink(href, cls, children) { return el("a", { class: cls, href, target: "_blank", rel: "noopener noreferrer" }, children); }
 function phonePaired(data) { return Boolean(data && data.hostRunning && data.phones && data.phones.length); }
-function remoteAndroidNote(cls) { return el("span", { class: `${cls} remote-android` }, [t("phone.promo.android"), " · ", externalLink(COMMUNITY_URL, "login-link", [t("phone.promo.androidLink")])]); }
 /** No phone paired yet: what the app does that nothing else does, the store, and how the QR below fits in. */
 function remotePromo(data) {
   const points = ["models", "hours", "private"].map(key => el("li", {}, [el("strong", { text: t(`phone.promo.${key}`) }), " ", t(`phone.promo.${key}Body`)]));
@@ -1276,49 +2175,97 @@ function remotePromo(data) {
       el("p", { class: "conn-lead", text: t("phone.promo.lead") }),
     ])]),
     el("ul", { class: "remote-points" }, points),
-    el("div", { class: "remote-get" }, [externalLink(remoteAppStoreUrl(), "btn large remote-store", [download, t("phone.promo.appStore")]), remoteAndroidNote("hint")]),
+    el("div", { class: "remote-get" }, [
+      externalLink(remoteAppStoreUrl(), "btn large remote-store", [download, t("phone.promo.appStore")]),
+      externalLink(remotePlayUrl(), "btn large remote-store", [download.cloneNode(true), t("phone.promo.googlePlay")]),
+    ]),
     el("p", { class: "remote-next", text: t(data.hostRunning ? "phone.promo.nextQr" : "phone.promo.nextHost") }),
   ]);
 }
 /** A phone is paired already: one quiet row for the next phone instead of the pitch. */
 function remoteGetApp() {
-  return section(null, [cell(t("phone.promo.compact"), externalLink(remoteAppStoreUrl(), "btn secondary compact", [t("phone.promo.appStoreShort")]), [remoteAndroidNote("cell-sub")])]);
+  return section(null, [cell(t("phone.promo.compact"), [
+    externalLink(remoteAppStoreUrl(), "btn secondary compact", [t("phone.promo.appStoreShort")]),
+    externalLink(remotePlayUrl(), "btn secondary compact", [t("phone.promo.googlePlayShort")]),
+  ])]);
+}
+/** One figure of the phone host's state, as Status draws its tiles: a small label over the value. */
+function phoneTile(label, value, sub) {
+  return el("div", { class: "stat-tile" }, [
+    el("div", { class: "stat-label", text: label }),
+    el("div", { class: "stat-value" }, [value]),
+    ...(Array.isArray(sub) ? sub : [sub]).filter(Boolean).map((line) => typeof line === "string" ? el("p", { class: "stat-sub", text: line }) : line),
+  ]);
 }
 function renderPhoneStatus(data) {
-  const rows = [cell(t("phone.host"), badge(data.hostRunning ? "ok" : "warn", t(data.hostRunning ? "phone.running" : "phone.stopped")))];
-  if (data.hostRunning) rows.push(cell(t("phone.mode"), el("span", { text: t(data.mode === "relay" ? "phone.relayStatus" : data.mode === "direct" ? "phone.directStatus" : "phone.localStatus") }), `${data.bind}:${data.port} · ${data.version}`),
-    cell(t("phone.notifications"), badge(data.pushReady ? "ok" : "warn", t(data.pushReady ? "phone.ready" : "phone.needsRelay"))));
-  else rows.push(el("div", { class: "cell-note" }, [hint(t("phone.install")), el("code", { text: data.hint })]));
-  $("#phone-status").replaceChildren(...rows);
+  const host = phoneTile(t("phone.host"), badge(data.hostRunning ? "ok" : "warn", t(data.hostRunning ? "phone.running" : "phone.stopped")),
+    data.hostRunning ? null : [el("p", { class: "stat-sub", text: t("phone.install") }), el("code", { class: "phone-install", text: data.hint })]);
+  const tiles = [host];
+  if (data.hostRunning) tiles.push(
+    phoneTile(t("phone.mode"), el("span", { text: t(data.mode === "relay" ? "phone.relayStatus" : data.mode === "direct" ? "phone.directStatus" : "phone.localStatus") }), `${data.bind}:${data.port} · ${data.version}`),
+    phoneTile(t("phone.notifications"), badge(data.pushReady ? "ok" : "warn", t(data.pushReady ? "phone.ready" : "phone.needsRelay"))),
+  );
+  $("#phone-status").replaceChildren(...tiles);
   if (!data.hostRunning) return;
+  // A phone is one line: its id, when it was last seen and whether it gets notifications, its state on the right.
   $("#phone-phones").replaceChildren(...(data.phones.length ? data.phones.map(phone => cell(
-    el("span", { class: "cell-label mono", text: phone.clientId.length > 12 ? `${phone.clientId.slice(0, 12)}…` : phone.clientId, title: phone.clientId }),
-    badge(phone.connected ? "ok" : "", t(phone.connected ? "phone.connected" : "phone.offline")),
-    [phone.lastSeen ? t("phone.lastSeen", { time: new Date(phone.lastSeen).toLocaleString(CURRENT_LANG) }) : t("phone.unknownSeen"), t(phone.push ? "phone.pushOn" : "phone.pushOff")],
+    el("span", { class: "cell-label mono phone-id", text: phone.clientId.length > 12 ? `${phone.clientId.slice(0, 12)}…` : phone.clientId, title: phone.clientId }),
+    phone.connected ? badge("ok", t("phone.connected")) : el("span", { class: "tag", text: t("phone.offline") }),
+    `${phone.lastSeen ? t("phone.lastSeen", { time: new Date(phone.lastSeen).toLocaleString(CURRENT_LANG) }) : t("phone.unknownSeen")} · ${t(phone.push ? "phone.pushOn" : "phone.pushOff")}`,
+    "phone-row",
   )) : [el("div", { class: "cell-note", text: t("phone.empty") })]));
   $("#phone-restart").hidden = !data.restartRequired;
+  phoneSyncSave();
+}
+// The loopback addresses a saved bind may name (packages/remote/src/config.ts resolveBind): any other bind
+// lets phones on the network reach this computer directly.
+const PHONE_LOOPBACK_BINDS = ["127.0.0.1", "::1", "localhost"];
+/**
+ * The phone-access choice that the saved settings already are, as Save would write it: "relay" (a Relay
+ * address, this computer only), "local" (no Relay, this computer only), or null. A direct bind (a LAN or
+ * Tailscale address) matches neither, so neither choice is pre-selected and any pick is a change to save.
+ */
+function phoneModeOf(settings) {
+  if (!settings) return null;
+  const bind = typeof settings.bind === "string" ? settings.bind : "127.0.0.1";
+  if (!PHONE_LOOPBACK_BINDS.includes(bind)) return null;
+  return settings.relay ? "relay" : "local";
+}
+/** The access choice saved now; Save stays off until a different one is picked, so pressing it always changes something. */
+function phoneSavedMode() { return phoneModeOf(phoneSnapshot && phoneSnapshot.settings); }
+function phoneSyncSave() {
+  const save = $("#phone-save");
+  const picked = $('#phone-content input[name="phone-mode"]:checked');
+  if (save && !phoneBusy) save.disabled = !picked || picked.value === phoneSavedMode();
+}
+/** What Save posts for a choice: Relay keeps the saved Relay address (or the default), and either choice binds this computer only. */
+function phoneSettingsBody(mode, settings, defaultRelay) {
+  return mode === "relay" ? { relay: settings.relay || defaultRelay, bind: "local" } : { relay: "off", bind: "local" };
 }
 function phoneSettings(data) {
   // The phone app pairs through the Relay only, so phone access is on (Relay) or off. A custom
   // relay address stays in the host's config file; the dashboard keeps whichever one is saved.
   const saved = data.settings;
-  const selected = saved.relay ? "relay" : "local";
+  const selected = phoneModeOf(saved);
   const choices = ["relay", "local"].map(value => {
     const radio = el("input", { type: "radio", name: "phone-mode", value, checked: value === selected });
+    radio.addEventListener("change", phoneSyncSave);
     return el("label", { class: "cell phone-choice" }, [radio, el("span", { class: "cell-text" }, [el("span", { class: "cell-label", text: t(`phone.choice.${value}`) }), el("span", { class: "cell-sub", text: t(`phone.help.${value}`) })])]);
   });
-  const save = el("button", { class: "btn", type: "button", text: t("common.save") });
+  const save = el("button", { class: "btn", type: "button", id: "phone-save", text: t("common.save"), disabled: "" });
   save.addEventListener("click", async () => {
     if (phoneBusy) return;
-    const mode = $('#phone-content input[name="phone-mode"]:checked').value;
+    const picked = $('#phone-content input[name="phone-mode"]:checked');
+    if (!picked) return;
     phoneBusy = true; save.disabled = true;
     hidePhoneQr();
     try {
-      const result = await phonePost("settings", mode === "relay" ? { relay: saved.relay || data.defaultRelay, bind: "local" } : { relay: "off", bind: "local" });
+      // The settings are read again at save time, so a Relay address saved since this form was drawn is kept.
+      const result = await phonePost("settings", phoneSettingsBody(picked.value, (phoneSnapshot && phoneSnapshot.settings) || saved, data.defaultRelay));
       toast(t(result.restartRequired ? "phone.restartRequired" : "common.saved"));
       await refreshPhone();
     } catch (error) { toast(t("common.saveFailed"), true, error.message); }
-    finally { phoneBusy = false; save.disabled = false; }
+    finally { phoneBusy = false; phoneSyncSave(); }
   });
   return section(t("phone.settings"), [...choices, cell(t("phone.apply"), save)]);
 }
@@ -1351,8 +2298,10 @@ function phoneControls(data) {
   });
   const phones = section(t("phone.phones"), []);
   $(".group", phones).id = "phone-phones";
-  return [section(t("phone.pairing"), [cell(t("phone.scan"), qr, t("phone.scanHelp")), el("div", { id: "phone-qr", class: "phone-qr" })], [t("phone.qrWarning"), !data.reachableFromPhone ? t("phone.unreachable") : null]),
-    phoneSettings(data), phoneRestart(), phones, phonePaired(data) ? remoteGetApp() : null, section(null, [rotate], t("phone.sharedKey"))].filter(Boolean);
+  // What is paired first, then how to pair another and get the app for it; the access setting, the
+  // restart it may need and the key reset come last, as the rarer things to change.
+  return [phones, section(t("phone.pairing"), [cell(t("phone.scan"), qr, t("phone.scanHelp")), el("div", { id: "phone-qr", class: "phone-qr" })], [t("phone.qrWarning"), !data.reachableFromPhone ? t("phone.unreachable") : null]),
+    phonePaired(data) ? remoteGetApp() : null, phoneSettings(data), phoneRestart(), section(null, [rotate], t("phone.sharedKey"))].filter(Boolean);
 }
 async function refreshPhone(rebuild = false) {
   if (!phoneActive() || offline()) return;
@@ -1363,15 +2312,26 @@ async function refreshPhone(rebuild = false) {
     // Pairing the first phone (or unpairing the last) swaps the pitch for its one-row form, so it rebuilds too.
     if (rebuild || !phoneSnapshot || phoneSnapshot.hostRunning !== data.hostRunning || phonePaired(phoneSnapshot) !== phonePaired(data)) {
       hidePhoneQr();
+      // The host, how phones reach it and whether notifications go out: three tiles in one surface.
       const state = section(t("phone.status"), []);
-      $(".group", state).id = "phone-status";
+      Object.assign($(".group", state), { id: "phone-status", className: "group stat-tiles phone-tiles" });
       $("#phone-content").replaceChildren(...(phonePaired(data) ? [] : [remotePromo(data)]), state, ...(data.hostRunning ? phoneControls(data) : []));
     }
     phoneSnapshot = data;
     renderPhoneStatus(data);
-  } catch (error) { toast(t("common.loadFailed"), true, error.message); }
+  } catch (error) {
+    toast(t("common.loadFailed"), true, error.message);
+    // With nothing drawn yet the page says the read failed; the 5-second refresh reads again.
+    if (!phoneSnapshot) $("#phone-content").replaceChildren(el("div", { class: "group" }, [loadFailedLine()]));
+  }
 }
-async function loadPhone() { phoneGeneration++; hidePhoneQr(); await refreshPhone(true); }
+async function loadPhone() {
+  phoneGeneration++;
+  hidePhoneQr();
+  // Until a status has landed, the page holds bars where its tiles will be.
+  if (!phoneSnapshot) $("#phone-content").replaceChildren(el("div", { class: "group" }, [skeletonLines(3)]));
+  await refreshPhone(true);
+}
 $("#phone-refresh").addEventListener("click", () => void loadPhone());
 setInterval(() => { if (!phoneBusy) void refreshPhone(); }, 5000);
 
@@ -1617,14 +2577,30 @@ function openMacRename(current) {
   ]));
 }
 
+/** The conflict row's body: the app and its own fix when we know it, else the unknown cause. */
+function macConflictBody(c) {
+  if (typeof c.name === "string" && c.name) {
+    const app = t("mac.conflict.app", { app: c.name });
+    const fixKey = `mac.conflict.fix.${c.app}`;
+    return typeof c.app === "string" && hasI18nKey(fixKey) ? `${app} ${t(fixKey)}` : app;
+  }
+  return t("mac.conflict.unknown");
+}
+
 function macAwakeCard(a) {
   const why = macAwakeWhy(a);
   const state = a.applied
     ? macStateRow("on", t("mac.awake.on"), why.text, macFacts(a))
     : macStateRow(why.warn ? "warn" : "off", t("mac.awake.off"), why.text, macFacts(a));
   const modes = [{ value: "off", label: t("mac.mode.off") }, { value: "working", label: t("mac.mode.working") }, { value: "on", label: t("mac.mode.on") }];
+  // Another app can write the same sleep setting (router awake.ts): it clears the bit when it stops,
+  // so a closed lid sleeps. Only worth saying while we hold it; an older router's string is ignored.
+  const conflict = a.conflict && typeof a.conflict === "object" && a.mode !== "off"
+    ? macStateRow("warn", t("mac.conflict.title"), macConflictBody(a.conflict))
+    : null;
   const rows = [
     state,
+    conflict,
     cell(el("span", { class: "cell-label", text: t("mac.mode.label") }),
       modSegmented("mac-mode", modes, a.mode, t("mac.mode.label"), (mode) => void macPut({ awake: { mode, until: null } })),
       t(`mac.mode.${a.mode}Help`), "wide"),
@@ -1677,9 +2653,10 @@ function macTetherCard(tt, setupOk) {
   const rename = el("button", { class: "btn secondary compact", type: "button", "data-key": "mac-rename", text: t(name ? "mac.ssid.change" : "mac.ssid.set") });
   rename.disabled = macSetup.running || !setupOk;
   rename.addEventListener("click", () => openMacRename(name));
+  // What is true now first, as on the card above it; then the switch and the hotspot's name.
   const rows = [
-    cell(el("label", { class: "cell-label", text: t("mac.tether.switch") }), enabled, t("mac.tether.switchHelp")),
     macStateRow(tone, t(`mac.net.${network}`), I18N.en[`mac.tstate.${tt.state}`] ? t(`mac.tstate.${tt.state}`) : tt.state, side),
+    cell(el("label", { class: "cell-label", text: t("mac.tether.switch") }), enabled, t("mac.tether.switchHelp")),
     // No "keep this network" pin here: beside the switch above it read as the same thing twice
     // (2026-10-20). The API keeps `pin` for the CLI.
     cell(t("mac.ssid.label"), [el("span", { class: name ? "mac-ssid" : "mac-ssid empty", text: name || t("mac.ssid.none") }), rename]),
@@ -1754,6 +2731,8 @@ setInterval(() => { if (!macBusy && !macSetup.running) void refreshMac(); }, 500
 function claudeSelect(selected) {
   const select = el("select", {});
   for (const model of claudeModels) select.appendChild(selectOption(model.id, labelOf(model)));
+  // A retired source still identifies a saved route, including when its row is removed.
+  if (selected && !claudeModels.some((model) => model.id === selected)) select.appendChild(selectOption(selected, selected));
   select.value = selected || claudeModels[0].id;
   return select;
 }
@@ -1761,11 +2740,14 @@ function targetSelect(route) {
   const select = el("select", {});
   select.appendChild(selectOption("", t("slots.passthrough")));
   for (const group of groupedModels(currentConfig)) {
-    const optgroup = el("optgroup", { label: providerLabel(group.name, group.provider) });
+    const optgroup = el("optgroup", { label: providerDisplayName(group.name, group.provider) });
     for (const model of group.models) optgroup.appendChild(selectOption(JSON.stringify([group.name, model.id]), labelOf(model)));
     select.appendChild(optgroup);
   }
-  select.value = route ? JSON.stringify([route.provider, route.model]) : "";
+  const value = route ? JSON.stringify([route.provider, route.model]) : "";
+  // Do not make an unavailable saved target look like passthrough; it must remain removable.
+  if (route && !$all("option", select).some((option) => option.value === value)) select.appendChild(selectOption(value, `${providerDisplayName(route.provider)} / ${route.model} (?)`));
+  select.value = value;
   return select;
 }
 function effortSelect(value, levels) {
@@ -1794,8 +2776,13 @@ function slotRow(id, route) {
   effort.setAttribute("aria-label", t("slots.th.effort"));
   const effortCell = el("div", { class: "map-col map-effort" }, [el("span", { class: "map-label", text: t("slots.th.effort") }), effort]);
   const remove = el("button", { class: "icon-btn remove", type: "button", title: t("common.remove"), "aria-label": t("common.remove"), onclick: () => { row.remove(); updateSlotSummary(); scheduleSlotsSave(); } }, [svgIcon("0 0 20 20", ["M10 2.8a7.2 7.2 0 1 0 0 14.4 7.2 7.2 0 0 0 0-14.4z", "M6.6 10h6.8"])]);
+  // Who answers, in its vendor's hue: Claude's own when the row passes through, else the provider picked.
+  const dot = vendorDot("anthropic", { type: "anthropic" });
   function sync() {
     const selected = routeFromTarget(target.value);
+    dot.style.color = selected ? providerHue(selected.provider, currentConfig.providers[selected.provider]) : providerHue("anthropic", { type: "anthropic" });
+    // A row that passes through reads quieter, so the rows that send a model elsewhere stand out.
+    row.classList.toggle("passthrough", !selected);
     const levels = selected ? effortLevelsFor(selected.provider, selected.model) : [];
     const supported = levels.length > 0;
     const prior = effort.value;
@@ -1818,11 +2805,11 @@ function slotRow(id, route) {
   row.append(
     el("div", { class: "map-col map-source" }, [el("span", { class: "map-label", text: t("slots.th.claude") }), source]),
     el("span", { class: "map-arrow", "aria-hidden": "true", text: "→" }),
-    el("div", { class: "map-col map-target" }, [el("span", { class: "map-label", text: t("slots.th.target") }), target]),
+    el("div", { class: "map-col map-target" }, [el("span", { class: "map-label", text: t("slots.th.target") }), el("div", { class: "map-target-control" }, [dot, target])]),
     effortCell,
     el("div", { class: "map-remove" }, [remove]),
   );
-  row._get = () => ({ id: source.value, route: routeFromTarget(target.value), effort: effort.value });
+  row._get = () => ({ id: source.value, route: routeFromTarget(target.value), effort: effort.disabled ? undefined : effort.value });
   sync();
   return row;
 }
@@ -1836,6 +2823,8 @@ async function loadSlots() {
     const routes = currentConfig.routes || {};
     const ids = [...claudeModels.map((model) => model.id), ...Object.keys(routes).filter((id) => !claudeModels.some((model) => model.id === id))];
     for (const id of ids) rows.appendChild(slotRow(id, routes[id]));
+    // Compare against what the controls actually displayed, not implicit/defaulted config fields.
+    slotsBaseline = readSlotRoutes();
     updateSlotSummary();
   } catch (error) {
     toast(t("common.loadFailed"), true, error.message);
@@ -1843,8 +2832,12 @@ async function loadSlots() {
 }
 $("#slots-add").addEventListener("click", () => {
   if (!currentConfig) return;
-  $("#slots-list").appendChild(slotRow(claudeModels[0].id, null));
+  const row = slotRow(claudeModels[0].id, null);
+  $("#slots-list").appendChild(row);
   updateSlotSummary();
+  // The new row lands at the end of a long list: bring it into view and put the focus on its Claude model, so the press visibly did something.
+  row.scrollIntoView({ block: "center", behavior: matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth" });
+  row.querySelector("select").focus({ preventScroll: true });
 });
 function allKnownModelIds(config) { return new Set(groupedModels(config).flatMap((group) => group.models.map((model) => model.id))); }
 // Which providers carry this exact id. One is what lets the router route it with no rule at all;
@@ -1883,7 +2876,13 @@ function applyPickerSelections(next, selections, preserveWindows = false) {
   // one) is not an orphan and stays.
   const currentExtras = (next.cli && next.cli.extraModels) || [];
   const orphans = new Set(currentExtras.filter((entry) => entry.model && !known.has(entry.model)).map((entry) => entry.model));
-  const selected = selections.filter((entry) => entry.id && entry.provider && known.has(entry.id));
+  // The app picker lists these in stored order, and that order is the operator's: an entry that
+  // stays keeps its place and one ticked now goes after them. The rebuild used to follow the order
+  // of `selections`, so every provider save moved that provider's models to the end.
+  const stored = new Map();
+  currentExtras.forEach((entry, index) => { if (!stored.has(entry.model)) stored.set(entry.model, index); });
+  const place = (entry) => stored.has(entry.id) ? stored.get(entry.id) : currentExtras.length;
+  const selected = selections.filter((entry) => entry.id && entry.provider && known.has(entry.id)).sort((a, b) => place(a) - place(b));
   const extras = new Map();
   const direct = new Map();
   for (const entry of selected) {
@@ -1913,6 +2912,33 @@ function applyPickerSelections(next, selections, preserveWindows = false) {
   // A legacy gpt- prefix rule is intentionally retained by the filter above.
   return next;
 }
+/**
+ * What a provider form's save leaves in the picker: every other provider's entries, and of its own
+ * the ones the "show in picker" box speaks for. A provider already in the picker keeps the subset
+ * the Clients screen chose, plus any model this save declares for the first time; ticking all of
+ * them again put back the models the operator had taken out there. A provider that had none shown
+ * — a new one, or the box just ticked — shows everything it declares, as before.
+ */
+function providerPickerSelections(config, providerName, saved, checkedModels, show) {
+  const others = pickerSelectionsExcept(config, providerName);
+  if (!show) return others;
+  const shown = new Set(((config.cli && config.cli.extraModels) || []).map((entry) => entry.model));
+  const declared = new Set(((saved && saved.models) || []).map((model) => typeof model === "string" ? model : model && model.id));
+  const keepSubset = [...declared].some((id) => shown.has(id));
+  const own = keepSubset ? checkedModels.filter((model) => shown.has(model.id) || !declared.has(model.id)) : checkedModels;
+  return [...others, ...own.map((model) => ({ ...model, provider: providerName }))];
+}
+/**
+ * `entries` (picker entries) with the ones `ids` names put into that order, among the places they
+ * already hold. The rest — ticked since the order was read, or not in the order list at all, as a
+ * Claude model the app lists itself — stay where they are.
+ */
+function orderPickerEntries(entries, ids) {
+  const rank = new Map(ids.map((id, index) => [id, index]));
+  const listed = entries.filter((entry) => rank.has(entry.model)).sort((a, b) => rank.get(a.model) - rank.get(b.model));
+  let next = 0;
+  return entries.map((entry) => rank.has(entry.model) ? listed[next++] : entry);
+}
 function updateSlotSummary() {
   const summaries = $all("#slots-list .map-row").map((row) => row._get()).filter((item) => item.route).slice(0, 3).map((item) => {
     const source = claudeModels.find((model) => model.id === item.id);
@@ -1926,6 +2952,38 @@ function updateSlotSummary() {
 let slotsSaveTimer = null;
 let slotsSaving = false;
 let slotsSaveAgain = false;
+/** Last acknowledged controls, independent of currentConfig (other screens refresh that).
+ * @type {Record<string, {provider: string, model: string, effort?: string} | null> | null}
+ */
+let slotsBaseline = null;
+/** Snapshot the controls before any await; a change during GET/PUT belongs to the next save. */
+function readSlotRoutes() {
+  const entries = $all("#slots-list .map-row").map((row) => {
+    const { id, route, effort } = row._get();
+    return [id, route ? { ...route, ...(effort !== undefined ? { effort } : {}) } : null];
+  });
+  if (new Set(entries.map(([id]) => id)).size !== entries.length) throw new Error(t("slots.duplicate"));
+  return Object.fromEntries(entries);
+}
+/** A changed row owns its provider/model/effort together; untouched rows and latest metadata survive.
+ * Explicit removal wins over a remote edit. An edited row deleted remotely is recreated in full,
+ * without resurrecting old metadata. Apply the same rule before PUT and after every 409.
+ * @param {Object} fresh
+ * @param {Record<string, Object | null>} before
+ * @param {Record<string, Object | null>} after
+ */
+function mergeSlotRoutes(fresh, before, after) {
+  const next = clone(fresh);
+  next.routes = { ...(next.routes || {}) };
+  const changed = new Set(modChanges(before, after).map((change) => change.path[0]));
+  for (const id of changed) {
+    const route = after[id];
+    if (!route) { delete next.routes[id]; continue; }
+    next.routes[id] = { ...next.routes[id], ...route };
+    if (route.effort === undefined) delete next.routes[id].effort;
+  }
+  return next;
+}
 function slotsStatus(text, isError) {
   const box = $("#slots-status");
   box.textContent = text;
@@ -1939,27 +2997,22 @@ function scheduleSlotsSave() {
   slotsSaveTimer = setTimeout(() => void saveSlots(), 500);
 }
 async function saveSlots() {
-  if (!currentConfig) return;
+  if (!currentConfig || !slotsBaseline) return;
   if (slotsSaving) { slotsSaveAgain = true; return; }
+  clearTimeout(slotsSaveTimer);
+  slotsSaveTimer = null;
   slotsSaving = true;
   try {
-    const next = clone(await latestConfig());
-    const routes = {};
-    const seen = new Set();
-    for (const row of $all("#slots-list .map-row")) {
-      const item = row._get();
-      if (seen.has(item.id)) { slotsStatus(t("slots.duplicate"), true); return; }
-      seen.add(item.id);
-      if (!item.route) continue;
-      const route = { ...((next.routes || {})[item.id] || {}), ...item.route };
-      if (effortLevelsFor(item.route.provider, item.route.model).length) route.effort = item.effort;
-      else delete route.effort;
-      routes[item.id] = route;
-    }
-    next.routes = routes;
-    await configRequest(next);
+    const sent = readSlotRoutes();
+    const before = slotsBaseline;
+    const rebase = (fresh) => mergeSlotRoutes(fresh, before, sent);
+    // A failed read must not fall back to stale settings, including on legacy routers.
+    const next = rebase(await api("/api/config"));
+    const out = await configRequest(next, rebase);
     currentConfig = next;
-    slotsStatus(t("slots.saved"));
+    slotsBaseline = sent;
+    slotsStatus(out && out.warning ? out.warning : t("slots.saved"), Boolean(out && out.warning));
+    configSaved(out);
     updateSlotSummary();
   } catch (error) {
     slotsStatus(`${t("common.saveFailed")} ${error.message}`, true);
@@ -2034,14 +3087,34 @@ function measureSummary(results) {
 }
 
 /**
+ * Whether this provider is Ollama (the local daemon or the cloud endpoint).
+ *
+ * Ollama states a model's thinking levels and context length in its own `/api/show`, beside the
+ * OpenAI-compatible surface, and a probe on that surface reads an unknown `reasoning_effort` as no
+ * effort at all. An empty ladder is therefore what an unread Ollama model looks like, not a
+ * decision (Discord report, 0.12.14).
+ */
+function isOllamaProvider(provider) {
+  if (!provider) return false;
+  if (provider.preset === "ollama") return true;
+  const url = String(provider.url || "");
+  return /^https?:\/\/(?:[^/]*\.)?ollama\.com(?::\d+)?(?:[/?#]|$)/i.test(url)
+    || /^https?:\/\/(?:127\.0\.0\.1|localhost|\[::1\]):11434(?:[/?#]|$)/i.test(url);
+}
+
+/**
  * Measure the models of one provider, in the background, and show the config the result settled.
  *
  * Only models missing a wire or a ladder are sent: one the operator set is their decision, and the
  * router will not overwrite it either, so measuring it again would spend requests to change nothing.
+ * Ollama's empty ladder is the exception — see `isOllamaProvider`.
  */
 async function startMeasurement(providerName, provider) {
   if (!provider || (provider.type !== "openai-compatible" && provider.type !== "anthropic-compatible")) return;
-  const models = modelsOf(provider).filter((model) => !model.wire || !model.effortLevels).map((model) => model.id);
+  const ollama = isOllamaProvider(provider);
+  const models = modelsOf(provider)
+    .filter((model) => !model.wire || !model.effortLevels || (ollama && Array.isArray(model.effortLevels) && model.effortLevels.length === 0))
+    .map((model) => model.id);
   if (models.length === 0) return;
   let jobId;
   try {
@@ -2109,8 +3182,9 @@ function providerRailItem(name, provider) {
     role: "option",
     "aria-selected": String(selected),
   }, [
+    vendorDot(name, provider),
     el("span", { class: "provider-rail-copy" }, [
-      el("strong", { text: providerLabel(name, provider) }),
+      el("strong", { text: providerDisplayName(name, provider) }),
       el("span", { text: t("providers.modelsCountShort", { count: modelsOf(provider).length }) }),
     ]),
     providerState(name, provider),
@@ -2140,14 +3214,46 @@ function renderProviderRail() {
   const list = $("#providers-list");
   const entries = Object.entries((currentConfig && currentConfig.providers) || {});
   const query = providerSearch.trim().toLowerCase();
-  const visible = entries.filter(([name, provider]) => !query || name.toLowerCase().includes(query) || providerLabel(name, provider).toLowerCase().includes(query) || providerKind(name, provider).toLowerCase().includes(query));
+  const visible = entries.filter(([name, provider]) => !query || name.toLowerCase().includes(query) || providerLabel(name, provider).toLowerCase().includes(query) || providerDisplayName(name, provider).toLowerCase().includes(query) || providerKind(name, provider).toLowerCase().includes(query));
   list.replaceChildren(...visible.map(([name, provider]) => providerRailItem(name, provider)));
   if (!entries.length) list.appendChild(el("div", { class: "provider-rail-empty", text: t("providers.empty") }));
   else if (!visible.length) list.appendChild(el("div", { class: "provider-rail-empty", text: t("providers.noSelection") }));
 }
 
+/**
+ * Everywhere a config names this provider besides its own block. Removing the block alone leaves a
+ * config the router refuses (a fallback or the search naming an unknown provider), so these are what
+ * a removal also cleans up — shown first, so nothing goes quietly (B13).
+ */
+function providerUsages(config, name) {
+  const routes = config.routes || {};
+  // The picker list names a provider per extra model; ownership follows the same rule the removal
+  // uses, so a model that routes elsewhere is not counted twice.
+  const extraModels = ((config.cli && config.cli.extraModels) || []).filter((entry) => {
+    const rule = (config.direct || []).filter((item) => entry.model.startsWith(item.prefix)).sort((a, b) => b.prefix.length - a.prefix.length)[0];
+    const route = routes[entry.model];
+    return (rule ? rule.provider : route ? route.provider : pickerOwner(config, entry.model)) === name;
+  });
+  return {
+    routes: Object.entries(routes).filter(([, route]) => route && route.provider === name).map(([id]) => id),
+    fallbacks: Object.entries(routes).flatMap(([id, route]) => (route && Array.isArray(route.fallbacks) ? route.fallbacks : []).filter((fallback) => fallback && fallback.provider === name).map((fallback) => ({ route: id, model: fallback.model }))),
+    direct: (config.direct || []).filter((rule) => rule && rule.provider === name).length,
+    picker: extraModels.length,
+    search: Boolean(config.webSearch && config.webSearch.provider === name),
+    classifier: classifierNames(config.autoModeClassifier, name),
+  };
+}
+/** The usage line's extra clauses, each absent when the config does not name this provider there. */
+function usageSuffix(usage, keys) {
+  return (usage.search ? keys.search : "") + (usage.classifier ? keys.classifier : "");
+}
 async function removeProvider(name, provider) {
-  if (!confirm(t("providers.removeConfirm", { name: providerLabel(name, provider) }))) return;
+  const usages = providerUsages(currentConfig || {}, name);
+  // What else goes with it is said before the confirm, never discovered afterwards.
+  const extra = usages.fallbacks.length || usages.direct || usages.picker || usages.search || usages.classifier
+    ? `\n\n${t("providers.removeExtra", { fallbacks: usages.fallbacks.length, direct: usages.direct, picker: usages.picker })}${usageSuffix(usages, { search: t("providers.usageSearch"), classifier: t("providers.usageClassifier") })}`
+    : "";
+  if (!confirm(`${t("providers.removeConfirm", { name: providerDisplayName(name, provider) })}${extra}`)) return;
   const next = clone(await latestConfig());
   // Resolve ownership before deleting declarations or the disambiguating direct rules.
   if (next.cli) next.cli.extraModels = (next.cli.extraModels || []).filter((entry) => {
@@ -2156,10 +3262,30 @@ async function removeProvider(name, provider) {
     return (rule ? rule.provider : route ? route.provider : pickerOwner(next, entry.model)) !== name;
   });
   delete next.providers[name];
-  next.routes = Object.fromEntries(Object.entries(next.routes || {}).filter(([, route]) => route.provider !== name));
+  // Routes and their fallbacks: a route that pointed here goes, and no other route keeps a fallback
+  // to a provider that no longer exists.
+  next.routes = Object.fromEntries(Object.entries(next.routes || {}).flatMap(([id, route]) => {
+    if (route.provider === name) return [];
+    const fallbacks = (route.fallbacks || []).filter((fallback) => fallback.provider !== name);
+    const cleaned = { ...route };
+    if (route.fallbacks !== undefined) {
+      if (fallbacks.length) cleaned.fallbacks = fallbacks;
+      else delete cleaned.fallbacks;
+    }
+    return [[id, cleaned]];
+  }));
   next.direct = (next.direct || []).filter((rule) => rule.provider !== name);
+  // The search and the Auto-mode classifier name a provider of their own; left behind, they are the
+  // same unknown-provider error as a fallback. The classifier's two stages are cleared one by one, so
+  // a first stage on another provider outlives the removal of the rest's, and the reverse.
+  if (next.webSearch && next.webSearch.provider === name) delete next.webSearch;
+  if (classifierNames(next.autoModeClassifier, name)) {
+    const kept = classifierWithout(next.autoModeClassifier, name);
+    if (kept) next.autoModeClassifier = kept;
+    else delete next.autoModeClassifier;
+  }
   try {
-    await configRequest(next);
+    const out = await configRequest(next);
     currentConfig = next;
     selectedProviderName = Object.keys(next.providers)[0] || null;
     providerDetailTab = "overview";
@@ -2167,8 +3293,14 @@ async function removeProvider(name, provider) {
     clientsLoaded = false;
     closeProviderDetail();
     renderProviderWorkspace();
-    toast(t("common.saved"));
-  } catch (error) { toast(t("common.saveFailed"), true, error.message); }
+    configSaved(out, t("common.saved"));
+  } catch (error) {
+    // The router refused (another change landed first): say so and show the config it holds, rather
+    // than leaving the form's copy on screen as if the removal had happened.
+    toast(t("common.saveFailed"), true, error.message);
+    providersLoaded = false;
+    void loadProviders();
+  }
 }
 
 function providerTabs(name, provider) {
@@ -2176,36 +3308,79 @@ function providerTabs(name, provider) {
   if ((provider.type === "anthropic" && provider.auth === "claude-code") || provider.type === "chatgpt" || (provider.type === "google" && provider.auth === "antigravity") || isKeyProvider(provider)) tabs.push({ id: "accounts", label: t("providers.accounts") });
   tabs.push({ id: "models", label: t("providers.modelsTab") });
   return el("div", { class: "provider-tabs", role: "tablist" }, tabs.map((tab) => {
-    const button = el("button", { class: providerDetailTab === tab.id ? "active" : "", type: "button", role: "tab", "aria-selected": String(providerDetailTab === tab.id), text: tab.label });
+    const button = el("button", { class: providerDetailTab === tab.id ? "active" : "", type: "button", role: "tab", id: `provider-tab-${tab.id}`, "aria-controls": "provider-tab-panel", "aria-selected": String(providerDetailTab === tab.id), text: tab.label });
     button.addEventListener("click", () => { providerDetailTab = tab.id; renderProviderDetail(); });
     return button;
   }));
 }
 
+/** One line of the overview's facts: a quiet name on the left, what it says on the right. */
+function providerFact(label, children) {
+  return el("div", { class: "provider-fact" }, [el("span", { class: "provider-fact-k", text: label }), el("div", { class: "provider-fact-v" }, children.filter(Boolean))]);
+}
+
+/**
+ * The overview reads like the provider's block on the Status screen: one card of facts (the connection
+ * verdict and what to do about it, where the config names the provider, its models), then its usage
+ * gauges as Status draws them. A provider the limits read does not list keeps its one-line usage figure.
+ */
 function providerOverview(name, provider) {
   const state = stateFor(name);
   const live = status && status.providers && status.providers[name];
-  const connection = section(t("providers.connection"), [
-    // The kind is already under the page title; this row is only the verdict and what to do about it.
-    cell(t("health.connection"), providerState(name, provider), [
-      state && !state.ok && state.error ? el("span", { class: "cell-sub bad-text", text: shortError(state.error), title: state.error }) : null,
-      live && live.needsLogin && provider.type === "chatgpt" ? el("div", { class: "cell-actions" }, [chatgptLoginButton(renderProviderDetail)]) : null,
-    ]),
-  ]);
   const models = modelsOf(provider);
   const measuring = measureStates.get(name);
   const running = measuring && measuring.state === "running";
-  // Names only, as one quiet line: the Models tab is where each one is listed and edited.
-  const modelSummary = section(t("providers.selectedModels"), [
-    models.length ? el("div", { class: "cell-note" }, [el("span", { class: "cell-label", text: models.map(labelOf).join(", ") })]) : el("div", { class: "cell-note", text: t("providers.noModels") }),
-    running ? el("div", { class: "cell-note", text: t("measure.running", { done: measuring.done, total: measuring.total }) }) : null,
-  ], running ? t("measure.help") : null);
+  // Where this provider is named besides its own block: routes, fallbacks, direct rules, the picker
+  // and the two single-provider settings. Seeing them before pressing remove is the point (B13).
+  const usages = providerUsages(currentConfig || {}, name);
+  const used = usages.routes.length || usages.fallbacks.length || usages.direct || usages.picker || usages.search || usages.classifier;
   const quota = quotaLine(name);
-  return el("div", { class: "provider-panel" }, [
-    connection,
-    quota ? section(null, [cell(t("providers.usage"), el("span", { text: quota }))]) : null,
-    modelSummary,
+  const gauges = providerGauges(name);
+  const facts = el("div", { class: "group provider-facts" }, [
+    // The kind is already under the page title; this line is only the verdict and what to do about it.
+    providerFact(t("health.connection"), [
+      providerState(name, provider),
+      state && !state.ok && state.error ? el("span", { class: "cell-sub bad-text", text: shortError(state.error), title: state.error }) : null,
+      live && live.needsLogin && provider.type === "chatgpt" ? el("div", { class: "cell-actions" }, [chatgptLoginButton(renderProviderDetail)]) : null,
+    ]),
+    used ? providerFact(t("providers.usedBy"), [
+      el("span", { text: t("providers.usageCounts", { routes: usages.routes.length, fallbacks: usages.fallbacks.length, direct: usages.direct, picker: usages.picker }) + usageSuffix(usages, { search: t("providers.usageSearch"), classifier: t("providers.usageClassifier") }) }),
+      usages.fallbacks.length ? el("span", { class: "cell-sub mono", text: t("providers.usageFallbacks", { list: usages.fallbacks.map((fallback) => `${fallback.route} → ${fallback.model}`).join(", ") }) }) : null,
+    ]) : null,
+    // Names only, as one line: the Models tab is where each one is listed and edited.
+    providerFact(t("providers.selectedModels"), [
+      el("span", { class: models.length ? "" : "cell-sub", text: models.length ? models.map(labelOf).join(", ") : t("providers.noModels") }),
+      running ? el("span", { class: "cell-sub", text: t("measure.running", { done: measuring.done, total: measuring.total }) }) : null,
+      running ? el("span", { class: "cell-sub", text: t("measure.help") }) : null,
+    ]),
+    !gauges && quota ? providerFact(t("providers.usage"), [el("span", { text: quota })]) : null,
   ]);
+  return el("div", { class: "provider-panel" }, [facts, providerUsageSection(name)]);
+}
+/** The provider's entry in the limits read when it has figures to draw, else null. */
+function providerGauges(name) {
+  const limits = providerLimits(name);
+  return limits && limits.accounts.some((account) => (account.windows || []).length) ? limits : null;
+}
+/** The overview's usage: Status's own account rows for this provider, or an empty placeholder until the read has figures. */
+function providerUsageSection(name) {
+  const gauges = providerGauges(name);
+  if (!gauges) return el("div", { id: "provider-usage-section", hidden: "" });
+  const now = Date.now();
+  const credentials = (status && status.credentials && status.credentials[name]) || [];
+  return el("section", { class: "section", id: "provider-usage-section" }, [
+    el("div", { class: "section-head" }, [el("h3", { class: "section-title", text: t("providers.usage") })]),
+    el("div", { class: "group provider-limits provider-usage" }, gauges.accounts.map((account) =>
+      limitsAccountRow(gauges, account, now, account.id === undefined ? undefined : credentials.find((c) => c.id === account.id)))),
+  ]);
+}
+/** A limits read landed: the open overview's gauges follow it, as Status's do, and nothing else on the page is redrawn. */
+function refreshProviderUsage() {
+  const shown = $("#provider-usage-section");
+  if (!shown || !selectedProviderName || providerDetailTab !== "overview") return;
+  // A provider that had no figures when the overview was drawn keeps its one-line usage figure there until the page is redrawn.
+  if (shown.hidden && quotaLine(selectedProviderName)) return;
+  shown.replaceWith(providerUsageSection(selectedProviderName));
 }
 
 function providerModelsPanel(name, provider) {
@@ -2213,7 +3388,14 @@ function providerModelsPanel(name, provider) {
   const edit = el("button", { class: "btn secondary compact", type: "button", text: t("common.edit"), onclick: () => openProviderForm({ name, provider }) });
   return el("div", { class: "provider-panel" }, [
     section(t("providers.selectedModels"), models.length
-      ? models.map((model) => cell(labelOf(model), modelEffortTag(model) ? el("span", { class: `model-effort-tag ${model.effortLevels.length ? "has-effort" : "no-effort"}`, text: modelEffortTag(model) }) : null, el("span", { class: "cell-sub mono", text: model.id }), "provider-model-row"))
+      ? models.map((model) => {
+          const tag = modelEffortTag(model);
+          const note = modelWindowNote(model);
+          return cell(labelOf(model), tag ? el("span", { class: `model-effort-tag ${model.effortLevels.length ? "has-effort" : "no-effort"}`, text: tag }) : null, [
+            el("span", { class: "cell-sub mono", text: model.id }),
+            note ? el("span", { class: "cell-sub warn-text", text: note }) : null,
+          ], "provider-model-row");
+        })
       : [el("div", { class: "cell-note", text: t("providers.noModels") })], t("providers.modelsHelp"), edit),
   ]);
 }
@@ -2225,12 +3407,12 @@ async function saveAnthropicRotation(name, provider, enabled, control, message) 
   if (enabled) next.providers[name].accountPool = true;
   else delete next.providers[name].accountPool;
   try {
-    await configRequest(next);
+    const out = await configRequest(next);
     currentConfig = next;
     slotsLoaded = false;
     clientsLoaded = false;
     renderProviderWorkspace();
-    toast(t("providers.rotationSaved"));
+    configSaved(out, t("providers.rotationSaved"));
   } catch (error) {
     control.checked = !enabled;
     message.textContent = "";
@@ -2247,7 +3429,7 @@ function claudeAccountLabel(account) {
 /** "5h 14% · weekly 10%" under a Claude account, or nothing while its usage is unknown. */
 function claudeQuotaNode(account) {
   const text = chatgptQuotaText(account && account.quota);
-  return text ? el("p", { class: "small account-quota", text }) : null;
+  return text ? quotaMeters([account.quota.rate_limits.primary, account.quota.rate_limits.secondary]) : null;
 }
 
 /** "Use first" for an account the pool does not lead with; `null` hands first place back to the current login. */
@@ -2263,8 +3445,8 @@ function claudePreferButton(name, id, disabled) {
 }
 
 /**
- * The same pool controls for stored logins and API keys; borrowed logins omit these.
- * @param {{preferred?: boolean, paused?: boolean, state?: string, cooldownSeconds?: number}} account
+ * The same pool controls for stored logins and API keys; the external Claude login only pauses.
+ * @param {{preferred?: boolean, paused?: boolean, state?: string, cooldownSeconds?: number, external?: boolean}} account
  * @param {(change: {preferred?: boolean, paused?: boolean, clearCooldown?: true}) => Promise<unknown>} patch
  */
 function accountPoolActions(account, patch) {
@@ -2279,9 +3461,9 @@ function accountPoolActions(account, patch) {
     });
     actions.push(button);
   };
-  add(t(account.preferred ? "providers.preferClear" : "providers.preferAction"), { preferred: !account.preferred });
+  if (!account.external) add(t(account.preferred ? "providers.preferClear" : "providers.preferAction"), { preferred: !account.preferred });
   add(t(account.paused ? "providers.chatgptResume" : "providers.chatgptPause"), { paused: !account.paused });
-  if (account.state === "cooling" || account.cooldownSeconds > 0) add(t("providers.chatgptClearCooldown"), { clearCooldown: true });
+  if (!account.external && (account.state === "cooling" || account.cooldownSeconds > 0)) add(t("providers.chatgptClearCooldown"), { clearCooldown: true });
   return actions;
 }
 
@@ -2307,7 +3489,7 @@ function accountPoolBadges(account) {
     chatgptStateBadge(account),
     ...Object.entries(account.quotaCooldowns || {}).map(([group, seconds]) =>
       el("span", { class: "badge warn", text: `${quotaGroupLabel(group)} · ${t("pool.coolingFor", { duration: durationText(seconds) })}` })),
-    account.inUse && account.state && account.state !== "ready" ? el("span", { class: "badge ok", text: t("providers.chatgptInUse") }) : null,
+    account.inUse && account.state && account.state !== "ready" ? el("span", { class: "badge ok in-use", text: t("providers.chatgptInUse") }) : null,
   ];
 }
 
@@ -2336,7 +3518,11 @@ function renderClaudeAccountRows(target, data, name, generation) {
       } catch (error) { removeOld.disabled = false; toast(t("common.actionFailed"), true, error.message); }
     });
   }
-  const currentActions = [choosable && leader !== "current" ? claudePreferButton(name, null, false) : null, removeOld].filter(Boolean);
+  const currentActions = [data.current && choosable && leader !== "current" && !data.current.paused ? claudePreferButton(name, null, false) : null,
+    ...(data.current ? accountPoolActions(data.current, async (change) => {
+      await api("/api/claude-accounts/current", { method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify(change) });
+      await refreshClaudeAccountPanel(name);
+    }) : []), removeOld].filter(Boolean);
   const currentRow = data.current ? el("article", { class: "cell account-card current" }, [
     el("div", { class: "cell-text account-card-copy" }, [
       el("strong", { text: t("providers.anthropicCurrentLogin") }), data.current.email ? el("span", { class: "small", text: data.current.email }) : null,
@@ -2344,7 +3530,7 @@ function renderClaudeAccountRows(target, data, name, generation) {
       duplicates.length ? hint(t("providers.anthropicOldSignIn")) : null,
       currentActions.length ? el("div", { class: "account-card-actions" }, currentActions) : null,
     ]),
-    el("div", { class: "account-card-badges" }, accountPoolBadges({ ...data.current, preferred: choosable && leader === "current" })),
+    el("div", { class: "account-card-badges" }, accountPoolBadges({ ...data.current, preferred: choosable && leader === "current" && !data.current.paused })),
   ]) : null;
   if (currentRow && preferredIndex < 0) rows.push(currentRow);
   for (const account of stored) {
@@ -2373,7 +3559,7 @@ function renderClaudeAccountRows(target, data, name, generation) {
     }
     rows.push(el("article", { class: "cell account-card" }, [
       el("div", { class: "cell-text account-card-copy" }, [
-        el("strong", { text: claudeAccountLabel(account) }), account.email && account.email !== account.label ? el("span", { class: "small", text: account.email }) : null, claudeQuotaNode(account), hint(t("providers.addedAccountHelp")),
+        el("strong", { text: claudeAccountLabel(account) }), account.email && account.email !== account.label ? el("span", { class: "small", text: account.email }) : null, claudeQuotaNode(account),
         el("div", { class: "account-card-actions" }, actions),
       ]),
       el("div", { class: "account-card-badges" }, accountPoolBadges({ ...account, state: account.state || (unavailable ? "needs-login" : "ready"), preferred: account.preferred || (choosable && account.id === leader) })),
@@ -2388,31 +3574,43 @@ function renderClaudeAccountRows(target, data, name, generation) {
   if (countNode) countNode.textContent = t("providers.accountCount", { count });
 }
 
+/**
+ * The answer each account list was last drawn from. The open list is fetched again on a timer, so a
+ * state the router learns later (Google asking for verification, a cooldown, a needs-login) shows
+ * without reopening the tab; an unchanged answer is not redrawn, so a button under the pointer stays.
+ */
+const accountRowsDrawn = new WeakMap();
+function drawAccountRows(target, data, draw) {
+  const json = JSON.stringify(data);
+  if (accountRowsDrawn.get(target) === json) return;
+  accountRowsDrawn.set(target, json);
+  draw();
+}
+function accountRowsFailed(target, error) {
+  accountRowsDrawn.delete(target);
+  target.replaceChildren(el("div", { class: "bad-text small", text: error.message }));
+}
+
 async function refreshClaudeAccountPanel(name) {
   const target = $("#claude-account-rows");
   if (!target || selectedProviderName !== name || providerDetailTab !== "accounts") return;
   const generation = providerDetailGeneration;
-  try { renderClaudeAccountRows(target, await api("/api/claude-accounts"), name, generation); }
-  catch (error) { if (generation === providerDetailGeneration) target.replaceChildren(el("div", { class: "bad-text small", text: error.message })); }
+  try { const data = await api("/api/claude-accounts"); drawAccountRows(target, data, () => renderClaudeAccountRows(target, data, name, generation)); }
+  catch (error) { if (generation === providerDetailGeneration) accountRowsFailed(target, error); }
 }
 
 function anthropicAccountsPanel(name, provider) {
   const rotation = el("input", { type: "checkbox", checked: Boolean(provider.accountPool) });
   const rotationMessage = el("span", { class: "small" });
   rotation.addEventListener("change", () => void saveAnthropicRotation(name, provider, rotation.checked, rotation, rotationMessage));
-  const add = el("button", { class: "cell-button", type: "button", text: t("providers.addClaudeAccount") });
+  const add = el("button", { class: "cell-button account-add", type: "button", text: t("providers.addClaudeAccount") });
   add.addEventListener("click", () => openClaudeAccountConsent(name));
-  const removeAll = el("button", { class: "cell-button destructive", type: "button", text: t("providers.anthropicLogoutAll") });
-  removeAll.addEventListener("click", async () => {
-    if (!confirm(t("providers.anthropicLogoutAllConfirm"))) return;
-    try { await api("/api/claude-logout", { method: "POST" }); await refreshClaudeAccountPanel(name); }
-    catch (error) { toast(t("common.actionFailed"), true, error.message); }
-  });
   rotation.setAttribute("role", "switch");
   rotation.setAttribute("aria-label", t("providers.anthropicPool"));
-  const rows = el("div", { id: "claude-account-rows", class: "group account-card-list" }, [el("div", { class: "small", text: t("providers.checking") })]);
+  const rows = el("div", { id: "claude-account-rows", class: "account-card-list" }, [el("div", { class: "small", text: t("providers.checking") })]);
   // The rotation switch first (it decides whether added accounts are used at all), then the
-  // accounts with "Add" at the end of their list, then the one destructive act on its own.
+  // accounts with "Add" as the last row of their card. Removing every added account is destructive,
+  // so it stands at the bottom beside removing the provider (anthropicLogoutAllButton).
   const panel = el("div", { class: "provider-panel" }, [
     el("section", { class: "section" }, [
       el("div", { class: "group" }, [cell(t("providers.anthropicPool"), el("label", { class: "switch" }, [rotation, el("span")]), [t("providers.accountPoolSubtitle"), rotationMessage])]),
@@ -2420,15 +3618,25 @@ function anthropicAccountsPanel(name, provider) {
     ]),
     el("section", { class: "section" }, [
       el("div", { class: "section-head" }, [el("h3", { class: "section-title", text: t("providers.accountPoolTitle") }), el("span", { id: "claude-account-count", class: "small", text: t("providers.accountCount", { count: 0 }) })]),
-      rows,
-      el("div", { class: "group stacked-add" }, [add]),
-      el("p", { class: "group-footer", text: t("providers.accountCountHelp") }),
+      el("div", { class: "group account-group" }, [rows, add]),
       el("p", { id: "claude-account-prefer", class: "group-footer", text: t("providers.preferHelp"), hidden: "" }),
+      el("p", { class: "group-footer", text: t("providers.accountCountHelp") }),
+      // Said once for every account added here, rather than under each of them.
+      el("p", { class: "group-footer", text: t("providers.addedAccountHelp") }),
     ]),
-    section(t("providers.dangerZone"), [removeAll], t("providers.anthropicLogoutAllConfirm")),
   ]);
   queueMicrotask(() => void refreshClaudeAccountPanel(name));
   return panel;
+}
+/** Signs every added Claude account out; the current Claude login is not one of them. */
+function anthropicLogoutAllButton(name) {
+  const removeAll = el("button", { class: "cell-button destructive", type: "button", text: t("providers.anthropicLogoutAll") });
+  removeAll.addEventListener("click", async () => {
+    if (!confirm(t("providers.anthropicLogoutAllConfirm"))) return;
+    try { await api("/api/claude-logout", { method: "POST" }); await refreshClaudeAccountPanel(name); }
+    catch (error) { toast(t("common.actionFailed"), true, error.message); }
+  });
+  return removeAll;
 }
 
 /** "5h 42%", "weekly 100% · resets 14:05" — the reset only matters once a window is full. */
@@ -2439,20 +3647,48 @@ function chatgptQuotaText(quota) {
 }
 /** The same line for any list of usage windows (`/api/limits` windows included). */
 function quotaWindowsText(windows) {
-  const windowName = (w) => {
-    const minutes = w.window_minutes;
-    if (!minutes) return "";
-    if (minutes >= 28 * 24 * 60) return t("quota.windowMonth");
-    if (minutes >= 7 * 24 * 60) return t("quota.windowWeek");
-    if (minutes === 300) return t("quota.window5h");
-    return t("quota.windowHours", { hours: Math.round(minutes / 60) });
-  };
   return (windows || []).filter((w) => w && typeof w.used_percent === "number").map((w) => {
-    const line = t("quota.line", { window: windowName(w), percent: Math.round(w.used_percent) }).trim();
-    if (w.used_percent < 100) return line;
-    const at = typeof w.reset_after_seconds === "number" ? Date.now() + w.reset_after_seconds * 1000 : typeof w.reset_at === "number" ? w.reset_at * 1000 : null;
-    return at ? `${line} · ${t("quota.resetAt", { time: new Date(at).toLocaleString([], { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" }) })}` : line;
+    const line = t("quota.line", { window: quotaWindowName(w), percent: Math.round(w.used_percent) }).trim();
+    const reset = quotaFullReset(w);
+    return reset ? `${line} · ${reset}` : line;
   }).join(" · ");
+}
+/** A usage window's name in a quota line: "5시간", "주간", "월간", else its hours. */
+function quotaWindowName(w) {
+  const minutes = w.window_minutes;
+  if (!minutes) return "";
+  if (minutes >= 28 * 24 * 60) return t("quota.windowMonth");
+  if (minutes >= 7 * 24 * 60) return t("quota.windowWeek");
+  if (minutes === 300) return t("quota.window5h");
+  return t("quota.windowHours", { hours: Math.round(minutes / 60) });
+}
+/** When a full window resets ("resets 11/12 14:05"); nothing for a window that still has room, where nobody acts on it. */
+function quotaFullReset(w) {
+  if (w.used_percent < 100) return "";
+  const at = typeof w.reset_after_seconds === "number" ? Date.now() + w.reset_after_seconds * 1000 : typeof w.reset_at === "number" ? w.reset_at * 1000 : null;
+  return at ? t("quota.resetAt", { time: new Date(at).toLocaleString([], { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" }) }) : "";
+}
+/**
+ * An account's usage on its row in the accounts list: the windows of its quota line, each as a name, a
+ * thin meter and its share, amber from 80% and red from 95% as on Status; a full window keeps its reset.
+ * The whole line is the group's accessible name. Nothing when no window has a share.
+ */
+function quotaMeters(windows) {
+  const shown = (windows || []).filter((w) => w && typeof w.used_percent === "number");
+  if (!shown.length) return null;
+  const text = quotaWindowsText(shown);
+  return el("div", { class: "account-quota account-meters", role: "img", "aria-label": text, title: text }, shown.map((w) => {
+    const percent = Math.round(w.used_percent);
+    const fill = el("span", { class: "meter-fill" });
+    fill.style.width = `${Math.max(0, Math.min(100, w.used_percent))}%`;
+    const reset = quotaFullReset(w);
+    return el("span", { class: `account-meter${percent >= 95 ? " tone-bad" : percent >= 80 ? " tone-warn" : ""}`, "aria-hidden": "true" }, [
+      el("span", { class: "account-meter-name", text: quotaWindowName(w) }),
+      el("span", { class: "meter" }, [fill]),
+      el("span", { class: "account-meter-figure", text: `${percent}%` }),
+      reset ? el("span", { class: "account-meter-reset", text: reset }) : null,
+    ]);
+  }));
 }
 
 /** A wait people read at a glance: "1시간 29분", "12분", "40초". */
@@ -2468,7 +3704,7 @@ function chatgptStateBadge(account) {
   if (account.state === "needs-login" || account.state === "quarantined") return el("span", { class: "badge bad", text: t("providers.anthropicReauth") });
   if (account.state === "needs-verification") return el("span", { class: "badge warn", text: t("providers.googleVerifyNeeded") });
   if (account.state === "cooling") return el("span", { class: "badge warn", text: t("pool.coolingFor", { duration: durationText(account.cooldownSeconds) }) });
-  return el("span", { class: "badge ok", text: account.inUse ? t("providers.chatgptInUse") : t("providers.chatgptStandby") });
+  return el("span", { class: account.inUse ? "badge ok in-use" : "badge ok", text: account.inUse ? t("providers.chatgptInUse") : t("providers.chatgptStandby") });
 }
 
 async function patchChatgptAccount(name, id, change) {
@@ -2512,13 +3748,14 @@ function renderChatgptAccountRows(target, data, name, generation) {
     }
     const quota = chatgptQuotaText(account.quota);
     const detail = [account.email && account.email !== account.label ? account.email : null, account.planType || null].filter(Boolean).join(" · ");
-    const help = account.state === "needs-login" || account.state === "quarantined" ? t("providers.chatgptReauthHelp") : own ? t("providers.chatgptOwnHelp") : t("providers.chatgptCodexHelp");
+    // How an account added here is kept is said once under the list (chatgptAccountsPanel); a row says only what is its own.
+    const help = account.state === "needs-login" || account.state === "quarantined" ? t("providers.chatgptReauthHelp") : own ? "" : t("providers.chatgptCodexHelp");
     return el("article", { class: `cell account-card${account.inUse ? " current" : ""}` }, [
       el("div", { class: "cell-text account-card-copy" }, [
         el("strong", { text: account.label }),
         detail ? el("span", { class: "small", text: detail }) : null,
-        quota ? el("p", { class: "small account-quota", text: quota }) : null,
-        hint(help),
+        quota ? quotaMeters([account.quota.rate_limits.primary, account.quota.rate_limits.secondary]) : null,
+        help ? hint(help) : null,
         actions.length ? el("div", { class: "account-card-actions" }, actions) : null,
       ]),
       el("div", { class: "account-card-badges" }, accountPoolBadges(account)),
@@ -2627,7 +3864,8 @@ function renderGoogleAccountRows(target, data, name, generation) {
       el("div", { class: "cell-text account-card-copy" }, [
         el("strong", { text: account.label }),
         detail ? el("span", { class: "small", text: detail }) : null,
-        hint(account.state === "needs-login" || account.state === "quarantined" ? t("providers.chatgptReauthHelp") : account.state === "needs-verification" ? t("providers.googleVerifyHelp") : t("providers.googleOwnHelp")),
+        // How an account is kept is said once under the list (googleAccountsPanel); a row says only what it needs.
+        account.state === "needs-login" || account.state === "quarantined" ? hint(t("providers.chatgptReauthHelp")) : account.state === "needs-verification" ? hint(t("providers.googleVerifyHelp")) : null,
         el("div", { class: "account-card-actions" }, actions),
       ]),
       el("div", { class: "account-card-badges" }, accountPoolBadges(account)),
@@ -2642,23 +3880,23 @@ async function refreshGoogleAccountPanel(name) {
   const target = $("#google-account-rows");
   if (!target || selectedProviderName !== name || providerDetailTab !== "accounts") return;
   const generation = providerDetailGeneration;
-  try { renderGoogleAccountRows(target, await api(`/api/google-accounts?provider=${encodeURIComponent(name)}`), name, generation); }
-  catch (error) { if (generation === providerDetailGeneration) target.replaceChildren(el("div", { class: "bad-text small", text: error.message })); }
+  try { const data = await api(`/api/google-accounts?provider=${encodeURIComponent(name)}`); drawAccountRows(target, data, () => renderGoogleAccountRows(target, data, name, generation)); }
+  catch (error) { if (generation === providerDetailGeneration) accountRowsFailed(target, error); }
 }
 
 function googleAccountsPanel(name) {
-  const add = el("button", { class: "cell-button", type: "button", text: t("providers.addGoogleAccount") });
+  const add = el("button", { class: "cell-button account-add", type: "button", text: t("providers.addGoogleAccount") });
   add.disabled = googleLoginBusy;
   add.addEventListener("click", () => void startGoogleLogin(() => { renderProviderDetail(); void refreshGoogleAccountPanel(name); }));
-  const rows = el("div", { id: "google-account-rows", class: "group account-card-list" }, [el("div", { class: "small", text: t("providers.checking") })]);
+  const rows = el("div", { id: "google-account-rows", class: "account-card-list" }, [el("div", { class: "small", text: t("providers.checking") })]);
   const panel = el("div", { class: "provider-panel" }, [
     el("section", { class: "section" }, [
       el("div", { class: "section-head" }, [el("h3", { class: "section-title", text: t("providers.googleAccountsTitle") }), el("span", { id: "google-account-count", class: "small", text: t("providers.chatgptAccountCount", { count: 0 }) })]),
-      rows,
-      el("div", { class: "group stacked-add" }, [add]),
+      el("div", { class: "group account-group" }, [rows, add]),
       googleLoginBusy ? el("p", { class: "group-footer", text: t("providers.googleLoginWaiting") }) : null,
+      el("div", { class: "group-footer notice warn" }, [el("strong", { text: t("providers.googleWarningShort") })]),
       el("p", { class: "group-footer", text: t("providers.googleAccountsSubtitle") }),
-      el("div", { class: "group-footer notice" }, [el("strong", { text: t("providers.googleWarningShort") })]),
+      el("p", { class: "group-footer", text: t("providers.googleOwnHelp") }),
     ]),
   ]);
   queueMicrotask(() => void refreshGoogleAccountPanel(name));
@@ -2669,24 +3907,24 @@ async function refreshChatgptAccountPanel(name) {
   const target = $("#chatgpt-account-rows");
   if (!target || selectedProviderName !== name || providerDetailTab !== "accounts") return;
   const generation = providerDetailGeneration;
-  try { renderChatgptAccountRows(target, await api(`/api/chatgpt-accounts?provider=${encodeURIComponent(name)}`), name, generation); }
-  catch (error) { if (generation === providerDetailGeneration) target.replaceChildren(el("div", { class: "bad-text small", text: error.message })); }
+  try { const data = await api(`/api/chatgpt-accounts?provider=${encodeURIComponent(name)}`); drawAccountRows(target, data, () => renderChatgptAccountRows(target, data, name, generation)); }
+  catch (error) { if (generation === providerDetailGeneration) accountRowsFailed(target, error); }
 }
 
 function chatgptAccountsPanel(name) {
-  const add = el("button", { class: "cell-button", type: "button", text: t("providers.addChatgptAccount") });
+  const add = el("button", { class: "cell-button account-add", type: "button", text: t("providers.addChatgptAccount") });
   add.disabled = chatgptLoginBusy;
   const waiting = el("p", { class: "group-footer", text: chatgptLoginBusy ? t("providers.chatgptAddWaiting") : "" });
   waiting.hidden = !chatgptLoginBusy;
   add.addEventListener("click", () => void startChatgptLogin(() => { renderProviderDetail(); void refreshChatgptAccountPanel(name); }, true));
-  const rows = el("div", { id: "chatgpt-account-rows", class: "group account-card-list" }, [el("div", { class: "small", text: t("providers.checking") })]);
+  const rows = el("div", { id: "chatgpt-account-rows", class: "account-card-list" }, [el("div", { class: "small", text: t("providers.checking") })]);
   const panel = el("div", { class: "provider-panel" }, [
     el("section", { class: "section" }, [
       el("div", { class: "section-head" }, [el("h3", { class: "section-title", text: t("providers.chatgptAccountsTitle") }), el("span", { id: "chatgpt-account-count", class: "small", text: t("providers.chatgptAccountCount", { count: 0 }) })]),
-      rows,
-      el("div", { class: "group stacked-add" }, [add]),
+      el("div", { class: "group account-group" }, [rows, add]),
       waiting,
       el("p", { class: "group-footer", text: t("providers.chatgptAccountsSubtitle") }),
+      el("p", { class: "group-footer", text: t("providers.chatgptOwnHelp") }),
     ]),
   ]);
   queueMicrotask(() => void refreshChatgptAccountPanel(name));
@@ -2763,18 +4001,23 @@ function keyStateBadge(name, credential, single) {
 }
 
 function keyUsageText(name, index) {
+  const windows = keyUsageWindows(name, index);
+  return windows ? quotaWindowsText(windows) : "";
+}
+/** The key's usage windows in the last limits read, by its place in the pool; null when the read has none for it. */
+function keyUsageWindows(name, index) {
   const entry = ((keyLimits && keyLimits.providers) || []).find((item) => item.provider === name);
   const account = entry && (entry.accounts || []).find((item) => item.account === index);
-  return account ? quotaWindowsText(account.windows) : "";
+  return account ? account.windows : null;
 }
 
 async function saveKeyPool(next) {
   try {
-    await configRequest(next);
+    const out = await configRequest(next);
     currentConfig = next;
     keyForm = null;
     renderProviderWorkspace();
-    toast(t("common.saved"));
+    configSaved(out, t("common.saved"));
     void refreshHealth();
     return true;
   } catch (error) {
@@ -2899,12 +4142,12 @@ function keyAccountRow(name, credential, index, pool) {
     el("div", { class: "cell-text account-card-copy" }, [
       el("strong", { text: label }),
       key ? el("span", { class: "small mono", text: maskKey(key) }) : null,
-      usage ? el("p", { class: "small account-quota", text: usage }) : null,
+      usage ? quotaMeters(keyUsageWindows(name, index)) : null,
       el("div", { class: "account-card-actions" }, [...actions, edit, remove]),
     ]),
     el("div", { class: "account-card-badges" }, [
       account.preferred ? el("span", { class: "badge first", text: t("providers.preferBadge") }) : null,
-      account.inUse ? el("span", { class: "badge ok", text: t("providers.chatgptInUse") }) : null,
+      account.inUse ? el("span", { class: "badge ok in-use", text: t("providers.chatgptInUse") }) : null,
       keyStateBadge(name, account, single),
     ]),
   ]);
@@ -2934,15 +4177,14 @@ async function refreshKeyAccountPanel(name) {
 }
 
 function keyAccountsPanel(name) {
-  const rows = el("div", { id: "key-account-rows", class: "group account-card-list" });
+  const rows = el("div", { id: "key-account-rows", class: "account-card-list" });
   const adding = keyForm && keyForm.provider === name && keyForm.id === null;
-  const add = el("button", { class: "cell-button", type: "button", text: t("providers.addKeyAccount") });
+  const add = el("button", { class: "cell-button account-add", type: "button", text: t("providers.addKeyAccount") });
   add.addEventListener("click", () => { keyForm = { provider: name, id: null }; renderProviderDetail(); });
   const panel = el("div", { class: "provider-panel" }, [
     el("section", { class: "section" }, [
-      el("div", { class: "section-head" }, [el("h3", { class: "section-title", text: t("providers.keyAccountsTitle", { name: providerLabel(name) }) }), el("span", { id: "key-account-count", class: "small" })]),
-      rows,
-      el("div", { class: "group stacked-add" }, [adding ? keyAccountForm(name, null, -1, []) : add]),
+      el("div", { class: "section-head" }, [el("h3", { class: "section-title", text: t("providers.keyAccountsTitle", { name: providerDisplayName(name) }) }), el("span", { id: "key-account-count", class: "small" })]),
+      el("div", { class: "group account-group" }, [rows, adding ? keyAccountForm(name, null, -1, []) : add]),
       el("p", { class: "group-footer", text: t("providers.keyAccountsHelp") }),
     ]),
   ]);
@@ -2968,8 +4210,14 @@ function renderProviderDetail() {
   // Removing is the one destructive act on this page, so it sits apart at the bottom, not beside Edit.
   const remove = el("button", { class: "cell-button destructive", type: "button", text: t("providers.remove"), onclick: () => void removeProvider(name, provider) });
   const back = el("button", { class: "provider-back", type: "button", onclick: closeProviderDetail }, [svgIcon("0 0 9 15", ["M7.5 1.5l-6 6 6 6"]), el("span", { text: t("nav.providers") })]);
+  // The name people know it by, in its vendor's hue; under it the kind and, when the name is not the
+  // key, the key itself, since routes, the picker and the config file name the provider by it.
+  const title = providerDisplayName(name, provider);
   const header = el("header", { class: "provider-detail-header" }, [
-    el("div", {}, [el("div", { class: "provider-title-line" }, [el("h2", { text: providerLabel(name, provider) }), providerState(name, provider)]), el("p", { class: "small", text: providerKind(name, provider) })]),
+    el("div", {}, [
+      el("div", { class: "provider-title-line" }, [vendorDot(name, provider), el("h2", { text: title }), providerState(name, provider)]),
+      el("p", { class: "small provider-kind" }, [el("span", { text: providerKind(name, provider) }), title !== name ? el("span", { class: "mono provider-key", text: name }) : null]),
+    ]),
     el("div", { class: "provider-detail-actions" }, [check, edit]),
   ]);
   let content;
@@ -2979,7 +4227,9 @@ function renderProviderDetail() {
   else if (providerDetailTab === "accounts" && isKeyProvider(provider)) content = keyAccountsPanel(name);
   else if (providerDetailTab === "models") content = providerModelsPanel(name, provider);
   else { providerDetailTab = "overview"; content = providerOverview(name, provider); }
-  detail.replaceChildren(back, header, providerTabs(name, provider), content, el("div", { class: "group provider-remove" }, [remove]));
+  // The destructive acts share one card at the bottom: on a Claude login's accounts, signing every added account out, then removing the provider.
+  const logoutAll = providerDetailTab === "accounts" && provider.type === "anthropic" && provider.auth === "claude-code" ? anthropicLogoutAllButton(name) : null;
+  detail.replaceChildren(back, header, providerTabs(name, provider), el("div", { id: "provider-tab-panel", role: "tabpanel", "aria-labelledby": `provider-tab-${providerDetailTab}` }, [content]), el("div", { class: "group provider-remove" }, [logoutAll, remove]));
 }
 
 function renderProviderWorkspace() {
@@ -2989,6 +4239,29 @@ function renderProviderWorkspace() {
   renderProviderDetail();
 }
 
+/** The Clients page's first read: its switches hold still, dimmed, until the config and status are in; a failure says so and they stay still. */
+function setClientsLoading(state) {
+  $("#view-clients").classList.toggle("is-unloaded", state === "loading" || state === "failed");
+  const line = $("#clients-status");
+  line.hidden = state === null;
+  line.classList.toggle("load-failed", state === "failed");
+  if (state === "failed") line.replaceChildren(t("common.loadFailed"));
+  else if (state === "loading") line.replaceChildren(el("span", { class: "spinner", "aria-hidden": "true" }), el("span", { text: t("common.loading") }));
+  else line.replaceChildren();
+}
+/** Opens the Clients page's data. A first read holds the page still behind a loading line; a failure says so, and the next visit reads again. */
+async function openClients() {
+  const first = !currentConfig;
+  if (first) setClientsLoading("loading");
+  const loaded = await loadClients();
+  // A read that lands clears the hold whenever it was set: a first read that failed after the config
+  // came in leaves currentConfig behind, so the retry is not "first" yet must still free the page.
+  if (loaded) setClientsLoading(null);
+  else if (first || $("#view-clients").classList.contains("is-unloaded")) {
+    clientsLoaded = false;
+    setClientsLoading("failed");
+  }
+}
 async function loadClients() {
   clientsLoaded = true;
   try {
@@ -2997,19 +4270,37 @@ async function loadClients() {
     pickerContextWindows = await api("/api/context-windows");
     if (!status) status = await api("/api/status");
     renderClients();
-  } catch (error) { toast(t("common.loadFailed"), true, error.message); }
+    return true;
+  } catch (error) { toast(t("common.loadFailed"), true, error.message); return false; }
 }
 
 async function loadProviders() {
   providersLoaded = true;
+  // Before the first config the rail and the detail hold bars, not the "no provider selected" text.
+  const first = !currentConfig;
+  if (first) {
+    $("#providers-list").replaceChildren(skeletonLines(4));
+    $("#provider-detail").replaceChildren(skeletonLines(3));
+  }
   try {
     await loadCatalogs();
     currentConfig = await api("/api/config");
+    // The Models tab says which models have no known window, and the live Codex catalogue's is not
+    // in the config. A router too old to answer leaves the note off rather than breaking the screen.
+    pickerContextWindows = await api("/api/context-windows").catch(() => pickerContextWindows);
     renderProviderWorkspace();
     void Promise.all(Object.entries(currentConfig.providers || {}).map(([name, provider]) => probeProvider(name, provider, () => {
       if ($("#view-providers").classList.contains("active")) renderProviderWorkspace();
     })));
-  } catch (error) { toast(t("common.loadFailed"), true, error.message); }
+  } catch (error) {
+    toast(t("common.loadFailed"), true, error.message);
+    // A first read that failed leaves the page in its failure state, and the next visit reads again.
+    if (first) {
+      providersLoaded = false;
+      $("#providers-list").replaceChildren(loadFailedLine());
+      $("#provider-detail").replaceChildren(loadFailedLine());
+    }
+  }
 }
 $("#providers-search").addEventListener("input", (event) => { providerSearch = event.target.value; renderProviderRail(); });
 $("#providers-add").addEventListener("click", openProviderChooser);
@@ -3025,9 +4316,14 @@ $("#providers-refresh").addEventListener("click", async () => {
 // ---- Provider modal -----------------------------------------------------------------
 
 let modalCleanup = null;
+/** What had focus when the dialog opened, restored when it closes (G-D10). */
+let modalOpener = null;
 function showModal(content, cleanup) {
   if (modalCleanup) modalCleanup();
   modalCleanup = cleanup || null;
+  // Where the keyboard was before the dialog opened: closing puts it back there instead of on <body> (G-D10).
+  const active = document.activeElement;
+  modalOpener = active && typeof active.focus === "function" ? active : null;
   $("#modal-content").replaceChildren(content);
   $("#modal-backdrop").hidden = false;
   const first = $("#modal-content input, #modal-content button, #modal-content select");
@@ -3039,15 +4335,46 @@ function closeModal() {
   if (cleanup) cleanup();
   $("#modal-backdrop").hidden = true;
   $("#modal-content").replaceChildren();
+  const opener = modalOpener;
+  modalOpener = null;
+  if (opener && opener.isConnected) opener.focus();
+}
+/**
+ * The dialog's own focusables, in tab order. Hidden and disabled controls stay out: Tab must not
+ * land on a field the screen does not show.
+ */
+function modalFocusables() {
+  return $all("#modal-content button, #modal-content input, #modal-content select, #modal-content textarea, #modal-content a[href]", $("#modal-content"))
+    .filter((node) => !node.disabled && node.getClientRects().length > 0);
 }
 $("#modal-close").addEventListener("click", closeModal);
 $("#modal-backdrop").addEventListener("click", (event) => { if (event.target === $("#modal-backdrop")) closeModal(); });
 window.addEventListener("keydown", (event) => {
-  if (event.key === "Escape" && !$("#modal-backdrop").hidden) { closeModal(); return; }
-  if (event.key === "Enter" && !$("#modal-backdrop").hidden && event.target.tagName !== "TEXTAREA") {
-    const action = $("#modal-content [data-default-action]");
-    if (action && !action.disabled) { event.preventDefault(); action.click(); }
+  // keyCode 229 also covers the IME commit key on browsers that already cleared isComposing.
+  if (event.defaultPrevented || event.isComposing || event.keyCode === 229 || $("#modal-backdrop").hidden) return;
+  if (event.key === "Escape") { closeModal(); return; }
+  // Tab stays inside the dialog: the page behind it is inert to the pointer, and a keyboard that
+  // walked out into it could press something the dialog is covering (G-D10).
+  if (event.key === "Tab") {
+    const focusables = modalFocusables();
+    if (!focusables.length) return;
+    const first = focusables[0];
+    const last = focusables[focusables.length - 1];
+    const active = document.activeElement;
+    if (event.shiftKey ? active === first || !$("#modal-content").contains(active) : active === last || !$("#modal-content").contains(active)) {
+      event.preventDefault();
+      (event.shiftKey ? last : first).focus();
+    }
+    return;
   }
+  if (event.key !== "Enter" || event.repeat || event.ctrlKey || event.altKey || event.metaKey || event.shiftKey) return;
+  // Only single-line text entry gets the shortcut. Buttons (including Cancel), selects, links,
+  // checkboxes, textareas and editable regions keep their own native keyboard behaviour.
+  const target = event.target;
+  if (!$("#modal-content").contains(target) || target.tagName !== "INPUT" || target.isContentEditable) return;
+  if (!["text", "search", "email", "url", "tel", "password", "number"].includes(target.type)) return;
+  const action = $("#modal-content [data-default-action]");
+  if (action && !action.disabled) { event.preventDefault(); action.click(); }
 });
 
 function openClaudeAccountConsent(providerName) {
@@ -3151,7 +4478,8 @@ function openProviderChooser() {
     tile(t("providers.grok"), t("providers.grokHelp"), { kind: "grok" }),
   ], null, true);
   const native = presets.filter((preset) => (preset.kind || "anthropic-compatible") === "anthropic-compatible");
-  group(t("providers.anthropicGroup"), native.map((preset) => tile(preset.name, null, { preset })), t("providers.presetHelp"));
+  // Claude's own API key is the native provider's API-key mode, offered here beside the other keys.
+  group(t("providers.anthropicGroup"), [tile("Claude API", null, { kind: "anthropic", auth: "api-key" }), ...native.map((preset) => tile(preset.name, null, { preset }))], t("providers.presetHelp"));
   const openai = presets.filter((preset) => preset.kind === "openai-compatible");
   group(t("providers.openaiGroup"), openai.map((preset) => tile(preset.name, null, { preset })), `${t("providers.presetHelp")} ${t("providers.openaiGroupHelp")}`);
   group(null, [tile(t("providers.custom"), t("providers.customHelp"), { kind: "custom" })], null, true);
@@ -3248,10 +4576,10 @@ function anthropicSourceText(source) {
 function openAnthropicProviderForm(options) {
   let formActive = true;
   const existing = options.provider;
-  const displayName = options.name ? providerLabel(options.name, existing) : t("providers.anthropic");
+  const displayName = options.name ? providerFormName(options.name, existing) : options.auth === "api-key" ? "Claude API" : t("providers.anthropic");
   const nameInput = el("input", { value: displayName, maxlength: "60" });
   const auth = el("select", {}, [selectOption("claude-code", t("providers.anthropicAuthClaudeCode")), selectOption("api-key", t("providers.anthropicAuthApiKey"))]);
-  auth.value = (existing && existing.auth) || "claude-code";
+  auth.value = (existing && existing.auth) || options.auth || "claude-code";
   const keyInput = el("input", { type: "password", autocomplete: "off", placeholder: existing && existing.apiKey ? t("providers.keySaved") : t("providers.keyPlaceholder") });
   const showKey = el("button", { class: "eye-button", type: "button", text: t("common.show") });
   showKey.addEventListener("click", () => { const show = keyInput.type === "password"; keyInput.type = show ? "text" : "password"; showKey.textContent = show ? t("common.hide") : t("common.show"); });
@@ -3260,10 +4588,15 @@ function openAnthropicProviderForm(options) {
   const sourceLine = el("div", { class: "small" });
   let foundModels = modelsOf(existing).length ? modelsOf(existing) : claudeModels.map((model) => ({ id: model.id, name: labelOf(model) }));
   let selected = new Set(existing ? modelsOf(existing).map((model) => model.id) : foundModels.map((model) => model.id));
+  // What the checklist started with: a new provider's list is drawn from the fallback catalogue, and
+  // a first live listing may fill in the rest only while the user has left that set as it was.
+  const initialSelection = new Set(selected);
+  let listed = false;
   const modelArea = el("div", { class: "form-field" });
   function renderModels() {
     const modelsBox = modelChecklist(foundModels, selected);
-    modelArea.replaceChildren(el("span", { text: t("providers.models") }), hint(t("providers.modelsHelp")), el("small", { text: t("providers.effortLevels", { levels: "low · medium · high · max" }) }), modelsBox);
+    // An API key's models are workers, not mapping choices: the mode hint below says so instead.
+    modelArea.replaceChildren(...[el("span", { text: t("providers.models") }), auth.value === "api-key" ? null : hint(t("providers.modelsHelp")), el("small", { text: t("providers.effortLevels", { levels: "low · medium · high · max" }) }), modelsBox].filter(Boolean));
   }
   renderModels();
   const authField = inputRow(t("providers.credentials"), auth, t("providers.anthropicCredentialsHelp"));
@@ -3275,6 +4608,7 @@ function openAnthropicProviderForm(options) {
     sourceLine.hidden = !reused;
   }
   auth.addEventListener("change", syncAuthFields);
+  auth.addEventListener("change", renderModels);
   syncAuthFields();
   async function runProbe() {
     probeButton.disabled = true;
@@ -3292,9 +4626,16 @@ function openAnthropicProviderForm(options) {
       if (Array.isArray(response.models) && response.models.length) {
         // Anthropic's own list, so a release shows up here without a ClaudeRipple update. A saved
         // model the list no longer carries stays visible and ticked rather than dropped on save.
-        const listed = new Set(response.models.map((model) => model.id));
-        foundModels = [...response.models, ...modelsOf(existing).filter((model) => !listed.has(model.id))];
-        selected = new Set(existing ? modelsOf(existing).map((model) => model.id) : foundModels.map((model) => model.id));
+        // What is ticked now wins: this listing arrives after the form opened, so it must not re-tick
+        // a model the user just unchecked. Only a new provider's first listing — one whose selection
+        // still matches the fallback set the form opened with — starts with all of them.
+        const ticked = modelArea.querySelector(".model-picker").selected().map((model) => model.id);
+        const untouched = ticked.length === initialSelection.size && ticked.every((id) => initialSelection.has(id));
+        const keep = tickedAfterListing(!existing && !listed && untouched, ticked, response.models.map((model) => model.id));
+        listed = true;
+        const named = new Set(response.models.map((model) => model.id));
+        foundModels = [...response.models, ...modelsOf(existing).filter((model) => !named.has(model.id))];
+        selected = keep;
         renderModels();
       }
     } catch (error) { if (formActive) result.replaceChildren(el("span", { class: "bad-text", text: t("providers.probeFailed") }), el("div", { class: "small", text: error.message })); }
@@ -3305,7 +4646,7 @@ function openAnthropicProviderForm(options) {
   // opens: a saved provider otherwise showed only what was ticked when it was first saved.
   if (auth.value === "claude-code") setTimeout(() => void runProbe(), 0);
   const modeHint = hint("");
-  function syncModeHint() { modeHint.textContent = auth.value === "claude-code" && accountPool ? t("providers.anthropicPoolRouting") : t("providers.anthropicIngressOnly"); }
+  function syncModeHint() { modeHint.textContent = auth.value === "api-key" ? t("providers.anthropicApiKeyWorkers") : accountPool ? t("providers.anthropicPoolRouting") : t("providers.anthropicIngressOnly"); }
   auth.addEventListener("change", syncModeHint);
   syncModeHint();
   const limitsInput = el("input", { type: "checkbox", checked: !(existing && existing.limits === false) });
@@ -3323,11 +4664,11 @@ function openAnthropicProviderForm(options) {
     const providerName = existing ? options.name : uniqueName(typedName, next.providers);
     const checkedModels = withSavedModelFields(form.querySelector(".model-picker").selected(), existing && next.providers[options.name]);
     const provider = { type: "anthropic", auth: auth.value, ...(auth.value === "claude-code" && accountPool ? { accountPool: true } : {}), ...(auth.value === "api-key" && (keyInput.value || (existing && existing.apiKey)) ? { apiKey: keyInput.value || existing.apiKey } : {}), limits: limitsInput.checked, models: checkedModels };
-    next.providers[providerName] = applyProviderLabel(provider, providerName, typedName);
+    next.providers[providerName] = applyProviderLabel(provider, providerName, existing ? typedProviderName(typedName, options.name, existing) : typedName);
     // accountPool makes these models native Claude routing targets. Without it this remains the
     // historical OpenAI ingress provider, and routing deliberately ignores it.
     saveButton.disabled = true;
-    try { await configRequest(next); currentConfig = next; selectedProviderName = providerName; providerDetailTab = auth.value === "claude-code" ? "accounts" : "overview"; slotsLoaded = false; clientsLoaded = false; providersLoaded = false; closeModal(); await loadProviders(); toast(t("common.saved")); }
+    try { const out = await configRequest(next); currentConfig = next; selectedProviderName = providerName; providerDetailTab = auth.value === "claude-code" ? "accounts" : "overview"; slotsLoaded = false; clientsLoaded = false; providersLoaded = false; closeModal(); await loadProviders(); configSaved(out, t("common.saved")); }
     catch (error) { toast(t("common.saveFailed"), true, error.message); }
     finally { saveButton.disabled = false; }
   });
@@ -3336,11 +4677,11 @@ function openAnthropicProviderForm(options) {
   if (auth.value === "claude-code") void runProbe();
 }
 /**
- * What a Grok form's check leaves ticked. A handful of models, so a new provider's first listing
- * starts with all of them ticked. Every later check — and every check of a saved provider — keeps
+ * What a model list's check leaves ticked. A caller may start a new provider's first listing with
+ * everything ticked (Grok, Claude). Every later check — and every check of a saved provider — keeps
  * what is ticked at that moment, so a model the user unticked stays unticked.
  */
-function grokTickedAfterCheck(firstListing, tickedIds, listedIds) {
+function tickedAfterListing(firstListing, tickedIds, listedIds) {
   return new Set(firstListing ? listedIds : tickedIds);
 }
 
@@ -3352,11 +4693,14 @@ function grokTickedAfterCheck(firstListing, tickedIds, listedIds) {
 function openGrokProviderForm(options) {
   let formActive = true;
   const existing = options.provider;
-  const nameInput = el("input", { value: options.name ? providerLabel(options.name, existing) : t("providers.grok"), maxlength: "60" });
+  const nameInput = el("input", { value: options.name ? providerFormName(options.name, existing) : t("providers.grok"), maxlength: "60" });
   const result = el("div", { class: "probe-result" });
   const probeButton = el("button", { class: "btn secondary", type: "button", text: t("providers.check") });
   let foundModels = modelsOf(existing);
   const currentChecked = new Set(foundModels.map((model) => model.id));
+  // What the checklist opened with. The first listing fills it out only while the person has left
+  // that set as it was: a model typed in before the list arrived is theirs and stays ticked (B21).
+  const initialSelection = new Set(currentChecked);
   let listed = false;
   const modelArea = el("div", { class: "form-field" });
   function renderModels(checked, help) {
@@ -3378,7 +4722,9 @@ function openGrokProviderForm(options) {
       ].filter(Boolean));
       if (Array.isArray(response.models) && response.models.length) {
         const ticked = modelArea.querySelector(".model-picker").selected();
-        const keep = grokTickedAfterCheck(!existing && !listed, ticked.map((model) => model.id), response.models.map((model) => model.id));
+        const tickedIds = ticked.map((model) => model.id);
+        const untouched = tickedIds.length === initialSelection.size && tickedIds.every((id) => initialSelection.has(id));
+        const keep = tickedAfterListing(!existing && !listed && untouched, tickedIds, response.models.map((model) => model.id));
         listed = true;
         foundModels = [...ticked.filter((model) => !response.models.some((m) => m.id === model.id)), ...response.models];
         renderModels(keep);
@@ -3410,6 +4756,9 @@ function openGrokProviderForm(options) {
   saveButton.addEventListener("click", async () => {
     const typedName = nameInput.value.trim();
     if (!typedName) { toast(t("providers.nameRequired"), true); return; }
+    // A Clients-screen picker save still open would land after this one and rebuild the list from
+    // the screen it read before: let it land first, so this save starts from what it stored.
+    await pickerSaving.catch(() => {});
     const next = clone(await latestConfig());
     const providerName = existing ? options.name : uniqueName(typedName, next.providers);
     const saved = existing && (next.providers[options.name] || existing);
@@ -3424,11 +4773,10 @@ function openGrokProviderForm(options) {
       ...(append.value.trim() ? { instructionsAppend: append.value.trim() } : {}),
       models: checkedModels,
     };
-    applyProviderLabel(next.providers[providerName], providerName, typedName);
-    const existingSelections = pickerSelectionsExcept(next, providerName);
-    applyPickerSelections(next, pickerInput.checked ? [...existingSelections, ...checkedModels.map((model) => ({ ...model, provider: providerName }))] : existingSelections);
+    applyProviderLabel(next.providers[providerName], providerName, existing ? typedProviderName(typedName, options.name, existing) : typedName);
+    applyPickerSelections(next, providerPickerSelections(next, providerName, saved, checkedModels, pickerInput.checked), true);
     saveButton.disabled = true;
-    try { await configRequest(next); currentConfig = next; selectedProviderName = providerName; providerDetailTab = "overview"; slotsLoaded = false; clientsLoaded = false; providersLoaded = false; closeModal(); await loadProviders(); toast(t("common.saved")); await offerPickerOn(pickerInput.checked && checkedModels.length > 0); }
+    try { const out = await configRequest(next); currentConfig = next; selectedProviderName = providerName; providerDetailTab = "overview"; slotsLoaded = false; clientsLoaded = false; providersLoaded = false; closeModal(); await loadProviders(); configSaved(out, t("common.saved")); await offerPickerOn(pickerInput.checked && checkedModels.length > 0); }
     catch (error) { toast(t("common.saveFailed"), true, error.message); }
     finally { saveButton.disabled = false; }
   });
@@ -3440,7 +4788,7 @@ function openGrokProviderForm(options) {
 function openGoogleProviderForm(options) {
   let formActive = true;
   const existing = options.provider;
-  const nameInput = el("input", { value: options.name ? providerLabel(options.name, existing) : t("providers.google"), maxlength: "60" });
+  const nameInput = el("input", { value: options.name ? providerFormName(options.name, existing) : t("providers.google"), maxlength: "60" });
   const keyInput = el("input", { type: "password", autocomplete: "off", placeholder: existing && existing.apiKey ? t("providers.keySaved") : t("providers.keyPlaceholder") });
   const showKey = el("button", { class: "eye-button", type: "button", text: t("common.show") });
   showKey.addEventListener("click", () => { const show = keyInput.type === "password"; keyInput.type = show ? "text" : "password"; showKey.textContent = show ? t("common.hide") : t("common.show"); });
@@ -3485,8 +4833,10 @@ function openGoogleProviderForm(options) {
       if (Array.isArray(response.models) && response.models.length) {
         const ticked = modelArea.querySelector(".model-picker").selected();
         // The catalogue lists dozens of Gemini variants, so a new provider starts with none ticked
-        // rather than all of them; saved and typed picks stay ticked and visible.
-        const keep = new Set([...currentChecked, ...ticked.map((model) => model.id)]);
+        // rather than all of them; saved and typed picks stay ticked and visible. The box as it is
+        // now is the answer: merging the saved set back in re-ticked a model the user unchecked
+        // while the listing was still in flight.
+        const keep = new Set(ticked.map((model) => model.id));
         foundModels = [...ticked.filter((model) => !response.models.some((m) => m.id === model.id)), ...response.models];
         renderModels(keep, t("providers.modelsFoundMany"));
       }
@@ -3515,6 +4865,8 @@ function openGoogleProviderForm(options) {
   saveButton.addEventListener("click", async () => {
     const typedName = nameInput.value.trim();
     if (!typedName) { toast(t("providers.nameRequired"), true); return; }
+    // As in the Grok form: an open Clients-screen picker save lands first.
+    await pickerSaving.catch(() => {});
     const next = clone(await latestConfig());
     const providerName = existing ? options.name : uniqueName(typedName, next.providers);
     const apiKey = auth.value === "api-key" ? keyInput.value.trim() || (existing && existing.apiKey) : undefined;
@@ -3534,13 +4886,12 @@ function openGoogleProviderForm(options) {
       ...(append.value.trim() ? { instructionsAppend: append.value.trim() } : {}),
       models: checkedModels,
     };
-    applyProviderLabel(next.providers[providerName], providerName, typedName);
+    applyProviderLabel(next.providers[providerName], providerName, existing ? typedProviderName(typedName, options.name, existing) : typedName);
     // Same rule as the other provider forms: read after the provider is updated, so an unticked
     // model is already undeclared and falls out of the picker on its own.
-    const existingSelections = pickerSelectionsExcept(next, providerName);
-    applyPickerSelections(next, pickerInput.checked ? [...existingSelections, ...checkedModels.map((model) => ({ ...model, provider: providerName }))] : existingSelections);
+    applyPickerSelections(next, providerPickerSelections(next, providerName, saved, checkedModels, pickerInput.checked), true);
     saveButton.disabled = true;
-    try { await configRequest(next); currentConfig = next; selectedProviderName = providerName; providerDetailTab = auth.value === "antigravity" ? "accounts" : "overview"; slotsLoaded = false; clientsLoaded = false; providersLoaded = false; closeModal(); await loadProviders(); toast(t("common.saved")); await offerPickerOn(pickerInput.checked && checkedModels.length > 0); }
+    try { const out = await configRequest(next); currentConfig = next; selectedProviderName = providerName; providerDetailTab = auth.value === "antigravity" ? "accounts" : "overview"; slotsLoaded = false; clientsLoaded = false; providersLoaded = false; closeModal(); await loadProviders(); configSaved(out, t("common.saved")); await offerPickerOn(pickerInput.checked && checkedModels.length > 0); }
     catch (error) { toast(t("common.saveFailed"), true, error.message); }
     finally { saveButton.disabled = false; }
   });
@@ -3557,7 +4908,7 @@ function openProviderForm(options) {
   const isAnthropic = options.kind === "anthropic" || (existing && existing.type === "anthropic");
   const isOpenAi = !isChatgpt && !isAnthropic && ((existing && existing.type === "openai-compatible") || (preset && preset.kind === "openai-compatible"));
   const isCustom = options.kind === "custom";
-  const displayName = (options.name && providerLabel(options.name, existing)) || (preset && preset.name) || (isChatgpt ? t("providers.chatgpt") : isAnthropic ? t("providers.anthropic") : t("providers.customName"));
+  const displayName = (options.name && providerFormName(options.name, existing)) || (preset && preset.name) || (isChatgpt ? t("providers.chatgpt") : isAnthropic ? t("providers.anthropic") : t("providers.customName"));
   if (isAnthropic) { openAnthropicProviderForm(options); return; }
   if (options.kind === "google" || (existing && existing.type === "google")) { openGoogleProviderForm(options); return; }
   if (options.kind === "grok" || (existing && existing.type === "grok")) { openGrokProviderForm(options); return; }
@@ -3815,6 +5166,8 @@ function openProviderForm(options) {
     if (!typedName) { toast(t("providers.nameRequired"), true); return; }
     const provider = draftProvider();
     if (!isChatgpt && (!provider.url || !/^https?:\/\//.test(provider.url))) { toast(t("providers.urlRequired"), true); return; }
+    // As in the Grok form: an open Clients-screen picker save lands first.
+    await pickerSaving.catch(() => {});
     const next = clone(await latestConfig());
     const providerName = existing ? options.name : uniqueName(typedName, next.providers, provider.url);
     const saved = existing && (next.providers[options.name] || existing);
@@ -3835,22 +5188,17 @@ function openProviderForm(options) {
       ? ["type", "auth", "defaultEffort", "identity", "limits", "instructionsAppend", "fast", "models"]
       : ["type", "url", "identity", "limits", "instructionsAppend", "preset", "sessionHeader", "wire", "headers", "models"]);
     const kept = saved ? Object.fromEntries(Object.entries(saved).filter(([key]) => !formKeys.has(key))) : {};
-    next.providers[providerName] = applyProviderLabel({ ...kept, ...provider }, providerName, typedName);
+    next.providers[providerName] = applyProviderLabel({ ...kept, ...provider }, providerName, existing ? typedProviderName(typedName, options.name, existing) : typedName);
     // A pooled provider's first key is `headers` and `credentials[0]` at once (the 계정 tab), so a
     // key changed here must change both, or the pool keeps sending the old one.
     const pooled = next.providers[providerName].credentials;
     if (Array.isArray(pooled) && pooled.length && normalizeKey(keyInput.value) && provider.headers) pooled[0] = { ...pooled[0], headers: { ...provider.headers } };
     // Read after `next.providers` has been updated, so an unticked model is already undeclared here
     // and falls out on its own, and a renamed provider answers to its new name.
-    const existingSelections = pickerSelectionsExcept(next, providerName);
-    if (pickerInput.checked) {
-      applyPickerSelections(next, [...existingSelections, ...checkedModels.map((model) => ({ ...model, provider: providerName }))], true);
-    } else {
-      applyPickerSelections(next, existingSelections);
-    }
+    applyPickerSelections(next, providerPickerSelections(next, providerName, saved, checkedModels, pickerInput.checked), pickerInput.checked);
     saveButton.disabled = true;
     try {
-      await configRequest(next);
+      const out = await configRequest(next);
       currentConfig = next;
       selectedProviderName = providerName;
       providerDetailTab = "overview";
@@ -3858,7 +5206,7 @@ function openProviderForm(options) {
       providersLoaded = false;
       closeModal();
       await loadProviders();
-      toast(t("common.saved"));
+      configSaved(out, t("common.saved"));
       await offerPickerOn(pickerInput.checked && checkedModels.length > 0);
       // Detached on purpose. Measuring asks every ticked model several questions, which is far
       // longer than a save should take, and a model whose wire is still unknown works exactly as it
@@ -3911,7 +5259,7 @@ const MOD_DEFAULTS = {
   allow: [], allowKnown: [], modes: [], delegation: "normal", providers: {},
   fallback: { agent: "general-purpose", model: "sonnet" },
   keepWarm: false, keepWarmHours: 2, keepWarmMinTokens: 30000,
-  compactModel: "claude-haiku-5-5",
+  compactModel: "claude-haiku-5-5", compactModels: [],
   swampAlert: false, layout: "dashboard", appearance: "auto", skin: "deep", language: "auto", hide: ["reason"], extras: [], setupDone: false,
 };
 
@@ -4103,7 +5451,7 @@ async function saveMod() {
       const sent = clone(modState.settings);
       let out;
       try {
-        out = await api("/api/mod-settings", { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ schemaVersion: 1, settings: sent, revision: modState.revision }) });
+        out = await api("/api/mod-settings", { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ schemaVersion: 2, settings: sent, revision: modState.revision }) });
       } catch (error) {
         if (error.status !== 409 || !error.body || !("settings" in error.body)) throw error;
         modWrites++;
@@ -4143,7 +5491,7 @@ async function saveCompactAt(value) {
   modRefresh();
   modStatus(t("slots.saving"));
   try {
-    const out = await api("/api/mod-settings", { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ schemaVersion: 1, compactAt: value }) });
+    const out = await api("/api/mod-settings", { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ schemaVersion: 2, compactAt: value }) });
     modState.compactAt = out && typeof out.compactAt === "number" && Number.isFinite(out.compactAt) ? out.compactAt : null;
     modStatus(t("mod.saved"));
   } catch (error) {
@@ -4230,8 +5578,12 @@ function modChoices() {
   const claudeEfforts = Array.isArray(options.claudeEfforts) && options.claudeEfforts.length ? options.claudeEfforts : ["low", "medium", "high", "xhigh", "max"];
   const workers = modAgents().map((agent) => {
     const info = modProviderInfo(agent.provider);
+    const pinned = agent.account !== undefined || typeof agent.accountNumber === "number";
     return {
+      // A pinned worker runs on one stored account: its number (the limits' "Claude n") picks the
+      // account tab it is listed under, so the label stays the bare model.
       value: agent.name, label: agent.model, model: agent.model, provider: agent.provider,
+      pinned, accountNumber: pinned && typeof agent.accountNumber === "number" ? agent.accountNumber : null, accountName: agent.account || "",
       billing: /(?::|-)free$/i.test(agent.model) ? "free" : agent.billing || (info && info.billing) || null,
       // A spent quota group lists its models under `models` while the provider still answers others.
       usable: !info || (info.usable !== false && !(info.models && info.models[agent.model])),
@@ -4275,6 +5627,48 @@ function modGroups(choices) {
   return groups;
 }
 function modGroupLabel(group) { return group.billing ? `${group.name} · ${t(`mod.billing.${group.billing}`)}` : group.name; }
+/** A group's head in the models list: its vendor's hue as a dot (Claude's own models take Claude's), then its name and billing. */
+function modGroupHead(group) {
+  const key = group.name === "Claude" ? "anthropic" : group.name;
+  const dot = el("span", { class: "vendor-dot", "aria-hidden": "true" });
+  dot.style.color = providerHue(key, modProviderInfo(key));
+  return el("span", { class: "tick-name" }, [dot, el("span", { text: modGroupLabel(group) })]);
+}
+
+// ---- Accounts: a provider with pinned workers lists one account at a time
+//
+// Account 1 is the provider's default: its ordinary workers, which run on the pool's own choice
+// (preferred account, else the saved order). Accounts 2… list their pinned workers. The numbers are
+// the limits' "Claude n"/"GPT n" (/api/mod-options `accounts`). The pinned workers of account 1, and
+// of an account no longer stored, are not listed; they stay valid where a setting already names them.
+
+/** The account tab a provider group shows, kept while the page is open; never saved. @type {Map<string, number>} */
+const modAccountTabs = new Map();
+/** The account a choice is listed under: 1 for an ordinary worker, its own number for a pinned one. */
+function modAccountOf(choice) { return choice.pinned ? choice.accountNumber : 1; }
+/** Whether a choice is listed at all: an ordinary worker, or a pinned one on account 2 or later. */
+function modListed(choice) { return !choice.pinned || choice.accountNumber > 1; }
+/** A choice's name where its account is not otherwise shown (a pick no longer offered, a hidden pin). */
+function modChoiceName(choice) {
+  if (!choice.pinned || !choice.accountNumber && !choice.accountName) return choice.label;
+  const account = choice.accountNumber > 1 || !choice.accountName ? t("mod.accountTab", { n: choice.accountNumber }) : choice.accountName;
+  return `${choice.label} · ${account}`;
+}
+/** A worker group's account tabs (`{number, label}`), or null when it has one account to show. */
+function modAccountTabsOf(group) {
+  if (!group.items.length || group.items[0].claude) return null;
+  const numbers = new Set(group.items.filter((choice) => choice.pinned && modListed(choice)).map((choice) => choice.accountNumber));
+  if (!numbers.size) return null;
+  const info = modProviderInfo(group.items[0].provider);
+  const accounts = info && Array.isArray(info.accounts) ? info.accounts : [];
+  const tabs = [1, ...[...numbers].sort((a, b) => a - b)].map((number) => accounts.find((account) => account.number === number) || { number });
+  return tabs.length > 1 ? tabs : null;
+}
+/** The tab shown for a group: the one picked here while it still exists, else account 1. */
+function modAccountTab(group, tabs) {
+  const picked = modAccountTabs.get(group.name);
+  return tabs.some((tab) => tab.number === picked) ? picked : 1;
+}
 
 // ---- The models to use: what the four workers are filled from and may run on
 
@@ -4302,17 +5696,38 @@ function modTickRows() {
   if (!choices.length) return [el("div", { class: "cell-note", text: t("mod.noModels") })];
   const onCount = choices.filter(modTicked).length;
   return modGroups(choices).map((group) => {
-    const boxes = group.items.map((choice) => {
+    const tabs = modAccountTabsOf(group);
+    const box = (choice) => {
       const on = modTicked(choice);
-      const input = el("input", { type: "checkbox", "data-key": `tick:${modTickKey(choice)}`, "aria-label": `${choice.label} · ${group.name}`, checked: on });
+      const account = tabs ? ` · ${t("mod.accountTab", { n: modAccountOf(choice) })}` : "";
+      const input = el("input", { type: "checkbox", "data-key": `tick:${modTickKey(choice)}`, "aria-label": `${choice.label} · ${group.name}${account}`, checked: on });
       if (on && onCount === 1) input.disabled = true;
       input.addEventListener("change", () => modTick(choice, input.checked));
       // A model paid differently from its group (a :free model on a paid provider) says so beside its name.
       const other = choice.billing && choice.billing !== group.billing ? el("span", { class: "model-effort-tag", text: t(`mod.billing.${choice.billing}`) }) : null;
       const off = choice.usable ? null : el("span", { class: "model-effort-tag warn-text", text: t("mod.notUsable") });
       return el("label", { class: "model-check", title: choice.model || choice.label }, [input, el("span", { text: choice.label }), other, off]);
+    };
+    const listed = group.items.filter(modListed);
+    if (!tabs) return el("div", { class: "tick-group" }, [el("div", { class: "tick-head" }, [modGroupHead(group)]), el("div", { class: "model-checklist" }, listed.map(box))]);
+    // Every account's list is drawn in the same place and only the picked one is visible, so the
+    // block keeps the tallest list's height and switching accounts moves nothing below it.
+    const shown = modAccountTab(group, tabs);
+    const id = (number) => `mod-account-${group.name}-${number}`;
+    const tabList = el("div", { class: "segmented account-tabs", role: "tablist", "aria-label": group.name }, tabs.map((tab) => el("button", {
+      type: "button", role: "tab", class: tab.number === shown ? "active" : "", "aria-selected": String(tab.number === shown), "aria-controls": id(tab.number),
+      "data-key": `account-tab:${group.name}:${tab.number}`, text: t("mod.accountTab", { n: tab.number }), ...(tab.label ? { title: tab.label } : {}),
+      onclick: () => { if (tab.number !== shown) { modAccountTabs.set(group.name, tab.number); modRefresh(); } },
+    })));
+    const panels = tabs.map((tab) => {
+      const panel = el("div", { class: `model-checklist${tab.number === shown ? "" : " account-hidden"}`, id: id(tab.number), role: "tabpanel" }, listed.filter((choice) => modAccountOf(choice) === tab.number).map(box));
+      if (tab.number !== shown) { panel.inert = true; panel.setAttribute("aria-hidden", "true"); }
+      return panel;
     });
-    return el("div", { class: "tick-group" }, [el("div", { class: "tick-head", text: modGroupLabel(group) }), el("div", { class: "model-checklist" }, boxes)]);
+    return el("div", { class: "tick-group" }, [
+      el("div", { class: "tick-head has-tabs" }, [modGroupHead(group), tabList]),
+      el("div", { class: "account-panels" }, panels),
+    ]);
   });
 }
 
@@ -4336,17 +5751,29 @@ function modTwoLevelRungs(rungs) {
 }
 /** One menu of `model · effort` for the ticked models, effort limited to what each model takes; the session's model too. */
 function modPickSelect(key, step, shown, label, onPick) {
-  const choices = modChoices().filter((choice) => choice.value === "general-purpose" || modTicked(choice));
-  const groups = modGroups(choices).map((group) => ({
-    group: modGroupLabel(group),
-    items: group.items.flatMap((choice) => modLadderOf(choice).map((effort) => ({ value: `${choice.value}|${effort}`, label: `${choice.label} · ${modEffortName(effort)}${choice.usable ? "" : t("mod.unavailableNow")}` }))),
-  }));
-  const current = step ? `${modTargetValue(step.target)}|${shown}` : "";
+  const picked = step ? modTargetValue(step.target) : "";
+  // An unlisted pinned worker (account 1's, see modListed) is offered only where it is the pick already.
+  const choices = modChoices().filter((choice) => choice.value === "general-purpose" || modTicked(choice) && (modListed(choice) || choice.value === picked));
+  const entries = (list) => list.flatMap((choice) => {
+    // A closed menu shows the option alone, not its group: a pinned worker names its account there.
+    const number = modListed(choice) ? modAccountOf(choice) : null;
+    const name = modListed(choice) ? (number && number > 1 ? `${choice.label} · ${t("mod.accountTab", { n: number })}` : choice.label) : modChoiceName(choice);
+    return modLadderOf(choice).map((effort) => ({ value: `${choice.value}|${effort}`, label: `${name} · ${modEffortName(effort)}${choice.usable ? "" : t("mod.unavailableNow")}` }));
+  });
+  // A provider with account tabs gets one group per account, named as its tab is.
+  const all = modGroups(modTickable());
+  const groups = modGroups(choices).flatMap((group) => {
+    const whole = all.find((entry) => entry.name === group.name);
+    const tabs = whole ? modAccountTabsOf(whole) : null;
+    if (!tabs) return [{ group: modGroupLabel(group), items: entries(group.items) }];
+    return tabs.map((tab) => ({ group: `${modGroupLabel(group)} · ${t("mod.accountTab", { n: tab.number })}`, items: entries(group.items.filter((choice) => modAccountOf(choice) === tab.number)) }));
+  });
+  const current = step ? `${picked}|${shown}` : "";
   const items = [...(step ? [] : [{ value: "", label: "—" }]), ...groups];
   // A pick that is not on offer now (its model unticked, or gone) keeps showing rather than a wrong neighbour.
   if (step && !groups.some((group) => group.items.some((item) => item.value === current))) {
     const choice = modChoiceOf(step.target);
-    items.unshift({ value: current, label: `${choice ? choice.label : modTargetValue(step.target)} · ${modEffortName(shown)}${t("mod.unavailable")}` });
+    items.unshift({ value: current, label: `${choice ? modChoiceName(choice) : picked} · ${modEffortName(shown)}${t("mod.unavailable")}` });
   }
   return modSelect(key, items, current, label, (value) => {
     if (!value) return;
@@ -4354,14 +5781,14 @@ function modPickSelect(key, step, shown, label, onPick) {
     onPick(modTargetOf(value.slice(0, bar)), value.slice(bar + 1));
   }, "rung-model");
 }
-/** @typedef {"general" | "ui" | "backend"} WorkerRuleKey */
+/** @typedef {"general" | "ui" | "backend" | "review"} WorkerRuleKey */
 /** Domain selection is local UI state, independently retained for each saved worker set.
  * @type {Map<string, WorkerRuleKey>}
  */
 const modRuleTabs = new Map();
 /** Save only this set's optional rule; deleting it makes the set follow its own general ladder.
  * @param {import("../mod/types").Mode | undefined} mode
- * @param {"ui" | "backend"} key
+ * @param {"ui" | "backend" | "review"} key
  * @param {import("../mod/types").Rule | undefined} rule
  */
 function modSetDomainRule(mode, key, rule) {
@@ -4381,6 +5808,7 @@ function modWorkerRows(mode) {
     { value: "general", label: t("mod.domain.general") },
     { value: "ui", label: t("mod.domain.ui") },
     { value: "backend", label: t("mod.domain.backend") },
+    { value: "review", label: t("mod.domain.review") },
   ], key, t("mod.workerDomain"), (value) => { modRuleTabs.set(id, value); modRefresh(); }), null, "wide")];
   if (key !== "general") rows.push(cell(t("mod.domainSeparate"), modSwitch(`worker-separate:${id}:${key}`, !!rule, t("mod.domainSeparate"), (on) => {
     // Switching on copies the set's general rungs, folded the same way a domain ladder is.
@@ -4417,7 +5845,7 @@ function modRungRow(mode, ruleKey, rowKey, name, hintKey, steps, save) {
     ]);
   });
   const add = el("button", { type: "button", class: "btn secondary compact", "data-key": `worker-add:${mode ? mode.id : "base"}:${ruleKey}:${rowKey}`, text: t("mod.modeAddModel"), onclick: () => {
-    const choice = modChoices().find((item) => item.value !== "general-purpose" && modTicked(item)) || modChoices().at(-1);
+    const choice = modChoices().find((item) => item.value !== "general-purpose" && modTicked(item) && modListed(item)) || modChoices().at(-1);
     save([...steps, { target: modTargetOf(choice.value), effort: modNearest("medium", modLadderOf(choice)) }]);
   } });
   return cell(el("span", { class: "cell-label strong", text: name }), el("div", { class: "rung-list" }, [el("ol", {}, rows), add]), modCap(t(hintKey)), "wide rung-row");
@@ -4490,9 +5918,9 @@ async function modLoadResets() {
   const claude = providers.some((provider) => provider.type === "anthropic") && modQuotaKnown(status && status.claude && status.claude.accounts, true);
   modResetProviders = [...chatgpt.flat(), ...(claude ? ["anthropic"] : [])];
 }
-/** The name a reset provider goes by: Claude, ChatGPT, or another ChatGPT provider's own name. */
+/** The name a reset provider goes by: Claude for the Claude login ("anthropic"), else the provider's name as Status shows it. */
 function modResetLabel(provider) {
-  return provider === "anthropic" ? "Claude" : provider === "chatgpt" ? "ChatGPT" : provider;
+  return provider === "anthropic" ? "Claude" : providerDisplayName(provider);
 }
 /** Choosing reset starts on a known provider the mode's workers use, else the first known one. */
 function modResetDefault(rungs) {
@@ -4628,7 +6056,7 @@ function modJudgeCard() {
     }
   }
   if (s.judge === "model") {
-    const models = modModels().map((model) => ({ value: model.model, label: `${model.name || model.model} · ${model.provider}` }));
+    const models = modModels().map((model) => ({ value: model.model, label: `${model.name || model.model} · ${providerDisplayName(model.provider)}` }));
     rows.push(cell(t("mod.model"), models.length || s.judgeModel
       ? modSelect("judge-model", models, s.judgeModel, t("mod.model"), (judgeModel) => modPatch({ judgeModel }))
       : el("span", { text: modCap(t("mod.noModels")) }), modCap(t("mod.haikuFallback"))));
@@ -4662,8 +6090,23 @@ function modCompactModelItems() {
   return [
     { value: "session", label: t("mod.compactSession") },
     { group: "Claude", items: claude },
-    ...[...groups].map(([provider, items]) => ({ group: provider, items })),
+    ...[...groups].map(([provider, items]) => ({ group: providerDisplayName(provider), items })),
   ];
+}
+
+function modCompactChoices(s) {
+  const choices = s.compactModels || [];
+  const items = modCompactModelItems();
+  const rows = choices.map((value, index) => el("li", { class: "rung-item" }, [
+    modSelect(`compact-choice:${index}`, items, value, t("mod.compactChoices"), (next) => {
+      if (!choices.includes(next)) modPatch({ compactModels: choices.map((item, at) => at === index ? next : item) });
+      else modRefresh();
+    }, "rung-model"),
+    el("div", { class: "rung-actions" }, [el("button", { type: "button", class: "btn secondary compact", "data-key": `compact-remove:${index}`, text: "✕", "aria-label": t("common.remove"), onclick: () => modPatch({ compactModels: choices.filter((_, at) => at !== index) }) })]),
+  ]));
+  const available = items.flatMap(item => item.group ? item.items : [item]).find(item => item.value !== s.compactModel && !choices.includes(item.value));
+  const add = el("button", { type: "button", class: "btn secondary compact", "data-key": "compact-add", text: t("mod.modeAddModel"), ...(!available || choices.length >= 4 ? { disabled: "" } : {}), onclick: () => { if (available) modPatch({ compactModels: [...choices, available.value] }); } });
+  return cell(t("mod.compactChoices"), el("div", { class: "rung-list" }, [el("ol", {}, rows), add]), t("mod.compactChoicesHint"), "wide rung-row");
 }
 
 function modCompactCard() {
@@ -4693,6 +6136,7 @@ function modCompactCard() {
   const hint = outOfRange ? t("mod.compactAtRange") : modCap(t("mod.compactAtHint"));
   return modCard("compact", t("mod.compaction"), t("mod.compactionBlurb"), [modSection(null, [
     cell(t("mod.compactModel"), modSelect("compact-model", modCompactModelItems(), s.compactModel, t("mod.compactModel"), (compactModel) => modPatch({ compactModel })), null, "wide"),
+    modCompactChoices(s),
     cell(t("mod.compactAt"), el("div", { class: "mode-until compact-at" }, [preset, custom]), el("span", { class: outOfRange ? "cell-sub warn-text" : undefined, text: hint }), "wide"),
   ])]);
 }
@@ -4738,7 +6182,19 @@ let usageTo = ""; // custom end (inclusive), a local "YYYY-MM-DD"
 let lastSummary = null;
 let configuredProviders = null; // provider names from /api/config, fetched once for this view
 let renderedProviderNames = "";
-let requestsGeneration = 0;
+// Each read applies only its own newest answer. The 3-second refresh starts another read while a slow
+// one (the 7-day aggregation) is still in flight, so a read is never thrown away for being superseded
+// by the poll: that discarded every answer slower than the poll, and the page stayed empty.
+let summarySeq = 0;
+let summaryApplied = 0;
+let requestsSeq = 0;
+let requestsApplied = 0;
+// Which selection the drawn figures belong to (null: nothing drawn yet), and which selection's latest
+// read failed while nothing for it is drawn. paintUsage and paintRequests turn these into what shows.
+let usageDrawnKey = null;
+let usageFailedKey = null;
+let requestsDrawnKey = null;
+let requestsFailedKey = null;
 (function restoreUsage() {
   try {
     const saved = JSON.parse(localStorage.getItem(USAGE_STORE) || "null");
@@ -4782,7 +6238,14 @@ function showLogsPanel(name) {
 }
 $("#logs-requests-tab").addEventListener("click", () => showLogsPanel("requests"));
 $("#logs-raw-tab").addEventListener("click", () => showLogsPanel("raw"));
-$("#logs-provider").addEventListener("change", (event) => { requestProvider = event.target.value; saveUsage(); void refreshRequests(); });
+$("#logs-provider").addEventListener("change", (event) => {
+  requestProvider = event.target.value;
+  saveUsage();
+  // The usage figures do not depend on the provider, so they are filtered at once; the requests are marked updating until their read lands.
+  paintUsage();
+  paintRequests();
+  void refreshRequests();
+});
 
 // ---- Usage period: local calendar days, so "today" starts at this machine's midnight.
 function isDay(value) { return typeof value === "string" && /^\d{4}-\d{2}-\d{2}$/.test(value) && !Number.isNaN(dayStart(value).valueOf()); }
@@ -4869,19 +6332,57 @@ for (const selector of ["#logs-from", "#logs-to"]) {
 renderPeriodControl();
 fillCustomDates();
 
-const EMPTY_BUCKET = { count: 0, ok: 0, failed: 0, input: 0, cached: 0, cacheWrite: 0, output: 0, avgMs: 0, cacheHitPercent: 0 };
+// ---- Cost: what a period's requests would cost at public API prices (2026-11-09). A subscription's
+// requests are shown at what the API would have charged. A row with no known price says "—", never
+// $0.00 (free); a total that includes an estimated cache rate is marked "≈"; a bucket the router
+// sent no cost for (one that does not price requests yet) shows no cost at all.
+function costUsdText(usd) {
+  if (!(usd > 0)) return "$0.00";
+  if (usd < 0.005) return "<$0.01";
+  return `$${usd.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+}
+/** A bucket's amount, "—" for one nothing of which was priced, or null when it carries no cost. */
+function costFigureOf(bucket) {
+  if (!bucket || typeof bucket.costUsd !== "number" || !Number.isFinite(bucket.costUsd)) return null;
+  if (bucket.costUsd <= 0 && bucket.unpricedRequests > 0) return "—";
+  return `${bucket.estimatedRequests > 0 ? "≈" : ""}${costUsdText(bucket.costUsd)}`;
+}
+/** What a bucket's amount leaves out or estimates, as the sentences the note carries; for a row's hover. */
+function costCaveatsOf(bucket) {
+  const lines = [];
+  if (bucket && bucket.unpricedRequests > 0) lines.push(t("logs.cost.unpriced", { count: formatNumber(bucket.unpricedRequests) }));
+  if (bucket && bucket.estimatedRequests > 0) lines.push(t("logs.cost.estimated", { count: formatNumber(bucket.estimatedRequests) }));
+  return lines;
+}
+/** The note under the summary: how the amounts are worked out, then what they leave out. */
+function renderCostNote(total) {
+  const note = $("#logs-cost-note");
+  const shown = costFigureOf(total) !== null;
+  note.hidden = !shown;
+  note.replaceChildren(...(shown ? [t("logs.cost.note"), ...costCaveatsOf(total)] : []).map((line) => el("div", { text: line })));
+}
+
+const EMPTY_BUCKET = { count: 0, ok: 0, failed: 0, input: 0, cached: 0, cacheWrite: 0, output: 0, avgMs: 0, cacheHitPercent: 0, conversationTokens: 0 };
 function renderSummary(summary) {
   const providers = (summary && summary.providers) || {};
   const total = (requestProvider ? providers[requestProvider] : summary && summary.total) || EMPTY_BUCKET;
-  $("#logs-summary").replaceChildren(
+  const cost = costFigureOf(total);
+  const chips = [
     summaryChip(t("logs.summary.requests"), formatNumber(total.count)),
     summaryChip(t("logs.summary.success"), `${formatNumber(total.ok)} / ${formatNumber(total.failed)}`),
+    // The router groups conversations: last whole prompt + every output, as on the Agents card.
+    // Input/output and the model table keep their independent request-volume accounting.
+    summaryChip(t("logs.th.tokens"), formatNumber(total.conversationTokens)),
     // On its own line: with the whole input counted the number runs to eight digits, and the
     // ellipsis on one line cut the cache rate off entirely.
     summaryChip(t("logs.summary.input"), formatNumber(totalInputOf(total)), t("logs.cacheHit", { percent: total.cacheHitPercent || 0 })),
     summaryChip(t("logs.summary.output"), formatNumber(total.output)),
-    summaryChip(t("logs.summary.duration"), formatSeconds(total.avgMs)),
-  );
+  ];
+  if (cost !== null) chips.push(summaryChip(t("logs.summary.cost"), cost, t("logs.cost.basis")));
+  chips.push(summaryChip(t("logs.summary.duration"), formatSeconds(total.avgMs)));
+  $("#logs-summary").classList.toggle("with-cost", cost !== null);
+  $("#logs-summary").replaceChildren(...chips);
+  renderCostNote(total);
   fitSummaryValues();
 }
 // A long period runs the input to ten digits and the requests to "52,939 / 310", wider than a chip
@@ -4912,13 +6413,15 @@ function renderProviderFilter(summary, records) {
   for (const model of (summary && Array.isArray(summary.models) ? summary.models : [])) if (model.provider) knownRequestProviders.add(model.provider);
   for (const record of records) if (record.provider) knownRequestProviders.add(record.provider);
   if (requestProvider) knownRequestProviders.add(requestProvider);
-  const names = [...knownRequestProviders].sort();
+  // Listed by the names people know them by, as the rows below name them.
+  // The names are providerDisplayName's, so two of a kind ("ChatGPT (work)", "ChatGPT (personal)") stay apart here too.
+  const names = [...knownRequestProviders].map((name) => [name, providerDisplayName(name)]).sort((a, b) => a[1].localeCompare(b[1]) || a[0].localeCompare(b[0]));
   // Rebuilt only when the list changes, so the 3-second refresh does not close an open menu.
-  const key = names.map((name) => `${name}\t${providerLabel(name)}`).join("\n");
+  const key = names.map(([name, title]) => `${name}\t${title}`).join("\n");
   const select = $("#logs-provider");
   if (key !== renderedProviderNames) {
     renderedProviderNames = key;
-    select.replaceChildren(el("option", { value: "", text: t("logs.all") }), ...names.map((name) => el("option", { value: name, text: providerLabel(name) })));
+    select.replaceChildren(el("option", { value: "", text: t("logs.all") }), ...names.map(([name, title]) => el("option", { value: name, text: title })));
   }
   if (select.value !== requestProvider) select.value = requestProvider;
 }
@@ -4926,11 +6429,20 @@ async function loadConfiguredProviders() {
   if (configuredProviders || currentConfig) return;
   try { configuredProviders = (await api("/api/config")).providers || {}; } catch { /* the usage and requests still name their providers */ }
 }
+/** A model row's cost: its amount (or "—"), what it leaves out or estimates on hover; "—" from a router that sends none. */
+function modelCostCell(entry) {
+  const figure = costFigureOf(entry);
+  const caveats = costCaveatsOf(entry);
+  return el("td", { class: "c-cost", "data-label": t("logs.th.cost"), title: caveats.length ? caveats.join(" ") : undefined }, [figure === null ? "—" : figure]);
+}
 function modelUsageRow(entry) {
   const total = totalInputOf(entry);
+  const rate = modelRateOf(entry);
   const model = el("div", { class: "request-models" }, [
     el("span", { class: "model", text: entry.model, title: entry.model }),
-    el("span", { class: `provider-badge ${providerClass(entry.provider)}`, text: providerLabel(entry.provider) }),
+    // A WebSearch side request is counted apart from the model's own turns; the router marks it.
+    entry.purpose === "web-search" ? el("span", { class: "purpose-tag", text: t("logs.webSearch"), title: t("logs.webSearchHelp") }) : null,
+    providerBadge(entry.provider, providerDisplayName(entry.provider)),
   ]);
   // The labels show only where a narrow window drops the header row.
   return el("tr", {}, [
@@ -4938,7 +6450,12 @@ function modelUsageRow(entry) {
     el("td", { class: "c-count", "data-label": t("logs.th.count") }, [formatNumber(entry.count)]),
     el("td", { class: "c-in", "data-label": t("logs.th.input") }, [el("span", { class: "token-cell", text: formatNumber(total) }, [el("span", { class: "cache-pill", text: t("logs.cacheHit", { percent: entry.cacheHitPercent || 0 }) })])]),
     el("td", { class: "c-out", "data-label": t("logs.th.output") }, [formatNumber(entry.output)]),
-    el("td", { class: "c-dur", "data-label": t("logs.th.avg") }, [formatSeconds(entry.avgMs)]),
+    modelCostCell(entry),
+    el("td", { class: "c-dur", "data-label": t("logs.th.avg"), title: rate === null ? undefined : t("logs.modelRateHelp") }, [
+      formatSeconds(entry.avgMs),
+      // An empty pill keeps the column's figures lined up where a row has no rate.
+      el("span", { class: "rate-pill", ...(rate === null ? { "aria-hidden": "true" } : { text: t("logs.rateApprox", { value: rateValue(rate) }) }) }),
+    ]),
   ]);
 }
 function renderModelUsage(summary) {
@@ -4951,17 +6468,73 @@ function renderModelUsage(summary) {
 function totalInputOf(usage) {
   return (usage.input || 0) + (usage.cached || 0) + (usage.cacheWrite || 0);
 }
+// Below this a request is mostly fixed overhead, and a rate from it is noise.
+const OUTPUT_RATE_MIN_MS = 500;
+/**
+ * Output tokens per second over the request's whole recorded time: the router's `ms` runs from the
+ * body read to the response end, so the wait for the first token is in it and this is not the
+ * model's generation speed. Only a finished model answer with a real output count gets one: a
+ * failure, a resend, an answer refused before reaching a model, a web search (answered in one piece
+ * after the search) and an image have none, and neither has an output of 0, which a missing usage
+ * also reads as.
+ */
+function outputRateOf(record) {
+  if (!record || record.kind !== "messages" || record.purpose === "web-search" || !record.ok || record.resent || record.upstreamCalled === false) return null;
+  const output = record.usage ? record.usage.output : undefined;
+  if (typeof output !== "number" || !Number.isFinite(output) || output <= 0) return null;
+  if (typeof record.ms !== "number" || !Number.isFinite(record.ms) || record.ms < OUTPUT_RATE_MIN_MS) return null;
+  return (output * 1000) / record.ms;
+}
+/**
+ * A model row's output rate, approximated from the summary it already has: its output over all its
+ * requests' time (`avgMs × count`). That time also holds failed, resent and token-count requests,
+ * which bring no output, so a model with long failures reads lower than its answers ran. A web
+ * search row has none, as on the request list.
+ */
+function modelRateOf(entry) {
+  if (!entry || entry.purpose === "web-search") return null;
+  const { output, avgMs, count } = entry;
+  if (![output, avgMs, count].every((n) => typeof n === "number" && Number.isFinite(n) && n > 0)) return null;
+  if (avgMs < OUTPUT_RATE_MIN_MS) return null;
+  return (output * 1000) / (avgMs * count);
+}
+function rateValue(rate) {
+  return rate >= 100 ? Math.round(rate).toLocaleString() : rate.toFixed(1);
+}
+function formatRate(rate) {
+  return t("logs.rate", { value: rateValue(rate) });
+}
+/** A provider's mark on a row: its vendor's hue as a dot, then a name (the provider's, or the account's). */
+function providerBadge(name, text, title) {
+  const dot = el("span", { class: "vendor-dot", "aria-hidden": "true" });
+  dot.style.color = providerHue(name, providerEntry(name));
+  return el("span", { class: `provider-badge ${providerClass(name)}`, ...(title ? { title } : {}) }, [dot, el("span", { class: "provider-badge-name", text })]);
+}
+function requestAccount(record) {
+  // The current login has a name only when its row snapshotted the email; an older row says just that it was the login.
+  if (record.account === "current") return record.accountLabel || t("providers.anthropicCurrent");
+  // The same naming as the accounts list (claudeAccountLabel): the router's generic default name is translated.
+  if (record.account) return record.accountLabel === "Claude account" ? t("providers.claudeAccountDefault") : record.accountLabel || record.account.slice(0, 8);
+  // An API key's label is kept on its row when the request runs; the keys configured now do not decide it.
+  return record.credential || "";
+}
 function requestDetail(record) {
   const details = [
     [t("logs.detail.id"), record.id],
-    [t("logs.detail.kind"), record.kind],
+    [t("logs.detail.kind"), record.purpose === "web-search" ? `${record.kind} · ${t("logs.webSearch")}` : record.kind],
     [t("logs.detail.stop"), record.stopReason || t("logs.none")],
     [t("logs.detail.uncached"), record.usage ? formatNumber(record.usage.input) : t("logs.none")],
     [t("logs.detail.cacheRead"), record.usage && record.usage.cached ? formatNumber(record.usage.cached) : t("logs.none")],
     [t("logs.detail.cacheWrite"), record.usage && record.usage.cacheWrite ? formatNumber(record.usage.cacheWrite) : t("logs.none")],
-  ].map(([label, value]) => el("div", {}, [el("span", { class: "detail-label", text: label }), el("span", { class: "detail-value", text: value })]));
-  if (record.note) details.push(el("div", { class: "request-note" }, [el("span", { class: "detail-label", text: t("logs.detail.note") }), el("span", { class: "detail-value", text: record.note })]));
-  return el("tr", { class: "request-detail" }, [el("td", { colspan: "7" }, [el("div", { class: "request-detail-grid" }, details)])]);
+  ];
+  const account = requestAccount(record);
+  if (account) details.push([t("logs.provider"), providerDisplayName(record.provider)], [t("logs.detail.account"), account]);
+  // Both tiers side by side: the ChatGPT sign-in often serves `default` for a request made on
+  // `priority` (#54), so the served tier cannot be the FAST badge's basis; the requested one is.
+  if (record.requestedTier || record.servedTier) details.push([t("logs.detail.tier"), `${record.requestedTier || t("logs.none")} / ${record.servedTier || t("logs.none")}`]);
+  const cells = details.map(([label, value]) => el("div", {}, [el("span", { class: "detail-label", text: label }), el("span", { class: "detail-value", text: value })]));
+  if (record.note) cells.push(el("div", { class: "request-note" }, [el("span", { class: "detail-label", text: t("logs.detail.note") }), el("span", { class: "detail-value", text: record.note })]));
+  return el("tr", { class: "request-detail" }, [el("td", { colspan: "7" }, [el("div", { class: "request-detail-grid" }, cells)])]);
 }
 function requestRow(record) {
   const row = el("tr", { class: "request-row", title: record.note || "", onclick: () => { expandedRequestId = expandedRequestId === record.id ? null : record.id; renderRequests(requestRows); } });
@@ -4969,17 +6542,25 @@ function requestRow(record) {
   // override it, and `gpt-6-sol@medium` beside an effort of high read as a contradiction
   // (2026-09-23). The effort column is the sent value, so the source is shown without it.
   const source = record.source ? record.source.replace(/@[^@]*$/, "") : "";
+  const account = requestAccount(record);
   const model = el("div", { class: "request-models" }, [
     el("span", { class: "model", text: record.target }),
     source && source !== record.target ? el("span", { class: "small", text: `(${source})` }) : null,
-    el("span", { class: `provider-badge ${providerClass(record.provider)}`, text: providerLabel(record.provider) }),
+    record.purpose === "web-search" ? el("span", { class: "purpose-tag", text: t("logs.webSearch"), title: t("logs.webSearchHelp") }) : null,
+    // The account says more than the provider's name, which the dot's hue already carries: the
+    // badge names the provider on hover and in the detail.
+    providerBadge(record.provider, account || providerDisplayName(record.provider), account ? providerDisplayName(record.provider) : undefined),
+    // The requested tier, not the served one: the ChatGPT sign-in answers `default` to a Fast request (#54).
+    record.requestedTier === "priority" ? el("span", { class: "fast-tag", text: "FAST", title: t("logs.fastHelp") }) : null,
   ].filter(Boolean));
   // The whole input, not the uncached remainder: a fully cached Anthropic turn reports `input: 2`,
   // which read as a two-token request (2026-09-23). The split is in the detail row.
   const totalInput = record.usage ? totalInputOf(record.usage) : 0;
+  const rate = outputRateOf(record);
+  // A row without usage keeps an empty pill, so its dash lines up with the figures above it.
   const input = record.usage
     ? el("span", { class: "token-cell", text: formatNumber(totalInput) }, [el("span", { class: "cache-pill", text: t("logs.cacheHit", { percent: Math.round(record.usage.cached / Math.max(1, totalInput) * 100) }) })])
-    : el("span", { class: "no-usage", text: t("common.notAvailable") });
+    : el("span", { class: "no-usage", text: t("common.notAvailable") }, [el("span", { class: "cache-pill", "aria-hidden": "true" })]);
   const status = record.resent
     ? el("span", { class: "status-text resent", text: `${t("logs.status.resent")} ${record.status}`, title: t("logs.status.resentHelp") })
     : el("span", { class: `status-text ${record.ok ? "ok" : "bad"}`, text: `${record.ok ? t("logs.status.ok") : t("logs.status.error")} ${record.status}` });
@@ -4990,7 +6571,10 @@ function requestRow(record) {
     el("td", { class: "c-effort", text: record.effort || t("common.notAvailable") }),
     el("td", { class: "c-in" }, [input]),
     el("td", { class: record.usage ? "c-out" : "c-out no-usage", text: record.usage ? formatNumber(record.usage.output) : t("common.notAvailable") }),
-    el("td", { class: "c-dur", text: formatSeconds(record.ms) }),
+    el("td", { class: "c-dur", title: rate === null ? undefined : t("logs.rateHelp") }, [
+      formatSeconds(record.ms),
+      el("span", { class: "rate-pill", ...(rate === null ? { "aria-hidden": "true" } : { text: formatRate(rate) }) }),
+    ]),
     el("td", { class: "c-status" }, [status]),
   );
   return row;
@@ -5004,30 +6588,146 @@ function renderRequests(records) {
   $("#requests-empty").hidden = records.length !== 0;
   scroll.scrollLeft = left;
 }
+/** A region whose first read has not landed: a few bars in the shape of its rows (every page uses it). */
+function skeletonLines(count) {
+  return el("div", { class: "skeleton-lines", "aria-hidden": "true" }, Array.from({ length: count }, (_, row) => el("span", { class: `skeleton-bar skeleton-w${row % 3}` })));
+}
+/** A region whose first read failed: the one line, in red, where its content would be. */
+function loadFailedLine(tag = "div") { return el(tag, { class: "load-failed", role: "alert", text: t("common.loadFailed") }); }
+/** The selection the usage figures cover: the period, and for a custom one its dates. */
+function usageKey() { return usagePeriod === "custom" ? `custom|${usageFrom}|${usageTo}` : usagePeriod; }
+/**
+ * What an area shows for a selection: "current" (its own figures, which stay when a later read fails),
+ * "dimmed" (an earlier selection's figures while this one's read is in flight), "failed" (its latest read
+ * failed and nothing for it is drawn), or "skeleton" (nothing has landed yet).
+ */
+function readState(drawnKey, failedKey, key) {
+  if (drawnKey === key) return "current";
+  if (failedKey === key) return "failed";
+  return drawnKey === null ? "skeleton" : "dimmed";
+}
+/** Placeholder bars in the shape of the summary chips, drawn until the first usage read lands. */
+function skeletonChips() {
+  return Array.from({ length: 6 }, () => el("div", { class: "logs-chip skeleton-chip", "aria-hidden": "true" }, [el("span", { class: "skeleton-bar skeleton-label" }), el("span", { class: "skeleton-bar skeleton-value" })]));
+}
+/** Table rows of placeholder bars, one per column, drawn until a table's first read lands. */
+function skeletonRows(columns, count) {
+  return Array.from({ length: count }, (_, row) => el("tr", { class: "skeleton-row", "aria-hidden": "true" }, Array.from({ length: columns }, (__, column) => el("td", {}, [el("span", { class: `skeleton-bar skeleton-w${(row + column) % 3}` })]))));
+}
+/**
+ * The usage summary and the model table. Figures for this selection show as they are; figures for an
+ * earlier selection stay readable but dimmed while this one's read is in flight; before anything has
+ * landed a skeleton holds the place; and a failed read with nothing for this selection says so.
+ */
+function paintUsage() {
+  const state = readState(usageDrawnKey, usageFailedKey, usageKey());
+  const failed = state === "failed";
+  const figures = state === "current" || state === "dimmed";
+  const summary = $("#logs-summary");
+  const card = $("#models-table").closest(".logs-table-card");
+  const tbody = $("#models-table tbody");
+  summary.hidden = failed;
+  $("#logs-usage-error").hidden = !failed;
+  $("#models-error").hidden = !failed;
+  if (figures) {
+    renderSummary(lastSummary);
+    renderModelUsage(lastSummary);
+  } else if (failed) {
+    summary.replaceChildren();
+    $("#logs-cost-note").hidden = true;
+    tbody.replaceChildren();
+    card.hidden = true;
+    $("#models-empty").hidden = true;
+  } else {
+    summary.classList.remove("with-cost");
+    summary.replaceChildren(...skeletonChips());
+    $("#logs-cost-note").hidden = true;
+    tbody.replaceChildren(...skeletonRows(6, 3));
+    card.hidden = false;
+    $("#models-empty").hidden = true;
+  }
+  const updating = state === "dimmed";
+  summary.classList.toggle("is-updating", updating);
+  card.classList.toggle("is-updating", updating);
+  paintLoadingLine();
+}
+/** The recent requests for the chosen provider, in the same states as the usage figures. */
+function paintRequests() {
+  const provider = requestProvider;
+  const state = readState(requestsDrawnKey, requestsFailedKey, provider);
+  const failed = state === "failed";
+  const figures = state === "current" || state === "dimmed";
+  const scroll = $("#requests-table").closest(".logs-table-card");
+  const tbody = $("#requests-table tbody");
+  $("#requests-error").hidden = !failed;
+  if (figures) {
+    renderRequests(requestRows);
+  } else if (failed) {
+    tbody.replaceChildren();
+    scroll.hidden = true;
+    $("#requests-empty").hidden = true;
+  } else {
+    tbody.replaceChildren(...skeletonRows(7, 5));
+    scroll.hidden = false;
+    $("#requests-empty").hidden = true;
+  }
+  scroll.classList.toggle("is-updating", state === "dimmed");
+  paintLoadingLine();
+}
+/** The one line that says a read is in flight: shown while an area waits for its selection's figures, and not while a failure is what shows. */
+function paintLoadingLine() {
+  const pending = (state) => state === "dimmed" || state === "skeleton";
+  const busy = pending(readState(usageDrawnKey, usageFailedKey, usageKey())) || pending(readState(requestsDrawnKey, requestsFailedKey, requestProvider));
+  $("#logs-updating").hidden = !busy;
+}
 async function refreshRequests() {
   if (logsPanel !== "requests") return;
-  // A period or provider picked while an older refresh is in flight must not be painted over by it.
-  const generation = ++requestsGeneration;
+  // A period or provider picked while an older read is in flight is not painted over by it: each read
+  // applies only if it is newer than the last applied one, and the selection it asked for is still the one shown.
   const provider = requestProvider;
+  const usage = usageKey();
   const range = usageRange();
   // A custom range with an unusable date waits for the fields instead of falling back to the hour.
   if (usagePeriod === "custom" && !range) return;
   $("#logs-range-caption").textContent = usageCaption(range, lastSummary && lastSummary.earliest);
   const summaryPath = range ? `/api/requests/summary?from=${range.from}&to=${range.to}` : "/api/requests/summary?since=3600";
   const suffix = provider ? `&provider=${encodeURIComponent(provider)}` : "";
-  const [records, summary] = await Promise.allSettled([api(`/api/requests?n=200${suffix}&kind=messages,image`), api(summaryPath), loadConfiguredProviders()]);
-  if (generation !== requestsGeneration) return;
-  // Each half keeps its last good contents when its own call fails.
-  if (summary.status === "fulfilled") {
-    lastSummary = summary.value;
-    $("#logs-range-caption").textContent = usageCaption(range, lastSummary.earliest);
-    renderSummary(lastSummary);
-    renderModelUsage(lastSummary);
-  }
-  if (records.status === "fulfilled") {
-    requestRows = Array.isArray(records.value.requests) ? records.value.requests : [];
-    renderRequests(requestRows);
-  }
+  const summarySeqNow = ++summarySeq;
+  const requestsSeqNow = ++requestsSeq;
+  paintUsage();
+  paintRequests();
+  // The configured providers are read once; a row's provider name needs them, so no answer is drawn before they are in.
+  const configured = loadConfiguredProviders();
+  // Each half is drawn as its own read lands, so a fast request list does not wait for the slow usage.
+  const usageRead = api(summaryPath).then(async (summary) => {
+    await configured;
+    if (summarySeqNow < summaryApplied || usage !== usageKey()) return;
+    summaryApplied = summarySeqNow;
+    lastSummary = summary;
+    usageDrawnKey = usage;
+    usageFailedKey = null;
+    $("#logs-range-caption").textContent = usageCaption(range, summary.earliest);
+    paintUsage();
+  }, () => {
+    if (summarySeqNow < summaryApplied || usage !== usageKey()) return;
+    // Figures already drawn for this selection stay, as before; nothing drawn for it means the failure shows.
+    usageFailedKey = usage;
+    paintUsage();
+  });
+  const requestsRead = api(`/api/requests?n=200${suffix}&kind=messages,image`).then(async (body) => {
+    await configured;
+    if (requestsSeqNow < requestsApplied || provider !== requestProvider) return;
+    requestsApplied = requestsSeqNow;
+    requestRows = Array.isArray(body.requests) ? body.requests : [];
+    requestsDrawnKey = provider;
+    requestsFailedKey = null;
+    paintRequests();
+  }, () => {
+    if (requestsSeqNow < requestsApplied || provider !== requestProvider) return;
+    requestsFailedKey = provider;
+    paintRequests();
+  });
+  await Promise.all([usageRead, requestsRead]);
   renderProviderFilter(lastSummary, requestRows);
 }
 async function refreshLogs() {

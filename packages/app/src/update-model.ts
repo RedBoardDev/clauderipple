@@ -13,6 +13,45 @@ export type RouterUpdate = {
 export type UpdateSeen = { updated: string[]; available: string[] };
 export type UpdateNotice = { kind: "updated"; version: string; relaunch: boolean } | { kind: "available"; version: string };
 
+/**
+ * The version of the running tray. Electron answers with its own version when it was started from
+ * a script file rather than a folder, which is how the CLI starts an npm install: getVersion() said
+ * 38.8.6 beside a 0.12.14 router, so every router looked newly updated and the tray replaced itself
+ * every couple of seconds (Discord report, 0.12.14). A packaged build carries its version in its
+ * bundle and answers right; the unpackaged ones have it in the package.json the build writes beside
+ * the tray (dist/app) or the workspace keeps (packages/app) — read through `packageVersion`.
+ */
+export function resolveTrayVersion(packaged: boolean, electronVersion: string, packageVersion: string | null): string {
+  if (packaged) return electronVersion;
+  return packageVersion?.trim() || electronVersion;
+}
+
+/** How many times one router/tray version pair may be replaced before the tray stays where it is. */
+export const REPLACEMENT_LIMIT = 3;
+
+/** Replacement attempts for one version pair, kept on disk: each attempt ends this process, so no run can count them. */
+export type ReplacementTries = { routerVersion: string; trayVersion: string; attempts: number };
+
+export function readReplacementTries(value: unknown): ReplacementTries | null {
+  if (!value || typeof value !== "object") return null;
+  const v = value as Partial<ReplacementTries>;
+  if (typeof v.routerVersion !== "string" || typeof v.trayVersion !== "string"
+    || typeof v.attempts !== "number" || !Number.isFinite(v.attempts)) return null;
+  return { routerVersion: v.routerVersion, trayVersion: v.trayVersion, attempts: Math.max(0, Math.floor(v.attempts)) };
+}
+
+/** A pair still not matching after this many launches will not start matching on its own. */
+export function replacementExhausted(previous: ReplacementTries | null, routerVersion: string, trayVersion: string, limit = REPLACEMENT_LIMIT): boolean {
+  if (!previous || previous.routerVersion !== routerVersion || previous.trayVersion !== trayVersion) return false;
+  return previous.attempts >= limit;
+}
+
+export function nextReplacementTries(previous: ReplacementTries | null, routerVersion: string, trayVersion: string): ReplacementTries {
+  const same = previous?.routerVersion === routerVersion && previous.trayVersion === trayVersion;
+  return { routerVersion, trayVersion, attempts: (same ? previous.attempts : 0) + 1 };
+}
+
+
 export function readUpdateSeen(value: unknown): UpdateSeen {
   if (!value || typeof value !== "object") throw new Error("invalid update notification state");
   const s = value as Partial<UpdateSeen>;
@@ -57,6 +96,12 @@ export class TrayReplacement {
       throw error;
     } finally { this.active = false; }
   }
+}
+
+/** The GitHub release that lists what changed in `version`; an unexpected version string gets the latest release. */
+export function releaseNotesUrl(version: string): string {
+  const base = "https://github.com/PBJ-2/clauderipple/releases";
+  return /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(version) ? `${base}/tag/v${version}` : `${base}/latest`;
 }
 
 export function rememberUpdate(seen: UpdateSeen, notice: UpdateNotice): UpdateSeen {

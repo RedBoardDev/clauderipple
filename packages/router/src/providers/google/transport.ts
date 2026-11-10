@@ -12,8 +12,9 @@
 // live** — this environment has no Antigravity subscription. See docs/ARCHITECTURE.md §4d.
 
 import type { GeminiRequest } from "./translate.ts";
-import { antigravityRequestId, antigravitySessionId, antigravityUserAgent, GOOGLE_OAUTH, resolveAntigravityWireModel } from "./antigravity.ts";
+import { antigravityRequestId, antigravitySessionId, antigravityUserAgentFor, GOOGLE_OAUTH, resolveAntigravityWireModel } from "./antigravity.ts";
 import { VERSION } from "../../version.ts";
+import { withDefaultUserAgent } from "../../presets.ts";
 
 export type GoogleTransportRequest = { url: string; headers: Record<string, string>; body: string };
 
@@ -64,12 +65,41 @@ export function googleBaseUrl(configured?: string): string {
   return (configured?.trim() || DEFAULT_BASE).replace(/\/+$/, "");
 }
 
+/**
+ * One pooled credential as the api-key wire takes it: the key, and the headers that travel beside
+ * it. A credential may state its key the way this wire does (`x-goog-api-key`), the way an
+ * OpenAI-wire provider does (`x-api-key`), or as a bearer; whichever it is, the key is sent once, on
+ * `x-goog-api-key` (`createTransport` puts it last), and the auth header it came from is not
+ * repeated. A credential with no key of its own leaves the provider's `apiKey` to answer, which is
+ * how a single-key provider keeps sending exactly what it always did (#112).
+ */
+export function credentialParts(headers: Record<string, string> | undefined): { apiKey: string | undefined; headers: Record<string, string> } {
+  const kept: Record<string, string> = {};
+  let apiKey: string | undefined;
+  for (const [name, value] of Object.entries(headers ?? {})) {
+    const lower = name.toLowerCase();
+    if (lower === "x-goog-api-key" || lower === "x-api-key") {
+      apiKey ??= value.trim() || undefined;
+      continue;
+    }
+    if (lower === "authorization") {
+      const bearer = /^\s*Bearer\s+(\S+)\s*$/i.exec(value)?.[1];
+      if (bearer) {
+        apiKey ??= bearer;
+        continue;
+      }
+    }
+    kept[name] = value;
+  }
+  return { apiKey, headers: kept };
+}
+
 /** The Cloud Code Assist base; the daily host, overridable by the provider's `url`. */
 export function antigravityBaseUrl(configured?: string): string {
   return (configured?.trim() || GOOGLE_OAUTH.dailyApi).replace(/\/+$/, "");
 }
 
-export function createTransport(mode: "api-key" | "antigravity", opts: { apiKey?: string; url?: string; sessionHeader?: string; headers?: Record<string, string> }): GoogleTransport {
+export function createTransport(mode: "api-key" | "antigravity", opts: { apiKey?: string; url?: string; sessionHeader?: string; headers?: Record<string, string>; pooled?: boolean }): GoogleTransport {
   if (mode === "antigravity") {
     const base = antigravityBaseUrl(opts.url);
     return {
@@ -117,8 +147,9 @@ export function createTransport(mode: "api-key" | "antigravity", opts: { apiKey?
           headers: {
             "content-type": "application/json",
             accept: o.stream ? "text/event-stream" : "application/json",
-            // The IDE client family is required to unlock newer agent models. Never a giveaway literal.
-            "user-agent": antigravityUserAgent(),
+            // The IDE client family is required to unlock newer agent models, and Gemini 4 Argon is
+            // served to the CLI family only. Never a giveaway literal.
+            "user-agent": antigravityUserAgentFor(resolved.wire),
             authorization: `Bearer ${auth.accessToken}`,
           },
           body: JSON.stringify(envelope),
@@ -148,15 +179,15 @@ export function createTransport(mode: "api-key" | "antigravity", opts: { apiKey?
       const query = o.stream ? "?alt=sse" : "";
       return {
         url: `${base}/v1beta/models/${encodeURIComponent(o.model)}:${method}${query}`,
-        headers: {
+        // A User-Agent the provider configures, in any case, wins over the relay default (issue #132).
+        headers: withDefaultUserAgent({
           "content-type": "application/json",
           accept: o.stream ? "text/event-stream" : "application/json",
-          ...(userAgent ? { "user-agent": userAgent } : {}),
-          ...(sessionHeader && o.conversationKey ? { [sessionHeader]: o.conversationKey } : {}),
+          ...(sessionHeader && o.conversationKey ? { [opts.pooled ? sessionHeader.toLowerCase() : sessionHeader]: o.conversationKey } : {}),
           ...(opts.headers ?? {}),
           // Kept after the vendor's own headers so nothing can shadow the credential on this wire.
           "x-goog-api-key": apiKey,
-        },
+        }, userAgent),
         body: JSON.stringify(req),
       };
     },

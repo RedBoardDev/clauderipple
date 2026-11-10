@@ -8,8 +8,13 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import type { CompatibleCaps } from "./compat.ts";
+import { tightenToOwnerOnly } from "./locked-file.ts";
 import { PRESETS } from "./presets.ts";
 import { hostProblem, portProblem } from "./remote-host.ts";
+import { ingressOnly } from "./targets.ts";
+
+export type ProcessPriority = "below-normal" | "normal" | "above-normal" | "high";
+export const PROCESS_PRIORITIES: readonly ProcessPriority[] = ["below-normal", "normal", "above-normal", "high"];
 
 export type ProviderModel = {
   id: string;
@@ -186,6 +191,12 @@ export type GoogleProvider = ProviderLabel & {
   sessionHeader?: string;
   /** Optional vendor headers to set on forwarded requests (never logged). The auth header is still `x-goog-api-key`. */
   headers?: Record<string, string>;
+  /**
+   * Several AI Studio keys sharing the same sticky credential pool as the other wires (#112). Each
+   * entry's key is sent on `x-goog-api-key`; `apiKey` mirrors the first entry, which stays the
+   * identity for probes and discovery. Absent, the provider keeps its single key.
+   */
+  credentials?: ProviderCredential[];
   /** Catalog preset used to populate this provider, if any (carried when a model folded into it). */
   preset?: string;
   /** Models offered in the GUI (the probe fills this from `GET /v1beta/models`). */
@@ -295,6 +306,16 @@ function reauthorized(headers: Record<string, string> | undefined, kind: "x-api-
 }
 
 /**
+ * The same re-send for the Gemini wire, whose convention is `x-goog-api-key` rather than either of
+ * the two above. Used on both the provider's own headers and every credential of its pool, so a
+ * many-key provider folded into a `google` provider keeps its keys (#112).
+ */
+function googleKeyed(headers: Record<string, string>): Record<string, string> {
+  const { key, kept } = credentialIn(headers);
+  return key === undefined ? headers : { "x-goog-api-key": key, ...kept };
+}
+
+/**
  * The provider shape a request for `model` is actually talking to.
  *
  * A model may speak another wire than the rest of its provider, on another path, under another auth
@@ -307,7 +328,8 @@ function reauthorized(headers: Record<string, string> | undefined, kind: "x-api-
  */
 export function providerFor(provider: Provider, model: string | undefined): Provider {
   if (!model || !("models" in provider) || !provider.models) return provider;
-  const entry = provider.models.find((m) => m.id === model);
+  const entry = provider.models.find((m) => m.id === model)
+    ?? provider.models.find((m) => m.id.replace(/-\d{8}$/, "") === model.replace(/-\d{8}$/, ""));
   if (!entry || (entry.wire === undefined && entry.url === undefined && entry.authHeader === undefined)) return provider;
 
   const url = entry.url ?? ("url" in provider ? provider.url : undefined);
@@ -320,6 +342,11 @@ export function providerFor(provider: Provider, model: string | undefined): Prov
     const { key, kept } = credentialIn("headers" in provider && provider.headers ? provider.headers : {});
     const apiKey = "apiKey" in provider && typeof provider.apiKey === "string" ? provider.apiKey : key;
     const sessionHeader = "sessionHeader" in provider ? provider.sessionHeader : undefined;
+    // The provider's pool travels with the key it mirrors: folding only `headers` left a many-key
+    // provider with one key on this wire, so a spent first key 429'd every Gemini turn (#112).
+    const credentials = "credentials" in provider && provider.credentials
+      ? provider.credentials.map((credential) => ({ ...credential, headers: googleKeyed(credential.headers) }))
+      : undefined;
     return {
       type: "google",
       auth: "api-key",
@@ -327,6 +354,7 @@ export function providerFor(provider: Provider, model: string | undefined): Prov
       url: url ?? "",
       ...(sessionHeader ? { sessionHeader } : {}),
       ...(Object.keys(kept).length > 0 ? { headers: kept } : {}),
+      ...(credentials && credentials.length > 0 ? { credentials } : {}),
       ...("models" in provider && provider.models ? { models: provider.models } : {}),
       ...("identity" in provider && provider.identity !== undefined ? { identity: provider.identity } : {}),
       ...("instructionsAppend" in provider && provider.instructionsAppend ? { instructionsAppend: provider.instructionsAppend } : {}),
@@ -395,6 +423,9 @@ export type Route = {
   fallbacks?: { provider: string; model: string; effort?: string }[];
 };
 
+/** Where an Auto mode classifier request goes: one provider and model, optionally an effort. */
+export type ClassifierTarget = Pick<Route, "provider" | "model" | "effort">;
+
 export type DirectRule = {
   /** A request whose model starts with this prefix is sent to `provider` with the model unchanged. */
   prefix: string;
@@ -417,13 +448,23 @@ export type CliModel = {
 export type Config = {
   /** Install new versions while idle. Omitted means enabled; hot-reloaded. */
   autoUpdate?: boolean;
+  /**
+   * Windows only. Absent means "normal". "below-normal" is what Task Scheduler gave the router
+   * before 0.12.23; "high" lets the router take CPU ahead of other programs.
+   */
+  processPriority?: ProcessPriority;
   listen: { host: string; port: number; /** OpenAI-compatible ingress port. Defaults to port + 2. */ openaiPort?: number };
   upstream: string;
   providers: Record<string, Provider>;
   /** Picker-slot alias → route. Keys are the model ids the app sends (e.g. "claude-opus-4-8"). */
   routes: Record<string, Route>;
-  /** Opt-in target for Claude Code's Auto mode security-monitor requests only. */
-  autoModeClassifier?: Pick<Route, "provider" | "model" | "effort">;
+  /**
+   * Opt-in targets for Claude Code's Auto mode security-monitor requests only (ARCHITECTURE §2,
+   * "Optional Auto mode classifier target"). `provider`/`model`/`effort` take every classifier
+   * request; `stage1` takes the first stage's yes/no instead. Either may be left out, and `stage1`
+   * may be "native": a request neither claims goes through ordinary routing, as without the setting.
+   */
+  autoModeClassifier?: Partial<ClassifierTarget> & { stage1?: ClassifierTarget | "native" };
   direct: DirectRule[];
   /** Short names usable in "[[ripple: sol@xhigh]]" markers and "@effort" suffixes. */
   aliases: Record<string, string>;
@@ -758,15 +799,32 @@ function foldSplitProviders(c: Config): Config {
 export function validate(c: Config): string[] {
   const errors: string[] = [];
   if (c.autoUpdate !== undefined && typeof c.autoUpdate !== "boolean") errors.push("autoUpdate must be true or false");
+  if (c.processPriority !== undefined && !PROCESS_PRIORITIES.includes(c.processPriority as ProcessPriority)) {
+    errors.push('processPriority must be "below-normal", "normal", "above-normal" or "high"');
+  }
   if (c.autoModeClassifier !== undefined) {
-    const target = c.autoModeClassifier;
-    if (!target || typeof target !== "object") errors.push("autoModeClassifier must be an object");
+    const settings = c.autoModeClassifier;
+    if (!settings || typeof settings !== "object") errors.push("autoModeClassifier must be an object");
     else {
-      const provider = c.providers[target.provider];
-      if (!provider) errors.push("autoModeClassifier: unknown provider");
-      else if (provider.type === "anthropic" && !provider.accountPool) errors.push("autoModeClassifier: provider is ingress-only");
-      if (typeof target.model !== "string" || !target.model.trim()) errors.push("autoModeClassifier: missing model");
-      if (target.effort !== undefined && typeof target.effort !== "string") errors.push("autoModeClassifier: effort must be a string");
+      // The first-stage target is checked the same way: a typo there would otherwise surface only as
+      // a classifier error, and so a blocked action, on every first stage.
+      const checkTarget = (target: Partial<ClassifierTarget>, label: string): void => {
+        const provider = c.providers[target.provider as string];
+        if (!provider) errors.push(`${label}: unknown provider`);
+        else if (ingressOnly(c, target.provider as string)) errors.push(`${label}: provider is ingress-only`);
+        if (typeof target.model !== "string" || !target.model.trim()) errors.push(`${label}: missing model`);
+        if (target.effort !== undefined && typeof target.effort !== "string") errors.push(`${label}: effort must be a string`);
+      };
+      const routesRest = settings.provider !== undefined || settings.model !== undefined || settings.effort !== undefined;
+      if (routesRest) checkTarget(settings, "autoModeClassifier");
+      const stage1 = settings.stage1;
+      const routesStage1 = stage1 !== undefined && stage1 !== "native";
+      if (routesStage1) {
+        if (!stage1 || typeof stage1 !== "object") errors.push(`autoModeClassifier.stage1 must be an object or "native"`);
+        else checkTarget(stage1, "autoModeClassifier.stage1");
+      }
+      // Both sides on ordinary routing is the same as no setting; saying so beats a silent no-op.
+      if (!routesRest && !routesStage1) errors.push("autoModeClassifier names no target");
     }
   }
   if (c.webSearch !== undefined) {
@@ -794,7 +852,7 @@ export function validate(c: Config): string[] {
         if (!c.providers[f.provider]) errors.push(`route ${alias}: fallback ${i} names unknown provider "${f.provider}"`);
         // A native `anthropic` provider is routable only when its Claude OAuth pool is explicitly
         // enabled. Existing native providers remain ingress-only to avoid hijacking Claude traffic.
-        else if (c.providers[f.provider]!.type === "anthropic" && !(c.providers[f.provider] as AnthropicProvider).accountPool) errors.push(`route ${alias}: fallback ${i} names "${f.provider}", which serves the OpenAI ingress only`);
+        else if (ingressOnly(c, f.provider)) errors.push(`route ${alias}: fallback ${i} names "${f.provider}", which serves the OpenAI ingress only`);
         if (!f.model || typeof f.model !== "string") errors.push(`route ${alias}: fallback ${i} missing model`);
         if (f.provider === r.provider && f.model === r.model) errors.push(`route ${alias}: fallback ${i} repeats the primary target`);
       });
@@ -854,10 +912,10 @@ export function validate(c: Config): string[] {
         const caps = p.caps;
         if (!caps || typeof caps !== "object" || Array.isArray(caps) ||
           (caps.effortLevels !== undefined && (!Array.isArray(caps.effortLevels) || caps.effortLevels.some((level) => typeof level !== "string"))) ||
-          (caps.thinking !== undefined && caps.thinking !== "enabled" && caps.thinking !== "none") ||
+          (caps.thinking !== undefined && caps.thinking !== "adaptive" && caps.thinking !== "enabled" && caps.thinking !== "none") ||
           (caps.betas !== undefined && typeof caps.betas !== "boolean") ||
           (caps.cacheControl !== undefined && typeof caps.cacheControl !== "boolean")) {
-          errors.push(`provider ${name}: caps must contain effortLevels?: string[], thinking?: "enabled"|"none", betas?: boolean, cacheControl?: boolean`);
+          errors.push(`provider ${name}: caps must contain effortLevels?: string[], thinking?: "adaptive"|"enabled"|"none", betas?: boolean, cacheControl?: boolean`);
         }
       }
     } else if (p.type === "chatgpt") {
@@ -983,6 +1041,8 @@ export class ConfigStore {
       this.mtimeMs = -1;
       return;
     }
+    // Before the mtime check: a chmod leaves the mtime alone, so a looser mode is seen on every read.
+    tightenToOwnerOnly(this.file, st.mode);
     if (st.mtimeMs === this.mtimeMs) return;
     try {
       const parsed = JSON.parse(fs.readFileSync(this.file, "utf8")) as Partial<Config>;

@@ -3,7 +3,8 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import type { Dataset, Effort, Model } from "../../../scripts/aa-dataset-lib.mjs";
 import { homeDir, type Config } from "./config.ts";
-import { declaredBy, resolve } from "./routing.ts";
+import { declaredBy, qualifiedModel, resolve } from "./routing.ts";
+import { isTargetProvider } from "./targets.ts";
 import { isJudgeOnlyModel } from "./model-policy.ts";
 
 export const AA_DATA_URL = "https://raw.githubusercontent.com/PBJ-2/clauderipple/data/aa-models.json";
@@ -11,7 +12,8 @@ const ATTRIBUTION = "Data: Artificial Analysis (artificialanalysis.ai)";
 const TTL_MS = 24 * 60 * 60_000;
 const RETRY_MS = 60 * 60_000;
 export type RouterEffort = "low" | "medium" | "high" | "xhigh" | "max";
-type ScoreModel = Pick<Model, "slug" | "base" | "effort" | "intelligence" | "costPerTask">;
+/** `priceIn`/`priceOut` are AA's USD per MTok list prices; null when AA gives none or the cache predates them. */
+type ScoreModel = Pick<Model, "slug" | "base" | "effort" | "intelligence" | "costPerTask" | "priceIn" | "priceOut">;
 export type ScoreDataset = Pick<Dataset, "generatedAt" | "attribution"> & { models: ScoreModel[] };
 export type ModelScores = {
   attribution: string;
@@ -42,10 +44,21 @@ export function parseScoreDataset(raw: unknown): ScoreDataset {
     const validNumber = (n: unknown): boolean => n === null || (typeof n === "number" && Number.isFinite(n));
     if (typeof m.slug !== "string" || !m.slug || slugs.has(m.slug) || typeof m.base !== "string" || !m.base || ![null, "low", "medium", "high", "xhigh", "max", "minimal", "non-reasoning"].includes(m.effort) || !validNumber(m.intelligence) || !validNumber(m.costPerTask)) throw new Error("invalid AA model score");
     slugs.add(m.slug);
-    models.push({ slug: m.slug, base: m.base, effort: m.effort, intelligence: m.intelligence, costPerTask: m.costPerTask });
+    // A cache written before prices existed has none: that is null, not an invalid record.
+    const price = (n: unknown): number | null => (typeof n === "number" && Number.isFinite(n) ? n : null);
+    models.push({ slug: m.slug, base: m.base, effort: m.effort, intelligence: m.intelligence, costPerTask: m.costPerTask, priceIn: price(m.priceIn), priceOut: price(m.priceOut) });
   }
   return { attribution: ATTRIBUTION, generatedAt: d.generatedAt, models };
 }
+
+type CatalogOptions = {
+  home?: string;
+  fetch?: typeof fetch;
+  now?: () => number;
+  warn?: (message: string) => void;
+  /** Called with every dataset the catalog loads from disk or fetches, so the request prices follow it. */
+  onDataset?: (dataset: ScoreDataset | null) => void;
+};
 
 /** Fetch at most daily, single-flight; offline keeps the last good disk/memory copy and retries hourly. */
 export class ModelScoreCatalog {
@@ -53,8 +66,8 @@ export class ModelScoreCatalog {
   private until = 0;
   private loaded = false;
   private pending: Promise<ScoreDataset | null> | null = null;
-  private readonly options: { home?: string; fetch?: typeof fetch; now?: () => number; warn?: (message: string) => void };
-  constructor(options: { home?: string; fetch?: typeof fetch; now?: () => number; warn?: (message: string) => void } = {}) { this.options = options; }
+  private readonly options: CatalogOptions;
+  constructor(options: CatalogOptions = {}) { this.options = options; }
 
   async get(): Promise<ScoreDataset | null> {
     if (this.pending) return this.pending;
@@ -65,6 +78,10 @@ export class ModelScoreCatalog {
   }
 
   private now(): number { return (this.options.now ?? Date.now)(); }
+  private publish(dataset: ScoreDataset): void {
+    this.dataset = dataset;
+    this.options.onDataset?.(dataset);
+  }
   private warn(message: string): void { (this.options.warn ?? console.warn)(`AA model scores: ${message}`); }
 
   private async refresh(): Promise<ScoreDataset | null> {
@@ -72,7 +89,7 @@ export class ModelScoreCatalog {
     if (!this.loaded) {
       this.loaded = true;
       try {
-        this.dataset = parseScoreDataset(JSON.parse(await fs.readFile(file, "utf8")));
+        this.publish(parseScoreDataset(JSON.parse(await fs.readFile(file, "utf8"))));
         // Disk mtime records retrieval, not AA's measurement/publication time. Honour TTL on restart.
         const fetched = (await fs.stat(file)).mtimeMs;
         if (fetched <= this.now()) this.until = fetched + TTL_MS;
@@ -86,7 +103,7 @@ export class ModelScoreCatalog {
       const response = await (this.options.fetch ?? fetch)(AA_DATA_URL, { headers: { accept: "application/json" }, signal: AbortSignal.timeout(5_000) });
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
       raw = await response.json();
-      this.dataset = parseScoreDataset(raw);
+      this.publish(parseScoreDataset(raw));
       this.until = this.now() + TTL_MS;
     } catch (e) {
       this.until = this.now() + RETRY_MS;
@@ -111,21 +128,21 @@ export class ModelScoreCatalog {
  * explicit routes/direct precedence and ambiguous owners behave exactly like inference. Native
  * Anthropic declarations remain visible (they are routable via OpenAI ingress, not Messages).
  * Marker aliases contribute their target ids; a slot contributes its resolved target, not the
- * Claude source label. Deduplicate by (provider, model); ambiguous declarations without an
- * explicit rule are not routable and are excluded.
+ * Claude source label. Deduplicate by (provider, model); duplicate declarations use qualified
+ * candidates, so both offerings are scored without guessing a bare id's owner.
  */
 export function buildModelScores(cfg: Config, dataset: ScoreDataset | null): ModelScores {
   const targets = new Map<string, { model: string; provider: string }>();
   const add = (model: string, provider: string): void => {
     if (cfg.providers[provider] && !isJudgeOnlyModel(model)) targets.set(`${provider}\0${model}`, { model, provider });
   };
-  const declared = new Set(Object.values(cfg.providers).flatMap(p => (p.models ?? []).map(m => m.id)));
+  const declared = new Set(Object.entries(cfg.providers).flatMap(([provider, p]) => (p.models ?? []).map(m => declaredBy(m.id, cfg).length > 1 ? `${provider}:${m.id}` : m.id)));
   const candidates = new Set([...declared, ...Object.values(cfg.aliases), ...cfg.cli.extraModels.map(m => m.model), ...Object.values(cfg.cli.models ?? {}), ...Object.keys(cfg.routes)]);
   // Fallbacks are explicit provider/model targets even when they are absent from declared lists.
   for (const route of Object.values(cfg.routes)) {
     for (const fallback of route.fallbacks ?? []) {
       const provider = cfg.providers[fallback.provider];
-      if (provider && (provider.type !== "anthropic" || provider.accountPool)) add(fallback.model, fallback.provider);
+      if (isTargetProvider(provider)) add(fallback.model, fallback.provider);
     }
   }
   for (const candidate of candidates) {
@@ -133,7 +150,8 @@ export function buildModelScores(cfg: Config, dataset: ScoreDataset | null): Mod
     if (result) { add(result.model, result.provider); continue; }
     // Native ingress has a separate resolver; do not pretend ambiguous translated models route.
     const owners = declaredBy(candidate, cfg);
-    if (owners.length === 1 && cfg.providers[owners[0]!]!.type === "anthropic") add(candidate.replace(/@[a-z]+$/, ""), owners[0]!);
+    // Deliberately include an ingress-only sole owner because the OpenAI ingress can still serve it.
+    if (owners.length === 1 && cfg.providers[owners[0]!]!.type === "anthropic") add(qualifiedModel(candidate, cfg)?.model ?? candidate.replace(/@[a-z]+$/, ""), owners[0]!);
   }
   const groups = new Map<string, ScoreModel[]>();
   for (const variant of dataset?.models ?? []) {

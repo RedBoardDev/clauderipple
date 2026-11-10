@@ -2,7 +2,7 @@
 // mode is on, when it ends by itself, and the eager-delegation note (Base's while no mode is on).
 // Pure; register.tsx wires them.
 
-import type { Hot, LimitItem, Mode, Settings } from '../types'
+import type { Hot, LimitItem, Mode, Settings } from '../types/index.d.ts'
 
 /** The mode that is on, if the settings name one that exists. */
 export function activeModeOf(s: Pick<Settings, 'modes' | 'activeMode'>): Mode | undefined {
@@ -38,7 +38,9 @@ export function eagerNote(s: Pick<Settings, 'modes' | 'activeMode' | 'activeSinc
 /** Modes replace the base worker set, without changing fallback, allow-list or provider policy. */
 export function routingSettings(s: Settings): Settings {
   const mode = activeModeOf(s)
-  return mode ? { ...s, rules: { general: { mode: 'ladder', rungs: mode.rungs } }, domainRules: mode.domainRules } : s
+  if (!mode) return s
+  const { domainRules: _, ...base } = s
+  return { ...base, rules: { general: { mode: 'ladder', rungs: mode.rungs } }, ...(mode.domainRules ? { domainRules: mode.domainRules } : {}) }
 }
 
 /** The provider whose quota reset ends the mode: 'anthropic' is Claude, any other a ChatGPT provider. */

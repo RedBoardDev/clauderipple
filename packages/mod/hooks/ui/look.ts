@@ -26,6 +26,8 @@ export type Surface = { borderStyle?: string; borderColor?: string; backgroundCo
 export type Paint = {
   /** Every capsule's backdrop, `width` × `height` px; '' when the skin paints none and the Box's own colour shows. */
   sea: (width: number, height: number, sea: Sea) => string
+  /** The work current, `width` px wide at art.ts's CURRENT_PX tall, drawn at a capsule's bottom; '' for a skin with no water. */
+  current: (width: number) => string
   plate: (width: number, height: number) => string
   switch: (on: boolean, busy?: boolean) => string
   word: (label: string, on: boolean, busy?: boolean) => { source: string; cells: number }
@@ -69,7 +71,7 @@ export type Look = {
 }
 
 const DEEP_PAINT: Paint = {
-  sea: deep.seaArt, plate: deep.plateArt, switch: deep.switchArt, word: deep.wordArt, extraHover: deep.extraHoverArt,
+  sea: deep.seaArt, current: deep.currentArt, plate: deep.plateArt, switch: deep.switchArt, word: deep.wordArt, extraHover: deep.extraHoverArt,
   pill: deep.pillArt, segmented: deep.segmentedArt, slider: deep.sliderArt, well: deep.wellArt, close: deep.closeArt,
   meter: deep.meterArt, ring: deep.ringArt, clock: deep.clockArt, gauge: deep.gaugeArt, icon: deep.iconArt,
   agents: deep.agentsArt, counted: deep.countedArt, rule: deep.ruleArt, tile: deep.tileArt, beads: deep.beadsArt,

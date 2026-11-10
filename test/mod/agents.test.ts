@@ -75,7 +75,7 @@ test('long fallback reasons do not create an unbounded SVG sea or thousands of c
   assert.ok(!textOf(tree).includes(agent.pick!.fallbackReason!))
   for (const svg of all.filter(n => n.type === 'Svg')) {
     assert.ok(Number(svg.props.width) <= 4096)
-    assert.ok(Number(svg.props.height) <= 4096)
+    assert.ok(Number(svg.props.height ?? 0) <= 4096)
     assert.ok(String(svg.props.source).length <= 131_072)
   }
 })
@@ -85,14 +85,81 @@ test('48 mixed workers including 31 Workflow workers keep their rows, Korean tit
   for (const skin of ['deep', 'flat'] as const) for (const appearance of ['light', 'dark'] as const) {
     const tree = renderAgents(el, { ...frame, skin, appearance }, { agents, now: frame.now, showDone: true }, actions)
     const all = nodes(tree)
-    assert.equal(all.filter(n => n.props.key === 'card-w0').length, 1)
-    assert.equal(all.filter(n => n.props.key === 'card-w47').length, 1)
-    assert.ok(textOf(tree).includes('검토 47'))
+    // Thirty cards at most: the latest thirty running, then the four newest finished.
+    assert.equal(all.filter(n => n.props.key === 'card-w1').length, 1)
+    assert.equal(all.filter(n => n.props.key === 'card-w34').length, 1)
+    assert.equal(all.filter(n => n.props.key === 'card-w0' || n.props.key === 'card-w35').length, 0)
+    assert.ok(textOf(tree).includes('검토 34'))
     for (const svg of all.filter(n => n.type === 'Svg')) {
       assert.ok(Number(svg.props.width) <= 4096)
-      assert.ok(Number(svg.props.height) <= 4096)
+      assert.ok(Number(svg.props.height ?? 0) <= 4096)
     }
   }
+})
+
+test('a card is one title line over two body rows at every width, its state on the time instead of a dot', () => {
+  const agent: AgentRec = { ...base, description: '긴 제목 '.repeat(200), usage: { input: 1000, cached: 30_000, cacheWrite: 0, output: 200 }, outputTotal: 5200, tools: 23 }
+  const widths = [20, 33, 44, 68, 140]
+  const heights = widths.map(columns => cardRows({ ...frame, columns }, agent))
+  assert.equal(new Set(heights).size, 1, heights.join(','))
+  for (const columns of widths) {
+    const tree = renderAgents(el, { ...frame, columns }, { agents: [agent], now: frame.now, showDone: false }, actions)
+    const all = nodes(tree)
+    // The title row lost its state dot; the body is exactly the model's row and the numbers' row.
+    assert.equal(all.some(n => n.props.key === 'mark'), false, 'state dot at ' + columns)
+    assert.equal(all.filter(n => n.props.key === 'model-row').length, 1)
+    assert.equal(all.filter(n => n.props.key === 'nums').length, 1)
+    assert.equal(all.filter(n => String(n.props.key).startsWith('nums-')).length, 0)
+    // The title is the whole title on one line: the engine cuts it at the edge, since the app's type
+    // is proportional. The body starts where the title does, and no number is given a fixed slot.
+    const titleBox = all.find(n => n.props.key === 'title')!
+    const titleText = titleBox.children.find((c): c is Tree => typeof c !== 'string')!
+    assert.equal(titleText.props.wrap, 'truncate-end')
+    // The display boundary cuts the shown text at its preview length; the card itself pre-cuts nothing.
+    assert.ok(String(titleText.children[0]).startsWith('긴 제목'), String(titleText.children[0]))
+    const modelText = all.find(n => n.props.key === 'model-text')!
+    assert.equal(modelText.props.wrap, 'truncate-end')
+    assert.equal(modelText.children[0], 'gpt-6.1-sol')
+    for (const key of ['model-row', 'nums']) assert.equal(all.find(n => n.props.key === key)!.props.paddingLeft, undefined, key)
+    // The model's row is the dot, the name and the effort; the tools sit with the numbers below.
+    assert.equal(all.some(n => n.props.key === 'tools'), false)
+    const numsRow = all.find(n => n.props.key === 'nums')!
+    const figureBoxes = numsRow.children.filter((c): c is Tree => typeof c !== 'string' && c.props.position !== 'absolute')
+    assert.deepEqual(figureBoxes.map(c => c.props.key), ['n-tokens', 'n-cache', 'n-tools'])
+    // Every row of a list card opens the conversation, not only the title (the head's press, then
+    // one under the model's row and one under the numbers').
+    for (const key of ['model-row', 'nums']) {
+      const row = all.find(n => n.props.key === key)!
+      assert.ok(row.children.some(c => typeof c !== 'string' && c.props.position === 'absolute'), 'press under ' + key)
+    }
+    assert.equal(all.some(n => n.props.key === 'value' && typeof n.props.width === 'number'), false)
+    // Neither the effort's bars nor the cache's ring is drawn any more.
+    assert.equal(all.some(n => n.type === 'Svg' && ['추론 강도', '캐시'].includes(String(n.props.alt))), false)
+    // The Claude app's count: the last prompt (1000 + 30000) plus every step's output (5200).
+    const text = textOf(tree)
+    assert.ok(text.includes('토큰') && text.includes('36k'), text)
+    // Cached share rounded down: 30000 / 31000 is 96.7%, never a whole 100.
+    assert.ok(text.includes('캐시') && text.includes('96%'), text)
+    assert.ok(text.includes('도구') && text.includes('23'), text)
+  }
+})
+
+test('the time\'s colour carries running, waiting, done and failed once the title dot is gone', () => {
+  const colour = (state: AgentRec['state']): unknown => nodes(renderAgents(el, frame, {
+    agents: [{ ...base, state, endedAt: state === 'running' || state === 'waiting' ? undefined : frame.now - 1 }], now: frame.now, showDone: false,
+  }, actions)).find(n => n.props.key === 'elapsed')?.props.color
+  assert.notEqual(colour('running'), colour('done'))
+  assert.notEqual(colour('waiting'), colour('running'))
+  assert.notEqual(colour('failed'), colour('done'))
+})
+
+test('the list head is one total: every agent\'s tokens added up', () => {
+  const six: AgentRec = { ...base, usage: { input: 100_000, cached: 500_000, cacheWrite: 0, output: 0 }, outputTotal: 0 }
+  const tree = renderAgents(el, frame, { agents: [{ ...six, id: 'x' }, { ...six, id: 'y' }], now: frame.now, showDone: false }, actions)
+  const text = textOf(tree)
+  assert.ok(text.includes('전체 에이전트'))
+  assert.ok(text.includes('600k'), text)
+  assert.ok(text.includes('1.2M'), text)
 })
 
 test('background tasks sit with the agents, running with running and ended with ended, on either surface', () => {

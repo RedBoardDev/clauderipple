@@ -161,3 +161,16 @@ test('Expo HTTP boundary handles ticket and receipt invalidation and transient e
   const badFetch: typeof fetch = async () => new Response('', { status: 503 });
   await assert.rejects(expoSender(badFetch)(payload), /HTTP 503/);
 });
+
+test('the payload names the host identity when one is configured', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'expo-push-'));
+  try {
+    const sent: ExpoPayload[] = [];
+    const notifier = new ExpoNotifier({ dir, host: 'host-key', seenRecently: () => false, log: () => {}, send: async p => { sent.push(p); return 'sent' as const; } });
+    notifier.subscribe('device', token, 'ko');
+    await notifier.onEvent('session', done);
+    assert.deepEqual(sent[0]!.data, { session: 'session', host: 'host-key' });
+    // The cleartext body stays fixed; the host is an identifier, not conversation content.
+    assert.ok(!JSON.stringify(sent[0]).includes(secret));
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});

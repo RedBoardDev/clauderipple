@@ -16,7 +16,7 @@ import type { DelegationPin } from '../types/index.d.ts'
  * add a domain word, `[[ripple: standard ui]]`; the router's own pattern stops at the name, so a
  * marker with a domain never reaches it as a model.
  */
-export const MARKER = /\[\[\s*(?:ripple|gpt)\s*:\s*([A-Za-z0-9.\-]+)\s*(?:@\s*([A-Za-z]+))?(?:\s+([A-Za-z]+))?\s*\]\]/
+export const MARKER = /\[\[\s*(?:ripple|gpt)\s*:\s*([A-Za-z0-9._:/\-]+)\s*(?:@\s*([A-Za-z]+))?(?:\s+([A-Za-z][A-Za-z-]*))?\s*\]\]/
 
 // The session's model markers no longer authorize a worker (2026-10-24). The judge reads one-shot
 // delegation intent; these name helpers remain for the user's explicit standing pin.
@@ -45,6 +45,11 @@ function says(text: string, word: string): boolean {
 }
 type Said ={ role: 'user' | 'assistant'; text: string; toolResults?: readonly unknown[] }
 type ModelSource = { model: string; provider: string }
+/** Once the provider is known, metadata and intent checks use its original model id. */
+export function providerModelId(model: string, provider?: string): string {
+  const base = model.replace(/@[^@]*$/, '')
+  return provider && base.startsWith(provider + ':') ? base.slice(provider.length + 1) : base
+}
 /** The person's words alone, shared by one-shot authorization and session pinning. */
 export function humanText(m: Said): string | null {
   const text = m.text.replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, '').trim()
@@ -116,7 +121,7 @@ function compareModelVersions(a: string, b: string): number {
 }
 /** A family name chooses its one generated worker, otherwise its latest version. Never cross families. */
 function familyPinSources(sources: readonly ModelSource[], workers: readonly ModelSource[]): readonly ModelSource[] {
-  if (new Set(sources.map(source => modelWords(source.model).join('|'))).size !== 1) return []
+  if (new Set(sources.map(source => modelWords(providerModelId(source.model, source.provider)).join('|'))).size !== 1) return []
   const generated = sources.filter(source => workers.some(worker => modelId(worker.model) === modelId(source.model) && worker.provider === source.provider))
   if (new Set(generated.map(source => modelId(source.model))).size === 1) return generated
   const latest = sources.reduce((best, source) => compareModelVersions(source.model, best.model) > 0 ? source : best)
@@ -134,10 +139,11 @@ export function delegationPin(message: Said, sources: readonly ModelSource[], wo
   const parts = pinParts(text).filter(part => pinInstruction(part) === 'pin')
   const matches = sources.flatMap(source => {
     const providers = rivalProviders(source.model, sources)
-    const targeted = parts.filter(part => pinsModel(part, source.model) && userNamed(source.model, [{ role: 'user', text: part }], [], { ...source, providers }))
+    const model = providerModelId(source.model, source.provider)
+    const targeted = parts.filter(part => pinsModel(part, model) && userNamed(source.model, [{ role: 'user', text: part }], [], { ...source, providers }))
     if (!targeted.length) return []
-    const exact = targeted.some(part => new RegExp(fullIdPattern(source.model), 'i').test(part))
-    const score = Math.max(...targeted.map(part => modelWords(source.model).filter(word => says(part, word)).length))
+    const exact = targeted.some(part => new RegExp(fullIdPattern(model), 'i').test(part))
+    const score = Math.max(...targeted.map(part => modelWords(model).filter(word => says(part, word)).length))
     return [{ ...source, exact, score }]
   })
   const exact = matches.some(source => source.exact)
@@ -174,7 +180,7 @@ export function pinAllows(pin: DelegationPin | null, model: string, provider?: s
  * Tool results, notices and compaction summaries are not the user.
  */
 export function userNamed(model: string, messages: readonly Said[], prompts: readonly string[] = [], source: { provider?: string; providers?: readonly string[] } = {}): boolean {
-  const words = modelWords(model)
+  const words = modelWords(providerModelId(model, source.provider))
   if (!words.length) return false
   // A notice opens on a tag (`<task-notification>`, `<local-command-stdout>`); a reply the app quotes
   // opens on `<!-- reply 1 -->` and is the user's own words.
@@ -209,8 +215,9 @@ export function userNamed(model: string, messages: readonly Said[], prompts: rea
  * one of its name words. Naming OpenCode then decides between two Argons, and says nothing about Sol.
  */
 export function rivalProviders(model: string, sources: readonly { model: string; provider: string }[]): string[] {
-  const words = modelWords(model)
-  return [...new Set(sources.filter(s => modelWords(s.model).some(word => words.includes(word))).map(s => s.provider))]
+  const owner = sources.find(s => model.startsWith(s.provider + ':'))?.provider
+  const words = modelWords(providerModelId(model, owner))
+  return [...new Set(sources.filter(s => modelWords(providerModelId(s.model, s.provider)).some(word => words.includes(word))).map(s => s.provider))]
 }
 
 export type Spawn = { subagentType: string; prompt: string; model?: string }

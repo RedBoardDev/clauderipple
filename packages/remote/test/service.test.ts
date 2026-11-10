@@ -65,6 +65,8 @@ test("install replaces a loaded agent and bootstraps; uninstall boots out and re
     return { status: 0, out: "" };
   };
   const spec = { ...specFor({ script: "/x/packages/remote/src/main.ts", claudePath: undefined, node: "/n/node", home: dir }), log: p.log };
+  fs.mkdirSync(path.dirname(p.plist), { recursive: true });
+  fs.writeFileSync(p.plist, plist(spec));
   install(spec, run, p);
   assert.deepEqual(calls.map((c) => c[1]), ["print", "bootout", "bootstrap"]);
   assert.equal(calls[2]![3], p.plist);
@@ -73,6 +75,20 @@ test("install replaces a loaded agent and bootstraps; uninstall boots out and re
   calls.length = 0;
   uninstall(run, p);
   assert.deepEqual(calls.map((c) => c[1]), ["print", "bootout"]);
+  assert.equal(fs.existsSync(p.plist), false);
+});
+
+test("host uninstall preserves its definition on launchctl lookup or bootout failures", t => {
+  const dir = tmp(t);
+  const p = { home: dir, plist: path.join(dir, "host.plist"), log: path.join(dir, "host.log") };
+  for (const failure of ["print", "bootout"]) {
+    fs.writeFileSync(p.plist, "owned definition");
+    const result = uninstall((_cmd, args) => ({ status: args[0] === failure ? 1 : 0, out: "permission denied" }), p);
+    assert.equal(result.state, failure === "print" ? "lookup-failed" : "stop-failed");
+    assert.equal(fs.readFileSync(p.plist, "utf8"), "owned definition");
+  }
+  const result = uninstall(() => ({ status: 113, out: "" }), p);
+  assert.equal(result.state, "removed");
   assert.equal(fs.existsSync(p.plist), false);
 });
 

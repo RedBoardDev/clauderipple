@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { measureModel, type MeasureDeps, type WireCandidate } from "../src/capabilities.ts";
+import { measureModel, ollamaApiBase, ollamaModelFacts, parseOllamaShow, type MeasureDeps, type WireCandidate } from "../src/capabilities.ts";
 
 // The vendor this is built against: one plan, one key, `/models` reporting ids only, and different
 // wires answering for different models (OpenCode Go, measured 2026-09-22). These tests stand in for
@@ -249,4 +249,44 @@ test("without discover, an empty ladder still means one request and no effortLev
   const { calls, fetch } = recorder(() => 200);
   assert.deepEqual(await measureModel("m", ANTHROPIC, [], { fetch }), { id: "m", wire: "anthropic" });
   assert.equal(calls.length, 1);
+});
+
+// Ollama's OpenAI-compatible surface reports ids alone and ignores an unknown `reasoning_effort`,
+// so a probe measured every thinking model as taking no effort. Its own `/api/show` states both.
+test("Ollama's own API base is recognised for the cloud endpoint and the local daemon", () => {
+  assert.equal(ollamaApiBase("https://ollama.com/v1"), "https://ollama.com");
+  assert.equal(ollamaApiBase("https://ollama.com"), "https://ollama.com");
+  assert.equal(ollamaApiBase("http://127.0.0.1:11434/v1"), "http://127.0.0.1:11434");
+  assert.equal(ollamaApiBase("http://localhost:11434"), "http://localhost:11434");
+  assert.equal(ollamaApiBase("http://192.168.1.5:11434/v1", "ollama"), "http://192.168.1.5:11434", "a preset ollama provider keeps its own host");
+  assert.equal(ollamaApiBase(undefined, "ollama"), "http://127.0.0.1:11434");
+  for (const other of [undefined, "", "not a url", "https://api.deepseek.com/v1", "http://127.0.0.1:8080/v1", "https://notollama.com/v1"]) {
+    assert.equal(ollamaApiBase(other), null, `${String(other)} is not Ollama`);
+  }
+});
+
+test("/api/show states thinking levels and the model-architecture's context length", () => {
+  assert.deepEqual(parseOllamaShow({
+    thinking: { values: ["low", "medium", "high"], default: "medium" },
+    capabilities: ["completion", "thinking"],
+    model_info: { "qwen3.context_length": 262144, "qwen3.attention.head_count": 32 },
+  }), { effortLevels: ["low", "medium", "high"], contextWindow: 262144 });
+  assert.deepEqual(parseOllamaShow({ thinking: { values: [true, false] }, model_info: { "gemma4.context_length": 1048576 } }), { contextWindow: 1048576 }, "an on/off switch is not a ladder");
+  assert.deepEqual(parseOllamaShow({ thinking: { values: ["", " high "] } }), { effortLevels: ["high"] });
+  assert.deepEqual(parseOllamaShow({ model_info: { "m.context_length": "131072" } }), {}, "a string is not a count");
+  assert.deepEqual(parseOllamaShow({ model_info: { "m.context_length": 0 } }), {});
+  for (const value of [null, undefined, "text", 42, {}]) assert.deepEqual(parseOllamaShow(value), {});
+});
+
+test("asking /api/show sends the model and the provider's own header, and a failure concludes nothing", async () => {
+  const calls: { url: string; body: Record<string, unknown>; headers: Record<string, string> }[] = [];
+  const fetch: MeasureDeps["fetch"] = async (url, init) => {
+    calls.push({ url, body: JSON.parse(String(init.body)) as Record<string, unknown>, headers: Object.fromEntries(new Headers(init.headers).entries()) });
+    return jsonResponse(200, { thinking: { values: ["low", "high"] }, model_info: { "llama.context_length": 131072 } });
+  };
+  assert.deepEqual(await ollamaModelFacts("https://ollama.com", "gpt-oss:120b", { fetch, headers: { authorization: "Bearer key" } }), { effortLevels: ["low", "high"], contextWindow: 131072 });
+  assert.deepEqual(calls, [{ url: "https://ollama.com/api/show", body: { model: "gpt-oss:120b" }, headers: { authorization: "Bearer key", "content-type": "application/json" } }]);
+  assert.equal(await ollamaModelFacts("https://ollama.com", "x", { fetch: async () => jsonResponse(404) }), undefined);
+  assert.equal(await ollamaModelFacts("https://ollama.com", "x", { fetch: async () => new Response("not json", { status: 200 }) }), undefined);
+  assert.equal(await ollamaModelFacts("https://ollama.com", "x", { fetch: async () => { throw new Error("offline"); } }), undefined);
 });

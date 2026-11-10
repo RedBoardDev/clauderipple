@@ -11,7 +11,7 @@ import { GREET_SIZE, action, actions as actions_, speak } from './parts'
 import type { Els } from './parts'
 import { cacheTone, providerColor, textTone } from './theme'
 import type { Frame, LogActions, LogView } from './view'
-import { cachePercent, clockTime, effortLabel, modelOf, promptTokens, seconds } from './view'
+import { cachePercent, clockTime, effortLabel, limitAccountLabel, modelOf, outputRate, promptTokens, rateText, seconds } from './view'
 
 /**
  * The router's answer to a thread continue on a model without server-side threads: answered here at
@@ -24,6 +24,9 @@ function entry(el: Els, frame: Frame, record: StatusRequest, mineOnly: boolean):
   const { Box, Text } = el
   const tone = textTone(frame.appearance)
   const cache = cachePercent(record.usage)
+  const rate = outputRate(record)
+  // The same shortening as the limits pane: an email's local part, a placeholder name left out.
+  const account = limitAccountLabel(record.accountLabel)
   if (record.resent && STATELESS_SWITCH.test(record.note ?? '')) {
     return (
       <Box key={record.at + '-' + displayText(record.target, DISPLAY.name)} flexDirection="row" flexWrap="wrap" columnGap={1}>
@@ -47,6 +50,7 @@ function entry(el: Els, frame: Frame, record: StatusRequest, mineOnly: boolean):
           {modelOf(record)}
         </Text>
         <Text color={providerColor(record.provider)}>{record.provider}</Text>
+        {account ? <Text dimColor>{account}</Text> : null}
         {record.resent ? (
           <Text dimColor>{t(frame.lang, 'log.resent', { status: String(record.status) })}</Text>
         ) : (
@@ -57,10 +61,13 @@ function entry(el: Els, frame: Frame, record: StatusRequest, mineOnly: boolean):
       </Box>
       <Box flexDirection="row" flexWrap="wrap" columnGap={1}>
         <Text dimColor>{record.effort ? effortLabel(record.effort, frame.lang) : '-'}</Text>
+        {/* The tier asked for, not the one served: the ChatGPT sign-in answers `default` to a Fast request (#54). */}
+        {record.requestedTier === 'priority' ? <Text color={tone.accent} bold>FAST</Text> : null}
         {record.usage ? <Text dimColor>{t(frame.lang, 'log.input', { tokens: tokens(promptTokens(record.usage)) })}</Text> : null}
         {cache !== undefined ? <Text color={tone[cacheTone(cache)]}>{t(frame.lang, 'band.cachePercent', { percent: cache })}</Text> : null}
         {record.usage ? <Text dimColor>{t(frame.lang, 'log.output', { tokens: tokens(record.usage.output) })}</Text> : null}
         <Text dimColor>{seconds(record.ms / 1000, frame.lang)}</Text>
+        {rate !== undefined ? <Text dimColor>{t(frame.lang, 'log.rate', { rate: rateText(rate) })}</Text> : null}
       </Box>
       {!record.ok && record.note ? (
         <Text color={record.resent ? undefined : tone.bad} dimColor={record.resent} wrap="wrap">

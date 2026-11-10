@@ -112,15 +112,15 @@ test("a corrupt settings.json is never overwritten", () => {
   } finally { t.restore(); }
 });
 
-test("a per-model value /autocompact saved is read, and a dashboard save replaces it rather than hiding behind it", () => {
+test("a per-model value /autocompact saved is read and preserved by a global dashboard save", () => {
   const t = withSettingsFile({ modelSettings: { "claude-opus-5": {}, "claude-opus-5-5": { autoCompactWindow: 400000, effort: "high" } } });
   try {
     assert.equal(readAutoCompactWindow(), 400000);
     writeAutoCompactWindow(500000);
     const written = JSON.parse(fs.readFileSync(t.file, "utf8"));
     assert.equal(written.autoCompactWindow, 500000);
-    // The per-model value would outrank the top-level one for Opus; its other keys stay.
-    assert.deepEqual(written.modelSettings, { "claude-opus-5": {}, "claude-opus-5-5": { effort: "high" } });
+    // User-specific model preferences still outrank the newly saved global default.
+    assert.deepEqual(written.modelSettings, { "claude-opus-5": {}, "claude-opus-5-5": { autoCompactWindow: 400000, effort: "high" } });
     assert.equal(readAutoCompactWindow(), 500000);
   } finally { t.restore(); }
 

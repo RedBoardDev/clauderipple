@@ -7,7 +7,7 @@
 // No gradient, glow, water or weather; 리플이 keeps its life. Every size is art.ts's, so the presses
 // laid over the pictures line up (kit.tsx). Pure: SVG only, so node tests can load it.
 
-import { AGENTS_W, CELL_PX, CLOSE_PX, CONTROL_PX, FLAME, GLYPH, ICON, ICON_PX, METER_H, METER_W, SWITCH_H, SWITCH_W, TILE_PX, esc, labelPx, r } from './art.ts'
+import { CELL_PX, CLOSE_PX, CONTROL_PX, countedWidth, FLAME, GLYPH, ICON, ICON_PX, METER_H, METER_W, SWITCH_H, SWITCH_W, TILE_PX, esc, labelPx, r } from './art.ts'
 import type { Icon, Tone } from './art.ts'
 import type { Paint } from './look.ts'
 import { svgDoc } from './theme.ts'
@@ -59,9 +59,9 @@ export function flatPictures(appearance: Appearance): Paint {
   const counted = (icon: Icon, count: number, on: boolean): string => {
     const text = count > 9 ? '9+' : String(count)
     const badge = count > 0
-      ? '<circle cx="20" cy="5.5" r="5.5" fill="' + ACCENT + '"/><text x="20" y="8.6" text-anchor="middle" font-size="' + (text.length > 1 ? 7 : 8.5) + '" font-weight="750"' + fillOf('#fff') + '>' + text + '</text>'
+      ? '<circle cx="19.2" cy="4.8" r="4.8" fill="' + ACCENT + '"/><text x="19.2" y="7.6" text-anchor="middle" font-size="' + (text.length > 1 ? 6 : 7.8) + '" font-weight="750"' + fillOf('#fff') + '>' + text + '</text>'
       : ''
-    return doc(AGENTS_W, 16, '<g transform="translate(0 .5)" fill="none" stroke="' + (on ? ACCENT : MUTED) + '" stroke-width="1.45" stroke-linecap="round" stroke-linejoin="round">' + ICON[icon] + '</g>' + badge)
+    return doc(countedWidth(count), 16, '<g transform="translate(0 .5)" fill="none" stroke="' + (on ? ACCENT : MUTED) + '" stroke-width="1.45" stroke-linecap="round" stroke-linejoin="round">' + ICON[icon] + '</g>' + badge)
   }
 
   return {
@@ -69,6 +69,9 @@ export function flatPictures(appearance: Appearance): Paint {
     // surface on a dark one (the app's bg-000, read from its stylesheet 2026-10-16). A grey tint
     // over the host's slot read as a dark block beside the prompt box.
     sea: (width, height) => doc(width, height, '<rect class="s" width="' + r(width) + '" height="' + r(height) + '" rx="9"/>', themed('.s', 'fill:#ffffff', 'fill:#30302e')),
+
+    // Flat has no water and so no current: work reads from 리플이's face and the band's own words.
+    current: () => '',
 
     // The capsule's own surface: it hides the words beneath a tip.
     plate: (width, height) => doc(width, height, '<rect class="p" width="' + r(width) + '" height="' + r(height) + '"/>', themed('.p', 'fill:#ffffff', 'fill:#30302e')),
@@ -94,7 +97,7 @@ export function flatPictures(appearance: Appearance): Paint {
     // A ghost button is the page's tint with a hairline; the one thing to press is the accent's fill.
     pill: (text, look, _tone, glyph) => {
       const gw = glyph ? 18 : 0
-      const cells = Math.ceil((labelPx(text, 12) + 26 + gw) / CELL_PX)
+      const cells = (labelPx(text, 12) + 20 + gw) / CELL_PX
       const w = cells * CELL_PX
       const h = CONTROL_PX
       const ink = look === 'primary' ? '#fff' : INK

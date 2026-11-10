@@ -1,6 +1,6 @@
 # Changelog
 
-## Personal fork — unreleased
+## Personal fork - unreleased
 
 ### Added
 
@@ -17,6 +17,859 @@
 - **macOS uses the native menu-bar app (`apps/macos`) instead of the Electron tray.** The CLI
   opens `com.clauderipple.mac`; if it is not installed, it points to `apps/macos/build.sh install`.
   Windows keeps the Electron tray, including its login item and router-down recovery.
+
+## 0.12.33 - 2026-11-07
+
+### Added
+
+- **Output speed (tok/s) for each request** (#130, thanks @csa906). The dashboard's request log and
+  the mod's log pane show a finished answer's output tokens per second over the whole request, and
+  Usage by model shows an approximate rate per model (`≈`). The band's last route shows it too,
+  after the cache hit, and drops it whole rather than cut the model's name when the row is short.
+  Failures, resends, refusals the router answered, web search, token counts and requests under
+  0.5 s have no rate.
+
+- **The phone is told when the computer loses its connection while Claude is working.** While a
+  turn, an approval or a Claude app conversation is active, the host renews a watch on its relay
+  every minute; if the computer sleeps, drops off the network or the host process dies, the relay
+  pushes "the PC disconnected" to the phone's Expo devices once per outage, and the host sends "the
+  PC is connected again" with the outage length when it is back. The relay holds only the phones'
+  Expo tokens, their language and the host's public key for this — no conversation content. An
+  expired Claude login while work is active now also reaches the phone (native and web) as its own
+  notice. Web push is not part of the relay watch: it needs the host's VAPID signing key.
+
+### Changed
+
+- **Ripple Remote for Android is on Google Play.** The dashboard's phone view shows a Google Play
+  button beside the App Store one, instead of the Discord sign-up for the closed test.
+
+### Fixed
+
+- **Hotspot failover leaves macOS's own join alone, and comes back only to a Wi-Fi that is really
+  there.** With no Wi-Fi address at all the router now waits a minute before trying the hotspot
+  itself, so macOS can wake an iPhone through Instant Hotspot; our `networksetup` join cancelled
+  that auto-join and could not wake a hidden phone. A return needs a saved network at -70 dBm or
+  better from a scan the radio really ran, not a weak one heard in airportd's cache, and the
+  hotspot is rejoined at once when nothing associated within 8 seconds of leaving. A changed Wi-Fi
+  address, subnet or network class resets the probe window for 30 seconds, so joining home Wi-Fi no
+  longer sends the Mac back to the hotspot.
+- **Account limits are read from the provider, not guessed.** A Claude subscription 429 whose unified
+  limit headers say the 5-hour or weekly window is spent now rests that account until the stated
+  reset instead of retrying it every minute, and the caller is answered with `x-should-retry: false`
+  and that reset as `retry-after`. A token refresh no longer brings a resting account back early.
+  OpenCode Go's 429 for its own failing upstream (`[prefill_cap_refused]`, `[overloaded]`) is retried
+  inside the turn and no longer cools the key, and a Google account banned for a Terms of Service
+  violation is parked instead of being refreshed and replayed. After an in-turn retry, the log line
+  and `requests.jsonl` name the account that actually answered.
+- **A finished subagent that SendMessage wakes up is back on its Agents card.** It showed in the
+  Claude app's background tasks but stayed "done" in the mod; its card now runs again, keeping the
+  time it ran before.
+- **The limits pane's dark backdrop reaches its last tile in a narrow pane.** With every account
+  listed and each reset wrapping onto two or three lines, the bottom tiles stood on a white page.
+
+## 0.12.32 — 2026-11-05
+
+### Changed
+
+- **Account tabs in the worker settings.** A provider with several accounts shows "계정 1",
+  "계정 2" … tabs on its model list; each tab lists that account's models by name, numbered as in
+  the limits pane. The worker ladder menu is grouped the same way.
+
+### Fixed
+
+- **Naming a worker pinned to an account now runs it on that account.** In 0.12.31 the mod could
+  not read the provider of these workers, so a task that named one ran on the worker ladder's
+  usual pick instead. The ladder could not list them either.
+- **No pinned workers for an account that needs signing in again.** Such a worker could only run
+  on another account. It comes back on its own once the account is signed in.
+
+## 0.12.31 — 2026-11-05
+
+### Added
+
+- **Choose which account a worker runs on.** When a provider keeps signed-in accounts of its own
+  (Claude accounts, ChatGPT accounts, or Google Antigravity accounts), ClaudeRipple now writes one
+  worker per model and stored account, named after the account's stable local id (for example
+  `claude-opus-5-5-3f2a9c1b`), and the dashboard's worker ladder lists each with its account name.
+  A worker started from one of these runs on that account instead of whichever one the usual
+  rotation would pick. The name never follows the account's label, so relabelling an account — or
+  removing one of two accounts that share a label — cannot point a saved ladder rung, workflow or
+  marker at another account. Accounts added or removed in a terminal (`login`, `claude-login`,
+  `google-login`, `logout`) are picked up within a few seconds without a restart, and remote hosts
+  over SSH tunnels get the new workers too. If the account is paused, rate-limited or removed, the
+  turn quietly uses the usual account order rather than failing. They are started like any other
+  worker, through a `[[ripple: …]]` marker or as a workflow agent.
+- **The "updated" notification opens that version's release notes.** Click it to see what changed.
+  After an automatic update the notice now comes from the tray that keeps running, so the click
+  still works once the old tray has handed over.
+
+### Fixed
+
+- **The mod band shows each provider's account in use.** Only Claude was narrowed to the account
+  being spent; with a second Gemini or ChatGPT account in use, the band kept showing the first.
+  The limits pane still lists every account.
+- **An open accounts tab in the dashboard follows the router.** It was drawn once, so a Google
+  account that started asking for verification kept reading "in use" with no verify button. The
+  list now refreshes every 10 seconds while it is open.
+
+## 0.12.30 — 2026-11-05
+
+### Fixed
+
+- **A script's own Anthropic API key is no longer swapped for your Claude login.** Scripts run from
+  a Code session's shell inherit its proxy. A `/v1/messages` call on the script's own `x-api-key`
+  used to be routed onto your Claude accounts: it was billed to your subscription, and a 429 there
+  paused every account for a minute, which made the mod replace named Claude workers with another
+  model. Such a request now goes to Anthropic on its own key, unchanged, and its answers no longer
+  affect your accounts. Claude Code itself, including on an API key, is unchanged.
+
+## 0.12.29 — 2026-11-05
+
+### Added
+
+- **`#local_…` session links work from the phone.** A desktop session's summary now carries its
+  Claude app session id, so Ripple Remote 1.0.11 can follow a link Claude wrote to another Code tab
+  session. Older apps ignore the field.
+
+## 0.12.28 — 2026-11-05
+
+### Added
+
+- **Choose the order of the models ClaudeRipple adds to the Claude Desktop picker** (#128, thanks
+  @csa906). The Clients screen has an "Order in the picker" card with ↑/↓ buttons; Claude's own
+  models keep their place. The order survives provider saves, a provider form no longer brings back
+  models you took out of the picker, and two quick picker saves no longer race. Reopen Claude
+  Desktop to see a new order.
+
+### Fixed
+
+- **Un-preferring an account moves running conversations back.** Removing the preferred flag used
+  to affect new conversations only, so going back from a sub-account to your own login left every
+  running session on the sub-account. They now return to the configured order (one cold prompt
+  cache each), as choosing a preferred account already did.
+- **Ticking a Claude model for the picker no longer hides it from the Model mapping sources** (#128),
+  and a model listed twice in `extraModels` shows once.
+
+## 0.12.27 — 2026-11-05
+
+### Fixed
+
+- **ChatGPT image generation works again** (#129). Since 2026-11-04 the hosted image tool reads a
+  request's reasoning effort as its new "complexity" setting, which the default image model
+  refuses, so every image failed with "Complexity 'low' is not supported". Image requests no longer
+  carry a reasoning effort. The subscription backend chooses the image model itself (Images 2.6);
+  naming Sunburst or Flare in the request has no effect there.
+- **Codex no longer stops with HTTP 400 after a long `exec` that sends `notify()` progress** (#124).
+  Codex records two outputs under one call id; they now reach Claude as one tool result.
+- **A Windows update no longer leaves the phone host on the old version** (#125). A rename refused
+  while another process or a virus scanner held the file is retried, scheduling the host update can
+  no longer abort the install, and the router re-requests a host update left at an older version.
+- **The current Claude login stays in the account list while the pool uses it** (#123). It used to
+  drop out 12 hours after the last un-routed request even when it was serving requests; a 401 still
+  drops that exact token. A refused usage lookup keeps the last figures marked stale, and the rate
+  limit headers on Claude answers keep them current meanwhile.
+- **Old messages no longer pile up on the phone after Remote Control reconnects** (#126). Lines
+  Claude Code re-appends under the same ids are recognised and not shown again, also after the host
+  restarts, and they no longer disturb running workers or the current plan.
+- **Phone photos reach the model in their real format** (#127). The host reads the image type from
+  the bytes rather than the phone's label, so a JPEG labelled PNG no longer makes the model refuse
+  the turn. The app side of this fix ships with the next Ripple Remote update.
+
+## 0.12.26 — 2026-11-04
+
+### Added
+
+- **The limits pane shows every account you added.** Several Claude accounts each get their own
+  numbered tile with the account's name, and the one new requests go to carries an "in use" badge;
+  ChatGPT and Gemini accounts are marked the same way. The band's limits row still shows the
+  account in use only.
+
+### Fixed
+
+- **A running session moves to the Claude account you make preferred.** A thread continuation
+  carried only its new messages, so the pool could not tell which conversation it belonged to: it
+  went to the preferred account, failed with `thread_not_found`, and the full replay then stuck to
+  the old account. Continuations now follow the conversation that produced them, and changing the
+  preferred account moves held conversations onto it (one cold prompt cache each).
+- **The Claude limits show the account actually serving requests**, not always the app login, and
+  show nothing rather than another account's figures while its usage is unknown.
+- **An idle phone no longer keeps the remote relay awake.** With Ripple Remote 1.0.9 (or the web
+  remote) the phone proves its connection to the relay with a ping the relay answers without
+  waking, and checks the host and reports presence every 60 s instead of every 10 s. Older apps and
+  hosts keep the previous behavior.
+
+## 0.12.25 — 2026-11-02
+
+### Added
+
+- **The phone's background-task list names each worker's model**, as the worker's card in the
+  conversation does (Ripple Remote 1.0.8 and the web remote). A later update without a model keeps
+  the one already known.
+
+## 0.12.24 — 2026-11-02
+
+### Added
+
+- **Red-team reviews have their own worker ladder.** Beside Frontend & design and Backend, the
+  dashboard's task domains now include Red team & review, with its own ordered models for light and
+  heavy work, so a review falls back to the next model when the first is out of quota. A delegation
+  marked `[[ripple: hard review]]` (or `redteam`, `red-team`) uses it; with none saved, the general
+  ladder runs. The mod's settings format moved to version 2, so a Claude session still running the
+  previous mod cannot save settings until it reloads the mod.
+
+### Fixed
+
+- **Codex tools reach Claude again with Codex 0.166** (#122, thanks @justzz). Codex now declares its
+  tools inside the request's input instead of the top-level list; those declarations were dropped, so
+  Claude printed `<invoke …>` calls as text instead of running them.
+- **The phone's "login was refused" banner clears when the Claude login recovers** (#121, thanks
+  @Lahai-Roi). A router check that overlapped the recovery could put the old banner back until the
+  host restarted, and could hide a new one the same way.
+- **A worker's background commands leave the Agents pane's running list when the worker ends**, as in
+  the Claude app.
+
+## 0.12.23 — 2026-11-01
+
+### Added
+
+- **The Compact card lets you choose the summary model for one press.** The dashboard can offer the
+  saved compaction model and up to four more. Claude Code's own compactor now handles every choice,
+  keeping its recent messages and reattached files; if the chosen model fails before answering, the
+  original request is sent unchanged. Automatic and typed compactions use the saved choice.
+- **Claude and OpenAI API keys have their own provider options.** A Claude API key serves its own
+  named workers, while ordinary Claude traffic stays on the app's sign-in. The OpenAI API preset
+  supplies the endpoint and sends a conversation cache key; it has not yet been checked with a live
+  key. Metered workers are named separately so a bare model id does not displace a subscription.
+- **The remote effort picker can return to Auto** (#120). The phone and browser can turn the mod's
+  automatic effort setting back on; choosing a level turns Auto off. An older host does not offer
+  the new choice.
+- **Windows can set the router's CPU priority in the dashboard** (#117, thanks @115dkk). The router
+  and phone host now start at Normal instead of inheriting Below Normal, so other busy processes are
+  less likely to delay them. The About page offers four levels and asks for confirmation before High.
+- **The tray explains why an update or setup failed** (#116, thanks @115dkk). The dialog names the
+  problem and offers an appropriate next step where one is available; the full output stays under
+  Details and can be copied.
+
+### Changed
+
+- **The dashboard and tray use reviewed Korean wording.** The dashboard's other five languages and
+  the tray translations follow the revised text, and the phone-key rotation warning says that
+  notifications end too.
+
+### Fixed
+
+- **The Agents pane stays visible with a long list, and ended commands stop showing as running.**
+  It draws at most thirty cards, preferring running work, and reports how many records are left out.
+  A background command's end notice in a worker's own conversation now settles its card at once.
+- **Native Claude workers use the model IDs Claude Code advertises** (#115, thanks @RedBoardDev).
+  Family aliases resolve to their concrete models, and a direct marker no longer sends an `@level`
+  suffix as part of the Anthropic model name. Explicit model versions and resumed runs are left alone.
+- **Codex custom and namespaced tools reach Claude with their identities intact.** Tool choices and
+  results survive translation, while tools unavailable on the current turn cannot be returned as
+  executable calls. Supported tool-result images reach native Anthropic; invalid or unsupported
+  images are omitted instead of failing the whole turn.
+- **A routed conversation's context count no longer jumps while an answer streams.** The router
+  scales its estimate using that conversation's last measured input, even when the request shrinks.
+  The Context pane labels routed counts as estimates rather than offering a misleading precise count.
+- **A picker model's context window can be edited over the Codex catalogue.** A saved choice now
+  takes effect; clearing it returns to the catalogue, and an explicit route window still takes
+  precedence.
+- **The remote shows progress narration and pending settings accurately.** Sentences Claude Code
+  writes between tool calls appear in the conversation, and a model or effort change waiting for
+  the current answer is reported as pending rather than failed.
+- **Windows session images and scratchpad files no longer fail over equivalent temp paths** (#98,
+  thanks @115dkk). Short and long path spellings are treated alike, and a folder owned by a trusted
+  elevated administrator is accepted; access and ownership checks still apply.
+- **Windows purge and tray replacement are safer under load** (#98, thanks @115dkk). The deferred
+  purge waits longer for its cleaner and retries receipt reads and writes, avoiding false failures.
+  A tray replacement also refuses to overwrite an existing backup.
+- **Clicking the macOS app icon opens the dashboard and brings it forward.** A running app now
+  handles the reopen, and an unfocused dashboard gets a second chance to come to the front.
+- **The laptop page warns when an AlDente setting can make a closed Mac sleep.** AlDente's
+  "Disable Sleep until Charge Limit" can clear the same sleep setting ClaudeRipple holds; the warning
+  points to "Stop Charging when Sleeping" as an alternative.
+- **A chat's cache stays warm across a session-process restart.** The last reply and cache timing
+  are restored for the same session and model while the cache is still valid; a clear or model
+  change drops the saved state.
+- **Auto mode's classifier prompt reaches translated providers unchanged** (#98, thanks @115dkk).
+  Provider identity and image hints were being added to its security prompt. A saved route to a
+  provider that cannot take routed requests now also produces a warning instead of failing silently.
+
+## 0.12.22 — 2026-10-29
+
+### Added
+
+- **The Auto mode classifier's two stages can each take their own model** (#91, thanks @115dkk).
+  The dashboard shows a row for the first stage and one for the rest; a setting with a single target
+  keeps working as before. A choice still being saved stays on screen through the five-second status
+  refresh, so the last choice is the one stored.
+- **Gemini 4 Argon through Antigravity** (#106, thanks @csa906). Cloud Code Assist lists and serves
+  Argon only to the Antigravity CLI client, so Argon alone is asked for and called with the CLI's
+  User-Agent; every other model and call keeps the IDE profile. Antigravity's terms warning still
+  applies.
+
+### Fixed
+
+- **Gemini 4 Argon's separate weekly quota shows in the limits** (#107, thanks @csa906). The quota
+  summary under the CLI profile carries Argon's own weekly bucket, which the IDE profile leaves out,
+  so the limits no longer show Gemini quota as available once Argon's week is spent.
+- **A failed Antigravity CLI model lookup is logged.** When the CLI-profile lookup fails or is cut
+  off, the IDE list still answers and Argon used to vanish from the model list without a trace; the
+  router now logs the host and the reason (no body or credential).
+
+## 0.12.21 — 2026-10-29
+
+### Changed
+
+- **The limits pane says exactly when each window resets, in the mod's own look.** It was a bare
+  table of shares and short reset hints ("6시간 뒤", "수 15:35"). It now sits in the same graphite
+  capsule as the context pane: a gauge of the window closest to its cap and how many are at 80% or
+  more, then a card per provider account with a bar per window, the reset as a full local date and
+  time ("10월 12일 (월) 오후 6:20 초기화") and the time left ("5시간 남음"), refreshed while open. A
+  window past its reset, one with no reset time, and Claude's save mode each say so in a sentence.
+  The terminal draws the same content as text.
+
+### Fixed
+
+- **The band's limits row lights under the pointer like its other buttons.** Its highlight was an
+  empty overlay box, which the app does not draw; the row now uses the same hover style as the
+  effort and context chips.
+- **The mod preview draws each picture at the size laid out for it**, so the band's controls no
+  longer overlap there.
+
+## 0.12.20 — 2026-10-29
+
+### Fixed
+
+- **A recovered provider no longer receives thinking signed by its fallback** (#89, #94).
+  Native Anthropic and Anthropic-compatible targets drop signed thinking and redacted-thinking
+  blocks known to belong only to another provider, even when the request is no longer rerouted.
+  Unknown origins remain unchanged on ordinary requests; reroutes still keep only target-owned
+  blocks. Replayed history stays stable across recovery turns and a later fallback keeps its own blocks.
+
+## 0.12.19 — 2026-10-29
+
+### Fixed
+
+- **Windows install, start and repair no longer stop on `Cannot read properties of null (reading
+  'pid')`** (#110, #62). Right after the scheduled task was registered, the router lookup printed
+  `null` when no router had started yet, and the pid was read off it. An update could leave the router
+  off until the next reboot.
+- **A worker name keeps the model's capitals as lower case** (#111).
+  `deepseek-ai/DeepSeek-V4.1-Flash-1017` is now `deepseek-ai-deepseek-v4-1-flash-1017`, not
+  `deepseek-ai--eep-eek--4-1--lash-1017`. Ladder rungs and allow lists saved under the old name move to
+  the new one, a marker that still says the old name resolves to the same model, and the old generated
+  worker file is removed. A hand-written worker that happens to use an old name, and a name that is
+  some declared model's id, are left alone.
+- **`wire: google` models use the provider's key pool** (#112). They sent the first key only, so a
+  spent key answered 429 to every turn. Keys are now picked and rotated like every other wire, with
+  `KEY`/`RETRY` lines and the `credential` field. Google's invalid-key 400 also rotates, the last key's
+  `Retry-After` is kept, and every key sent on a request (and Antigravity's tokens) is masked in
+  streamed errors, logs, exceptions and the request record. Single-key providers send what they sent.
+- **Responses-wire reasoning that arrives only as text is passed back** (#109). Reasoning without
+  `encrypted_content`, and a completed item addressed by `output_index` alone, were not carried to the
+  next turn. A `content[].thinking must be passed back` 400 now logs the assistant turns' block kinds
+  and counts (no content) and tells the client not to retry it.
+- **A retired model is skipped instead of picked again** (#94). An explicit `ModelDeprecated` / "has
+  been deprecated" 404 or 410 marks that provider's model unusable, the ladder skips it with
+  `model_deprecated`, and `/api/status` shows it. A config change for the provider or a success from
+  the model clears it.
+- **A running worker moves to the next rung of its ladder when its provider is exhausted** (#89).
+  After the router records the worker's target as exhausted or retired, the worker's next request goes
+  to the next usable rung of the same tier, logged as `LADDER pick=… A → B reason=…`. Only the ladder
+  snapshot the mod writes at the start of the spawn prompt is read, and every fallback must still be on
+  the saved ladder. Thinking blocks another provider signed are not forwarded on a reroute; the target's
+  own are kept. A fresh key added to an exhausted provider clears its exhaustion.
+- **The Desktop handoff waits for running background workers** (#114). Handing a session to the app
+  stopped the host's SDK and killed a worker still running; the handoff and settings restarts now wait
+  for the live query's background tasks, and a worker the app reports `stopped` shows as stopped on the
+  phone.
+- **The phone no longer shows a stored permission mode as the app's** (#113). After a handoff the
+  mode is omitted rather than claimed, `/clear` and `/new` keep the session's own choice (a desktop
+  session's latest one), and a model or effort change waiting on a background task is reported as
+  pending instead of applied.
+- **A question card no longer reaches the phone ahead of the text before it.** The Remote Control
+  permission stream could beat the transcript watcher, so the assistant's preamble arrived after the
+  card.
+
+### Known
+
+- When a provider recovers after a reroute, thinking the fallback signed may still be sent back to the
+  original provider. This predates 0.12.19 and is fixed in 0.12.20.
+
+## 0.12.18 — 2026-10-28
+
+### Fixed
+
+- **A model saved with `"contextWindow": null` gets its catalogue window too.** The catalogue
+  backfill and the new-provider check filled only a missing field, so a config that stored the blank
+  as `null` (Hive's models in a real config) kept running on the 258,400 fallback after 0.12.17.
+
+## 0.12.17 — 2026-10-28
+
+### Fixed
+
+- **A routed model compacts within its own window, not at the global setting.** With
+  `autoCompactWindow` set in settings.json, Claude Code used it for every model and treated the
+  per-model windows the router sends at bootstrap as defaults only: a slot routed to GPT-6.1 Sol
+  (475K) compacted at 600K, past what Sol accepts. The router now writes
+  `modelSettings.<model>.autoCompactWindow` for each routed model, the smaller of the model's window
+  and the global setting, which Claude Code honours over the global value. Native Claude models are
+  left to the global setting. An entry the person wrote themselves is never touched, entries for
+  models no longer routed are removed, and uninstall removes only the unchanged entries it wrote.
+  Changes to the global setting are picked up within 15 seconds.
+- **The phone and the band show the window the session actually compacts at.** The phone showed a
+  1M Claude session against 1M while the Desktop app said 600K, and the band's fallback used the
+  global setting for every model. Both now read the router's per-model effective window from
+  `/api/context-windows` (`compactWindow`); the band still prefers `/context`'s own figure.
+- **A provider that does not report context sizes gets them from the model catalogue.** Hive's
+  `/models` lists ids alone, so its models fell back to `cli.autoCompactWindow` (258,400) even where
+  the same model has a published window. A blank window is now filled from models.dev when the id,
+  without its organisation prefix and, failing that, its build stamp, matches a catalogue model
+  exactly; where providers disagree the smallest window is taken, since a reseller may serve less.
+  A value set by the person or the vendor is never replaced.
+
+### Added
+
+- **The Models tab says when a model's context size is unknown** and which fallback it runs on.
+
+## 0.12.16 — 2026-10-28
+
+### Added
+
+- **A session the phone creates on a folder saved as an environment now starts in the Claude app**
+  (#102). Such a session ran its first turn on the host and was then handed to the app with
+  `--desktop --resume`, which the app imports with Remote Control off, so every later turn stayed
+  invisible in the app until a restart. When the folder is one the person saved as an environment, the
+  host now creates the session on that environment as Claude's own phone app does: the app picks it up
+  in about three seconds, starts it and attaches Remote Control, and the first message goes through
+  the bridge once the worker has attached. Only a definite refusal (no matching environment, no login,
+  a 4xx) falls back to the old path; a lost answer, a 5xx or an attach timeout holds the first message
+  as failed rather than risking a second session.
+- **A phone message to a session the app holds runs in the app, and its turn shows on the phone**
+  (#102). A session open in the app without Remote Control answered every phone message with "turn on
+  Remote Control", and a handed-off session ran the message on the host, where the app never showed it
+  until a restart. The host now offers plain text to the mod inside the app's own CLI process, which
+  types it in as the person's prompt, and tails the transcript whenever it is not running the session,
+  so turns typed in the app reach the phone too and the mod's prompt shows once whichever arrives
+  first. Attachments, slash commands and interrupts still get the blocked answer, a claimed message is
+  never also run on the host, and a claim that never arrives is reported failed after two minutes,
+  with a notice that says to resend or delete the message.
+- **The phone's model and effort are kept as the app's own record for the session.** The app keeps each
+  session's model and effort in its own record and re-applies it when the session is opened, while a
+  phone's `set_model`, effort control or in-session `/model` changed only the running CLI, so a
+  phone-picked model was lost the moment the session was opened on the Mac. A phone change now also
+  asks for the app's record to change, through a job the mod in another app session claims and applies
+  with the app's own tools, and only while that session is in bypassPermissions since the app would
+  otherwise ask the person to approve. A change made in the app shows on the phone at the next poll, a
+  phone change still on its way is not undone by the app's older value, and when the app could not be
+  changed the phone keeps its choice and says what to check in the app. A Mac, whose sidebar names no
+  root, now builds the record reader anyway, so the sync is no longer off in production.
+- **The tray sets the laptop's stay-awake mode.** Changing the mode or the hotspot failover meant
+  opening the window and going to Laptop settings, which is what people skip on their way out. The tray
+  now reads `GET /api/power` with each healthy poll and shows a submenu with the current mode in its
+  label: the three modes as radio items, the hotspot switch and a shortcut to the Laptop page, or to
+  setup when the sudoers rule is missing. A mode picked there has no end time, so it clears one set in
+  the dashboard; routers without the API and Linux show nothing.
+
+### Changed
+
+- **A model id can name the provider that should serve it, and a shared id no longer deletes
+  workers** (#94). When two providers declared the same vendor id, the router wrote one worker per id,
+  so adding a second provider deleted the first's worker, and a bare duplicate gave no way to say
+  which subscription should pay. A `<provider>:<modelId>` marker now selects that provider only when
+  the prefix is a configured provider that declares the remaining id, and the upstream receives only
+  the model id; anything else stays a model id, so Ollama's `qwen3:8b` is unchanged. The first
+  outbound provider in config order keeps the plain worker name and later ones take
+  `<name>-<provider>`, every duplicate worker carries a qualified `model:`, single-owner files stay
+  byte-identical, and quota is checked by the worker's own provider and id, so a spent Google key
+  falls through to the OpenCode Go worker for the same model. A duplicate that stays ambiguous is
+  refused with its qualified alternatives rather than guessed or sent to Anthropic.
+
+### Fixed
+
+- **An interrupted worker stops showing as running** (#108). A background agent stopped during a tool
+  call can leave no task notification, so the phone kept its card running forever. The worker's own
+  complete transcript now supplies an exact final interruption marker as proof of stopped, background
+  history is reconciled, and parent and nested snapshots refresh when a worker's record changes, while
+  a normal final answer still completes as before. Nothing is inferred from elapsed time, a parent's
+  interruption or completion, a missing inventory or a failed Task Stop, and a partial append, quoted
+  marker or resumed transcript stays nonterminal, preferring a missed stop to a false one.
+- **A Windows update no longer takes its own router for another installation** (#100). The headless
+  scheduled task starts conhost before PowerShell, so the router is a grandchild rather than a direct
+  child, and the identity check found no router of its own. The lookup now walks the launcher's whole
+  subtree from one process snapshot, without weakening task ownership or accepting an unrelated
+  shared-runtime router; an unreadable PID discovery still yields nothing.
+- **A Codex request to a Claude model no longer needs a Claude Code version the router never saw**
+  (#103). The fallback `user-agent` was pinned to `claude-cli/2.1.266`, and Anthropic refuses a model
+  to a client below a version floor it raises over time, so Opus 5.5 answered "version 2.1.280 or
+  newer is required" on a machine whose Code tab never passed through the router. The fallback now
+  takes the newest version the machine can vouch for: a recent observed Claude Code request, else the
+  newest CLI the Desktop app has cached, else a constant updated to 2.1.304. Headers from an observed
+  request are still replayed exactly.
+- **Codex's `/compact` reaches a Claude model as a request it accepts** (#104). The remote-compaction
+  body ends with a control item that the OpenAI ingress dropped as unknown, so the assistant's turn
+  stayed last and Anthropic answered "This model does not support assistant message prefill." The
+  trigger now becomes the user turn that asks for the summary, with every earlier item passed through
+  unchanged, and a transcript that ends with the assistant for any other reason gets one short
+  "Continue." turn. Both land before the cache breakpoint is placed, and the Claude Code path is
+  untouched. Codex then expects exactly one `compaction` item back: the summary now comes back as
+  that item, in a format only the router reads, and when Codex sends it with the next turn the
+  router restores it as user text in place, so the conversation carries on from the summary. A
+  compaction item that OpenAI produced is still dropped, now with a warning in the log.
+- **Workers on one account no longer pile onto one key, and the log names the key that answered**
+  (#101). Every worker of one person injected the same opening text, so the conversation key collided
+  and one secondary key's claim was renewed indefinitely; the key is now captured before routing so
+  agents, sessions and full opening messages separate, while metadata-less side requests keep their
+  shared affinity. A healthy conversation stays on its key rather than switching back when an earlier
+  key recovers, since a warm cache is worth more than config order. The credential records the
+  responder's label or ordinal, an OAuth account by ordinal rather than its email, selection reasons
+  and retries are logged without runtime ids or tokens, and the measured relay `server_error` "Global
+  regions" 400 is read as a workspace-key refusal, rested briefly and tried on another key while
+  ordinary 400s still stop.
+- **A Claude worker whose prompt starts with a delegation marker still passes through** (#94).
+  Refusing ambiguous markers on Claude requests dropped the old rule that a `claude-*` request is
+  never refused, so a worker whose prompt began with `[[ripple: standard]]` or `[[ripple: opus@high]]`
+  was answered "not an alias and not an agent name". A Claude request now passes through unless its
+  marker names a model two providers declare.
+- **A handed-off phone session keeps going while the app is idle** (#102). After the app adopted a
+  phone session for its list, every next phone message waited for Remote Control, which the app never
+  turns on for a session it adopted, and the session had forked once when a host process kept between
+  turns answered from its own last line while the person typed in the app. The host now resumes a
+  session it started and handed off when the app's registry entry, read fresh, says idle, and queues
+  the message with its own notice while the app runs a turn, across host restarts. It lets its SDK
+  process go after each turn while the app holds the session, so every phone turn resumes from the
+  transcript.
+- **A phone message runs with the settings picked before it, and a late change cannot undo a newer
+  pick.** A message sent right after a model or permission pick could run with the old one, "send now"
+  could wait for changes picked after it, and a change that hung held every later one forever. Each
+  session now has one queue in which every setting change, direct send, "send now" and queue drain
+  takes one place with one deadline of fifteen seconds from when it starts; an expired place lets the
+  queue move on and invalidates its token, checked before every outgoing call, so an overtaken change
+  never reaches the session. A message already handed on still records its receipt after the deadline,
+  and a Stop, a removal or the app taking the message during a wait is reported rather than passed
+  over.
+- **A handed-off session's queue settles once the app has answered** (#102). A mod-delivered message
+  left an "awaiting" mark that only a result event clears, and an app-run turn writes none to the
+  host's log, so the next message sat in the queue while the app was idle and pressing send ran it on
+  the host. The mark is now dropped, the host writes the app's own running, waiting and idle state for
+  a handed-off session it follows so the phone shows when the app is working, and a short app turn
+  between two polls no longer leaves a stale mark, which also clears old ones left by an earlier
+  build. A stop from the phone on a session the app is running now says to stop it in the app instead
+  of reporting a stop that never happened.
+- **A page of history belongs to the log it was read from, and a rebuilt log gets a fresh tail.** A
+  phone or browser asked for the page before a sequence number of one epoch, the host rebuilt the log
+  as another meanwhile, and it answered with the new log's page, so the reader merged its past under
+  the old recent events; the web client also lost a stretch of history for good after a fresh tail and
+  dropped loaded pages whenever a same-epoch tail arrived. The request now names its epoch and the
+  answer names the one the host read, a mismatch gets no page and a fresh tail, and a read that
+  rebuilds the log tells every attached reader. A phone's cursor carries its epoch, so a rebuilt log
+  sends the new tail with `hasOlder` instead of a slice of it, and a phone already at the last
+  sequence gets an empty frame so its saved copy knows it is current.
+- **A slow connection no longer queues a tail for every update.** Ten desktop updates on a slow link
+  queued ten 260 KB tails, and eight session lists grew the buffer from 1 MiB to 2.1 MiB while the
+  held tail never left. A tail now waits until the buffer drains, one per session, and the newest
+  snapshot goes out then; a backed-up connection gets only the newest list once it drains. A detach or
+  close clears what was waiting.
+- **A Code tab plan finishes when its turn wraps up.** The Code tab checks its task list off when a
+  turn calls `wrap_up`, so a turn may end without a last advance, and the phone kept such a plan at
+  "step 1 in progress, 0/3" after the turn had ended. A successful `wrap_up` now completes the
+  per-turn plan; session-scoped `TaskCreate` and `TodoWrite` lists are left alone, and a `wrap_up`
+  from a retired turn cannot finish the next turn's plan.
+- **A released closed lid sleeps again.** Releasing the lid-closed hold ran `pmset sleepnow` whenever
+  `ioreg` said a closed lid causes sleep, which on 2026-10-26 overrode an Amphetamine session and audio
+  playing at the desk; the first fix left the Mac to idle sleep when another process held a
+  system-sleep assertion, but Amphetamine's indefinite session and powerd's "display is on" were taken
+  as such holds though they do not stop lid-close sleep, so on 2026-10-28 the Mac ran on battery from
+  55% to 11%. Only `PreventSystemSleep` now counts as another process's hold, the closed Mac driving a
+  TV is caught by reading attached external displays from `ioreg`'s framebuffers instead, and battery,
+  heat and a failed guard read still sleep the lid.
+- **The band leaves room for other mods and loads under strict plugin validation.** The dashboard
+  band, the alert cards and the settings and setup cards returned their own tree without asking for
+  what another mod drew above the prompt, so that drawing vanished; every path now asks for it once
+  and puts ours under it, and the engine's bare answer is left out so the band looks the same when no
+  other mod draws. Claude Code 2.1.310's strict plugin validation also rejects an inline import in the
+  state contract, which is now named from the surrounding module scope instead.
+
+## 0.12.15 — 2026-10-26
+
+### Added
+
+- **The band's Compact has the chat tidy up before it summarises.** The press sends a turn of its
+  own that asks the chat to say what it has done and what is left, note its decisions and update any
+  handoff or memory file; the prompt and the answer stay in the transcript and the summary is built
+  from them. The switch beside Compact is on until turned off, and with it off the chat compacts at
+  once as before. The prompt reaches the model as the person's own words rather than as a message
+  from the plugin, a press whose prompt was dropped sends it again instead of leaving the button
+  dead, and a turn that is stopped or fails compacts nothing and says so.
+- **The limits row opens a pane that says when each plan window resets.** The row is a button now,
+  lit under the pointer, and the pane lists every provider account's windows with the share used and
+  when each resets: the time left while a window is close ("2시간 뒤"), else the weekday and the
+  local clock ("목 09:00"), and "초기화 중" once it has passed. Pressed again or closed, it goes,
+  and its press takes no width from the row; each window's own hover tip gave way to the row's one
+  hint.
+- **A Fast request is marked FAST in the band's log and the dashboard** (#97). Telling which GPT
+  requests burn the subscription faster meant opening `requests.jsonl`, since a Fast request looked
+  like any other row. The band's log shows FAST in the accent colour after the effort on a row's
+  second line, the dashboard puts an outlined FAST badge after the provider and a "requested tier /
+  served tier" line in the expanded detail, and the mark follows the requested tier because the
+  ChatGPT sign-in often serves "default" for a Fast request.
+- **The dashboard's Status page names each problem and the step that clears it.** Readiness listed
+  codes only the tray explained, so an untrusted certificate or a missing Desktop proxy entry looked
+  like a dead router. The page now words each problem, including a config that failed validation and
+  was adopted anyway (status carries the errors and `/readyz` answers 503), and offers a diagnostic
+  copy of versions, states and provider names that never carries a key or a header. Provider calls
+  bypass a company proxy in the environment, so diagnostics name the proxy variables that are set
+  without their values and say upstream connections ignore them. An update that started and failed
+  now shows its reason with a retry, modal dialogs keep Tab inside and put focus back where it was,
+  and every dashboard language carries every key.
+- **The browser remote's session list folds, pins and searches its projects.** Sections fold to
+  their name and count (the archive starts folded and opens in place), pinning lifts the Desktop
+  app's stars and this device's own pins into a section of their own, and a search reaches every
+  segment of a session's working directory. One page of rows draws at a time with a "show more" row,
+  and each row's menu offers archive, pin and mark unread, disabled with a reason while the computer
+  is away. A search with no list to look at says so, and is never shown as "nothing matched".
+- **The browser remote shows what a session changed, and asks for uncommitted work or the branch.**
+  The session header opens the same pane the phone has: the uncommitted/branch switch where the host
+  offers it, each file with its line counts, and one file's whole patch over the list with git's
+  headers left out and copy of just the change. Previous and next walk only the files that have a
+  patch and are disabled at the ends; the list and the open file keep their scroll, and Escape
+  returns focus to the header button it was opened from.
+- **A session's folder can be read from the phone, one small file at a time.** A new pair of request
+  ops lists the folder and reads one file of at most 1 MB, always resolved against the session's own
+  cwd: absolute paths, `..` and symlinks that lead outside are refused after realpath, a larger file
+  is reported with its size, dotfiles are left out, and the host advertises the capability so an
+  older app sees nothing new. The folder sheet now lists the drives at the top of every browse
+  (leaving out the one being browsed, cached for half a minute) and takes a typed path, so a folder
+  that no longer exists comes back as an error instead of an empty list.
+- **The browser remote keeps your place in a conversation as it grows.** Answers can be copied from
+  a control named for screen readers, an answer the host moved into a blob is read to its last page
+  first, and a refused clipboard names the browser's refusal instead of claiming a copy. A selection
+  made while the answer streams is carried across the redraw by character offsets, an opened thinking
+  block or tool detail stays open when its row is redrawn, earlier pages load by themselves one at a
+  time with a deadline, a refusal or a dropped connection offers the reader's own retry, an empty page
+  ends the asking, and a conversation opens again where it was left rather than at its end.
+- **The phone and the browser draw a command, a finished turn and a decided plan as what they are.**
+  Compaction, a fresh start and a rewind are drawn as their state — running until the turn they
+  started ends, then done or failed — in one quiet row with no control on it, while an unknown slash
+  command is left to the host and drawn as words. A finished turn names itself ("턴 3"), but only
+  where the conversation's first page is loaded. A completed plan card reopens read-only, a late or
+  replayed acknowledgement from an old turn no longer restores a plan, and Code and provider plans,
+  TodoWrite and TaskCreate/Update/List now share one successful-result reducer, so a reconnect or a
+  completed turn no longer hides outstanding work.
+- **A question with several parts keeps your drafts and submits once.** The browser's sequential
+  prompts became navigable question cards with full option previews: drafts are scoped to the
+  session's epoch, custom input is kept exactly, single and multi-select contracts are enforced, an
+  incomplete or duplicate decision is blocked, fields being edited stay stable while chrome updates,
+  and keyboard focus returns after a selection.
+- **Background work and worker conversations stay visible on the phone and the browser.** Commands,
+  monitors and scheduled wakeups left running while the main turn is idle are listed with SDK Stop
+  inventories (PR and CI subscriptions included), stopped and failed workers are told apart, and an
+  unknown state is kept when no authoritative inventory exists. A worker's open conversation follows
+  its steps, asking only for what came after the last one and reading the launch instruction once,
+  and a nested worker keeps a return path with its frame's position and tool state.
+
+### Changed
+
+- **The Logs summary counts a period's tokens once per conversation.** Adding every request inflated
+  the total, and subtracting cached input failed after a cache loss or a provider translation. The
+  summary now has a tokens chip counted the way the Agents card counts — the last whole prompt per
+  conversation plus every output in the period, from persisted conversation identities —
+  while the input and output chips keep the split and the request-volume counters are unchanged;
+  older logs fall back to independent-request counts. The request row reads the whole prompt in its
+  input cell with the cache's share on a pill and the output in a cell of its own. Usage is read only
+  from the response's own top-level object, so usage embedded in a tool input or in response text
+  cannot inflate a count.
+- **The Agents card reads like the app's task list and counts tokens as the app does.** Every step
+  re-sends the whole conversation, so summing each step's input ran to millions; a worker's tokens
+  are now the last response's whole prompt plus every response's output, and a finished worker takes
+  the larger of that and its last response's own count. The card is a one-line title the engine cuts
+  with an ellipsis, with the time and a chevron at its end, then the model's name with its effort,
+  then tokens, cache and tool count; the time's colour carries the state, a four-digit tool count
+  reads 1.2k, the cached share rounds down so 99.96% reads 99%, a whole card opens its conversation,
+  and a background task's card follows the same layout. The empty pane now says that background
+  commands and watches appear there too.
+- **Every pull request is typechecked and tested on macOS, Linux and Windows.** Linux and Windows
+  run non-blocking until they pass, since the suite has only been run on macOS. CI also parses every
+  mod file, resolves its relative imports and checks that `hooks.json` and `plugin.json` name files
+  that exist, without executing the mod or fetching the engine, and the publish workflow packs the
+  tarball, installs it into an empty prefix with scripts disabled and checks the files an install
+  runs, so a missing `dist/` cannot ship.
+
+### Fixed
+
+- **Claude Code's mid-conversation system messages are folded for compatible vendors** (#92,
+  OpenRouter). Claude Code 2.1.308+ puts SessionStart hook context and deferred-tool deltas in
+  messages with role "system" carrying `tool_addition` and `tool_removal` blocks; only top-level
+  fields were cleaned, so a vendor's Anthropic skin refused every turn with a 400 once a hook or a
+  deferred MCP tool was in play. Such a message becomes a user turn with its text byte-for-byte; a
+  `tool_addition`'s definition joins tools through the same loop declared tools get and is appended
+  after them so the cached tool prefix does not move, a `tool_removal` goes with its block, and the
+  request log counts each fold.
+- **OpenCode Go's spent plan is read as a spent plan, and delegation skips it** (#95). The service
+  answers a used-up subscription window with a 429 whose body says "Go usage limit exceeded" and no
+  retry header, which the classifier read as a temporary rate limit: the worker retried the same 429
+  for minutes and the next delegation chose the same provider. The pattern now carries the plan's
+  own phrase with a per-minute/hour guard, and the ladder leaves out a provider whose every key has
+  a window at 100%, naming its reset as `exhaustedUntil`, so the next delegation does not spend a
+  429 on it.
+- **OpenCode Go's `gemini-4-argon` runs on its Google wire** (#94, in part). The listing no longer
+  carries `gemini-4-argon-contributor` and carries `gemini-4-argon` instead, but a model picked from
+  the listing saves only its id and name, so without a preset row it inherited the preset's
+  Responses wire and the vendor refused it with "Model does not support this protocol". The row is
+  written out as the wire is published per model, not per family.
+- **A session read on the phone no longer keeps its unread dot** (#96). The dot comes from the
+  Claude app's own Local Storage, which the host only read; clearing attention never told the list
+  the phone had read the session, so a session opened on the phone stayed unread forever. The host
+  now records the activity the phone read per session and reports unread false once that record
+  reaches the sidebar's last activity; anything newer is unread again, mark-unread forgets the
+  record, and records for sessions that left the list are pruned. Writes stay rare: only a dot
+  actually shown is recorded.
+- **A web search the router serves itself is logged under its own model with usage.** It was logged
+  with the target's name and no usage, so the model table showed a phantom model with zero tokens
+  (126 requests in a week). The record now names the model the search ran on, keeps purpose
+  "web-search" and carries the backend's usage; the model table and recent requests key rows by
+  purpose, tag them "web search" with the help note worded as the page's other notes, read older
+  provider/model records with no tokens as the same row, and hourly buckets write purpose.
+- **The tray stops replacing itself, and an update leaves the dashboard as you left it** (#93).
+  Started as `electron main.js`, the tray read Electron's own version instead of its package's, so it
+  saw a newly updated router on every poll and replaced itself about every two seconds; the version
+  now comes from one function, and a pair that never converges is counted in
+  `~/.clauderipple/tray-replacement.json` — after three launches the tray stays up and says why once.
+  A replacement is now started as a login launch and shows the window only when it was up before, so
+  an automatic update no longer brings a closed dashboard to the front, and `clauderipple update`
+  refreshes the fetched Electron into a staging folder before moving it over.
+- **A pinned ClaudeRipple shows our icon instead of Electron's.** macOS keeps a Dock pin by bundle
+  path and draws that bundle while the app is not running, so the running tray could only paint our
+  icon over Electron's atom. macOS now runs `tray-runtime/ClaudeRipple.app`, a copy of the fetched
+  Electron with our name, identifier, icon and an ad-hoc signature, rebuilt on every refresh and
+  falling back to plain Electron if the build fails. A pin that already points at Electron.app
+  cannot be rewritten by code: unpin it and pin the new bundle.
+- **The tray waits for a slow but valid answer and labels a quota by its real period.** After a TCP
+  connection it took any quiet moment for a dead router, and every primary quota window was labelled
+  weekly. Readiness now uses the router's own answer, and a quota window is labelled by the period it
+  actually covers.
+- **Uninstalling a second installation no longer takes the real install's setup.** The release check
+  installs under its own home and port, but its uninstall removed the Claude Desktop proxy and the
+  Codex provider whatever they pointed at, deleted the keychain's CA by name (the real install's has
+  the same one) and removed worker files the real install had written. A home other than
+  `~/.clauderipple` now removes only its own: the proxy and the Codex provider when they point at
+  its port, its CA by fingerprint, and worker files the default home's manifest does not record;
+  `picker off` and `direct on` follow the same rule, and `direct on` keeps a Desktop proxy the
+  person wrote instead of refusing it.
+- **Install and uninstall act only on what this home recorded.** Every install on an account shares
+  one launchd label, systemd unit and task name, so a definition is not proof of ownership: acting on
+  one now requires the home it records, an unreadable one is preserved and reported, and a launcher
+  that records this home is adopted while a malformed marker stays unknown. A service that is already
+  stopped reads as removed rather than a permission error, a control that fails leaves the definition
+  in place, and the Windows phone host is started and stopped through its own runtime home with only
+  an explicit success counted. A value in `~/.claude/settings.json` is removed only when this home
+  recorded it and no other home records the same value, a file that is not a JSON object is refused
+  so its other keys are never dropped, and a worker file is removed only after every shared claim was
+  read. A legacy entry an older version wrote without a marker is taken over only on independent
+  evidence that it is this home's, and an ambiguous or unreadable one stays untouched and reported.
+  A restart also waits for the relaunched router to answer before judging it, so a healthy restart is
+  no longer reported as unverified.
+- **A direct switch keeps what it can prove and refuses the rest.** A direct transition accepts
+  Claude Code's own opus, sonnet and haiku aliases and refuses a shared routed slot before changing
+  either client, so a preserved model cannot become a broken direct connection. CA removal fails
+  closed when its fingerprint or the trust store cannot be read, and a certificate whose trust
+  settings outlived it in the keychain no longer reads as trusted.
+- **Uninstall removes this installation's phone host and says what it cannot take back.** The phone
+  host is a second account-wide service, and uninstalling left it running against files about to
+  disappear; it is now read first and stopped and removed only when its definition records this
+  installation's home, while another home's host, or one that records none, is reported and left
+  alone (an explicit `remote uninstall` may still take an unrecorded one). Uninstall names the
+  sudoers grant `awake setup` installed, the PATH line the installer added to the profile and any
+  remote SSH hosts still configured, and the context cap it wrote is claimed like a model slot so it
+  takes back exactly its own value.
+- **An interrupted install keeps the old runtime, the command and its lock.** `install.sh` deleted
+  the runtime folder before unpacking Node into it, so a failed download, extraction or a full disk
+  left neither; the archive is now unpacked beside it and swapped with two renames, the previous
+  runtime is put back if the swap fails, the command wrapper is renamed over instead of removed
+  first, a backup that cannot be deleted is reported while the run continues, and Node is rolled
+  back until npm and its wrapper succeed. Service locks are claimed with an atomic directory holding
+  its owner's identity, published only once that owner exists, and reclaimed only after that exact
+  process exits — a failed process lookup is not read as one — so a crashed controller no longer
+  blocks every later run; empty or damaged legacy locks are kept and their manual recovery is named.
+- **An Ollama model takes its thinking levels and context window from `/api/show`.** Its
+  OpenAI-compatible surface reports ids alone and ignores `reasoning_effort`, so the probe measured
+  every thinking model as taking none, wrote `[]` to the config where an empty ladder means a
+  decision, and the model kept showing no effort steps and no context window. Providers on
+  ollama.com or the local daemon are measured through `/api/show` first, an empty ladder on Ollama
+  is treated as blank rather than settled, and a ladder someone set is never replaced.
+- **A cancelled turn is not counted against the provider, and a finished stream ends at once.** A
+  person's cancellation was recorded as an upstream failure and interrupted delivery as a completed
+  one; cancellation is now kept out of global upstream health, interrupted delivery is recorded as
+  aborted, and a translated stream completes at its protocol terminal with the usage before it
+  instead of waiting for EOF.
+- **A macOS host no longer stalls for seconds on every session list.** `Sessions.list` asked whether
+  each closed Claude app session was open, and on macOS each ask ran a synchronous `ps -axo
+  pid,command` — dozens per list, every poll and every phone update, stalling the host for 5 to 14
+  seconds: phone pushes went out late, relay pings ran late, and Remote Control state reads and the
+  away probe timed out behind them. macOS now reads one snapshot at start and refreshes it in the
+  background every five seconds, as Windows already did.
+- **A session's folder and times read as the phone shows them.** A Windows host's cwd was split on "/"
+  alone, so a session row showed the whole path instead of the folder, and a home folder was only
+  abbreviated when the string matched exactly; both separators and drive-letter case are handled now.
+  The clock follows the phone's 12/24-hour and language settings (HH:MM only as a fallback), and file
+  sizes read in KB/MB with a decimal only where it distinguishes something.
+- **A phone message arrives whole, once, and from the computer that owns it.** A long host message is
+  transported in bounded UTF-8 chunks and reassembled before delivery while older clients keep
+  their wire contract, an attachment up to 8 MiB is validated with bounded checks instead of
+  recursive matching, and a reused message id carrying other words or attachments is refused with a
+  sentence the phone can show instead of being answered as a success that never ran. A handoff input
+  is kept in the host queue with its original id and photo bytes until a session can receive it,
+  recovered across a restart without a second writer and retried within the existing three attempts,
+  while an explicit Stop still holds. Queues are bound to the pairing identity so a replacement host
+  does not receive the previous one's unsent messages, refused originals stay readable and copyable,
+  and a native push now names the sending host so a tap cannot open a session in the wrong pairing.
+- **A phone's connection recovers once, and its figures follow the model it is routed to.** A socket
+  left healthy after a background suspension was replaced on every foreground, and a probe that went
+  unanswered left the phone waiting. Healthy sockets are kept, recovery starts within three seconds
+  of an unanswered probe, there is one retry and countdown chain, and superseded sockets and stale
+  callbacks are closed so a stop cannot revive an old timer. A turn's text now closes at response,
+  approval and lifecycle boundaries, so a later running turn cannot revive an old cursor; a
+  session's context capacity comes from the routed model rather than a stale SDK cache and is
+  dropped on a model or epoch change; a conversation started after `/clear` keeps its title, stale
+  attention is retired when desktop work resumes, and a failed desktop credential read is retried
+  only within its window.
+- **The band draws at the app's own type again.** Since the app's newer type sets a cell at about
+  8.8 px, pictures sat in gaps wider than themselves, the sea ended short of the capsule's right
+  edge, fewer facts fit and the route shrank to "Op…". Each picture now fills the cells laid out for
+  it whatever px a cell is, icon slots are the pictures' exact width, the facts and Handoff pill sit
+  half a cell from what they show, and a counted icon draws its badge only while it has a count. The
+  work current runs along the capsule's true bottom and no longer restarts on a redraw, and the
+  limits row keeps its height under the pointer.
+- **The Agents pane keeps live workers and stops re-reading what cannot change.** The forty-record
+  limit applied to running workers too, cutting live cards off from their counts and usage; it now
+  bounds only finished ones. A long command stays in the running state instead of turning amber
+  after eight seconds, queued coordinator follow-ups are shown in the agent's conversation, the
+  instruction is recorded beside its delivery so a slow read cannot delay it, `/clear` no longer
+  empties the Agents list, a finished conversation is read once per state instead of on every
+  redraw, an open conversation no longer redraws on the clock, a tool-run line presses and lights
+  along its whole width without flicker, and an agent's page keeps its head at the top while
+  scrolling.
+- **A worker runs on the definition and policy it was prepared with.** Switching auto to
+  general-purpose discarded the Agent tool restriction, so the registered definition is kept and
+  only its model is overridden, with the picked effort applied to the executor too. A managed worker
+  whose routing policy cannot be prepared is refused rather than run on unchecked input, engine-owned
+  agents stay independent, and an empty or incomplete rule reason is refused. A current router
+  outage now shows over historical routes, and context counts are bound to the model, capacity and
+  context generations so a late response cannot overwrite them after a clear, resume or compaction.
+- **A Handoff answer from a chat that was cleared is dropped.** A fork outlives `/clear`, so its
+  answer came back to the new chat and opened a session there with the old chat's note. Each press
+  now carries a run id and the chat generation it started in, and an answer that lands elsewhere is
+  dropped without a toast or a failed card.
+- **The dashboard keeps your edits and clears what a removal leaves behind.** Removing a provider
+  left the web search, the Auto-mode classifier and other routes' fallbacks pointing at a provider
+  that no longer existed, which the config check refuses; the removal now clears them, the provider
+  page lists every place it is named, and the confirm says what else will go, while the Clients page
+  shows each route's fallback chain. A config or catalogue change rebuilt the picker rows and
+  replaced a context window being typed: typed text is carried over the rebuild with its caret and
+  saved on the next change, a Grok model typed before the first listing is no longer unticked, only
+  edited mapping rows are rebased, changed controls are no longer rebuilt during status polling, and
+  a success notice no longer masks a partial-save warning.
 
 ## 0.12.14 — 2026-10-24
 

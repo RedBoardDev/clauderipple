@@ -3,6 +3,7 @@
 // few things only the app can do: doctor, repair, the direct switch, reopening Claude.
 
 import { app, BrowserWindow, nativeTheme, screen, shell } from "electron";
+import { execFile } from "node:child_process";
 import path from "node:path";
 
 import { ORIGIN } from "./protocol";
@@ -103,9 +104,10 @@ export function openWindow(deps: WindowDeps, view?: string): void {
     if (mac) app.dock?.hide();
   });
   if (mac) {
-    // The window's Dock icon is the running bundle's: installed from npm that is Electron.app, so the
-    // Dock showed Electron's atom (2026-10-20). Ours is set on it whatever bundle runs, once the Dock
-    // icon is up: set while the app had none, it was dropped when show() put the bundle's back.
+    // The window's Dock icon is the running bundle's. npm installs run our own ClaudeRipple.app,
+    // but a checkout or a runtime fetched before that still runs Electron.app, whose Dock icon is
+    // the atom (2026-10-20). Ours is set on it whatever bundle runs, once the Dock icon is up: set
+    // while the app had none, it was dropped when show() put the bundle's back.
     void app.dock?.show().then(dockIcon);
   }
   void win.loadURL(`${ORIGIN}/?lang=${encodeURIComponent(deps.lang)}${view ? `#${view}` : ""}`);
@@ -124,9 +126,37 @@ function dockIcon(): void {
   setTimeout(set, 2_000).unref();
 }
 
-/** The tray app has no Dock icon until a window opens, so a window opened from it could come up behind the frontmost app. */
+/** When the window last asked LaunchServices to bring the app forward (see focusApp). */
+let lastLaunchServicesFocus = 0;
+
+/**
+ * The tray app has no Dock icon until a window opens, so a window opened from it could come up behind the frontmost app.
+ *
+ * macOS 14+ activation is cooperative: `steal` is ignored unless the active app yields, so a window
+ * opened from the launcher icon (a second instance) or the tray menu came up behind other apps and
+ * the app never became frontmost — the icon looked like it did nothing, and BetterTouchTool's
+ * move-to-other-display acted on the frontmost app instead (2026-10-30, `lsappinfo front` +
+ * CGWindowList). LaunchServices opening our own bundle is honoured, so when the window is still not
+ * focused a moment later, `open` the bundle once; the reopen it sends lands in `activate` (main.ts).
+ */
 function focusApp(): void {
-  if (process.platform === "darwin") app.focus({ steal: true });
+  if (process.platform !== "darwin") return;
+  app.focus({ steal: true });
+  setTimeout(() => {
+    if (!win || win.isDestroyed() || !win.isVisible() || win.isFocused()) return;
+    if (Date.now() - lastLaunchServicesFocus < 5_000) return;
+    lastLaunchServicesFocus = Date.now();
+    const bundle = ownBundle();
+    if (bundle) execFile("/usr/bin/open", ["-a", bundle], () => undefined);
+  }, 400).unref();
+}
+
+/** The .app this process runs from (…/Name.app/Contents/MacOS/<exe>), or null outside a bundle. */
+function ownBundle(): string | null {
+  const exe = app.getPath("exe");
+  const marker = `.app${path.sep}Contents${path.sep}MacOS${path.sep}`;
+  const at = exe.lastIndexOf(marker);
+  return at < 0 ? null : exe.slice(0, at + 4);
 }
 
 export function mainWindow(): BrowserWindow | null {

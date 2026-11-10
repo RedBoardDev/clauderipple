@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { homeDir } from "./config.ts";
 import { withFileLock, writeJsonAtomic } from "./locked-file.ts";
+import { readOwners } from "../../cli/src/owners.ts";
 import { MOD_SETTINGS_SCHEMA_VERSION, hadRetiredRouting, normalizeSettings } from "../../mod/hooks/settings.ts";
 import type { ModSettingsSnapshot } from "../../mod/types/index.d.ts";
 
@@ -87,8 +88,12 @@ export function readAutoCompactWindow(): number | null {
     const settings = JSON.parse(text) as Record<string, unknown>;
     const top = tokenCount(settings.autoCompactWindow);
     if (top !== null) return top;
-    const models = object(settings.modelSettings) ? Object.values(settings.modelSettings) : [];
-    const values = new Set(models.map(m => object(m) ? tokenCount(m.autoCompactWindow) : null).filter(v => v !== null));
+    const models = object(settings.modelSettings) ? Object.entries(settings.modelSettings) : [];
+    const { store } = readOwners(claudeSettingsPath());
+    const values = new Set(models.map(([id, m]) => {
+      if (!object(m) || Object.values(store.homes).some(c => c.compactWindows?.[id] === m.autoCompactWindow)) return null;
+      return tokenCount(m.autoCompactWindow);
+    }).filter(v => v !== null));
     return values.size === 1 ? [...values][0]! : null;
   } catch {
     // A corrupt file is Claude Code's own problem; keep this endpoint answering rather than fail it.
@@ -97,10 +102,10 @@ export function readAutoCompactWindow(): number | null {
 }
 
 /**
- * Write or remove `autoCompactWindow` in settings.json, keeping every other key. A per-model
- * value `/autocompact` saved is dropped, since it would outrank the dashboard's for that model
- * (Opus kept 400k under modelSettings while the dashboard read "model default", 2026-10-24). Backs
- * up the previous bytes first and replaces the file atomically, as `cli/src/settings.ts` does for
+ * Write or remove the global `autoCompactWindow`, preserving user per-model preferences.
+ * Router-owned per-model values are reconciled separately under this same file lock; a dashboard
+ * save must never erase a user's explicit model override (2026-10-28). Backs up the previous
+ * bytes first and replaces the file atomically, as `cli/src/settings.ts` does for
  * the env block. `null` removes the override (the model's default).
  */
 export function writeAutoCompactWindow(tokens: number | null): void {
@@ -127,13 +132,6 @@ export function writeAutoCompactWindow(tokens: number | null): void {
     const next = { ...current };
     if (tokens === null) delete next.autoCompactWindow;
     else next.autoCompactWindow = tokens;
-    if (object(next.modelSettings)) {
-      next.modelSettings = Object.fromEntries(Object.entries(next.modelSettings).map(([model, entry]) => {
-        if (!object(entry) || !("autoCompactWindow" in entry)) return [model, entry];
-        const { autoCompactWindow: _shadowing, ...rest } = entry;
-        return [model, rest];
-      }));
-    }
     if (JSON.stringify(next) === JSON.stringify(current)) return;
     if (previous !== null) {
       const backup = `${file}.bak-clauderipple-${new Date().toISOString().replace(/[-:]/g, "").slice(0, 15)}`;
@@ -144,19 +142,46 @@ export function writeAutoCompactWindow(tokens: number | null): void {
   });
 }
 
-export function readModSettings(home = homeDir()): ModSettingsSnapshot {
-  let text: string;
-  try { text = fs.readFileSync(path.join(home, "mod-settings.json"), "utf8"); }
+type StoredModSettings = Omit<ModSettingsSnapshot, "compactAt">;
+const modSettingsCache = new Map<string, { version: string; snapshot: StoredModSettings; compactModel: string | undefined }>();
+
+/** Absence is not the UI's normalized Haiku default: an unset compaction target changes nothing. */
+export function readCompactModel(home = homeDir()): string | undefined {
+  readModRoutingSettings(home);
+  return modSettingsCache.get(path.join(home, "mod-settings.json"))?.compactModel;
+}
+
+/** Worker authorization needs only this store, never Claude Code's compaction/ownership files. */
+export function readModRoutingSettings(home = homeDir()): StoredModSettings {
+  const file = path.join(home, "mod-settings.json");
+  let stat: fs.Stats;
+  try { stat = fs.statSync(file); }
   catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return { settings: normalizeSettings(null), revision: 0, stored: false, compactAt: readAutoCompactWindow() };
+    modSettingsCache.delete(file);
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return { settings: normalizeSettings(null), revision: 0, stored: false };
     throw error;
   }
-  // Corruption is not an empty store: fail rather than silently overwrite it.
-  const stored: unknown = JSON.parse(text);
+  // Atomic replacement and permission changes invalidate too, even if mtime is preserved.
+  const version = `${stat.mtimeMs}:${stat.ctimeMs}:${stat.ino}:${stat.size}:${stat.mode}`;
+  const cached = modSettingsCache.get(file);
+  if (cached?.version === version) return structuredClone(cached.snapshot);
+  modSettingsCache.delete(file);
+  // Corruption/unreadability is not an empty store, nor authority to reuse a previous good value.
+  const stored: unknown = JSON.parse(fs.readFileSync(file, "utf8"));
   if (!object(stored) || !revision(stored.revision) || stored.revision < 1) throw new Error("invalid mod settings store");
   validateSettings(stored.settings);
-  // Auto and field rules are gone: the dashboard says so once, until the next save drops them.
-  return { settings: normalizeSettings(stored.settings), revision: stored.revision, stored: true, compactAt: readAutoCompactWindow(), ...(hadRetiredRouting(stored.settings) ? { legacy: true } : {}) };
+  const snapshot: StoredModSettings = {
+    settings: normalizeSettings(stored.settings), revision: stored.revision, stored: true,
+    ...(hadRetiredRouting(stored.settings) ? { legacy: true } : {}),
+  };
+  const compactModel = typeof stored.settings.compactModel === "string" && stored.settings.compactModel.trim() ? stored.settings.compactModel.trim() : undefined;
+  modSettingsCache.set(file, { version, snapshot, compactModel });
+  if (modSettingsCache.size > 32) modSettingsCache.delete(modSettingsCache.keys().next().value!);
+  return structuredClone(snapshot);
+}
+
+export function readModSettings(home = homeDir()): ModSettingsSnapshot {
+  return { ...readModRoutingSettings(home), compactAt: readAutoCompactWindow() };
 }
 
 /** Reject old writers before normalization/fill can erase evidence of their format. */

@@ -201,6 +201,32 @@ test("usage-hourly.jsonl is readable by its owner only, even one written before 
   });
 });
 
+test("web search buckets from before the flag join the new ones, apart from the model's own turns", () => {
+  withDir((dir) => {
+    const file = path.join(dir, "requests.jsonl");
+    // An hour written by the router before 2026-10-26: the search model left as
+    // "<provider>/<model>" and no tokens recorded at all.
+    const oldHour = Math.floor(Date.parse("2026-10-20T09:00:00.000Z") / HOUR);
+    fs.writeFileSync(path.join(dir, "usage-hourly.jsonl"),
+      JSON.stringify({ h: oldHour, p: "chatgpt", m: "chatgpt/gpt-6-luna", count: 1, ok: 1, failed: 0, input: 0, cached: 0, cacheWrite: 0, output: 0, ms: 9000 }) + "\n");
+    const log = new RequestLog(file);
+    log.add(record("search", "2026-10-20T10:30:00.000Z", { provider: "chatgpt", target: "gpt-6-luna", purpose: "web-search", usage: usage(60, 40, 10) }));
+    log.add(record("turn", "2026-10-20T10:40:00.000Z", { provider: "chatgpt", target: "gpt-6-luna", usage: usage(1000, 0, 50) }));
+    const from = Date.parse("2026-10-20T09:00:00.000Z");
+    const to = Date.parse("2026-10-20T11:00:00.000Z");
+    const rows = log.usage(from, to).models;
+    const search = rows.find((m) => m.purpose === "web-search");
+    assert.deepEqual(search && { model: search.model, count: search.count, input: search.input, cached: search.cached, output: search.output },
+      { model: "gpt-6-luna", count: 2, input: 60, cached: 40, output: 10 });
+    const turn = rows.find((m) => !m.purpose);
+    assert.deepEqual(turn && { model: turn.model, count: turn.count, input: turn.input }, { model: "gpt-6-luna", count: 1, input: 1000 });
+    // A restart reads the same two rows: the open hour is replayed from requests.jsonl.
+    const reloaded = new RequestLog(file);
+    assert.deepEqual(reloaded.usage(from, to).models.map((m) => [m.model, m.purpose ?? "", m.count]).sort(),
+      [["gpt-6-luna", "", 1], ["gpt-6-luna", "web-search", 2]]);
+  });
+});
+
 test("malformed usage-history lines are skipped and good ones still count", () => {
   withDir((dir) => {
     const file = path.join(dir, "requests.jsonl");

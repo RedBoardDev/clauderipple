@@ -1,7 +1,10 @@
 import type { Calibration, Domain, DomainRules, Effort, Level, Mode, Rule, Rung, Settings, SettingsChange, Skin, Step, TierTarget } from '../types/index.d.ts'
 
-/** Bump whenever a writer's normalization can lose another format's fields. */
-export const MOD_SETTINGS_SCHEMA_VERSION = 1
+/**
+ * Bump whenever a writer's normalization can lose another format's fields. 2: `domainRules.review`,
+ * which a version-1 mod drops on its next save.
+ */
+export const MOD_SETTINGS_SCHEMA_VERSION = 2
 
 export const DOMAINS: readonly Domain[] = ['general', 'design', 'frontend', 'backend', 'infra', 'data', 'test', 'docs', 'research']
 export const LEVELS: readonly Level[] = ['light', 'standard', 'deep']
@@ -30,7 +33,7 @@ export const DEFAULTS: Settings = {
   providers: {},
   fallback: { agent: 'general-purpose', model: 'sonnet' },
   keepWarm: false, keepWarmHours: 2, keepWarmMinTokens: 30000,
-  compactModel: 'claude-haiku-5-5',
+  compactModel: 'claude-haiku-5-5', compactModels: [],
   swampAlert: false, layout: 'dashboard', appearance: 'auto', skin: 'deep', language: 'auto', hide: ['reason'], extras: [], setupDone: false,
 }
 
@@ -174,7 +177,7 @@ function generalRule(raw: unknown): Rule {
 function domainRules(raw: unknown): DomainRules | undefined {
   const source = object(raw)
   const out: DomainRules = {}
-  for (const key of ['ui', 'backend'] as const) {
+  for (const key of ['ui', 'backend', 'review'] as const) {
     // A domain ladder has two levels, so its four rungs are folded on the way in.
     if (object(source[key]).mode === 'ladder') out[key] = { mode: 'ladder', rungs: twoLevelRungs(generalRule(source[key]).rungs) }
   }
@@ -317,6 +320,7 @@ export function normalizeSettings(raw: unknown, workers?: readonly Worker[]): Se
   // old choice (or anything unknown) reads as Haiku, the default it always meant.
   if (typeof value.compactModel === 'string' && value.compactModel.trim()) result.compactModel = value.compactModel.trim()
   else if (value.compactWith === 'session') result.compactModel = 'session'
+  result.compactModels = names(value.compactModels).slice(0, 4)
   if (Array.isArray(value.hide)) result.hide = [...new Set(value.hide.filter((part): part is string => typeof part === 'string' && ['timer', 'reason', 'route', 'limits'].includes(part)))]
   result.fallback = target(value.fallback, DEFAULTS.fallback)!
   const domains = domainRules(value.domainRules)

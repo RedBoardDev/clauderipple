@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { hottest, limitLabel, saveUntil, swamped, contextWindow, coldAlert, hotAlert, hotWindowMoved, swampAlert, keptAlert, bandPriority, claudeLimitsFrom, CLAUDE_USAGE_STALE_MS } from '../../packages/mod/hooks/session.ts'
+import { hottest, limitLabel, saveUntil, swamped, contextWindow, modelCompactWindow, coldAlert, hotAlert, hotWindowMoved, swampAlert, keptAlert, bandPriority, claudeLimitsFrom, CLAUDE_USAGE_STALE_MS } from '../../packages/mod/hooks/session.ts'
 const now = Date.parse('2026-10-10T00:00:00Z')
 const hot = { kind: 'five_hour', percent: 80, resetsAt: '2026-10-10T05:00:00Z' }
 
@@ -20,6 +20,15 @@ test('the router stands in for the plan windows of the current login, fresh snap
   assert.deepEqual(claudeLimitsFrom({ claude: { accounts: [] } }, now), [])
   assert.deepEqual(claudeLimitsFrom({}, now), [])
   assert.deepEqual(claudeLimitsFrom(null, now), [])
+})
+
+test('the plan windows follow the in-use account, and the login when no row is marked', () => {
+  const at = now - 60_000
+  const account = (id: string, used: number, extra: Record<string, unknown> = {}) => ({ id, ...extra, quota: { at, rate_limits: { primary: { used_percent: used, window_minutes: 300 } } } })
+  // A stored account serves the pool now: its figure stands in, not the login's 81%.
+  assert.deepEqual(claudeLimitsFrom({ claude: { accounts: [account('current', 81), account('stored', 15, { inUse: true })] } }, now), [{ kind: 'five_hour', percentUsed: 15 }])
+  // A router that marks no row (older than the flag) keeps reading the login.
+  assert.deepEqual(claudeLimitsFrom({ claude: { accounts: [account('current', 81), account('stored', 15)] } }, now), [{ kind: 'five_hour', percentUsed: 81 }])
 })
 
 test('hottest only considers five_hour/seven_day at or above eighty', () => {
@@ -89,6 +98,22 @@ test('the context percent is measured against the compaction window when it is s
   assert.equal(swamped(at400k), 80)
   assert.equal(swampAlert(swamped(at400k), null), true)
   assert.equal(swamped({ ...at400k, tokens: 319_999, percent: 319_999 / 400_000 * 100 }), null)
+})
+
+test('fallback context windows follow the router model including effort variants and older routers', () => {
+  const body = { resolvedWindows: {
+    'claude-opus-5-5': { contextWindow: 1_000_000, compactWindow: 600_000 },
+    'claude-opus-4-7': { contextWindow: 475_000, compactWindow: 475_000 },
+    'gpt@high': { compactWindow: 300_000 },
+    gpt: { compactWindow: 475_000 },
+  } }
+  assert.equal(contextWindow(1_000_000, modelCompactWindow(body, 'claude-opus-5-5')), 600_000)
+  assert.equal(contextWindow(1_000_000, modelCompactWindow(body, 'claude-opus-4-7')), 475_000)
+  assert.equal(contextWindow(200_000, 600_000, modelCompactWindow(body, 'claude-opus-4-7')), 475_000)
+  assert.equal(modelCompactWindow(body, 'gpt@high'), 300_000)
+  assert.equal(modelCompactWindow(body, 'gpt@low'), 475_000)
+  assert.equal(modelCompactWindow({ resolvedWindows: { gpt: { contextWindow: 475_000 } } }, 'gpt'), null)
+  assert.equal(modelCompactWindow(null, 'gpt'), null)
 })
 
 test('dismissed hot returns at +10 points and swamp at +15 points of context, inclusively', () => {  assert.equal(hotAlert(hot, null), true)

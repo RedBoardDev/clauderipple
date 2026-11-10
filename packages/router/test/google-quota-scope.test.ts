@@ -37,7 +37,7 @@ const groupsOf = (account: { quotaCooldowns?: Record<string, number> } | undefin
 const secondsOf = (account: { quotaCooldowns?: Record<string, number> } | undefined, group: string): number =>
   Object.entries(account?.quotaCooldowns ?? {}).find(([k]) => k.split("@")[0] === group)?.[1] ?? 0;
 
-async function rig(t: TestContext, reply: (seen: { token: string | undefined; model: string }) => Reply, accounts = 1) {
+async function rig(t: TestContext, reply: (seen: { token: string | undefined; model: string }) => Reply, accounts = 1, logger = new Logger(null, 1e6, 1, false)) {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "cr-quota-scope-"));
   const seen: { token: string | undefined; model: string }[] = [];
   const upstream = http.createServer(async (req, res) => {
@@ -53,7 +53,7 @@ async function rig(t: TestContext, reply: (seen: { token: string | undefined; mo
   for (let n = 1; n <= accounts; n++) saveGoogleAccount(home, {
     accessToken: `token-${n}`, projectId: `project-${n}`, email: `user-${n}@example.test`, expiresAt: Date.now() + 3_600_000,
   });
-  const adapter = new GoogleAdapter("google", { type: "google", auth: "antigravity", url }, home, new Logger(null, 1e6, 1, false));
+  const adapter = new GoogleAdapter("google", { type: "google", auth: "antigravity", url }, home, logger);
   const outcomes: GoogleOutcome[] = [];
   const front = http.createServer(async (req, res) => {
     let body = "";
@@ -79,7 +79,8 @@ async function rig(t: TestContext, reply: (seen: { token: string | undefined; mo
 }
 
 test("models map onto the two measured quota groups; anything else has none", () => {
-  for (const model of ["gemini-3.8-flash", "gemini-3.8-flash@high", "Gemini-4-Pro"]) assert.equal(antigravityQuotaScope(model), "gemini", model);
+  for (const model of ["gemini-3.8-flash", "gemini-3.8-flash@high", "Gemini-4-Pro", "gemini-4-argonaut"]) assert.equal(antigravityQuotaScope(model), "gemini", model);
+  for (const model of ["gemini-4-argon", "gemini-4-argon-low", "gemini-4-argon@high"]) assert.equal(antigravityQuotaScope(model), "argon", model);
   for (const model of ["claude-opus-5-5-low", "claude-sonnet-5-5-high", "gpt-oss-120b", "gpt-oss"]) assert.equal(antigravityQuotaScope(model), "3p", model);
   for (const model of ["gpt-6-luna", "gpt-ossify", "deepseek-v4", ""]) assert.equal(antigravityQuotaScope(model), undefined, model);
 });
@@ -155,6 +156,42 @@ test("a failure that is about the account still rests all of it", async t => {
   assert.equal(r.seen.length, 1);
 });
 
+// Measured 2026-11-06 in router.log.1: Google disabled account 23c72a59 for a Terms of Service
+// violation. The 403 carries PERMISSION_DENIED, which the auth heuristic used to read as a stale
+// token: the adapter refreshed and replayed, then rested the account a minute and kept it in
+// rotation — 73 such 403s and 39 refresh+replays in one night. It is a dead credential.
+const TOS_403 = { error: {
+  code: 403,
+  message: "This service has been disabled in this account for violation of Terms of Service. Please submit an appeal to continue using this product.",
+  status: "PERMISSION_DENIED",
+  details: [{
+    "@type": "type.googleapis.com/google.rpc.ErrorInfo", reason: "TOS_VIOLATION", domain: "cloudcode-pa.googleapis.com",
+    metadata: { uiMessage: "true", appeal_url: "https://cloudcode-pa.googleapis.com/v1internal:appeal" },
+  }],
+} };
+
+test("a 403 Terms of Service ban parks the account: no refresh, no replay, not ready", async t => {
+  const lines: string[] = [];
+  const logger = { info: (line: string) => lines.push(line), warn: (line: string) => lines.push(line) } as unknown as Logger;
+  const r = await rig(t, () => ({ status: 403, body: TOS_403 }), 1, logger);
+
+  const refused = await r.call(OPUS);
+  assert.equal(refused.status, 401, "the refusal is about the account, not the request");
+  const [account] = r.adapter.accountStatus();
+  assert.equal(account!.state, "quarantined", "the status screen shows it as not ready");
+  assert.equal(account!.cooldownSeconds, undefined, "a ban is not a rest that expires by itself");
+  assert.equal(r.adapter.hasUsable(), false);
+  assert.equal(r.seen.length, 1, "no replay after a refresh");
+  const parked = lines.filter(line => line.includes("TOS_VIOLATION"));
+  assert.equal(parked.length, 1, "one warn line names the reason");
+  assert.match(parked[0]!, new RegExp(`account ${account!.id.slice(0, 8)}`));
+  assert.doesNotMatch(lines.join("\n"), /refreshed after/);
+
+  // The account stays out of rotation: the next turn is refused without reaching Google.
+  assert.equal((await r.call(GEMINI)).status, 429);
+  assert.equal(r.seen.length, 1);
+});
+
 test("clearing an account's cooldown also clears its resting groups", async t => {
   let spent = true;
   const r = await rig(t, ({ model }) => spent && model.startsWith("claude-") ? { status: 429, body: THIRD_PARTY_429 } : { status: 200, body: OK });
@@ -223,4 +260,42 @@ test("a group spent on one host still answers on the other: each Cloud Code Assi
 
   assert.equal((await call(GEMINI)).status, 429);
   assert.deepEqual(sent, [DAILY, PROD], "nothing sent for the group still resting on daily");
+});
+
+// Gemini 4 Argon has a quota of its own (usage.ts antigravityQuotaScope, measured 2026-10-27). No
+// spent Argon has been observed yet, so this body is the measured Claude 429 (THIRD_PARTY_429) with
+// Argon's wire id in `metadata.model`.
+const ARGON_429 = { error: { ...THIRD_PARTY_429.error, details: [
+  { ...THIRD_PARTY_429.error.details[0], metadata: { ...THIRD_PARTY_429.error.details[0]!.metadata, model: "gemini-4-argon-low" } },
+  THIRD_PARTY_429.error.details[1],
+] } };
+const ARGON = "gemini-4-argon";
+
+test("a spent Argon rests only Argon: Gemini Flash and Claude keep answering, and the refusal says so", async t => {
+  const r = await rig(t, ({ model }) => model.startsWith("gemini-4-argon-") ? { status: 429, body: ARGON_429 } : { status: 200, body: OK });
+
+  const spent = await r.call(ARGON);
+  assert.equal(spent.status, 429);
+  const [account] = r.adapter.accountStatus();
+  assert.equal(account!.state, "ready");
+  assert.deepEqual(groupsOf(account), ["argon"]);
+  assert.equal(r.adapter.hasUsable(ARGON), false);
+  assert.equal(r.adapter.hasUsable(GEMINI), true, "Flash's own quota is not Argon's");
+  assert.equal(r.adapter.hasUsable(OPUS), true);
+
+  assert.equal((await r.call(GEMINI)).status, 200);
+  assert.equal((await r.call(OPUS)).status, 200);
+  const refused = await r.call(ARGON);
+  assert.equal(refused.status, 429);
+  assert.match(JSON.parse(refused.text).error.message, /the Gemini 4 Argon quota is spent on every signed-in account; other Gemini and Claude\/GPT models still answer/);
+  assert.equal(r.seen.filter(s => s.model.startsWith("gemini-4-argon-")).length, 1, "the resting Argon is refused without an upstream call");
+});
+
+test("a spent Gemini group leaves Argon answering", async t => {
+  const FLASH_429 = { error: { ...ARGON_429.error, details: [{ ...ARGON_429.error.details[0], metadata: { ...ARGON_429.error.details[0]!.metadata, model: "gemini-3.8-flash-low" } }, ARGON_429.error.details[1]] } };
+  const r = await rig(t, ({ model }) => model.startsWith("gemini-3.8-flash") ? { status: 429, body: FLASH_429 } : { status: 200, body: OK });
+  assert.equal((await r.call(GEMINI)).status, 429);
+  assert.deepEqual(groupsOf(r.adapter.accountStatus()[0]), ["gemini"]);
+  assert.equal(r.adapter.hasUsable(ARGON), true);
+  assert.equal((await r.call(ARGON)).status, 200);
 });

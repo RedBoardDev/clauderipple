@@ -53,7 +53,7 @@ test("model success and effort rejection report partial, without confusing appro
   assert.equal(f.permissions.pending(bridgeId).length, 0);
 });
 
-test("15 seconds means unknown; verdict_pending is not applied and a late worker response is persisted", async t => {
+test("15 seconds means unknown; verdict_pending and late worker answers never record applied settings", async t => {
   t.mock.timers.enable({ apis: ["setTimeout"] });
   const f = bridgeFixture(t);
   const changing = f.sessions.setModel(bridgeId, "gpt-test", "max", "late-model");
@@ -69,10 +69,10 @@ test("15 seconds means unknown; verdict_pending is not applied and a late worker
   f.emit(reply(model.request_id));
   await tick(); await tick();
   const results = f.sessions.log(bridgeId).tail().events.filter(e => e.kind === "settings").filter(e => e.reqId === "late-model");
-  assert.deepEqual(results.map(e => e.status), ["unknown", "applied"]);
-  assert.equal(f.sessions.summaryOf(bridgeId)?.effort, "max");
-  assert.equal(f.posts.length, 1, "routed effort has no separate Claude flag request");
-  assert.deepEqual(await f.sessions.setModel(bridgeId, "gpt-test", "max", "late-model"), { status: "applied", model: "gpt-test", effort: "max" });
+  assert.deepEqual(results.map(e => e.status), ["unknown"]);
+  assert.notEqual(f.sessions.summaryOf(bridgeId)?.model, "gpt-test");
+  assert.equal(f.posts.length, 1, "an abandoned change starts no follow-up control");
+  assert.deepEqual(await f.sessions.setModel(bridgeId, "gpt-test", "max", "late-model"), { status: "unknown" });
 });
 
 test("a reconnect recovers the worker result without resending an id; settings share one session lane", async t => {
@@ -139,9 +139,9 @@ test("a replacement releases a timed-out settings lane without publishing unknow
   await posted(f);
   t.mock.timers.tick(15_001);
   assert.deepEqual(await first, { status: "unknown" });
-  const next = f.sessions.setMode(bridgeId, "acceptEdits", "after-timeout");
   f.registry.set(bridgeId, { sessionId: bridgeId, pid: 43, status: "idle", bridgeSessionId: "replacement" });
   await f.sessions.pollDesktop();
+  const next = f.sessions.setMode(bridgeId, "acceptEdits", "after-timeout");
   const mode = await posted(f, 1);
   f.emit(reply(mode.request_id));
   assert.deepEqual(await next, { status: "applied", permissionMode: "acceptEdits" });

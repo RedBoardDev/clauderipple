@@ -85,3 +85,28 @@ test("corrupt receipts never read as an empty queue", t => {
   fs.writeFileSync(f, "[{\"id\":\"bad\"}]");
   assert.throws(() => MessageReceipts.open(f), /Invalid message receipt/);
 });
+
+test("a receipt remembers what its id was accepted with, and reports a reused id with other content", t => {
+  const f = file(t);
+  const receipts = MessageReceipts.open(f);
+  receipts.begin("send:s:m1", "s", "hash-one");
+  assert.equal(receipts.conflict("send:s:m1", "hash-one"), false);
+  assert.equal(receipts.conflict("send:s:m1", "hash-two"), true, "even while pending, other content is a conflict");
+  receipts.complete("send:s:m1", "s");
+  assert.equal(receipts.conflict("send:s:m1", "hash-one"), false);
+  assert.equal(receipts.conflict("send:s:m1", "hash-two"), true);
+  // The fingerprint survives a restart.
+  const reopened = MessageReceipts.open(f);
+  assert.equal(reopened.conflict("send:s:m1", "hash-two"), true);
+  assert.equal(reopened.conflict("send:s:m1", "hash-one"), false);
+});
+
+test("receipts written before fingerprints keep the idempotent answer", t => {
+  const f = file(t);
+  fs.writeFileSync(f, JSON.stringify([{ key: "send:s:old", session: "s", state: "completed", at: Date.now() }]));
+  const receipts = MessageReceipts.open(f);
+  assert.equal(receipts.conflict("send:s:old", "anything"), false, "nothing to compare against is not a conflict");
+  // A request without a fingerprint does not become a conflict either.
+  receipts.begin("send:s:new", "s");
+  assert.equal(receipts.conflict("send:s:new", "anything"), false);
+});

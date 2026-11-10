@@ -8,11 +8,29 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
+import { spawnSync } from "node:child_process";
 import { pathToFileURL } from "node:url";
 
 const scripts = path.resolve(import.meta.dirname, "../../../scripts");
 const read = (name: string): string => fs.readFileSync(path.join(scripts, name), "utf8");
+
+test("install writes a fresh starter config owner-only", { skip: process.platform === "win32" }, t => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "cr-starter-config-"));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  for (const name of ["ca.pem", "ca.key", "leaf.pem", "leaf.key"]) fs.writeFileSync(path.join(home, name), "test");
+  const settings = path.join(home, "settings.json");
+  // A foreign proxy stops install before it can register or start a real supervisor.
+  fs.writeFileSync(settings, JSON.stringify({ env: { HTTPS_PROXY: "http://127.0.0.1:1" } }));
+  const env: NodeJS.ProcessEnv = { ...process.env, CLAUDERIPPLE_HOME: home, CLAUDE_SETTINGS_PATH: settings };
+  delete env.NODE_OPTIONS;
+  const result = spawnSync(process.execPath, [path.resolve(import.meta.dirname, "../src/index.ts"), "install"], { env, encoding: "utf8", timeout: 30_000 });
+  assert.equal(result.status, 1, result.stdout + result.stderr);
+  assert.match(result.stdout, /starter config written/);
+  assert.match(result.stderr, /HTTPS_PROXY/);
+  assert.equal(fs.statSync(path.join(home, "config.json")).mode & 0o777, 0o600);
+});
 
 test("the pinned-Node cmd wrapper switches to UTF-8 before non-ASCII paths, without a BOM", () => {
   const ps1 = read("install.ps1");
@@ -58,4 +76,26 @@ test("install.sh stops on a failed setup with a non-zero code and the next comma
   assert.match(block, /exit 1/);
   assert.match(block, /clauderipple install/);
   assert.match(block, /clauderipple repair/);
+});
+
+// G-D03: an interrupted install must not destroy what was already working. install.sh unpacks Node
+// beside the runtime and swaps by rename, keeps the previous runtime until the new one is in place,
+// and replaces the command wrapper by rename too. Checked by inspection, as the bodies are shell.
+test("install.sh stages the runtime swap and replaces the command by rename", () => {
+  const sh = read("install.sh");
+  assert.match(sh, /^cleanup\(\) \{/m);
+  assert.match(sh, /trap cleanup EXIT/);
+  const extract = sh.slice(sh.indexOf("download_node()"), sh.indexOf('NODE="$(find_node'));
+  assert.match(extract, /STAGING="\$RUNTIME\.new\.\$\$"/);
+  assert.match(extract, /tar -xzf "\$tmp\/node\.tar\.gz" -C "\$STAGING"/);
+  assert.doesNotMatch(extract, /rm -rf "\$RUNTIME"$/m, "the runtime is not deleted before a new one is unpacked");
+  assert.match(extract, /BACKUP="\$RUNTIME\.old\.\$\$"/);
+  assert.match(extract, /mv "\$RUNTIME" "\$BACKUP"/);
+  assert.match(extract, /mv "\$STAGING" "\$RUNTIME"/);
+  assert.match(sh, /mv "\$BACKUP" "\$RUNTIME"/, "a failed install puts the previous runtime back");
+  const wrapperAt = sh.indexOf('WRAPPER="$BIN');
+  const wrapper = sh.slice(wrapperAt, sh.indexOf(";;", wrapperAt));
+  assert.match(wrapper, /WRAPPER="\$BIN\/\.clauderipple\.new\.\$\$"/);
+  assert.match(wrapper, /mv -f "\$WRAPPER" "\$BIN\/clauderipple"/);
+  assert.doesNotMatch(wrapper, /rm -f "\$BIN\/clauderipple"/, "the old command is replaced, never removed first");
 });

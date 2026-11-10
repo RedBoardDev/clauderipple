@@ -2,7 +2,7 @@ import { expect, mock, test } from 'claude-code/testing'
 import type { RenderElement, RenderNode, RenderPropsOf } from 'claude-code'
 import type { AgentRec, StatusRequest } from '../types'
 import { normalizeSettings } from '../hooks/settings'
-import { renderAgents } from '../hooks/ui/agents'
+import { LIST_SHOWN, renderAgents } from '../hooks/ui/agents'
 import { renderAlert } from '../hooks/ui/alerts'
 import { renderBand, renderFooter } from '../hooks/ui/band'
 import { renderLog } from '../hooks/ui/log'
@@ -17,7 +17,7 @@ const SETTINGS = normalizeSettings({ setupDone: true, language: 'ko', judge: 'je
 const PROPS: RenderPropsOf['Pane'] = { title: '경계', isFocused: true, bodyColumns: 100, placement: 'inline', scroll: { offset: 0, bodyRows: 30 }, view: {} }
 const frame = (surface: Frame['surface'], columns = 100): Frame => ({ surface, columns, maxRows: 30, now: 1_000_000, lang: 'ko', skin: 'deep', appearance: 'auto' })
 const BAND: BandActions = { toggleAuto: noop, toggleWarm: noop, compact: noop, clear: noop, handoff: noop, toggleLog: noop, toggleAgents: noop, openSettings: noop, toggleEffortMenu: noop, pickEffort: noop, releaseDelegationPin: noop }
-const ALERT: AlertActions = { compact: noop, clear: noop, dismiss: noop, toggleSave: noop, openSettings: noop, noteInput: noop, copy: noop }
+const ALERT: AlertActions = { compact: noop, clear: noop, dismiss: noop, toggleSave: noop, openSettings: noop, noteInput: noop, toggleTidy: noop, pickCompactModel: noop, copy: noop }
 const QUICK: SettingsActions = { patch: noop, jevKey: noop, testJev: noop, openAllSettings: noop, close: noop }
 const DASH: DashboardView = { effort: { level: 'high', mode: 'auto' }, model: 'Opus', context: null, cache: null, warm: { on: false, pings: 0, cost: 0 }, limit: null, route: null, notice: null, auto: true, agents: { live: 0, total: 0 }, compactions: 0, logOpen: false, agentsOpen: false, effortMenu: false, hide: [], extras: [], isWorking: false }
 const SURFACES = ['terminal', 'desktop', 'vscode', 'mobile'] as const
@@ -39,12 +39,13 @@ test('the display boundary removes escape payloads and refused controls without 
   expect(displayText(HUGE).length).toBe(DISPLAY.preview)
 })
 
-test('wide agent panes keep all forty cards and clickable open controls without space strips', async ($, on) => {
+test('wide agent panes keep every card they list and clickable open controls without space strips', async ($, on) => {
   const opened: string[] = []
   on('ui.render', { component: 'Pane', requestId: 'wide' }, ($, e) => renderAgents($.ui.resolve(e), frame(e.surface, e.props.bodyColumns), { agents: AGENTS, now: 1_000_000, showDone: true }, { open: id => { opened.push(id) }, back: noop, toggleDone: noop, toggleRun: noop }) as RenderElement)
   for (const surface of ['desktop', 'vscode'] as const) for (const columns of [200, 300, 600]) {
     const ui = await $.ui.mount({ plugin: 'test', surface, component: 'Pane', requestId: 'wide', props: { ...PROPS, bodyColumns: columns } })
-    for (let i = 0; i < 40; i++) {
+    // Forty running: the list draws the latest thirty (LIST_SHOWN).
+    for (let i = 40 - LIST_SHOWN; i < 40; i++) {
       expect(await ui.find({ type: 'Text', text: '검토 ' + i }), surface + ' ' + columns + ' card ' + i).toBeDefined()
       const buttons = await ui.findAll({ type: 'Button' })
       const open = buttons.find(b => String(b.props.key).startsWith('open-a' + i + '-') || b.props.key === 'open-a' + i)
@@ -53,7 +54,7 @@ test('wide agent panes keep all forty cards and clickable open controls without 
     }
     await ui.unmount()
   }
-  expect(opened.length).toBe(240)
+  expect(opened.length).toBe(6 * LIST_SHOWN)
 })
 
 test('a 120000 character phone queue preview leaves the following band controls pressable', async ($, on) => {
@@ -153,6 +154,8 @@ for (const failedKey of ['lang', 'settings', 'phoneQueue', 'judgeDown', 'jev', '
     on('ui.log', () => ({ value: undefined }))
     on('ui.close', () => { closed++; return { value: undefined } })
     const site = failedKey === 'requests' ? { component: 'Pane' as const, requestId: 'ripple-log', props: PROPS } : { component: 'AbovePrompt' as const, props: { bodyColumns: 100, maxRows: 30, scroll: { offset: 0, bodyRows: 30 }, isWorking: false, hasSurvey: false, view: {} } }
+    // The band asks for what is drawn under it; the engine alone answers with its own (empty) drawing.
+    on('ui.render', { component: 'AbovePrompt' }, () => ({ type: 'engine', ref: 0 }))
     const ui = await $.ui.mount({ plugin: 'ripple', surface: 'desktop', ...site })
     expect(await ui.find({ type: 'Text', text: /상태 읽기 실패/ })).toBeDefined()
     expect(reads).toBe(1)

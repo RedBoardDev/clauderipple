@@ -27,6 +27,7 @@
 
 import type { ElementTable, RenderNode } from 'claude-code'
 
+import { CELL_PX, SVG_MAX_PX } from './art'
 import type { Frame } from './view'
 import { isRich } from './view'
 import { GAUGE_FACES, GRID, detailOf, gaugeStep, rippleBody, rippleCss } from './ripple'
@@ -67,11 +68,30 @@ export function rippleSource(face: Face, size: number, appearance: Appearance, p
  */
 export function mascot(el: Els, frame: Frame, key: string, face: Face, alt: string, size = FACE_SIZE, percent?: number): RenderNode {
   if (!('Svg' in el)) return ''
-  const { Box, Svg } = el
   // In a Box of its own that never shrinks: beside a column of text it keeps its size.
+  return filled(el, 'ripple-' + key, rippleSource(face, size, frame.appearance, percent), alt, size)
+}
+
+/**
+ * How far past its own width a picture may stretch to fill the cells laid out for it. A picture is
+ * drawn for a cell of CELL_PX, but a cell is what the host's type makes it: under the desktop's
+ * newer type (2026-10-25, ~8.8 px) pictures drawn to the pixel fell short of their cells, so the
+ * band's sea ended before its right edge and its icons sat in wide gaps.
+ */
+const STRETCH = 2
+
+/**
+ * A picture drawn `width` px wide for a cell of CELL_PX, in a Box `key` of its own that never
+ * shrinks: `width / CELL_PX` cells wide, which the picture fills at its own proportions (asked wider
+ * than that, the host's `max-width: 100%` holds it to the Box). So it keeps its place among the
+ * host's cells whatever px a cell is, and is exactly its own size where a cell is CELL_PX.
+ */
+export function filled(el: Els, key: string, source: string, alt: string, width: number): RenderNode {
+  if (!('Svg' in el)) return ''
+  const { Box, Svg } = el
   return (
-    <Box key={'ripple-' + key} flexShrink={0}>
-      <Svg source={rippleSource(face, size, frame.appearance, percent)} alt={alt} width={size} height={size} />
+    <Box key={key} flexShrink={0} alignItems="center" width={width / CELL_PX}>
+      <Svg source={source} alt={alt} width={Math.min(SVG_MAX_PX, Math.ceil(width * STRETCH))} />
     </Box>
   )
 }

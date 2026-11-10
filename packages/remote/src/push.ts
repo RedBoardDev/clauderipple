@@ -13,11 +13,15 @@
 // service answering 404/410 means the subscription is gone for good, so it is dropped.
 import path from "node:path";
 import webpush from "web-push";
+import { SLOW_PING_MS } from "./protocol.ts";
 import { readJson, writeFileAtomic } from "./fsutil.ts";
 import { pushContent, type PushContext } from "./push-content.ts";
 import type { PushEvent, PushSubscriptionJSON, SessionSummary } from "./protocol.ts";
 
 export const VISIBLE_MS = 30_000;
+/** A client on the slow cadence (a presence report every SLOW_PING_MS) stays visible for three
+ * missed reports, as a fast client does at VISIBLE_MS. */
+export const SLOW_VISIBLE_MS = 3 * SLOW_PING_MS;
 /** A session a connected phone looked at within this needs no push (Paseo agent-attention-policy PRESENCE_THRESHOLD_MS). */
 export const SEEN_MS = 180_000;
 
@@ -170,6 +174,25 @@ export class Notifier {
           // Only drop it if it is still the subscription this send used, not one the phone just replaced.
           if (this.subs[clientId]?.sub.endpoint === stored.sub.endpoint) { delete this.subs[clientId]; this.save(); }
           this.opts.log?.(`push: subscription for device ${clientId.slice(0, 8)} is gone (${(e as { statusCode: number }).statusCode}); removed`);
+        } else this.opts.log?.(`push: send failed for device ${clientId.slice(0, 8)}: ${(e as Error).message}`);
+      }
+    }));
+  }
+
+  /**
+   * A host-wide notice (the Claude login expired) to every web subscriber, whatever session a phone
+   * is looking at: SEEN_MS is about conversation alerts, not this. Fixed copy, no session id.
+   */
+  async system(body: (lang: "ko" | "en") => string, tag: string, ttl = 86_400): Promise<void> {
+    if (!Object.keys(this.subs).length) return;
+    await Promise.all(Object.entries(this.subs).map(async ([clientId, stored]) => {
+      const payload: PushPayload = { title: "Ripple Remote", body: body(stored.lang), session: "", tag };
+      try {
+        await this.opts.send(stored.sub, JSON.stringify(payload), { urgency: "normal", ttl, topic: tag.replace(/[^\w-]/g, "").slice(0, 32) });
+      } catch (e) {
+        if (isGone(e)) {
+          if (this.subs[clientId]?.sub.endpoint === stored.sub.endpoint) { delete this.subs[clientId]; this.save(); }
+          this.opts.log?.(`push: subscription for device ${clientId.slice(0, 8)} is gone; removed`);
         } else this.opts.log?.(`push: send failed for device ${clientId.slice(0, 8)}: ${(e as Error).message}`);
       }
     }));

@@ -11,6 +11,9 @@ import { BUNDLE_ID, launcherPath, launcherScript, writeBundle } from "./bundle.t
 import * as launchd from "./launchd.ts";
 import * as schtasks from "./schtasks.ts";
 import * as systemd from "./systemd.ts";
+import type { AgentStart } from "./ownership.ts";
+import { launcherHome, plistEnvironment, unitEnvironment } from "./ownership.ts";
+import { ensureInstallationId } from "../../router/src/installation-id.ts";
 import type { Runtime } from "./runtime.ts";
 import { installKind } from "./update.ts";
 import type { AgentState } from "./supervisor.ts";
@@ -41,6 +44,9 @@ export function registration(rt: Runtime, home: string, version: string, platfor
 export function writePaths(rt: Runtime, home: string): string {
   const file = path.join(home, "paths.json");
   fs.mkdirSync(home, { recursive: true });
+  // The installation's opaque id: the router reports it, and the CLI accepts a status as this
+  // installation's only when it matches (B01/D6).
+  ensureInstallationId(home);
   fs.writeFileSync(
     file,
     JSON.stringify({ node: rt.node, env: rt.env, cli: rt.cli, router: rt.router, hookScript: rt.hookScript, repo: rt.repo, install: installKind(rt, { stateHome: home }) }, null, 2) + "\n",
@@ -59,13 +65,21 @@ export type SupervisorView = {
   pid: number | null;
   /** The definition is byte-for-byte what this installation would register. */
   current: boolean;
+  /** The home the definition records, so a GUI can say which installation owns it (B01). */
+  installedHome: string | null;
+  /**
+   * Set when the definition or the service's process state could not be read. The view then says
+   * nothing about whether it is missing: doctor reports this instead of claiming it is absent, and
+   * repair leaves it alone rather than registering over something it could not inspect.
+   */
+  lookupError?: string | null;
 };
 
 export type SupervisorOps = {
   inspect(): SupervisorView;
   /** Writes this installation's definition and (re)loads it. Returns the definition's path. */
   register(): string;
-  start(): "already-running" | "started" | "failed";
+  start(): AgentStart;
 };
 
 /** Reads only the head of `file`: the program is often a 100MB binary, and only a script matters. */
@@ -138,9 +152,18 @@ function readText(file: string): string | null {
   }
 }
 
-function view(definition: string[], registered: boolean, current: boolean, state: AgentState, pid: number | null): SupervisorView {
+function view(definition: string[], registered: boolean, current: boolean, state: AgentState, pid: number | null, installedHome: string | null, lookupError: string | null = null): SupervisorView {
   const [program = null, ...args] = definition;
-  return { registered, program, args, programExists: targetsExist(program, args), state, pid, current };
+  return { registered, program, args, programExists: targetsExist(program, args), state, pid, current, installedHome, lookupError };
+}
+
+/** A failed service lookup is "unknown", never "not loaded": control decisions must not guess. */
+function safeLookup<T>(call: () => T, fallback: T): { value: T; error: string | null } {
+  try {
+    return { value: call(), error: null };
+  } catch (error) {
+    return { value: fallback, error: (error as Error).message };
+  }
 }
 
 /** launchd, with an injectable launchctl so tests never reach the real one. */
@@ -152,13 +175,17 @@ export function launchdSupervisor(reg: Registration, home: string, run: launchd.
       const text = readText(launchd.plistPath());
       const bundleCurrent = !reg.bundle || readText(launcherPath(home)) === launcherScript({ home, node: reg.bundle.node, script: reg.bundle.script });
       const current = text !== null && text === launchd.renderPlist({ ...opts, stdoutLog }) && bundleCurrent;
-      return view(text ? plistProgramArguments(text) : [], text !== null, current, launchd.agentState(run), launchd.agentPid(run));
+      const installedHome = text ? plistEnvironment(text).CLAUDERIPPLE_HOME ?? null : null;
+      // Do not throw: doctor and repair serve the menu-bar app and must still say what they know.
+      const state = safeLookup(() => launchd.agentState(run) as AgentState, "unknown" as AgentState);
+      const pid = safeLookup(() => launchd.agentPid(run), null);
+      return view(text ? plistProgramArguments(text) : [], text !== null, current, state.value, pid.value, installedHome, state.error ?? pid.error);
     },
     register() {
       if (reg.bundle) writeBundle({ home, node: reg.bundle.node, script: reg.bundle.script, version: reg.bundle.version });
       return launchd.installAgent(opts, run);
     },
-    start: () => launchd.startAgent(run),
+    start: () => launchd.startAgent(home, run),
   };
 }
 
@@ -167,10 +194,13 @@ export function systemdSupervisor(reg: Registration, home: string): SupervisorOp
   return {
     inspect() {
       const text = readText(systemd.unitPath());
-      return view(text ? unitExecStart(text) : [], text !== null, text === systemd.renderUnit(opts), systemd.agentState(), systemd.agentPid());
+      const installedHome = text ? unitEnvironment(text).CLAUDERIPPLE_HOME ?? null : null;
+      const state = safeLookup(() => systemd.agentState() as AgentState, "unknown" as AgentState);
+      const pid = safeLookup(() => systemd.agentPid(), null);
+      return view(text ? unitExecStart(text) : [], text !== null, text === systemd.renderUnit(opts), state.value, pid.value, installedHome, state.error ?? pid.error);
     },
     register: () => systemd.installAgent(opts),
-    start: () => systemd.startAgent(),
+    start: () => systemd.startAgent(home),
   };
 }
 
@@ -180,12 +210,17 @@ export function schtasksSupervisor(reg: Registration, home: string): SupervisorO
   return {
     inspect() {
       const text = readText(launcher);
-      const registered = schtasks.existingTaskDefinition() !== null;
-      return view(text ? launcherProgram(text) : [], registered, registered && text === schtasks.renderLauncher(opts), schtasks.agentState(), schtasks.agentPid());
+      const read = safeLookup(() => schtasks.existingTaskDefinition(), null);
+      const registered = read.value !== null;
+      const taskArguments = (read.value as { arguments?: unknown } | null)?.arguments;
+      const installedHome = typeof taskArguments === "string" ? launcherHome(taskArguments) : null;
+      const state = safeLookup(() => schtasks.agentState() as AgentState, "unknown" as AgentState);
+      const pid = safeLookup(() => schtasks.agentPid(schtasks.taskName(), { home }), null);
+      return view(text ? launcherProgram(text) : [], registered, registered && text === schtasks.renderLauncher(opts), state.value, pid.value, installedHome, read.error ?? state.error ?? pid.error);
     },
     // installAgent keeps an existing task whose whole definition already matches (issue #9).
     register: () => schtasks.installAgent(opts),
-    start: () => schtasks.startAgent(),
+    start: () => schtasks.startAgent(schtasks.taskName(), { home }),
   };
 }
 

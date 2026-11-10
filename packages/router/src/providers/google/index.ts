@@ -19,31 +19,46 @@ import { setTimeout as sleep } from "node:timers/promises";
 import type { GoogleProvider, ProviderModel } from "../../config.ts";
 import type { Logger } from "../../log.ts";
 import type { RequestUsage } from "../../requestlog.ts";
-import { exhaustionHeaders, providerExhaustion, type ProviderExhaustion } from "../../health.ts";
-import { CredentialPool, retryAfterMs } from "../../pool.ts";
+import { exhaustionHeaders, modelDeprecation, providerExhaustion, type ModelUnavailable, type ProviderExhaustion } from "../../health.ts";
+import { CredentialPool, pinnedCredential, retryAfterMs } from "../../pool.ts";
 import { credentialHeaderValues, redactErrorText } from "../../redact.ts";
 import { SseParser } from "../chatgpt/sse.ts";
 import { fetchWithRetry } from "../retry.ts";
+import { FINGERPRINT_BLOCK_HINT, isCloudflareFingerprintBlock } from "../openai/index.ts";
+import { StartInputs } from "../start-input.ts";
 import { estimateTokens, formatSse, GoogleStreamMapper, toGeminiRequest, type GeminiRequest } from "./translate.ts";
-import { antigravityBaseUrl, createTransport, googleBaseUrl, resolveApiKey, type GoogleTransport } from "./transport.ts";
+import { antigravityBaseUrl, createTransport, credentialParts, googleBaseUrl, resolveApiKey, type GoogleTransport } from "./transport.ts";
 import { ThoughtSignatureStore, type ThoughtSignatureSink } from "./thoughtSignatures.ts";
 import { conversationKey, serverToolNames, toolNameRestoreMap, type AnthropicRequest } from "../chatgpt/translate.ts";
 import { GoogleAccountPool, type GoogleAccountSummary, type GoogleCredential, type FetchLike } from "./accounts.ts";
 import { fetchAvailableModels, hostForModel, resolveAntigravityWireModel, staticAntigravityModels, GOOGLE_OAUTH, type HostMap, type MergedCatalogue } from "./antigravity.ts";
 import { antigravityQuotaScope, GoogleUsage, type QuotaGroup } from "./usage.ts";
 import { ANTIGRAVITY_PROMPT_REFUSAL_MESSAGE, isAntigravityPromptRefusal } from "./prompt-refusal.ts";
+import { promptAdditions } from "../../identity.ts";
+import type { RequestKind } from "../../routing.ts";
 
 const PING_MS = 15_000;
 /** How long the CCA model list is reused before asking again. */
 const MODELS_CACHE_MS = 60 * 60 * 1000;
 
-export type GoogleOutcome = { status: number; bytes: number; note?: string; usage?: RequestUsage; stopReason?: string; messageId?: string; upstreamCalled?: false; refusal?: "no-account" | "prompt-incompatible"; exhaustion?: ProviderExhaustion | undefined } & (
+export type GoogleOutcome = { account?: string; upstreamStatus?: number; retryAfterMs?: number | undefined; errorBody?: string; status: number; bytes: number; note?: string; usage?: RequestUsage; stopReason?: string; messageId?: string; upstreamCalled?: false; refusal?: "no-account" | "prompt-incompatible"; exhaustion?: ProviderExhaustion | undefined; modelUnavailable?: ModelUnavailable | undefined } & (
   | { kind?: "response" }
   // No status or bytes have reached the client; the proxy may try one route fallback.
   | { kind: "prompt-incompatible"; status: 400; bytes: 0; errorBody: string }
   // Google has no capacity for the model (see `isModelCapacityExhausted`). Unwritten as above.
   | { kind: "model-capacity"; status: 529; bytes: 0; errorBody: string }
 );
+
+/**
+ * The credential this turn goes out on (`Credential.headers` from the provider's pool), and how to
+ * ask for the next one when the upstream refuses this one. The same handoff the OpenAI-compatible
+ * adapter takes: the proxy owns the pool, and nothing has reached the client here yet, so another
+ * key can still answer the first ask (#112).
+ */
+export type GoogleCredentialHandoff = {
+  headers: Record<string, string>;
+  next?: (status: number, retryAfterMs: number | undefined, body: string) => Record<string, string> | null;
+};
 
 /**
  * How often a turn asks again when Google says it has no capacity for the model, and how long it
@@ -70,6 +85,13 @@ export function isModelCapacityExhausted(status: number, text: string): boolean 
   } catch {
     return false;
   }
+}
+
+/** Include escaped/folded spellings that a transport exception may echo. */
+function redactGoogleError(text: string, secrets: readonly string[]): string {
+  return redactErrorText(text, secrets.flatMap(secret => [
+    secret, secret.replace(/\s+/g, " ").trim(), JSON.stringify(secret).slice(1, -1),
+  ]), 2000);
 }
 
 function anthropicError(status: number, type: string, message: string): { status: number; body: string } {
@@ -104,6 +126,22 @@ export function googleLooksLikeAuth(status: number, text: string): boolean {
   if (status === 401) return true;
   if (/\b(API_KEY_INVALID|PERMISSION_DENIED|UNAUTHENTICATED|API key not valid|invalid api key)\b/i.test(text)) return true;
   return false;
+}
+
+/**
+ * Stricter than `googleLooksLikeAuth`, for walking an api-key pool on HTTP 400/403 only: the
+ * structured error must name an auth reason, so a prompt that merely quotes one never rotates keys.
+ */
+export function googleKeyRejected(status: number, text: string): boolean {
+  if (status !== 400 && status !== 403) return false;
+  try {
+    const error = (JSON.parse(text) as { error?: { status?: unknown; details?: { reason?: unknown }[] } } | null)?.error;
+    const authReasons = new Set(["API_KEY_INVALID", "PERMISSION_DENIED", "UNAUTHENTICATED"]);
+    return typeof error?.status === "string" && authReasons.has(error.status) ||
+      Array.isArray(error?.details) && error.details.some(detail => typeof detail?.reason === "string" && authReasons.has(detail.reason));
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -153,6 +191,7 @@ export function antigravityScopeKey(group: string, host: string): string {
 const GROUP_NAMES: Record<string, { spent: string; other: string }> = {
   "3p": { spent: "Claude/GPT", other: "Gemini" },
   gemini: { spent: "Gemini", other: "Claude/GPT" },
+  argon: { spent: "Gemini 4 Argon", other: "other Gemini and Claude/GPT" },
 };
 
 /**
@@ -173,8 +212,26 @@ export function googleValidationUrl(text: string): string | undefined {
   }
 }
 
+/**
+ * Google's own ban on the account: a 403 `PERMISSION_DENIED` whose ErrorInfo reason is
+ * `TOS_VIOLATION` (measured 2026-11-06, router.log.1: "This service has been disabled in this
+ * account for violation of Terms of Service. Please submit an appeal…"). Only the person appealing
+ * can clear it, so it is a dead credential: refreshing the token and replaying the turn changed
+ * nothing and kept the account in rotation (73 such 403s and 39 replays on one account in one night).
+ */
+export function googleTosViolation(status: number, text: string): boolean {
+  if (status !== 403) return false;
+  try {
+    const error = (JSON.parse(text) as { error?: { details?: { reason?: unknown }[] } } | null)?.error;
+    return Array.isArray(error?.details) && error.details.some((detail) => detail?.reason === "TOS_VIOLATION");
+  } catch {
+    return false;
+  }
+}
+
 export function mapHttpError(status: number, text: string): { status: number; body: string } {
   const message = `Google provider: ${vendorMessage(text)}`;
+  if (status === 403 && isCloudflareFingerprintBlock(text)) return anthropicError(403, "permission_error", `Google provider: ${FINGERPRINT_BLOCK_HINT}`);
   if (status === 429) return anthropicError(429, "rate_limit_error", message);
   if (googleLooksLikeAuth(status, text)) return anthropicError(401, "authentication_error", message);
   if (status === 403) return anthropicError(403, "permission_error", message);
@@ -207,9 +264,9 @@ export type GoogleAccountStatus = GoogleAccountSummary & {
 /** How a send across the accounts ended. */
 type SendResult =
   | { kind: "ok"; upstream: Response; credential: GoogleCredential }
-  | { kind: "prompt-refused" }
-  | { kind: "no-capacity"; text: string; asks: number }
-  | { kind: "refused"; status: number; text: string; retryAfterSeconds?: number; verify?: { url: string; account: string }; group?: string }
+  | { kind: "prompt-refused"; account: string }
+  | { kind: "no-capacity"; text: string; asks: number; account: string }
+  | { kind: "refused"; status: number; text: string; account: string; retryAfterSeconds?: number; verify?: { url: string; account: string }; group?: string }
   /** `group`: only that quota group rests everywhere; the accounts still answer the other one. */
   | { kind: "all-resting"; backMs?: number; group?: string }
   | { kind: "no-account" }
@@ -225,7 +282,7 @@ export class GoogleAdapter {
   private readonly usage: GoogleUsage;
   /** Cooldowns and conversation stickiness, shared with the proxy's other credential pools. */
   private readonly pool: CredentialPool;
-  private readonly lastInputByKey = new Map<string, number>();
+  private readonly startInputs = new StartInputs();
   /** Thought signatures keyed by the tool_use id we minted; survives across turns of one process. */
   private readonly thoughtSignatures = new ThoughtSignatureStore();
   /** The account that answered last, for the dashboard's "active" mark. */
@@ -410,6 +467,8 @@ export class GoogleAdapter {
     const catalogue: MergedCatalogue | null = await fetchAvailableModels(credential.accessToken, credential.projectId, {
       hosts,
       ...(this.fetchImpl ? { fetchImpl: this.fetchImpl } : {}),
+      // The IDE list still answers, so without this line Gemini 4 Argon just goes missing.
+      cliFailed: (host, reason) => this.log.warn(`google ${this.name}: CLI model list on ${host} failed (${reason}); models served only to the CLI client, such as Gemini 4 Argon, are left out`),
     });
     if (!catalogue) {
       this.log.warn(`google ${this.name}: fetchAvailableModels returned nothing; falling back to the static list`);
@@ -456,15 +515,8 @@ export class GoogleAdapter {
     return (this.pool.pick(this.name, all) as GoogleCredential | null) ?? all[0]!;
   }
 
-  private rememberInput(key: string, usage: { input_tokens: number; cache_read_input_tokens: number }): void {
-    const total = usage.input_tokens + usage.cache_read_input_tokens;
-    if (total <= 0) return;
-    this.lastInputByKey.set(key, total);
-    if (this.lastInputByKey.size > 500) this.lastInputByKey.delete(this.lastInputByKey.keys().next().value!);
-  }
-
   /** Handle a fully-read Messages request. Model/effort have already been resolved by routing. */
-  async handle(req: http.IncomingMessage, res: http.ServerResponse, path: string, json: AnthropicRequest, model: string, effort: string | undefined): Promise<GoogleOutcome> {
+  async handle(req: http.IncomingMessage, res: http.ServerResponse, path: string, json: AnthropicRequest, model: string, effort: string | undefined, credential?: GoogleCredentialHandoff, options?: { kind?: RequestKind; accountPin?: string }): Promise<GoogleOutcome> {
     if (path.startsWith("/v1/messages/count_tokens")) {
       const body = JSON.stringify({ input_tokens: estimateTokens(json) });
       res.writeHead(200, { "content-type": "application/json", "content-length": String(Buffer.byteLength(body)) }).end(body);
@@ -493,8 +545,7 @@ export class GoogleAdapter {
       model,
       ...(useEffort ? { effort: useEffort } : {}),
       caps,
-      ...(this.cfg.identity === undefined ? {} : { identity: this.cfg.identity }),
-      ...(this.cfg.instructionsAppend ? { instructionsAppend: this.cfg.instructionsAppend } : {}),
+      ...promptAdditions(options?.kind ?? "turn", this.cfg),
       thoughtSignatures: signatures,
       // The CCA path never adds the sentinel: the signature goes back on the exact functionCall the
       // model signed (or nothing at all), rather than a fabricated validator bypass.
@@ -505,7 +556,7 @@ export class GoogleAdapter {
     // The same input floor behavior as the other translated adapters: the CLI snapshots message_start
     // before usage arrives, so announce an estimate and correct it in message_delta.
     const key = conversationKey(json);
-    const startInput = Math.max(estimateTokens(json), this.lastInputByKey.get(key) ?? 0);
+    const startInput = this.startInputs.start(key, estimateTokens(json));
 
     const transport = createTransport(this.cfg.auth, {
       ...(this.cfg.apiKey ? { apiKey: this.cfg.apiKey } : {}),
@@ -515,41 +566,86 @@ export class GoogleAdapter {
     });
 
     if (this.cfg.auth === "antigravity") {
-      return this.handleAntigravity(res, json, upstreamRequest, transport, model, useEffort, wantStream, key, startInput, host!, signatures);
+      return this.handleAntigravity(res, json, upstreamRequest, transport, model, useEffort, wantStream, key, startInput, host!, signatures, options?.accountPin);
     }
 
-    const apiKey = resolveApiKey(this.cfg.apiKey);
-    if (!apiKey) {
+    // The key this attempt goes out on: the pool's own when the proxy chose one, else the provider's
+    // (`apiKey`, or the environment). A single-key provider declares no key on its credential, so this
+    // is exactly the key it always sent.
+    let credentialHeaders = credential?.headers;
+    const pooled = !!this.cfg.credentials?.length || Object.keys(credentialHeaders ?? {}).length > 0;
+    const providerApiKey = resolveApiKey(this.cfg.apiKey);
+    const firstKey = credentialParts(credentialHeaders).apiKey ?? providerApiKey;
+    if (!firstKey) {
       const out = anthropicError(401, "authentication_error", "Google provider: no API key; set apiKey or GEMINI_API_KEY");
       res.writeHead(out.status, { "content-type": "application/json", "content-length": String(Buffer.byteLength(out.body)) }).end(out.body);
       return { status: out.status, bytes: Buffer.byteLength(out.body), note: "no api key", upstreamCalled: false, refusal: "no-account" };
     }
 
-    let built;
-    try {
-      built = transport.build(upstreamRequest, { model, stream: wantStream, conversationKey: key });
-    } catch (error) {
-      const out = anthropicError(400, "invalid_request_error", (error as Error).message);
-      res.writeHead(out.status, { "content-type": "application/json", "content-length": String(Buffer.byteLength(out.body)) }).end(out.body);
-      return { status: out.status, bytes: Buffer.byteLength(out.body), note: (error as Error).message };
-    }
+    // One attempt's wire, rebuilt per credential because moving to another key moves the key header
+    // with it. Never throws for a missing key: `firstKey` above proves `apiKey` answers if this
+    // credential states none.
+    const attempt = (headers: Record<string, string> | undefined): { built: { url: string; headers: Record<string, string>; body: string }; secrets: string[] } => {
+      const parts = credentialParts(headers);
+      const apiKey = parts.apiKey ?? providerApiKey;
+      const wire = createTransport("api-key", {
+        pooled,
+        ...(apiKey ? { apiKey } : {}),
+        ...(this.cfg.url ? { url: this.cfg.url } : {}),
+        ...(this.cfg.sessionHeader ? { sessionHeader: this.cfg.sessionHeader } : {}),
+        // Only explicit pool credentials replace base authentication. The implicit single-key
+        // path keeps the provider's headers byte-for-byte, including its auth conventions.
+        headers: pooled
+          ? Object.fromEntries([
+              ...Object.entries(this.cfg.headers ?? {}).filter(([name]) => !/^(authorization|x-api-key|x-goog-api-key)$/i.test(name)),
+              ...Object.entries(parts.headers),
+            ].map(([name, value]) => [name.toLowerCase(), value]))
+          : this.cfg.headers ?? {},
+      });
+      const built = wire.build(upstreamRequest, { model, stream: wantStream, conversationKey: key });
+      return { built, secrets: [...(apiKey ? [apiKey] : []), ...credentialHeaderValues(Object.entries(built.headers))] };
+    };
 
-    const upstreamSecrets = [apiKey, ...credentialHeaderValues(Object.entries(built.headers))];
+    // Every credential sent on any attempt: after a retry the vendor's error may still echo the
+    // first one.
+    const upstreamSecrets = [
+      ...(providerApiKey ? [providerApiKey] : []),
+      ...credentialHeaderValues(Object.entries(this.cfg.headers ?? {})),
+      ...Object.entries(this.cfg.headers ?? {}).filter(([name]) => /^x-goog-api-key$/i.test(name)).map(([, value]) => value),
+    ];
+    // Header-parser exceptions may quote escaped bytes or fold whitespace before echoing a key.
+    // Supply those spellings to the shared redactor rather than maintaining another redactor here.
+    const redact = (text: string): string => redactGoogleError(text, upstreamSecrets);
     const controller = new AbortController();
     const onClose = (): void => controller.abort();
     res.on("close", onClose);
 
     let upstream: Response;
     try {
-      upstream = await fetchWithRetry(built.url, {
-        method: "POST",
-        headers: built.headers,
-        body: built.body,
-        signal: controller.signal,
-      }, { log: (line) => this.log.info(`google ${this.name}: ${line}`) });
+      for (;;) {
+        const { built, secrets } = attempt(credentialHeaders);
+        for (const secret of secrets) if (!upstreamSecrets.includes(secret)) upstreamSecrets.push(secret);
+        upstream = await fetchWithRetry(built.url, {
+          method: "POST",
+          headers: built.headers,
+          body: built.body,
+          signal: controller.signal,
+        }, { log: (line) => this.log.info(`google ${this.name}: ${redact(line)}`) });
+        // Nothing has been written to the client, so a refusal another key could answer is asked
+        // again here rather than handed to the user as a 429 they would have to retry by hand. The
+        // proxy decides which key is next and charges the refusal to the one that answered (§4
+        // Credential pools); an answer that is the request's own fault is never retried.
+        if (upstream.ok || !upstream.body || res.headersSent || controller.signal.aborted || !credential?.next) break;
+        const text = await upstream.clone().text().catch(() => "");
+        const next = credential.next(upstream.status, retryAfterMs(Object.fromEntries(upstream.headers)) ?? googleRetryDelayMs(text), text);
+        if (!next) break;
+        await upstream.body.cancel().catch(() => { /* already closed */ });
+        credentialHeaders = next;
+      }
     } catch (error) {
       res.off("close", onClose);
       if (controller.signal.aborted) return { status: 0, bytes: 0, note: "client closed" };
+      (error as Error).message = redact((error as Error).message);
       const out = anthropicError(502, "api_error", `Google provider unreachable: ${(error as Error).message}`);
       if (!res.headersSent) res.writeHead(out.status, { "content-type": "application/json" }).end(out.body);
       throw error;
@@ -557,17 +653,18 @@ export class GoogleAdapter {
 
     if (!upstream.ok || !upstream.body) {
       const text = await upstream.text().catch(() => "");
-      const safeText = redactErrorText(text, upstreamSecrets);
+      const safeText = redact(text);
       const out = mapHttpError(upstream.status, safeText);
       this.log.warn(`google ${this.name}: upstream ${upstream.status} for ${model}: ${safeText.slice(0, 400)}`);
       res.off("close", onClose);
       // A spending cap or a used-up quota: the client is told not to retry, in the same answer.
       const exhaustion = providerExhaustion(upstream.status, text, retryAfterMs(Object.fromEntries(upstream.headers)) ?? googleRetryDelayMs(text));
       res.writeHead(out.status, { "content-type": "application/json", "content-length": String(Buffer.byteLength(out.body)), ...(exhaustion ? exhaustionHeaders(exhaustion) : {}) }).end(out.body);
-      return { status: out.status, bytes: Buffer.byteLength(out.body), note: `upstream ${upstream.status}`, exhaustion };
+      return { upstreamStatus: upstream.status, retryAfterMs: retryAfterMs(Object.fromEntries(upstream.headers)) ?? googleRetryDelayMs(text), errorBody: text,
+        status: out.status, bytes: Buffer.byteLength(out.body), note: `upstream ${upstream.status}`, exhaustion, modelUnavailable: modelDeprecation(upstream.status, text) };
     }
 
-    return this.streamBack(res, upstream, transport, json, model, wantStream, key, startInput, controller, onClose);
+    return this.streamBack(res, upstream, transport, json, model, wantStream, key, startInput, controller, onClose, this.thoughtSignatures, redact);
   }
 
   /**
@@ -576,13 +673,17 @@ export class GoogleAdapter {
    * and its failure handling mirror the ChatGPT pool (accounts.ts), because the cache cost of moving
    * a conversation off its account is the same (§4).
    */
-  private async handleAntigravity(res: http.ServerResponse, json: AnthropicRequest, upstreamRequest: GeminiRequest, transport: GoogleTransport, model: string, effort: string | undefined, wantStream: boolean, key: string, startInput: number, host: string, signatures: ThoughtSignatureSink): Promise<GoogleOutcome> {
+  private async handleAntigravity(res: http.ServerResponse, json: AnthropicRequest, upstreamRequest: GeminiRequest, transport: GoogleTransport, model: string, effort: string | undefined, wantStream: boolean, key: string, startInput: number, host: string, signatures: ThoughtSignatureSink, accountPin?: string): Promise<GoogleOutcome> {
     const controller = new AbortController();
     const onClose = (): void => controller.abort();
     res.on("close", onClose);
 
+    const upstreamSecrets = new Set<string>();
+    const redact = (text: string): string => redactGoogleError(text, [...upstreamSecrets]);
     const sent = await this.sendToAnAccount({
       conversation: key,
+      ...(accountPin ? { accountPin } : {}),
+      redact,
       signal: controller.signal,
       system: upstreamRequest.systemInstruction,
       model,
@@ -595,7 +696,9 @@ export class GoogleAdapter {
           antigravity: { accessToken: credential.accessToken, projectId: credential.projectId, conversationKey: key },
           antigravityBaseUrl: host,
         });
-        return { built, secrets: [credential.accessToken, ...credentialHeaderValues(Object.entries(built.headers))] };
+        const secrets = [credential.accessToken, ...credentialHeaderValues(Object.entries(built.headers))];
+        for (const secret of secrets) upstreamSecrets.add(secret);
+        return { built };
       },
     });
 
@@ -604,13 +707,13 @@ export class GoogleAdapter {
       if (sent.kind === "aborted") return { status: 0, bytes: 0, note: "client closed" };
       if (sent.kind === "prompt-refused") {
         const err = anthropicError(400, "invalid_request_error", ANTIGRAVITY_PROMPT_REFUSAL_MESSAGE);
-        return { kind: "prompt-incompatible", status: 400, bytes: 0, errorBody: err.body,
+        return { kind: "prompt-incompatible", status: 400, bytes: 0, errorBody: err.body, account: sent.account,
           note: "upstream 429: suspected Antigravity SDK prompt refusal with remaining quota", refusal: "prompt-incompatible" };
       }
       if (sent.kind === "no-capacity") {
         // Overloaded, so Claude Code asks again on its own when no fallback takes the turn.
         const err = anthropicError(529, "overloaded_error", `Google provider: ${vendorMessage(sent.text)} — Google is out of capacity for this model (MODEL_CAPACITY_EXHAUSTED), asked ${sent.asks} times. This is Google's server capacity, not your account or its quota; try again shortly, or give the route a fallback.`);
-        return { kind: "model-capacity", status: 529, bytes: 0, errorBody: err.body,
+        return { kind: "model-capacity", status: 529, bytes: 0, errorBody: err.body, account: sent.account,
           note: `upstream 503 MODEL_CAPACITY_EXHAUSTED after ${sent.asks} asks; account not rested` };
       }
       if (sent.kind === "unreachable") {
@@ -652,17 +755,20 @@ export class GoogleAdapter {
       return { status: err.status, bytes: Buffer.byteLength(err.body), note,
         ...(sent.kind === "no-account" ? { upstreamCalled: false as const, refusal: "no-account" as const } : {}),
         ...(exhaustion ? { exhaustion } : {}),
+        ...(sent.kind === "refused" ? { account: sent.account, modelUnavailable: modelDeprecation(sent.status, sent.text) } : {}),
       };
     }
 
-    return this.streamBack(res, sent.upstream, transport, json, model, wantStream, key, startInput, controller, onClose, signatures);
+    const outcome = await this.streamBack(res, sent.upstream, transport, json, model, wantStream, key, startInput, controller, onClose, signatures, redact);
+    return { ...outcome, account: sent.credential.ownerId };
   }
 
   /** Stream (or buffer) an already-ok upstream response back to the client as Anthropic SSE. */
-  private async streamBack(res: http.ServerResponse, upstream: Response, transport: GoogleTransport, json: AnthropicRequest, model: string, wantStream: boolean, key: string, startInput: number, controller: AbortController, onClose: () => void, signatures: ThoughtSignatureSink = this.thoughtSignatures): Promise<GoogleOutcome> {
+  private async streamBack(res: http.ServerResponse, upstream: Response, transport: GoogleTransport, json: AnthropicRequest, model: string, wantStream: boolean, key: string, startInput: number, controller: AbortController, onClose: () => void, signatures: ThoughtSignatureSink, redact: (text: string) => string): Promise<GoogleOutcome> {
     const mapper = new GoogleStreamMapper(model, startInput, toolNameRestoreMap(json), (info) => {
       if (info.signature) signatures.set(info.id, info.signature);
     });
+    mapper.redactError = redact;
     const parser = new SseParser();
     const reader = upstream.body!.getReader();
     const decoder = new TextDecoder();
@@ -684,7 +790,7 @@ export class GoogleAdapter {
           if (done) break;
           for (const raw of parser.feed(decoder.decode(value, { stream: true }))) {
             const output = mapper.feed(transport.unwrap(raw) as never);
-            this.rememberInput(key, mapper.usage);
+            this.startInputs.note(key, mapper.usage);
             for (const anthropic of output) bytes += write(res, formatSse(anthropic));
             if (mapper.isFinished) break;
           }
@@ -702,7 +808,7 @@ export class GoogleAdapter {
         whole += decoder.decode();
         for (const raw of parseWholeBody(whole, transport)) {
           mapper.feed(raw as never);
-          this.rememberInput(key, mapper.usage);
+          this.startInputs.note(key, mapper.usage);
         }
       }
       if (!mapper.isFinished) {
@@ -768,12 +874,15 @@ export class GoogleAdapter {
    */
   private async sendToAnAccount(spec: {
     conversation: string | undefined;
+    /** The stored account a pinned worker runs on; absent for ordinary turns. */
+    accountPin?: string;
+    redact: (text: string) => string;
     signal: AbortSignal;
     system: GeminiRequest["systemInstruction"];
     model: string;
     /** The CCA host this turn goes to; quota evidence is read from the same host. */
     host: string;
-    build: (credential: GoogleCredential) => { built: { url: string; headers: Record<string, string>; body: string }; secrets: string[] };
+    build: (credential: GoogleCredential) => { built: { url: string; headers: Record<string, string>; body: string } };
   }): Promise<SendResult> {
     const tried = new Set<string>();
     const replayed = new Set<string>();
@@ -785,7 +894,7 @@ export class GoogleAdapter {
     const group = antigravityQuotaScope(spec.model);
     const scope = group ? antigravityScopeKey(group, spec.host) : undefined;
     for (;;) {
-      const credential = await this.pickAccount(spec.conversation, tried, scope);
+      const credential = await this.pickAccount(spec.conversation, tried, scope, spec.accountPin);
       if (credential === "none") return { kind: "no-account" };
       if (credential === null) {
         if (last) return last;
@@ -795,7 +904,7 @@ export class GoogleAdapter {
         return { kind: "all-resting", ...(backMs ? { backMs } : {}), ...(resting ? { group: resting } : {}) };
       }
 
-      const { built, secrets } = spec.build(credential);
+      const { built } = spec.build(credential);
       let upstream: Response;
       try {
         // Retried on the same account, before any status or byte reaches the client, so a relay's
@@ -805,13 +914,14 @@ export class GoogleAdapter {
           headers: built.headers,
           body: built.body,
           signal: spec.signal,
-        }, { log: (line) => this.log.info(`google ${this.name}: ${line}`), stopOn: isModelCapacityExhausted });
+        }, { log: (line) => this.log.info(`google ${this.name}: ${spec.redact(line)}`), stopOn: isModelCapacityExhausted });
       } catch (e) {
         if (spec.signal.aborted) return { kind: "aborted" };
         this.pool.penalise(this.name, credential.id, 0);
         tried.add(credential.ownerId);
         lastThrown = e as Error;
-        this.log.info(`google ${this.name}: account ${credential.ownerId.slice(0, 8)} unreachable (${(e as Error).message}); trying another`);
+        lastThrown.message = spec.redact(lastThrown.message);
+        this.log.info(`google ${this.name}: account ${credential.ownerId.slice(0, 8)} unreachable (${lastThrown.message}); trying another`);
         continue;
       }
 
@@ -823,8 +933,18 @@ export class GoogleAdapter {
       }
 
       const text = await upstream.text().catch(() => "");
-      const safeText = redactErrorText(text, secrets);
+      const safeText = spec.redact(text);
       const status = upstream.status;
+      // A Terms of Service ban is not a token problem: no refresh, replay or wait changes it, and
+      // the account must leave rotation instead of answering 403 every night (2026-11-06). Park it
+      // like a dead credential, with the one line that says which account and why.
+      if (googleTosViolation(status, text)) {
+        this.pool.penalise(this.name, credential.id, 401);
+        this.log.warn(`google ${this.name}: account ${credential.ownerId.slice(0, 8)} parked: 403 TOS_VIOLATION (Google disabled this account for violating its Terms of Service); no refresh or replay`);
+        last = { kind: "refused", status, text: safeText, account: credential.ownerId };
+        tried.add(credential.ownerId);
+        continue;
+      }
       this.log.warn(`google ${this.name}: account ${credential.ownerId.slice(0, 8)} answered ${status}: ${safeText.slice(0, 400)}`);
       // The model, not the account, is out of capacity: resting the account refused every other turn
       // with "all accounts resting" for its ten seconds (10 times in 3 minutes, 2026-10-20), and
@@ -832,7 +952,7 @@ export class GoogleAdapter {
       if (isModelCapacityExhausted(status, text)) {
         capacityAsks++;
         const delay = capacityRetry.delaysMs[capacityAsks - 1];
-        if (delay === undefined) return { kind: "no-capacity", text: safeText, asks: capacityAsks };
+        if (delay === undefined) return { kind: "no-capacity", text: safeText, asks: capacityAsks, account: credential.ownerId };
         this.log.info(`google ${this.name}: ${spec.model} out of capacity (ask ${capacityAsks}); asking again in ${delay}ms without resting the account`);
         try {
           await sleep(delay, undefined, { signal: spec.signal });
@@ -846,7 +966,7 @@ export class GoogleAdapter {
       // cooldown and account rotation. The proxy can still try a route fallback.
       if (isAntigravityPromptRefusal(spec.system, status, text, upstream.headers.get("retry-after")) &&
           this.usage.hasRemainingQuota(credential, spec.model, spec.host)) {
-        return { kind: "prompt-refused" };
+        return { kind: "prompt-refused", account: credential.ownerId };
       }
       // Not a rest and not a refresh: the account works again the moment its person finishes
       // Google's page, so it stays in rotation and the next turn finds out.
@@ -854,7 +974,7 @@ export class GoogleAdapter {
       if (verifyUrl) {
         this.verifyUrls.set(credential.ownerId, verifyUrl);
         const summary = this.accounts.summaries().find((s) => s.id === credential.ownerId);
-        last = { kind: "refused", status, text: safeText, verify: { url: verifyUrl, account: summary?.email ?? summary?.label ?? credential.ownerId.slice(0, 8) } };
+        last = { kind: "refused", status, text: safeText, account: credential.ownerId, verify: { url: verifyUrl, account: summary?.email ?? summary?.label ?? credential.ownerId.slice(0, 8) } };
         tried.add(credential.ownerId);
         continue;
       }
@@ -878,21 +998,31 @@ export class GoogleAdapter {
       const waitMs = retryHeader ? retryAfterMs({ "retry-after": retryHeader }) : googleRetryDelayMs(text);
       const spent = group && isGroupQuotaExhausted(status, text, group) ? group : undefined;
       const verdict = this.pool.penalise(this.name, credential.id, credentialRefused ? 403 : status, waitMs, text, spent ? scope : undefined);
-      last = { kind: "refused", status, text: safeText, ...(status === 429 && waitMs ? { retryAfterSeconds: Math.ceil(waitMs / 1000) } : {}), ...(spent ? { group: spent } : {}) };
+      last = { kind: "refused", status, text: safeText, account: credential.ownerId, ...(status === 429 && waitMs ? { retryAfterSeconds: Math.ceil(waitMs / 1000) } : {}), ...(spent ? { group: spent } : {}) };
       if (!verdict.retryable) return last;
       tried.add(credential.ownerId);
     }
   }
 
   /**
-   * An account for one turn: the conversation's own while it is healthy, else the first usable one.
-   * With a quota scope, an account whose quota for that group rests is passed over too.
+   * An account for one turn: the pinned one while it is present and usable, else the conversation's
+   * own while it is healthy, else the first usable one. With a quota scope, an account whose quota
+   * for that group rests is passed over too.
    */
-  private async pickAccount(conversation: string | undefined, tried: ReadonlySet<string> = new Set(), scope?: string): Promise<GoogleCredential | "none" | null> {
+  private async pickAccount(conversation: string | undefined, tried: ReadonlySet<string> = new Set(), scope?: string, pin?: string): Promise<GoogleCredential | "none" | null> {
     const all = await this.accounts.credentials();
     if (all.length === 0) return "none";
     const rest = all.filter((c) => !tried.has(c.ownerId));
-    return this.pool.pick(this.name, rest, conversation, scope) as GoogleCredential | null;
+    const pinned = pinnedCredential(this.name, rest, pin, this.pool, scope);
+    if (pinned) {
+      if (pin && tried.size === 0) this.log.info(`google ${this.name}: account-pin ${pinned.ownerId.slice(0, 8)}`);
+      return pinned;
+    }
+    const next = this.pool.pick(this.name, rest, conversation, scope) as GoogleCredential | null;
+    // Once per turn: a retry after the pinned account's own refusal is the normal order, not a pin
+    // that could not be honoured.
+    if (pin && tried.size === 0) this.log.info(`google ${this.name}: account-pin fallback ${pin} → ${next ? next.ownerId.slice(0, 8) : "none"}`);
+    return next;
   }
 
   /** When the first account can take a turn in `scope` again: the later of its own rest and the scope's. */

@@ -86,9 +86,9 @@ export interface ProcessSnapshotOptions {
   /** How long a snapshot is served before a new one is read. */
   ttlMs?: number;
   now?: () => number;
-  /** The synchronous read: the first one, and the only one off Windows. */
+  /** The synchronous read: the first one only. */
   exec?: ProcessExec;
-  /** The background read on Windows. */
+  /** Every later read, in the background. */
   execAsync?: ProcessExecAsync;
   /** A background read that failed. Reported once per run of failures. */
   onError?: (error: unknown) => void;
@@ -100,6 +100,10 @@ export interface ProcessSnapshotOptions {
  * event loop never waits for it again (2026-10-12, one keychain read per request blocked the
  * relay pings). Only the very first read waits, once, so the desktop registry is never empty
  * when it is asked for (issue #70).
+ *
+ * macOS reads the same way. A synchronous `ps` there is ~50 ms, but Sessions.list asks once per
+ * closed Claude app session (sessionControls → isOpen), so every list ran dozens of them and
+ * stalled the host for 5–14 s at a time: pushes went out late and relay pings ran late (2026-10-24).
  *
  * The registry is read synchronously — Sessions.list, summary and isOpen all are — so the
  * snapshot cannot be awaited everywhere without making the whole session list asynchronous.
@@ -125,9 +129,8 @@ export class ProcessSnapshot {
     this.runAsync = options.execAsync ?? execAsync;
     this.onError = options.onError ?? (error => console.error("[process snapshot]", error instanceof Error ? error.message : String(error)));
   }
-  /** The processes known now; on Windows this is what the last read found. */
+  /** The processes known now: what the last read found. */
   current(): ProcessInfo[] {
-    if (this.platform !== "win32") return listProcesses(this.platform, this.run);
     if (!this.read) {
       // The first read is the one the host cannot do without: it waits, once.
       this.read = true;

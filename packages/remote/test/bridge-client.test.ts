@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { BridgeClient, decodeSse } from "../src/bridge-client.ts";
+import { BridgeClient, bridgeCreateNotCreated, decodeSse } from "../src/bridge-client.ts";
 import type { InputBlock } from "../src/images.ts";
 
 const auth = () => ({ accessToken: "secret-not-for-phone", organizationUuid: "org", expiresAt: Date.now() + 60_000 });
@@ -38,6 +38,48 @@ test("client writes exact prompt, permission and interrupt envelopes, never work
   assert.equal(headers.get("x-organization-uuid"), "org");
   assert.equal(headers.get("anthropic-beta"), null);
   assert.equal(JSON.parse(String(calls[2]?.options.body)).events[0].payload.request.subtype, "interrupt");
+});
+
+test("environment creation uses the collection endpoint once and reads either session id envelope", async () => {
+  for (const body of [{ session: { id: "cse_nested" } }, { id: "cse_top" }]) {
+    let calls = 0;
+    const client = new BridgeClient({ auth, fetch: async (url, options) => {
+      calls++;
+      assert.equal(String(url), "https://api.anthropic.com/v1/code/sessions");
+      assert.equal(options?.method, "POST");
+      assert.deepEqual(JSON.parse(String(options?.body)), { title: "Title", events: [], environment_id: "env_test", config: { sources: [] } });
+      const headers = new Headers(options?.headers);
+      assert.equal(headers.get("x-organization-uuid"), "org");
+      assert.equal(headers.get("anthropic-client-platform"), "ios");
+      assert.equal(headers.get("anthropic-beta"), null);
+      return Response.json(body);
+    } });
+    assert.equal(await client.createEnvironmentSession("env_test", "Title"), "session" in body ? "cse_nested" : "cse_top");
+    assert.equal(calls, 1);
+  }
+});
+
+test("environment creation distinguishes definite refusals from unknown outcomes without retrying", async () => {
+  for (const status of [400, 401, 403, 404, 500, 503]) {
+    let calls = 0;
+    const client = new BridgeClient({ auth, fetch: async () => { calls++; return new Response("secret-not-for-phone", { status }); } });
+    await assert.rejects(client.createEnvironmentSession("env_test", "Title"), error => {
+      assert.equal(bridgeCreateNotCreated(error), status < 500);
+      assert.ok(error instanceof Error && !error.message.includes("secret-not-for-phone"));
+      return true;
+    });
+    assert.equal(calls, 1);
+  }
+  for (const response of [() => { throw new Error("connection lost"); }, () => new Response("not json"), () => Response.json({})]) {
+    let calls = 0;
+    const client = new BridgeClient({ auth, fetch: async () => { calls++; return response(); } });
+    await assert.rejects(client.createEnvironmentSession("env_test", "Title"), error => !bridgeCreateNotCreated(error));
+    assert.equal(calls, 1);
+  }
+  let calls = 0;
+  const expired = new BridgeClient({ auth: () => ({ ...auth(), expiresAt: 0 }), fetch: async () => { calls++; return new Response(); } });
+  await assert.rejects(expired.createEnvironmentSession("env_test", "Title"), bridgeCreateNotCreated);
+  assert.equal(calls, 0);
 });
 
 test("client sends image and text blocks unchanged in the user envelope", async () => {

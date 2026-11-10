@@ -7,7 +7,10 @@ import { setTimeout as delay } from "node:timers/promises";
 import * as launchd from "./service.ts";
 import * as windows from "../../cli/src/schtasks.ts";
 import { renderUnit } from "../../cli/src/systemd.ts";
+import { recordedLaunchHome } from "../../cli/src/launcher.ts";
+import { type AgentStop, type Ownership, ownerOf, plistEnvironment, unitEnvironment } from "../../cli/src/ownership.ts";
 import { loadConfig, remoteHome } from "./config.ts";
+import { assertGeneration, definitionGeneration, withServiceLockAsync, writeServiceFile } from "../../cli/src/service-definition.ts";
 
 export const TASK = "ClaudeRippleHost";
 export const UNIT = "clauderipple-host.service";
@@ -18,6 +21,33 @@ export function servicePaths(platform = process.platform, home = os.homedir()): 
   if (platform === "darwin") { const p = launchd.paths(home); return { definition: p.plist, log: p.log, runtime }; }
   if (platform === "win32") return { definition: path.join(runtime, `${TASK}.ps1`), log: path.join(runtime, "logs", "launcher.log"), runtime };
   return { definition: path.join(process.env.XDG_CONFIG_HOME || path.join(home, ".config"), "systemd", "user", UNIT), log: `journalctl --user -u ${UNIT}`, runtime };
+}
+
+/** The home an install without CLAUDERIPPLE_HOME uses. */
+function defaultInstallationHome(): string {
+  return process.env.CLAUDERIPPLE_HOME ?? path.join(os.homedir(), ".clauderipple");
+}
+
+/**
+ * Who the registered host service belongs to (D1, 2026-10-25). The definition is account-wide
+ * (one label, one task, one unit) and records the installation home it was written for — the same
+ * evidence a router service definition carries. Pure: parses text and compares homes.
+ */
+export function hostServiceOwnership(definitionText: string | null, platform: NodeJS.Platform, installationHome: string): Ownership {
+  if (definitionText === null) return { state: "absent", home: null };
+  const recorded = platform === "darwin" ? plistEnvironment(definitionText).CLAUDERIPPLE_HOME ?? null
+    : platform === "linux" ? unitEnvironment(definitionText).CLAUDERIPPLE_HOME ?? null
+    : recordedLaunchHome(definitionText, "win32");
+  return ownerOf(recorded, installationHome);
+}
+
+function readDefinition(file: string): string | null {
+  try {
+    return fs.readFileSync(file, "utf8");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw error;
+  }
 }
 function systemctl(args: string[]): string {
   return execFileSync("systemctl", ["--user", ...args], { encoding: "utf8", timeout: 150_000, stdio: ["ignore", "pipe", "pipe"] });
@@ -126,40 +156,138 @@ export async function refreshRunningHost(version: string, dir = remoteHome()): P
   throw new Error("host did not start the target version; application remains pending");
 }
 
-export async function installService(spec: Spec): Promise<string[]> {
-  const platform = process.platform;
-  if (platform === "darwin") return launchd.install(spec);
-  const p = servicePaths();
+export async function installService(spec: Spec, deps: HostServiceDeps = {}): Promise<string[]> {
+  const platform = deps.platform ?? process.platform;
+  if (platform === "darwin") return installServiceLocked(spec, deps);
+  return withServiceLockAsync(servicePaths(platform, deps.userHome).definition, () => installServiceLocked(spec, deps));
+}
+
+async function installServiceLocked(spec: Spec, deps: HostServiceDeps): Promise<string[]> {
+  const platform = deps.platform ?? process.platform;
+  const installationHome = spec.env.CLAUDERIPPLE_HOME ?? defaultInstallationHome();
+  const p = servicePaths(platform, deps.userHome);
+  const read = deps.readDefinition ?? (() => readDefinition(p.definition));
+  let generation = definitionGeneration(read());
+  const check = () => assertGeneration(read, generation);
+  const owner = hostServiceOwnership(read(), platform, installationHome);
+  if (owner.state === "unknown") throw new Error("휴대폰 호스트 서비스의 설치 소유권을 확인할 수 없어 기존 정의를 보존했습니다.");
+  if (owner.state === "other") throw new Error(`the phone host service belongs to another ClaudeRipple installation (${owner.home}); remove it with that installation's uninstall`);
+  if (platform === "darwin") return launchd.install(spec, deps.launchctl, launchd.paths(deps.userHome));
   if (platform === "win32") {
-    await controlShutdown();
-    windows.stopAgent(TASK);
-    windows.installAgent({ name: TASK, program: spec.node, args: ["--disable-warning=ExperimentalWarning", spec.script, ...spec.args], home: p.runtime, env: spec.env });
-    if (windows.startAgent(TASK) === "failed") throw new Error("could not start the host scheduled task");
+    await (deps.shutdown ?? controlShutdown)();
+    check();
+    const task = deps.windows ?? windows;
+    const stopped = task.stopAgent(TASK, { home: p.runtime, ...(deps.taskDeps ? { deps: deps.taskDeps } : {}) });
+    if (stopped !== "stopped" && stopped !== "not-loaded") throw new Error(`휴대폰 호스트의 작업을 중지하지 못했습니다. (${stopped})`);
+    check();
+    task.installAgent({ name: TASK, program: spec.node, args: ["--disable-warning=ExperimentalWarning", spec.script, ...spec.args], home: p.runtime, env: spec.env }, deps.taskDeps);
+    generation = definitionGeneration(windows.renderLauncher({ program: spec.node, args: ["--disable-warning=ExperimentalWarning", spec.script, ...spec.args], home: p.runtime, env: spec.env }));
+    check();
+    const started = task.startAgent(TASK, { home: p.runtime, ...(deps.taskDeps ? { deps: deps.taskDeps } : {}) });
+    if (started !== "started" && started !== "already-running") throw new Error(`휴대폰 호스트의 작업을 시작하지 못했습니다. (${started})`);
   } else if (platform === "linux") {
-    systemctl(["show-environment"]); // Fail before writing when there is no user manager.
+    const manager = deps.systemctl ?? systemctl;
+    const call = (args: string[]) => { check(); manager(args); check(); };
+    call(["show-environment"]); // Fail before writing when there is no user manager.
     if (fs.existsSync(p.definition) && !fs.readFileSync(p.definition, "utf8").startsWith("[Unit]\nDescription=Ripple Remote host\n")) throw new Error("refusing to replace a foreign host unit");
-    fs.mkdirSync(path.dirname(p.definition), { recursive: true });
-    fs.writeFileSync(p.definition, unit(spec), { mode: 0o600 });
-    systemctl(["daemon-reload"]);
-    systemctl(["enable", UNIT]);
-    systemctl(["restart", UNIT]);
+    check();
+    const definition = unit(spec);
+    writeServiceFile(p.definition, definition);
+    generation = definitionGeneration(definition);
+    call(["daemon-reload"]);
+    call(["enable", UNIT]);
+    call(["restart", UNIT]);
   } else throw new Error(`host service is unsupported on ${platform}`);
-  await waitForHost();
+  await (deps.waitForHost ?? waitForHost)();
+  check();
   return [`installed and started ${p.definition}`, `logs: ${p.log}`];
 }
-export async function uninstallService(): Promise<string[]> {
-  if (process.platform === "darwin") return launchd.uninstall();
-  const p = servicePaths();
-  if (process.platform === "win32") {
-    await controlShutdown();
-    windows.stopAgent(TASK);
-    if (windows.agentState(TASK) !== "not-loaded" && !windows.removeAgent(TASK)) throw new Error("could not remove the host scheduled task");
-  } else if (process.platform === "linux") {
-    systemctl(["disable", "--now", UNIT]);
-  } else throw new Error(`host service is unsupported on ${process.platform}`);
-  fs.rmSync(p.definition, { force: true });
-  if (process.platform === "linux") systemctl(["daemon-reload"]);
-  return [`removed ${p.definition}`];
+/** What a caller may inject so an uninstall can be tested without launchd, systemd or PowerShell. */
+export type HostServiceDeps = {
+  platform?: NodeJS.Platform;
+  userHome?: string;
+  launchctl?: launchd.Run;
+  systemctl?: (args: string[]) => string;
+  installationHome?: string;
+  readDefinition?: () => string | null;
+  windows?: Pick<typeof windows, "stopAgent" | "startAgent" | "installAgent" | "removeAgent">;
+  taskDeps?: windows.TaskDeps;
+  shutdown?: () => Promise<void>;
+  waitForHost?: () => Promise<void>;
+  stop?: () => Promise<void | AgentStop> | void | AgentStop;
+  removeDefinition?: () => void;
+  /** Retained for caller compatibility; an explicit request never substitutes for ownership. */
+  explicit?: boolean;
+};
+
+/**
+ * Removes the phone host service, but only one this home may take. It is account-wide, so a
+ * release check under its own home must not remove the real installation's host; a definition that
+ * records another home or records no home is preserved, even on an explicit request. As with the
+ * router, a user request is not ownership evidence (B01, D1).
+ */
+export async function uninstallService(deps: HostServiceDeps = {}): Promise<string[]> {
+  const platform = deps.platform ?? process.platform;
+  if (platform === "darwin" && !deps.stop && !deps.removeDefinition) return uninstallServiceLocked(deps);
+  return withServiceLockAsync(servicePaths(platform, deps.userHome).definition, () => uninstallServiceLocked(deps));
+}
+
+async function uninstallServiceLocked(deps: HostServiceDeps): Promise<string[]> {
+  const platform = deps.platform ?? process.platform;
+  const home = deps.installationHome ?? defaultInstallationHome();
+  const p = servicePaths(platform, deps.userHome);
+  let text: string | null;
+  try {
+    text = (deps.readDefinition ?? (() => readDefinition(p.definition)))();
+  } catch (error) {
+    throw new Error(`the phone host service definition could not be read (${(error as Error).message}); left it alone`);
+  }
+  let generation = definitionGeneration(text);
+  const check = () => assertGeneration(deps.readDefinition ?? (() => readDefinition(p.definition)), generation);
+  const owner = hostServiceOwnership(text, platform, home);
+  if (owner.state === "absent") return ["no phone host service was installed"];
+  if (owner.state === "other") throw new Error(`the phone host service belongs to another ClaudeRipple installation (${owner.home}); left it alone`);
+  if (owner.state === "unknown") {
+    throw new Error("휴대폰 호스트 서비스의 설치 소유권을 확인할 수 없어 기존 정의를 보존했습니다.");
+  }
+  const lines: string[] = [];
+  if (!deps.stop && !deps.removeDefinition && platform === "darwin") {
+    const result = launchd.uninstall(deps.launchctl, launchd.paths(deps.userHome), text);
+    if ("detail" in result) throw new Error(result.detail);
+    return result.lines;
+  }
+  if (deps.stop) {
+    const stopped = await deps.stop();
+    check();
+    if (stopped !== undefined && stopped !== "stopped" && stopped !== "not-loaded") throw new Error(`휴대폰 호스트의 작업을 중지하지 못했습니다. (${stopped})`);
+  } else if (platform === "win32") {
+    await (deps.shutdown ?? controlShutdown)();
+    check();
+    const task = deps.windows ?? windows;
+    const options = { home: p.runtime, ...(deps.taskDeps ? { deps: deps.taskDeps } : {}) };
+    const stopped = task.stopAgent(TASK, options);
+    if (stopped !== "stopped" && stopped !== "not-loaded") throw new Error(`휴대폰 호스트의 작업을 중지하지 못했습니다. (${stopped})`);
+    check();
+    const removed = task.removeAgent(TASK, options);
+    if (removed !== "removed" && removed !== "absent") throw new Error(`휴대폰 호스트의 작업을 제거하지 못했습니다. (${removed})`);
+  } else if (platform === "linux") {
+    check();
+    (deps.systemctl ?? systemctl)(["disable", "--now", UNIT]);
+    check();
+  } else throw new Error(`host service is unsupported on ${platform}`);
+  check();
+  if (deps.removeDefinition) deps.removeDefinition();
+  else {
+    fs.rmSync(p.definition, { force: true });
+    generation = definitionGeneration(null);
+    if (platform === "linux") {
+      check();
+      (deps.systemctl ?? systemctl)(["daemon-reload"]);
+      check();
+    }
+  }
+  lines.push(`removed ${p.definition}`);
+  return lines;
 }
 export function serviceStatus(): ReturnType<typeof launchd.agentStatus> {
   if (process.platform === "darwin") return launchd.agentStatus();

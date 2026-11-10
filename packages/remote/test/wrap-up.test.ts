@@ -11,6 +11,7 @@ import { Sessions } from "../src/sessions.ts";
 import { PermissionQueue } from "../src/permissions.ts";
 import { BridgeClient } from "../src/bridge-client.ts";
 import type { DesktopProcess } from "../src/desktop.ts";
+import { WATCH_IDLE_MS } from "../src/protocol.ts";
 import type { AlertBody } from "../src/protocol.ts";
 import { firstSentence, wrapUpFields, WRAP_LIMITS } from "../src/wrap-up.ts";
 import { pushFor } from "../src/push.ts";
@@ -71,7 +72,7 @@ function fixture(t: TestContext, opts: { tail?: unknown[]; status?: DesktopProce
     sessions, alerts, listed,
     write: (lines: unknown[]) => fs.appendFileSync(file, lines.map(line).join("")),
     setStatus: (status: DesktopProcess["status"]) => { registry.get(id)!.status = status; },
-    advance: () => { now += 4000; },
+    advance: (ms = 4000) => { now += ms; },
     sent: () => sent,
     poll: async () => { await sessions.pollDesktop(); await new Promise(resolve => setImmediate(resolve)); },
   };
@@ -113,13 +114,49 @@ test("a blocked question raises an attention the phone clears by opening the ses
   assert.equal(f.listed().attention, null, "a later poll does not raise the same question again");
 });
 
-test("an ask that is not blocked pushes the question but leaves no attention", async t => {
+test("opening a blocked question does not disarm the dead-man switch", async t => {
+  const f = fixture(t, { tail: [wrapUp({ recap: "Fixed it.", ask: "Restart the router?", blocked: true }), done] });
+  await f.poll();
+  f.advance(); f.setStatus("idle");
+  await f.poll();
+  assert.equal(f.listed().attention?.reason, "question");
+  // The turn is long over: only the unanswered question can keep the PC watched now.
+  f.advance(WATCH_IDLE_MS + 1);
+  assert.equal(f.sessions.workActive(), true, "a blocked question is work the person owes");
+  // The phone opens the session: the unread flag clears, the question does not.
+  f.sessions.markSeen(id);
+  assert.equal(f.listed().attention, null);
+  assert.equal(f.sessions.workActive(), true, "seeing the question is not answering it");
+  // The person answers by typing in the Mac app: the question is gone with the new message.
+  f.write([spoken("u2", "Yes, restart it")]);
+  // Past the desktop poll's own 3 s refresh window, as the next real poll would be.
+  f.advance();
+  await f.poll();
+  assert.equal(f.sessions.workActive(), true, "the idle tail starts when the question is answered");
+  f.advance(WATCH_IDLE_MS + 1);
+  assert.equal(f.sessions.workActive(), false, "an answered question lets the idle window end");
+});
+
+test("a desktop-only turn clears stale question attention when work restarts and marks its new finish", async t => {
+  const f = fixture(t, { tail: [wrapUp({ ask: "Continue?", blocked: true }), done] });
+  await f.poll();
+  f.advance(); f.setStatus("idle"); await f.poll();
+  assert.equal(f.listed().attention?.reason, "question");
+  f.write([spoken("next", "Continue")]);
+  f.advance(); f.setStatus("busy"); await f.poll();
+  assert.equal(f.listed().attention, null, "a question from a previous turn is not still pending");
+  f.write([answer, done]);
+  f.advance(); f.setStatus("idle"); await f.poll();
+  assert.equal(f.listed().attention?.reason, "finished", "unopened desktop sessions use the same transition contract");
+});
+
+test("an ask that is not blocked pushes the question but only marks finished output", async t => {
   const f = fixture(t, { tail: [wrapUp({ recap: "Two options.", ask: "Which one first?" }), done] });
   await f.poll();
   f.advance(); f.setStatus("idle");
   await f.poll();
   assert.deepEqual(f.alerts.map(a => a.body), [{ kind: "question", ask: "Which one first?", blocked: false }]);
-  assert.equal(f.listed().attention, null);
+  assert.equal(f.listed().attention?.reason, "finished");
 });
 
 test("the status line is the recap's first sentence, and the list is sent only when it changes", async t => {

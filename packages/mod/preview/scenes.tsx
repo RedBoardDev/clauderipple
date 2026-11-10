@@ -4,7 +4,7 @@
 import { test } from 'claude-code/testing'
 import type { ContextGridSquare, RenderElement, RenderPropsOf, SessionContextBreakdown } from 'claude-code'
 
-import type { AgentRec, BgTask, LimitItem, Settings, Skin } from '../types'
+import type { AgentRec, BgTask, CostSummary, LimitItem, Settings, Skin } from '../types'
 import { normalizeSettings } from '../hooks/settings'
 import { renderAgents, talkOf } from '../hooks/ui/agents'
 import { renderAlert } from '../hooks/ui/alerts'
@@ -13,6 +13,7 @@ import { renderContext } from '../hooks/ui/context'
 import type { ContextView } from '../hooks/ui/context'
 import { renderPhoneQueue } from '../hooks/ui/queue'
 import { renderLog } from '../hooks/ui/log'
+import { renderLimits } from '../hooks/ui/limits'
 import { renderSettings } from '../hooks/ui/settings'
 import { renderSetup } from '../hooks/ui/setup'
 import type { AgentEntry, AlertView, DashboardView, Frame, SettingsView } from '../hooks/ui/view'
@@ -33,7 +34,7 @@ const DASH: DashboardView = {
   cache: { expiresAt: NOW + 41 * 60_000, ttlMs: 3_600_000 },
   warm: { on: false, pings: 0, cost: 0 },
   limit: null,
-  route: { model: 'gpt-6.1-sol', provider: 'chatgpt', ok: true, resent: false, status: '200', effort: 'high', cachePct: 96, seconds: 2.1 },
+  route: { model: 'gpt-6.1-sol', provider: 'chatgpt', ok: true, resent: false, status: '200', effort: 'high', cachePct: 96, seconds: 2.1, rate: 87.4 },
   notice: null,
   auto: true,
   agents: { live: 0, total: 0 },
@@ -48,14 +49,17 @@ const DASH: DashboardView = {
 
 const SETTINGS: Settings = normalizeSettings({ judge: 'jev', judgeModel: 'deepseek-v4.1-flash', modes: [{ id: 'm1', name: 'GPT 우선' }, { id: 'm2', name: '절약' }], activeMode: 'm1' } as never)
 
-/** Every plan window the limits row gauges: Claude's 5-hour, weekly and Fable, then two GPT accounts. */
+/**
+ * Every plan window the limits row gauges: Claude's 5-hour (no reset given), weekly (near its cap)
+ * and Fable, then two GPT accounts, the second's 5-hour past its reset and its weekly nearly spent.
+ */
 const LIMITS: LimitItem[] = [
   { provider: 'claude', type: 'anthropic', title: 'Claude', account: 0, kind: 'five_hour', label: '', percent: 1 },
   { provider: 'claude', type: 'anthropic', title: 'Claude', account: 0, kind: 'seven_day', label: '', percent: 88, resetsAt: '2026-10-12T18:20:00' },
   { provider: 'claude', type: 'anthropic', title: 'Claude', account: 0, kind: 'scoped', label: 'Fable', percent: 2, resetsAt: '2026-10-15T10:59:59+00:00' },
   { provider: 'chatgpt', type: 'chatgpt', title: 'GPT', account: 0, kind: 'seven_day', label: '', windowMinutes: 10080, percent: 23, resetsAt: '2026-10-19T13:20:00' },
-  { provider: 'chatgpt', type: 'chatgpt', title: 'GPT', account: 1, kind: 'five_hour', label: '', windowMinutes: 300, percent: 64 },
-  { provider: 'chatgpt', type: 'chatgpt', title: 'GPT', account: 1, kind: 'seven_day', label: '', windowMinutes: 10080, percent: 97, resetsAt: '2026-10-19T13:20:00' },
+  { provider: 'chatgpt', type: 'chatgpt', title: 'GPT', account: 1, kind: 'five_hour', label: '', windowMinutes: 300, percent: 64, resetsAt: '2026-10-12T13:05:00' },
+  { provider: 'chatgpt', type: 'chatgpt', title: 'GPT', account: 1, kind: 'seven_day', label: '', windowMinutes: 10080, percent: 97, resetsAt: '2026-10-14T09:42:00' },
 ]
 
 /** Every readable provider at once, for the general limits row: Claude, GPT, Gemini and OpenCode Go. */
@@ -71,6 +75,51 @@ const LIMITS_ALL: LimitItem[] = [
   { provider: 'opencode-go', type: 'opencode-go', title: 'Go', account: 0, kind: 'five_hour', label: '', windowMinutes: 300, percent: 3, resetsAt: '2026-10-15T05:39:48Z' },
   { provider: 'opencode-go', type: 'opencode-go', title: 'Go', account: 0, kind: 'seven_day', label: '', windowMinutes: 10080, percent: 52, resetsAt: '2026-10-19T00:00:00Z' },
   { provider: 'opencode-go', type: 'opencode-go', title: 'Go', account: 0, kind: 'window', label: '', windowMinutes: 43200, percent: 92, resetsAt: '2026-10-18T05:43:30Z' },
+]
+/**
+ * The windows of LIMITS_ALL with a pace forecast on three of them (2026-11-09): Claude's weekly (88%)
+ * runs out in 2h 10m and GPT's weekly (23%, nowhere near its cap) in 45 minutes, both before their
+ * resets; OpenCode Go's monthly window in 3 days. Everything else has none.
+ */
+const LIMITS_RISK: LimitItem[] = LIMITS_ALL.map(item => {
+  if (item.provider === 'anthropic' && item.kind === 'seven_day') return { ...item, exhaustsAt: NOW + 130 * 60_000 }
+  if (item.provider === 'chatgpt' && item.kind === 'seven_day') return { ...item, exhaustsAt: NOW + 45 * 60_000 }
+  if (item.provider === 'opencode-go' && item.kind === 'seven_day') return { ...item, exhaustsAt: NOW + 3 * 86_400_000 }
+  return item
+})
+/** Claude's and GPT's windows of LIMITS_RISK alone: the row fits gauges, or figures. */
+const LIMITS_RISK_FEW: LimitItem[] = LIMITS_RISK.filter(item => item.provider === 'anthropic' || item.provider === 'chatgpt')
+/** What requests cost today and over a week, at API prices: an estimate in the total, a provider and a model with no price. */
+const COST_TODAY: CostSummary = {
+  from: Date.parse('2026-10-12T00:00:00'),
+  total: { costUsd: 15.678, unpricedRequests: 3, estimatedRequests: 12 },
+  providers: [
+    { name: 'anthropic', costUsd: 12.3, unpricedRequests: 0, estimatedRequests: 12 },
+    { name: 'chatgpt', costUsd: 3.378, unpricedRequests: 0, estimatedRequests: 0 },
+    { name: 'opencode-go', costUsd: 0, unpricedRequests: 3, estimatedRequests: 0 },
+  ],
+  models: [
+    { name: 'claude-opus-5-5', costUsd: 9.9, unpricedRequests: 0, estimatedRequests: 12 },
+    { name: 'gpt-6.1-sol', costUsd: 3.378, unpricedRequests: 0, estimatedRequests: 0 },
+    { name: 'claude-sonnet-5-5', costUsd: 2.4, unpricedRequests: 0, estimatedRequests: 0 },
+    { name: 'claude-haiku-5-5', costUsd: 0.004, unpricedRequests: 0, estimatedRequests: 0 },
+    { name: 'deepseek-v4.1-flash', costUsd: 0, unpricedRequests: 3, estimatedRequests: 0 },
+  ],
+}
+const COST_WEEK: CostSummary = { from: Date.parse('2026-10-06T00:00:00'), total: { costUsd: 234.5, unpricedRequests: 9, estimatedRequests: 40 }, providers: [], models: [] }
+/**
+ * Every account the owner added (2026-11-04): the Claude app login and a stored account the router
+ * serves turns with now, then two GPT accounts, the second in use and named with a long email.
+ */
+const LIMITS_ACCOUNTS: LimitItem[] = [
+  { provider: 'anthropic', type: 'anthropic', title: 'Claude', account: 0, kind: 'five_hour', label: '', percent: 81, resetsAt: '2026-10-12T15:40:00' },
+  { provider: 'anthropic', type: 'anthropic', title: 'Claude', account: 0, kind: 'seven_day', label: '', percent: 64, resetsAt: '2026-10-15T10:00:00' },
+  { provider: 'anthropic', type: 'anthropic', title: 'Claude', account: 1, accountLabel: 'work@example.com', inUse: true, kind: 'five_hour', label: '', percent: 15, resetsAt: '2026-10-12T16:10:00' },
+  { provider: 'anthropic', type: 'anthropic', title: 'Claude', account: 1, accountLabel: 'work@example.com', inUse: true, kind: 'seven_day', label: '', percent: 32, resetsAt: '2026-10-16T09:00:00' },
+  { provider: 'anthropic', type: 'anthropic', title: 'Claude', account: 1, accountLabel: 'work@example.com', inUse: true, kind: 'scoped', label: 'Fable', percent: 2, resetsAt: '2026-10-16T09:00:00' },
+  { provider: 'chatgpt', type: 'chatgpt', title: 'GPT', account: 0, accountLabel: 'me@example.com', kind: 'seven_day', label: '', windowMinutes: 10080, percent: 23, resetsAt: '2026-10-19T13:20:00' },
+  { provider: 'chatgpt', type: 'chatgpt', title: 'GPT', account: 1, accountLabel: 'design-team-shared-account@example.com', inUse: true, kind: 'five_hour', label: '', windowMinutes: 300, percent: 64, resetsAt: '2026-10-12T15:05:00' },
+  { provider: 'chatgpt', type: 'chatgpt', title: 'GPT', account: 1, accountLabel: 'design-team-shared-account@example.com', inUse: true, kind: 'seven_day', label: '', windowMinutes: 10080, percent: 97, resetsAt: '2026-10-14T09:42:00' },
 ]
 const SETTINGS_VIEW: SettingsView = { settings: SETTINGS, jev: { source: 'env', test: { state: 'idle' } } }
 
@@ -89,7 +138,7 @@ const AGENTS: AgentRec[] = [
   {
     id: 'd1', description: 'deepseek-v4.1-flash·low · 테스트 실패 원인 조사', type: 'deepseek-v4-1-flash', model: 'deepseek-v4.1-flash@low', provider: 'deepseek',
     pick: { domain: 'test', level: 'light', effort: 'low', why: '로그 한 군데만 보면 되는 조사', target: { agent: 'deepseek-v4-1-flash' }, by: 'marker', rung: 'light', ms: 0 },
-    state: 'waiting', now: 'Bash npm test -- --runInBand', toolSince: NOW - 41_000, startedAt: NOW - 95_000, cost: 0,
+    state: 'running', now: 'Bash npm test -- --runInBand', toolSince: NOW - 41_000, startedAt: NOW - 95_000, cost: 0,
     effort: 'low', answeredBy: 'deepseek-v4.1-flash', usage: { input: 900, cached: 41_000, cacheWrite: 2100, output: 3100 }, tools: 9,
   },
   {
@@ -268,7 +317,7 @@ const CONTEXT: SessionContextBreakdown = (() => {
     autoCompactThreshold: 144_000, isAutoCompactEnabled: true, apiUsage: null,
   }
 })()
-const CONTEXT_VIEW: ContextView = { breakdown: CONTEXT, basis: 'summary', busy: false, open: [], place: { cwd: '/work', home: '/home/me' } }
+const CONTEXT_VIEW: ContextView = { breakdown: CONTEXT, basis: 'summary', busy: false, precise: true, open: [], place: { cwd: '/work', home: '/home/me' } }
 
 const SCENES: Scene[] = [
   // The Context pane the band's context chip opens (2026-10-24): an estimate, a precise count under
@@ -276,6 +325,8 @@ const SCENES: Scene[] = [
   { name: 'context', columns: PANE, draw: (el, f) => renderContext(el, f, CONTEXT_VIEW, noop) },
   { name: 'context-busy-open', columns: PANE, draw: (el, f) => renderContext(el, f, { ...CONTEXT_VIEW, busy: true, open: ['skills'] }, noop) },
   { name: 'context-narrow', columns: PANE_NARROW, draw: (el, f) => renderContext(el, f, CONTEXT_VIEW, noop) },
+  // A routed model (a GPT chat): no precise count to offer (2026-10-30).
+  { name: 'context-routed', columns: PANE, draw: (el, f) => renderContext(el, f, { ...CONTEXT_VIEW, precise: false }, noop) },
   { name: 'context-wide', columns: 100, draw: (el, f) => renderContext(el, f, { ...CONTEXT_VIEW, basis: 'full' }, noop) },
   { name: 'flat-context', columns: PANE, skin: 'flat', draw: (el, f) => renderContext(el, f, CONTEXT_VIEW, noop) },
   { name: 'context-none', columns: PANE, draw: (el, f) => renderContext(el, f, { ...CONTEXT_VIEW, breakdown: null, error: 'count_tokens 529 overloaded' }, noop) },
@@ -308,11 +359,46 @@ const SCENES: Scene[] = [
   { name: 'band-limits-94', columns: 94, draw: (el, f) => site(el, f, { ...DASH, limit: { kind: 'seven_day', percent: 88, resetsAt: '2026-10-12T18:20:00', save: false }, extras: ['context', 'limits'], limits: LIMITS }) },
   { name: 'band-limits-100', columns: 100, draw: (el, f) => site(el, f, { ...DASH, limit: { kind: 'seven_day', percent: 88, resetsAt: '2026-10-12T18:20:00', save: false }, extras: ['context', 'limits'], limits: LIMITS }) },
   { name: 'band-limits-70', columns: 70, draw: (el, f) => site(el, f, { ...DASH, limit: { kind: 'seven_day', percent: 88, resetsAt: '2026-10-12T18:20:00', save: false }, extras: ['context', 'limits'], limits: LIMITS }) },
+  // The limits pane the row opens (2026-10-25, redrawn 2026-10-29): a dial of the window closest to
+  // its cap, a tile per provider account, each window's bar and share, the exact local date and
+  // time it resets and the time left; a passed reset says so, a window without one says that, and
+  // save mode says until when.
+  { name: 'limits-pane', columns: PANE, draw: (el, f) => renderLimits(el, f, { items: LIMITS, saveUntil: Date.parse('2026-10-12T18:20:00') }, noop) },
+  { name: 'limits-pane-narrow', columns: PANE_NARROW, draw: (el, f) => renderLimits(el, f, { items: LIMITS }, noop) },
+  { name: 'limits-pane-all', columns: 100, draw: (el, f) => renderLimits(el, f, { items: LIMITS_ALL }, noop) },
+  { name: 'limits-pane-none', columns: PANE, draw: (el, f) => renderLimits(el, f, { items: [] }, noop) },
+  { name: 'flat-limits-pane', columns: PANE, skin: 'flat', draw: (el, f) => renderLimits(el, f, { items: LIMITS }, noop) },
+  // Every account the owner added (2026-11-04): numbered, the label and "사용 중" dim after the
+  // name; the band's row keeps to the Claude account in use, unnumbered.
+  { name: 'limits-pane-accounts', columns: PANE, draw: (el, f) => renderLimits(el, f, { items: LIMITS_ACCOUNTS, saveUntil: Date.parse('2026-10-12T18:20:00') }, noop) },
+  { name: 'limits-pane-accounts-narrow', columns: PANE_NARROW, draw: (el, f) => renderLimits(el, f, { items: LIMITS_ACCOUNTS, saveUntil: Date.parse('2026-10-12T18:20:00') }, noop) },
+  // A pane a phone's width (2026-11-07): every reset wraps, the time left on a line of its own, and
+  // the water must still reach the last tile.
+  { name: 'limits-pane-accounts-phone', columns: 36, draw: (el, f) => renderLimits(el, f, { items: LIMITS_ACCOUNTS }, noop) },
+  { name: 'flat-limits-pane-accounts', columns: PANE, skin: 'flat', draw: (el, f) => renderLimits(el, f, { items: LIMITS_ACCOUNTS }, noop) },
+  { name: 'band-limits-accounts-94', columns: 94, draw: (el, f) => site(el, f, { ...DASH, limit: { kind: 'seven_day', percent: 32, resetsAt: '2026-10-16T09:00:00', save: false }, extras: ['context', 'limits'], limits: LIMITS_ACCOUNTS }) },
   // Every readable provider (2026-10-15): Claude, GPT, Gemini and OpenCode Go in one row, at the
-  // two real widths. Narrow, the scoped windows go first, then a later provider's group.
+  // two real widths. Narrow, the later providers' scoped windows go first, then a later provider's
+  // group, and Claude's Fable last; the windows that fit again come back after the groups.
   { name: 'band-limits-all-100', columns: 100, draw: (el, f) => site(el, f, { ...DASH, limit: { kind: 'seven_day', percent: 88, resetsAt: '2026-10-12T18:20:00', save: false }, extras: ['context', 'limits'], limits: LIMITS_ALL }) },
   { name: 'band-limits-all-140', columns: 140, draw: (el, f) => site(el, f, { ...DASH, limit: { kind: 'seven_day', percent: 88, resetsAt: '2026-10-12T18:20:00', save: false }, extras: ['context', 'limits'], limits: LIMITS_ALL }) },
   { name: 'band-limits-all-94', columns: 94, draw: (el, f) => site(el, f, { ...DASH, limit: { kind: 'seven_day', percent: 88, resetsAt: '2026-10-12T18:20:00', save: false }, extras: ['context', 'limits'], limits: LIMITS_ALL }) },
+  // The pace forecast (2026-11-09): a window the router expects to run out before its reset gets at
+  // least amber, red within the hour, and "~2시간" after its figure; compact has the tone only.
+  { name: 'band-limits-forecast-140', columns: 140, draw: (el, f) => site(el, f, { ...DASH, limit: { kind: 'seven_day', percent: 88, resetsAt: '2026-10-12T18:20:00', save: false }, extras: ['context', 'limits'], limits: LIMITS_RISK }) },
+  { name: 'band-limits-forecast-100', columns: 100, draw: (el, f) => site(el, f, { ...DASH, limit: { kind: 'seven_day', percent: 88, resetsAt: '2026-10-12T18:20:00', save: false }, extras: ['context', 'limits'], limits: LIMITS_RISK }) },
+  { name: 'band-limits-forecast-94', columns: 94, draw: (el, f) => site(el, f, { ...DASH, limit: { kind: 'seven_day', percent: 88, resetsAt: '2026-10-12T18:20:00', save: false }, extras: ['context', 'limits'], limits: LIMITS_RISK }) },
+  { name: 'flat-band-limits-forecast-140', columns: 140, skin: 'flat', draw: (el, f) => site(el, f, { ...DASH, limit: { kind: 'seven_day', percent: 88, resetsAt: '2026-10-12T18:20:00', save: false }, extras: ['context', 'limits'], limits: LIMITS_RISK }) },
+  // Fewer providers, so the row has room for gauges and for figures: the forecast after the figure.
+  { name: 'band-limits-forecast-gauge-140', columns: 140, draw: (el, f) => site(el, f, { ...DASH, limit: { kind: 'seven_day', percent: 88, resetsAt: '2026-10-12T18:20:00', save: false }, extras: ['context', 'limits'], limits: LIMITS_RISK_FEW }) },
+  { name: 'flat-band-limits-forecast-gauge-140', columns: 140, skin: 'flat', draw: (el, f) => site(el, f, { ...DASH, limit: { kind: 'seven_day', percent: 88, resetsAt: '2026-10-12T18:20:00', save: false }, extras: ['context', 'limits'], limits: LIMITS_RISK_FEW }) },
+  { name: 'band-limits-forecast-figures-100', columns: 100, draw: (el, f) => site(el, f, { ...DASH, limit: { kind: 'seven_day', percent: 88, resetsAt: '2026-10-12T18:20:00', save: false }, extras: ['context', 'limits'], limits: LIMITS_RISK_FEW }) },
+  // The pane's cost section (2026-11-09): today, each provider, the models that cost most, the last
+  // seven days, and the notes; a window with a forecast says it under its reset, in its tone.
+  { name: 'limits-pane-cost', columns: PANE, draw: (el, f) => renderLimits(el, f, { items: LIMITS_RISK, cost: { today: COST_TODAY, week: COST_WEEK }, saveUntil: Date.parse('2026-10-12T18:20:00') }, noop) },
+  { name: 'flat-limits-pane-cost', columns: PANE, skin: 'flat', draw: (el, f) => renderLimits(el, f, { items: LIMITS_RISK, cost: { today: COST_TODAY, week: COST_WEEK } }, noop) },
+  { name: 'limits-pane-cost-narrow', columns: PANE_NARROW, draw: (el, f) => renderLimits(el, f, { items: LIMITS_RISK, cost: { today: COST_TODAY, week: COST_WEEK } }, noop) },
+  { name: 'limits-pane-cost-none', columns: PANE, draw: (el, f) => renderLimits(el, f, { items: LIMITS, cost: {} }, noop) },
   { name: 'settings', draw: (el, f) => renderSettings(el, f, SETTINGS_VIEW, noop) },
   { name: 'settings-off', draw: (el, f) => renderSettings(el, f, { ...SETTINGS_VIEW, settings: { ...SETTINGS, effortAuto: false, judge: 'haiku', keepWarm: true, activeMode: undefined } }, noop) },
   { name: 'settings-key', draw: (el, f) => renderSettings(el, f, { settings: { ...SETTINGS, jevSource: 'typesafe', judge: 'jev' }, jev: { source: null, test: { state: 'fail', message: 'key rejected (401)' } } }, noop) },
@@ -322,7 +408,8 @@ const SCENES: Scene[] = [
   { name: 'alert-swamp', draw: alert({ kind: 'swamp', percent: 63, tokens: 126_000 }) },
   { name: 'alert-hot', draw: alert({ kind: 'hot', limitKind: 'five_hour', percent: 86, resetsAt: '2026-10-12T15:40:00', save: false }) },
   { name: 'alert-judge', draw: alert({ kind: 'judgeDown', judge: 'jev', reason: 'key rejected (401)' }) },
-  { name: 'alert-compact', draw: alert({ kind: 'compactNote', draft: '' }) },
+  { name: 'alert-compact', draw: alert({ kind: 'compactNote', draft: '', tidy: true, pick: 'claude-haiku-5-5', models: [{ value: 'claude-haiku-5-5', label: 'Claude Haiku' }, { value: 'session', label: '앱 기본' }], cold: false }) },
+  { name: 'alert-tidying', draw: alert({ kind: 'result', stage: 'tidying' }) },
   { name: 'alert-handing', draw: alert({ kind: 'result', stage: 'handingOff' }) },
   { name: 'alert-handed', draw: alert({ kind: 'result', stage: 'handoffDone', detail: '새 대화를 열고 입력창에 인수인계 내용을 넣었습니다. 새 대화에서 Enter를 누르면 이어갑니다.' }) },
   { name: 'alert-compacted', draw: alert({ kind: 'result', stage: 'compacted' }) },

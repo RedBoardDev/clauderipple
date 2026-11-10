@@ -2,10 +2,11 @@
 // callbacks it hands in. Every renderer in ./ is a pure function of (elements, view, actions);
 // none of them calls the engine, so they can be drawn and tested anywhere.
 
-import type { AgentRec, BgTask, Effort, JudgeKind, JudgeRun, LadderOptions, LimitItem, Pick as EffortPick, Settings, Skin, StatusRequest, TierTarget } from '../../types'
+import type { AgentRec, BgTask, CostBucket, CostSummary, Effort, JudgeKind, JudgeRun, LadderOptions, LimitItem, Pick as EffortPick, Settings, Skin, StatusRequest, TierTarget } from '../../types'
 import type { Appearance } from './theme'
 import { t } from '../i18n'
 import { DISPLAY, displayText } from './display'
+import { limitTone } from './theme'
 import type { Lang } from '../i18n'
 
 export type Surface = 'terminal' | 'desktop' | 'vscode' | 'mobile'
@@ -51,6 +52,8 @@ export type RouteView = {
   /** Prompt tokens read from cache, in percent. */
   cachePct?: number
   seconds: number
+  /** Output tokens a second over the whole request (outputRate), when it has one. */
+  rate?: number
   note?: string
 }
 
@@ -120,11 +123,13 @@ export type BandActions = {
   releaseDelegationPin?: () => void
   /** Opens or closes the Context pane (desktop: the context chip is its press). */
   toggleContext?: () => void
+  /** Opens or closes the limits pane (desktop: the limits row is its press). */
+  toggleLimits?: () => void
 }
 
 // ---- Alerts and cards ------------------------------------------------------------------------
 
-export type ResultStage = 'handingOff' | 'handoffDone' | 'compacting' | 'compacted' | 'failed'
+export type ResultStage = 'tidying' | 'handingOff' | 'handoffDone' | 'compacting' | 'compacted' | 'failed'
 
 export type AlertView =
   /** The cache expired on a big chat: the next prompt re-reads it all. */
@@ -138,8 +143,8 @@ export type AlertView =
   /** The judge failed and Auto fell back. */
   | { kind: 'judgeDown'; judge: JudgeKind; reason: string; network?: boolean }
   | { kind: 'result'; stage: ResultStage; detail?: string }
-  /** Compact with an optional note of what to keep. */
-  | { kind: 'compactNote'; draft: string }
+  /** Compact with an optional note of what to keep, and whether the chat tidies up first. */
+  | { kind: 'compactNote'; draft: string; tidy: boolean; pick: string; models: { value: string; label: string }[]; cold: boolean }
   /** The band's Clear asks before the conversation is started over. */
   | { kind: 'clear' }
 
@@ -152,6 +157,9 @@ export type AlertActions = {
   openSettings: () => void
   /** Each change of the compact note's field. */
   noteInput: (text: string) => void
+  /** The compact card's "tidy up first" switch; the last choice is kept. */
+  toggleTidy: () => void
+  pickCompactModel: (value: string) => void
   /** Copies a written handoff again (its done card). */
   copy: () => void
 }
@@ -209,7 +217,7 @@ export type SetupActions = {
 /** One entry of an agent's conversation as the pane draws it (agents.tsx `talkOf`). */
 export type AgentEntry =
   /** What it was asked: its first prompt, or a later message sent to it. */
-  | { kind: 'prompt'; text: string }
+  | { kind: 'prompt'; text: string; receipt?: number }
   /** Its own words. */
   | { kind: 'text'; text: string }
   /** A tool it called: the tool, a short line of its input, how it stands, and an edit's lines added and removed. */
@@ -251,6 +259,19 @@ export type LogView = {
 
 export type LogActions = {
   toggleScope: () => void
+}
+
+/** The limits pane: every plan window the router answered, grouped by provider account. */
+export type LimitsView = {
+  items: readonly LimitItem[]
+  /** What requests cost at API prices, today and over the last seven days; a part absent while it is not known. */
+  cost?: { today?: CostSummary; week?: CostSummary }
+  /** Save mode holds Auto down until then (epoch ms); absent while it is off. */
+  saveUntil?: number
+}
+
+export type LimitsActions = {
+  close: () => void
 }
 
 // ---- Helpers register.tsx and the drawings share ----------------------------------------------
@@ -305,10 +326,40 @@ export function promptTokens(usage: Usage): number {
   return usage.input + usage.cached + (usage.cacheWrite ?? 0)
 }
 
+/**
+ * The share of a prompt the cache served, in percent.
+ *
+ * Rounded down: a request always carries some uncached input (or a cache write), so a whole 100%
+ * cannot happen, yet rounding turned 99.96% into 100% on the Agents card (2026-10-25). The log
+ * pane and the band's route read the same figure.
+ */
 export function cachePercent(usage: Usage | undefined): number | undefined {
   if (!usage) return undefined
   const prompt = promptTokens(usage)
-  return prompt > 0 ? Math.round((usage.cached / prompt) * 100) : undefined
+  return prompt > 0 ? Math.floor((usage.cached / prompt) * 100) : undefined
+}
+
+// Below this a request is mostly fixed overhead, and a rate from it is noise.
+const OUTPUT_RATE_MIN_MS = 500
+
+/**
+ * Output tokens per second over the request's whole recorded time, the dashboard's figure: the
+ * router's `ms` runs from the body read to the response end, so the wait for the first token is in
+ * it and this is not the model's generation speed. Only a finished model answer with a real output
+ * count has one: not a failure, a resend, a refusal the router answered itself or a web search
+ * (answered in one piece), and not an output of 0, which a missing usage also reads as.
+ */
+export function outputRate(record: StatusRequest): number | undefined {
+  if ((record.kind !== undefined && record.kind !== 'messages') || record.purpose === 'web-search' || !record.ok || record.resent || record.upstreamCalled === false) return undefined
+  const output = record.usage?.output
+  if (typeof output !== 'number' || !Number.isFinite(output) || output <= 0) return undefined
+  if (typeof record.ms !== 'number' || !Number.isFinite(record.ms) || record.ms < OUTPUT_RATE_MIN_MS) return undefined
+  return (output * 1000) / record.ms
+}
+
+/** A rate as the log shows it: one decimal below 100, whole above. */
+export function rateText(rate: number): string {
+  return rate >= 100 ? String(Math.round(rate)) : rate.toFixed(1)
 }
 
 // The requested name's `@effort` is the agent file's default, not what was sent; the sent effort is
@@ -335,6 +386,8 @@ export function routeOf(record: StatusRequest): RouteView {
   const cache = cachePercent(record.usage)
   if (record.effort) route.effort = record.effort
   if (cache !== undefined) route.cachePct = cache
+  const rate = outputRate(record)
+  if (rate !== undefined) route.rate = rate
   if (record.note) route.note = record.note
   return route
 }
@@ -405,6 +458,66 @@ export function resetsLabel(resetsAt: string | undefined, now: number, lang: Lan
   return t(lang, 'band.resetsIn', { time: t(lang, 'units.days', { n: Math.round(left / 86_400_000) }) })
 }
 
+/** Short weekday names by `Date#getDay()`, Sunday first. */
+const WEEKDAYS = ['units.weekdaySun', 'units.weekdayMon', 'units.weekdayTue', 'units.weekdayWed', 'units.weekdayThu', 'units.weekdayFri', 'units.weekdaySat'] as const
+
+/** A weekday's short name in the person's language: "Thu", "목". */
+function weekdayName(day: number, lang: Lang): string {
+  return t(lang, WEEKDAYS[((day % 7) + 7) % 7]!)
+}
+
+/** A reset this close reads as the time left; further off, as the weekday and the clock. */
+const RESET_NEAR_MS = 20 * 3_600_000
+
+/**
+ * A moment as the limits pane names it, in local time to the minute with its date and weekday:
+ * "10월 30일 (목) 오후 3:35", "Thu, Oct 30, 3:35 PM", "jue 30 oct, 15:35". A language keeps its
+ * own clock (`units.clockHours`: 12 with its morning and afternoon words, or 24).
+ */
+export function resetMoment(at: number, lang: Lang): string {
+  const d = new Date(at)
+  const hours = d.getHours()
+  const mm = String(d.getMinutes()).padStart(2, '0')
+  const twelve = t(lang, 'units.clockHours') === '12'
+  const time = t(lang, hours < 12 ? 'units.am' : 'units.pm', { time: (twelve ? String(hours % 12 || 12) : String(hours).padStart(2, '0')) + ':' + mm })
+  return t(lang, 'limits.date', { month: t(lang, 'units.month' + (d.getMonth() + 1)), day: d.getDate(), weekday: weekdayName(d.getDay(), lang), time })
+}
+
+/**
+ * The time from now to a reset: to the minute under a day ("4시간 12분", "35분"), to the hour past
+ * one ("2일 5시간"). Counted up to the next whole minute, so a reset 30 seconds off still reads
+ * "1분" until it passes.
+ */
+export function timeLeft(ms: number, lang: Lang): string {
+  const minutes = Math.max(1, Math.ceil(ms / 60_000))
+  const days = Math.floor(minutes / 1440)
+  const hours = Math.floor((minutes % 1440) / 60)
+  const rest = minutes % 60
+  if (days > 0) return hours > 0 ? t(lang, 'units.dayHour', { d: days, h: hours }) : t(lang, 'units.days', { n: days })
+  if (hours > 0) return rest > 0 ? t(lang, 'units.hourMin', { h: hours, m: rest }) : t(lang, 'units.hours', { n: hours })
+  return t(lang, 'units.minutes', { n: rest })
+}
+
+/**
+ * A reset as a short detail reads it: "2시간 뒤" while the window is close, else the weekday and
+ * the local time ("목 09:00"), "초기화 중" once it has passed. The hover tips keep the whole
+ * sentence (`resetsLabel`); the limits pane names the moment whole (`resetMoment`). Twenty hours is
+ * where the router's own status label (`limitLabel` in session.ts) stops naming the clock and
+ * names the day.
+ */
+export function resetShort(resetsAt: string | undefined, now: number, lang: Lang): string | undefined {
+  if (!resetsAt) return undefined
+  const at = Date.parse(resetsAt)
+  if (!Number.isFinite(at)) return undefined
+  const left = at - now
+  if (left <= 0) return t(lang, 'band.resetting')
+  if (left < RESET_NEAR_MS) {
+    const minutes = Math.max(1, Math.round(left / 60_000))
+    return t(lang, 'band.resetIn', { time: minutes < 60 ? t(lang, 'units.minutes', { n: minutes }) : t(lang, 'units.hours', { n: Math.round(minutes / 60) }) })
+  }
+  return t(lang, 'band.resetDay', { day: weekdayName(new Date(at).getDay(), lang), time: clockTime(at).slice(0, 5) })
+}
+
 /** "five_hour" → "5-hour", "seven_day" → "Weekly". */
 export function limitName(kind: string, lang: Lang): string {
   if (kind === 'five_hour') return t(lang, 'band.fiveHour')
@@ -429,8 +542,14 @@ export function limitItemName(item: Pick<LimitItem, 'kind' | 'label' | 'windowMi
   return displayText(item.label || item.kind.replace(/_/g, ' '), DISPLAY.name)
 }
 
-/** One limits group as the row heads it: a provider's own, or one of its accounts ("GPT", "GPT 1", …). */
-export type LimitGroup = { key: string; provider: string; type?: string; title?: string; account: number; items: LimitItem[] }
+/**
+ * One limits group as the row heads it: a provider's own, or one of its accounts ("GPT", "GPT 1", …),
+ * with the account's label and in-use mark when the router gave them.
+ */
+export type LimitGroup = { key: string; provider: string; type?: string; title?: string; account: number; accountLabel?: string; inUse?: true; items: LimitItem[] }
+
+/** Whether a group is Claude's own plan. */
+const isClaude = (g: Pick<LimitGroup, 'provider' | 'type'>): boolean => g.type === 'anthropic' || g.provider === 'claude'
 
 /**
  * The groups the row draws, one per provider account, Claude's plan first (the row keeps it to the
@@ -443,24 +562,91 @@ export function limitGroups(items: readonly LimitItem[]): LimitGroup[] {
     const key = item.provider + '#' + item.account
     let group = index.get(key)
     if (!group) {
-      group = { key, provider: item.provider, ...(item.type ? { type: item.type } : {}), ...(item.title ? { title: item.title } : {}), account: item.account, items: [] }
+      group = {
+        key,
+        provider: item.provider,
+        ...(item.type ? { type: item.type } : {}),
+        ...(item.title ? { title: item.title } : {}),
+        account: item.account,
+        ...(item.accountLabel ? { accountLabel: item.accountLabel } : {}),
+        ...(item.inUse ? { inUse: true as const } : {}),
+        items: [],
+      }
       index.set(key, group)
       groups.push(group)
     }
     group.items.push(item)
   }
   // Claude's own plan comes first however the router ordered it; a stable sort keeps the rest.
-  const rank = (g: LimitGroup) => (g.type === 'anthropic' || g.provider === 'claude' ? 0 : 1)
+  const rank = (g: LimitGroup) => (isClaude(g) ? 0 : 1)
   return groups.sort((a, b) => rank(a) - rank(b))
+}
+
+/**
+ * The groups the band's limits row draws: of each provider's accounts only the one the router serves
+ * new turns with (the first when none is marked: an older router, or the in-use account's usage not
+ * known yet), so the narrow row reads one "Claude", one "GPT", one "Gemini"; the pane lists them all.
+ * Until 2026-11-05 only Claude was narrowed: a second Gemini account in use left the row showing the
+ * first, spent one, because the narrow row dropped later accounts first.
+ */
+export function bandLimitGroups(groups: readonly LimitGroup[]): LimitGroup[] {
+  const kept = new Map<string, LimitGroup>()
+  for (const g of groups) {
+    const held = kept.get(g.provider)
+    if (!held || (g.inUse && !held.inUse)) kept.set(g.provider, g)
+  }
+  return groups.filter(g => kept.get(g.provider) === g)
+}
+
+/**
+ * The generic name the router gives an account the owner never named ("Claude account 2", "ChatGPT
+ * account"): it says nothing the number does not, so the pane leaves it out.
+ */
+const PLACEHOLDER_LABEL = /^(?:Claude|ChatGPT|Google) account(?: \d+)?$/i
+
+/** The most of an account's label the pane shows, in UTF-16 units (displayText adds "…"). */
+const ACCOUNT_LABEL_MAX = 24
+
+/**
+ * An account's label as the pane shows it beside the group's name: an email's local part
+ * ("work@example.com" → "work"), anything else as given, cut short; '' for none or a placeholder.
+ */
+export function limitAccountLabel(label: string | undefined): string {
+  const clean = displayText(label ?? '', DISPLAY.name).trim()
+  if (!clean || PLACEHOLDER_LABEL.test(clean)) return ''
+  const at = clean.indexOf('@')
+  return displayText(at > 0 ? clean.slice(0, at) : clean, ACCOUNT_LABEL_MAX)
+}
+
+/**
+ * What the pane says after a numbered group's name: `tag`, "사용 중" on the account the router serves
+ * new turns with, set apart right after the name (a badge on the desktop, in brackets on the
+ * terminal) and never cut; then `label`, the account's own name short and dim, which is cut first
+ * when room runs out. Both empty for a provider with one account, which reads as it always has.
+ */
+export function limitGroupAccount(group: Pick<LimitGroup, 'accountLabel' | 'inUse'>, numbered: boolean, lang: Lang): { tag: string; label: string } {
+  if (!numbered) return { tag: '', label: '' }
+  return { tag: group.inUse ? t(lang, 'limits.inUse') : '', label: limitAccountLabel(group.accountLabel) }
 }
 
 /** The head's name when the item carries none: from its kind, else its config name. */
 function groupTitle(group: Pick<LimitGroup, 'provider' | 'type' | 'title'>): string {
   if (group.title) return group.title
-  if (group.type === 'anthropic' || group.provider === 'claude') return 'Claude'
+  if (isClaude(group)) return 'Claude'
   if (group.type === 'chatgpt' || group.provider === 'chatgpt') return 'GPT'
   if (group.type === 'google') return 'Gemini'
   return group.provider
+}
+
+/**
+ * A provider's config name as the limits pane names its group ("anthropic" → "Claude", "chatgpt" →
+ * "GPT", "opencode-go" → "Go"): the title the router gave its plan windows, else the name its
+ * type or id implies, else the id itself. The cost tile names its providers by it.
+ */
+export function providerDisplayName(provider: string, items: readonly LimitItem[]): string {
+  const item = items.find(i => i.provider === provider)
+  const named = item ? groupTitle(item) : provider === 'anthropic' ? 'Claude' : groupTitle({ provider })
+  return displayText(named, DISPLAY.name)
 }
 
 /** A group's head: "Claude", "GPT", "Gemini", or its config name; "GPT 1"/"GPT 2" when numbered. */
@@ -470,30 +656,175 @@ export function limitGroupName(group: Pick<LimitGroup, 'provider' | 'type' | 'ti
 }
 
 /**
- * The groups that fit `budget`, narrowing in this order: the scoped windows (Fable, 3P, …) go
- * first, one group's at a time from the last group back, so Claude's own Fable is the last of them
- * to go (all of them going at once hid Fable for Gemini's two 3P windows, 2026-10-15); then a later
- * provider's secondary accounts (the last one first), then a later provider's whole group —
- * Claude's own group (the first) stays to the last. Null when even that does not fit (no row).
+ * Which groups carry their account's number: a provider with more than one account ("GPT 1",
+ * "GPT 2"). Decided on the whole set the router answered, before any narrowing, so the number is
+ * the account's own and holds even when only one of them is drawn.
+ */
+export function limitGroupNumbered(groups: readonly LimitGroup[]): (group: LimitGroup) => boolean {
+  const accounts = new Map<string, number>()
+  for (const group of groups) accounts.set(group.provider, (accounts.get(group.provider) ?? 0) + 1)
+  return group => (accounts.get(group.provider) ?? 1) > 1
+}
+
+/**
+ * The groups that fit `budget`, narrowing in this order: first the scoped windows (3P, …) of every
+ * group but the first, one group's at a time from the last group back (all of them going at once
+ * hid Fable for Gemini's two 3P windows, 2026-10-15); then a later provider's secondary accounts
+ * (the last one first); then a later provider's whole group, last first; only then the first
+ * group's own scoped windows (Claude's Fable). The owner wants Claude's Fable on the band over later
+ * providers (2026-11-10). Claude's group (the first) stays to the last, even when it is a stored
+ * account (account 1…) the row shows for being in use; index 0 is the first group whether or not
+ * it is Claude's. Then the refill: the scoped windows dropped above come back into the groups still
+ * drawn, Claude's group first and the rest from first to last, each window only while the row still
+ * fits (so Gemini's 3P returns when the groups dropped after it leave room). A dropped group or
+ * secondary account never returns. Null when even that does not fit (no row).
  * `width` measures a set of groups the way the row draws it.
  */
 export function narrowLimitGroups(groups: readonly LimitGroup[], budget: number, width: (gs: readonly LimitGroup[]) => number): LimitGroup[] | null {
   let out = [...groups]
-  for (let i = out.length - 1; i >= 0 && width(out) > budget; i--) {
-    if (!out[i]!.items.some(item => item.kind === 'scoped')) continue
-    out = out.map((g, j) => j === i ? { ...g, items: g.items.filter(item => item.kind !== 'scoped') } : g).filter(g => g.items.length > 0)
+  // A group left with no window goes too. Index 0 is passed only by the last step below.
+  const dropScoped = (at: number) => {
+    out = out.map((g, j) => j === at ? { ...g, items: g.items.filter(item => item.kind !== 'scoped') } : g).filter(g => g.items.length > 0)
   }
-  while (width(out) > budget && out.some(g => g.account > 0)) {
-    const at = out.map(g => g.account > 0).lastIndexOf(true)
+  for (let i = out.length - 1; i >= 1 && width(out) > budget; i--) {
+    if (out[i]!.items.some(item => item.kind === 'scoped')) dropScoped(i)
+  }
+  // A secondary account is one whose provider already shows an earlier group, not any account
+  // numbered past 0: the band keeps one group a provider (bandLimitGroups), and Gemini's account in
+  // use being account 1 hid Gemini whenever the row was short while MiniMax, after it, stayed (2026-11-09).
+  const secondary = (g: LimitGroup, i: number) => out.some((o, j) => j < i && o.provider === g.provider)
+  while (width(out) > budget && out.some(secondary)) {
+    const at = out.map(secondary).lastIndexOf(true)
     out = out.filter((_, i) => i !== at)
   }
   while (width(out) > budget && out.length > 1) out = out.slice(0, -1)
+  // Only now the first group's own scoped windows: Claude's Fable outlasts every later provider.
+  if (width(out) > budget && out.length) dropScoped(0)
   if (!out.length || width(out) > budget) return null
+  return refillScoped(groups, out, budget, width)
+}
+
+/**
+ * The scoped windows `shown` lacks, put back into the groups it still draws while the row fits: the
+ * first group's first (Claude's Fable), then the others from first to last, each window in its own
+ * order and added only if the row still fits with it. A window that does not fit stays out, and no
+ * group or account is added back.
+ */
+function refillScoped(groups: readonly LimitGroup[], shown: LimitGroup[], budget: number, width: (gs: readonly LimitGroup[]) => number): LimitGroup[] {
+  let out = shown
+  for (let at = 0; at < out.length; at++) {
+    const original = groups.find(g => g.key === out[at]!.key)
+    if (!original) continue
+    for (const item of original.items) {
+      if (item.kind !== 'scoped' || out[at]!.items.includes(item)) continue
+      const next = out.map((g, j) => j !== at ? g : { ...g, items: original.items.filter(i => i === item || g.items.includes(i)) })
+      if (width(next) <= budget) out = next
+    }
+  }
   return out
 }
 
 /** A window's hover tip: "Claude 주간 88% · 4시간 뒤 초기화". */
 export function limitItemTip(item: LimitItem, group: string, lang: Lang, now: number): string {
   const reset = resetsLabel(item.resetsAt, now, lang)
-  return t(lang, 'band.limitsTip', { provider: group, window: limitItemName(item, lang), value: Math.round(item.percent) + '%', reset: reset ? ' · ' + reset : '' })
+  const tip = t(lang, 'band.limitsTip', { provider: group, window: limitItemName(item, lang), value: Math.round(item.percent) + '%', reset: reset ? ' · ' + reset : '' })
+  const out = exhaustSentence(item, now, lang)
+  return out ? tip + ' · ' + out : tip
+}
+
+// ---- Pace forecast -------------------------------------------------------------------------------
+//
+// A window the router says will reach 100% before it resets (`exhaust_at`, parsed into `exhaustsAt`)
+// is at risk whatever its share is now: its figure goes amber, red once the end is an hour off, and
+// the band's row says how long is left after the figure. A window without a forecast is as it was.
+
+/** From this close, the forecast is red. */
+export const EXHAUST_URGENT_MS = 60 * 60_000
+
+/** Milliseconds until the window runs out at its pace, or null: no forecast, or its moment has passed. */
+export function exhaustLeft(item: Pick<LimitItem, 'exhaustsAt'>, now: number): number | null {
+  const at = item.exhaustsAt
+  return typeof at === 'number' && Number.isFinite(at) && at > now ? at - now : null
+}
+
+/** A window's tone: its share's (limitTone), at least amber when it runs out ahead of its reset, red within the hour. */
+export function limitItemTone(item: Pick<LimitItem, 'percent' | 'exhaustsAt'>, now: number): 'ink' | 'warn' | 'bad' {
+  const share = limitTone(item.percent)
+  const left = exhaustLeft(item, now)
+  if (left === null || share === 'bad') return share
+  return left <= EXHAUST_URGENT_MS ? 'bad' : 'warn'
+}
+
+/** The time left as the band's row shortens it: "~45분", "~2시간", "~3일" ("~45m", "~2h", "~3d"). */
+export function exhaustShort(ms: number, lang: Lang): string {
+  const minutes = Math.max(1, Math.ceil(ms / 60_000))
+  if (minutes < 60) return '~' + t(lang, 'units.minutes', { n: minutes })
+  const hours = Math.round(minutes / 60)
+  return '~' + (hours < 48 ? t(lang, 'units.hours', { n: hours }) : t(lang, 'units.days', { n: Math.round(hours / 24) }))
+}
+
+/** The widest forms exhaustShort takes in a language, for the row to keep a slot as wide as any of them. */
+export function exhaustShortWidest(lang: Lang): string[] {
+  return [exhaustShort(59 * 60_000, lang), exhaustShort(47 * 3_600_000, lang), exhaustShort(7 * 86_400_000, lang)]
+}
+
+/** "At this pace it runs out in 2h 10m", or '' for a window with no forecast. */
+export function exhaustSentence(item: Pick<LimitItem, 'exhaustsAt'>, now: number, lang: Lang): string {
+  const left = exhaustLeft(item, now)
+  return left === null ? '' : t(lang, 'limits.exhaust', { time: timeLeft(left, lang) })
+}
+
+// ---- Pace ----------------------------------------------------------------------------------------
+//
+// Every window with a reset still ahead says how its pace is going (2026-11-10). A window with no exhaust
+// forecast says where its pace takes it at the reset: under 95% is comfortable, 95 to 100 tight (amber
+// in the pane). Above 100 the pace says nothing here, since a window that reaches 100% has its exhaust
+// forecast. The pane puts the pace as a short label after the time left, not as a line of its own.
+
+/** A window's pace when no exhaust forecast applies: comfortable under 95% projected at its reset, tight from 95 to 100. */
+export type PaceLevel = 'comfortable' | 'tight'
+
+/**
+ * The pace of a window, or null: an exhaust forecast applies, no projection, more than 100, or no reset
+ * still ahead. A passed or missing reset has no time left to put the pace beside; the pane redraws
+ * across a reset before the limits are read again, and the old window's projection says nothing about
+ * the new one.
+ */
+export function paceLevel(item: Pick<LimitItem, 'exhaustsAt' | 'projectedPercent' | 'resetsAt'>, now: number): PaceLevel | null {
+  if (exhaustLeft(item, now) !== null) return null
+  const reset = item.resetsAt ? Date.parse(item.resetsAt) : NaN
+  if (!Number.isFinite(reset) || reset <= now) return null
+  const projected = item.projectedPercent
+  if (typeof projected !== 'number' || !Number.isFinite(projected)) return null
+  if (projected < 95) return 'comfortable'
+  // A projection that rounds to 100 without an exhaust moment (it lands right at the reset) is tight
+  // too; past 100 the exhaust moment has passed (an old reading), and the pace says nothing.
+  return projected <= 100 ? 'tight' : null
+}
+
+/** The pace as a label after the time left: "projected 84%", or '' when the pace says nothing. */
+export function paceLabel(item: Pick<LimitItem, 'exhaustsAt' | 'projectedPercent' | 'resetsAt'>, now: number, lang: Lang): string {
+  if (paceLevel(item, now) === null) return ''
+  return t(lang, 'limits.paceProjected', { percent: Math.round(item.projectedPercent!) })
+}
+
+// ---- Cost ----------------------------------------------------------------------------------------
+
+/**
+ * An amount in US dollars as the limits pane writes it: "$12.34", "$1,234.56", "<$0.01" for less
+ * than a cent, "$0.00" for none. API prices are in dollars whatever the language.
+ */
+export function costText(usd: number): string {
+  if (!Number.isFinite(usd) || usd <= 0) return '$0.00'
+  if (usd < 0.005) return '<$0.01'
+  return '$' + usd.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+}
+
+/**
+ * A line's amount: "—" when nothing was priced (its requests have no known price: a $0.00 would say
+ * they were free), "≈" before it when part of it is an estimate.
+ */
+export function costFigure(line: Pick<CostBucket, 'costUsd' | 'unpricedRequests' | 'estimatedRequests'>): string {
+  if (line.costUsd <= 0 && line.unpricedRequests > 0) return '—'
+  return (line.estimatedRequests > 0 ? '≈' : '') + costText(line.costUsd)
 }

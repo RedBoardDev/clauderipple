@@ -7,12 +7,16 @@ import {
   CLAUDE_CODE_IDENTITY,
   ClaudeCodeAuthStore,
   ClaudeCodeCredentialStore,
-  fromClaudeCodeToolName,
   nativeAnthropicHeaders,
   observedAnthropicHeaders,
-  toClaudeCodeToolName,
 } from "../src/providers/anthropic.ts";
-import { ObservedClaudeCodeAuth } from "../src/providers/anthropic-observed.ts";
+import { OBSERVED_CLAUDE_CODE_TTL_MS, ObservedClaudeCodeAuth } from "../src/providers/anthropic-observed.ts";
+import {
+  CLAUDE_CLI_FALLBACK_VERSION,
+  claudeCliUserAgent,
+  installedClaudeCliVersion,
+  parseClaudeCliVersion,
+} from "../src/providers/claude-cli-version.ts";
 import { saveClaudeAuthFile } from "../src/providers/anthropic-token-file.ts";
 import { posixModes } from "../../../test/capabilities.ts";
 
@@ -108,14 +112,11 @@ test("get reads the injected keychain before the credentials file", t => {
   assert.equal(credentialsFileReads, 0);
 });
 
-test("OAuth native headers and custom tool names follow Claude Code wire requirements", () => {
+test("OAuth native headers follow Claude Code wire requirements", () => {
   const headers = nativeAnthropicHeaders({ type: "anthropic", auth: "claude-code" }, { accessToken: "secret", expiresAt: Date.now() + 1_000 });
   assert.equal(headers.authorization, "Bearer secret");
   assert.equal(headers["anthropic-beta"], "claude-code-20250219,oauth-2025-04-20");
   assert.equal(headers["anthropic-version"], "2023-06-01");
-  assert.equal(toClaudeCodeToolName("Read"), "custom_Read");
-  assert.equal(toClaudeCodeToolName("web_search"), "web_search");
-  assert.equal(fromClaudeCodeToolName("custom_Read"), "Read");
   assert.equal(CLAUDE_CODE_IDENTITY, "You are Claude Code, Anthropic's official CLI for Claude.");
 });
 
@@ -166,4 +167,48 @@ test("expired observed header falls through env, stored CLI credential, then 060
   const fromStored = new ClaudeCodeAuthStore(validStored, { observed, home, env: {}, now: () => 12 * 60 * 60 * 1_000 + 1 }).get();
   assert.ok(!(fromStored instanceof Error));
   assert.equal(fromStored.source, "stored");
+});
+
+test("the fallback user-agent takes the observed version, then this machine's CLI, then the constant", () => {
+  const credentials = { accessToken: "secret", expiresAt: Date.now() + 1_000 };
+  const provider = { type: "anthropic" as const, auth: "claude-code" as const };
+  const agent = (versionSources: Parameters<typeof nativeAnthropicHeaders>[2]): string =>
+    nativeAnthropicHeaders(provider, credentials, versionSources)["user-agent"]!;
+
+  assert.equal(agent({ observed: "claude-cli/2.1.308 (external, cli)" }), "claude-cli/2.1.308 (external, cli)");
+  assert.equal(agent({ observed: "2.1.308" }), "claude-cli/2.1.308 (external, cli)", "a bare version is accepted");
+  assert.equal(agent({ observed: "ClaudeDesktop/1", installed: () => "2.1.310" }), "claude-cli/2.1.310 (external, cli)");
+  assert.equal(agent({ observed: null, installed: () => "2.1.310" }), "claude-cli/2.1.310 (external, cli)");
+  assert.equal(agent({ observed: null, installed: () => null }), claudeCliUserAgent(CLAUDE_CLI_FALLBACK_VERSION));
+  assert.match(CLAUDE_CLI_FALLBACK_VERSION, /^\d+\.\d+\.\d+$/);
+});
+
+test("a version parser rejects anything but a three-part version", () => {
+  assert.equal(parseClaudeCliVersion("claude-cli/2.1.304 (external, cli)"), "2.1.304");
+  assert.equal(parseClaudeCliVersion(" 2.1.304 "), "2.1.304");
+  assert.equal(parseClaudeCliVersion("2.1"), null);
+  assert.equal(parseClaudeCliVersion("ClaudeDesktop/1"), null);
+  assert.equal(parseClaudeCliVersion("foo/1.2.3 claude-cli/2.1.304"), null, "only Claude Code's own form is read");
+  assert.equal(parseClaudeCliVersion(null), null);
+});
+
+test("an observation hands its CLI version to fallback headers only inside the snapshot TTL", () => {
+  const observed = new ObservedClaudeCodeAuth();
+  observed.observe(["authorization", "Bearer token", "user-agent", "claude-cli/2.1.309 (external, cli)"], 10_000);
+  assert.equal(observed.cliVersion(10_000), "2.1.309");
+  assert.equal(observed.cliVersion(10_000 + OBSERVED_CLAUDE_CODE_TTL_MS - 1), "2.1.309");
+  assert.equal(observed.cliVersion(10_000 + OBSERVED_CLAUDE_CODE_TTL_MS), null);
+
+  const store = new ClaudeCodeAuthStore(new ClaudeCodeCredentialStore(() => null, () => 10_001), { observed, home: "/nonexistent", env: {}, now: () => 10_001 });
+  assert.equal(store.observedCliVersion(), "2.1.309");
+});
+
+test("the installed CLI version is the newest cached version directory", t => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "cr-claude-cli-versions-"));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  fs.mkdirSync(path.join(directory, "2.1.280"));
+  fs.mkdirSync(path.join(directory, "2.1.310"));
+  fs.mkdirSync(path.join(directory, "not-a-version"));
+  assert.equal(installedClaudeCliVersion([directory]), "2.1.310");
+  assert.equal(installedClaudeCliVersion([path.join(directory, "missing")]), null);
 });

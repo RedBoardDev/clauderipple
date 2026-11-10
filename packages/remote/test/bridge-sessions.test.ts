@@ -4,7 +4,8 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { Sessions } from "../src/sessions.ts";
-import { BridgeClient } from "../src/bridge-client.ts";
+import { BridgeClient, DESKTOP_WAITING, DesktopBlockedError } from "../src/bridge-client.ts";
+import { setTimeout as delay } from "node:timers/promises";
 import { PermissionQueue } from "../src/permissions.ts";
 import { liveDesktopProcesses, type DesktopProcess } from "../src/desktop.ts";
 import { ATTACHMENT_CAP, ATTACHMENT_COUNT } from "../src/protocol.ts";
@@ -14,7 +15,7 @@ const id = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
 const tick = () => new Promise(resolve => setImmediate(resolve));
 const line = (value: unknown) => JSON.stringify(value) + "\n";
 
-function fixture(t: import("node:test").TestContext, rejected = false, resumed: boolean | string = false) {
+function fixture(t: import("node:test").TestContext, rejected = false, resumed: boolean | string = false, postGate?: Promise<void>) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-session-test-"));
   const projects = path.join(root, "projects");
   fs.mkdirSync(path.join(projects, "project"), { recursive: true });
@@ -30,6 +31,7 @@ function fixture(t: import("node:test").TestContext, rejected = false, resumed: 
   const client = new BridgeClient({ auth: () => ({ accessToken: "private-token", organizationUuid: "org", expiresAt: Date.now() + 60_000 }), fetch: async (url, options) => {
     if (options?.method === "POST") {
       posts.push(JSON.parse(String(options.body)));
+      await postGate;
       return new Response("{}", { status: rejected ? 403 : 200 });
     }
     if (String(url).endsWith("/sessions/bridge")) {
@@ -49,7 +51,7 @@ function fixture(t: import("node:test").TestContext, rejected = false, resumed: 
     }]));
   }
   const permissions = PermissionQueue.open(path.join(root, "permissions.json"));
-  const sessions = new Sessions({ now: () => now, log() {}, dir: path.join(root, "host"), desktopProjects: projects, desktopRegistry: () => registry, desktopProcesses: () => "", bridgeClient: client, permissions,
+  const sessions = new Sessions({ modOfferMs: 20, now: () => now, log() {}, dir: path.join(root, "host"), desktopProjects: projects, desktopRegistry: () => registry, desktopProcesses: () => "", bridgeClient: client, permissions,
     router: { status: async () => ({ ok: true, proxyEnv: {} }), figures: async () => { throw new Error("unused"); } },
     queryFn: () => { queries++; return { async *[Symbol.asyncIterator]() {}, interrupt: async () => {}, setModel: async () => {}, setPermissionMode: async () => {}, close() {} }; }, onEvent() {}, onSessions() {} });
   t.after(async () => { sessions.shutdown(); await tick(); fs.rmSync(root, { recursive: true, force: true }); });
@@ -283,6 +285,21 @@ test("bridge caps total base64 at ATTACHMENT_COUNT times ATTACHMENT_CAP, inclusi
   assert.equal(f.queries(), 0);
 });
 
+test("a bridge send accepted after its lane deadline still logs the message and completes its receipt", async t => {
+  const gate = Promise.withResolvers<void>();
+  const f = fixture(t, false, false, gate.promise);
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const sending = f.sessions.orderedSend(id, "slow-accept", "slow words");
+  await tick();
+  assert.equal(f.posts.length, 1);
+  t.mock.timers.tick(15_000);
+  gate.resolve();
+  assert.equal(await sending, id);
+  assert.equal(f.sessions.log(id).tail().events.filter(e => e.kind === "user" && e.clientMsgId === "slow-accept").length, 1);
+  assert.equal(await f.sessions.orderedSend(id, "slow-accept", "slow words"), id);
+  assert.equal(f.posts.length, 1, "the completed receipt answers a resend without posting again");
+});
+
 test("a rejected live bridge send fails each attempt without logging the user or starting a writer", async t => {
   const f = fixture(t, true);
   await assert.rejects(Promise.resolve(f.sessions.send(id, "phone", "not accepted")), /받지 않았습니다/);
@@ -321,6 +338,59 @@ test("attach replays approvals requested before the stream connected, skipping a
   assert.equal(await f.sessions.decide(id, pending[0]!.id, "deny"), true);
   assert.equal(f.posts.length, 1);
   assert.equal(await f.sessions.decide(id, pending[0]!.id, "deny"), false, "the second answer resolves nothing again");
+});
+
+for (const bridgeAppears of [true, false]) test(`a completed Desktop session without RC waits, then sends once when ${bridgeAppears ? "RC appears" : "the Desktop writer exits"}`, async t => {
+  const f = fixture(t);
+  f.registry.set(id, { sessionId: id, pid: 42, status: "idle" });
+  assert.throws(() => f.sessions.send(id, "direct-blocked", "/help"), DesktopBlockedError);
+  f.sessions.enqueue(id, "waiting-rc", "원문\n" + "긴 메시지 😀".repeat(1000));
+  await delay(40);
+  assert.equal(f.sessions.summaryOf(id)?.queueHeld, undefined);
+  assert.equal(f.sessions.summaryOf(id)?.queue?.[0]?.error, DESKTOP_WAITING);
+  assert.equal(f.queries(), 0);
+  assert.equal(f.posts.length, 0);
+  if (bridgeAppears) f.registry.get(id)!.bridgeSessionId = "bridge";
+  else f.registry.clear();
+  f.sessions.pollQueued();
+  await tick(); await tick();
+  assert.equal(f.sessions.summaryOf(id)?.queue, undefined);
+  assert.equal(f.queries(), bridgeAppears ? 0 : 1);
+  assert.equal(f.posts.length, bridgeAppears ? 1 : 0);
+  if (bridgeAppears) assert.equal((f.posts[0] as { events: { payload: { message: { content: string } } }[] }).events[0]!.payload.message.content, "원문\n" + "긴 메시지 😀".repeat(1000));
+  f.sessions.pollQueued();
+  await f.sessions.pollDesktop();
+  await tick();
+  assert.equal(f.queries() + f.posts.length, 1, "no repeated input on subsequent polls");
+});
+
+test("a user-paused RC wait remains paused after the bridge appears", async t => {
+  const f = fixture(t);
+  f.registry.set(id, { sessionId: id, pid: 42, status: "idle" });
+  f.sessions.enqueue(id, "stopped-wait", "kept");
+  await tick();
+  f.sessions.holdQueue(id);
+  f.registry.get(id)!.bridgeSessionId = "bridge";
+  f.sessions.pollQueued();
+  await f.sessions.pollDesktop();
+  await tick();
+  assert.equal(f.posts.length, 0);
+  assert.equal(f.sessions.summaryOf(id)?.queueHeld, true);
+  f.sessions.resumeQueue(id);
+  await tick(); await tick();
+  assert.equal(f.posts.length, 1);
+});
+
+test("a definite bridge refusal keeps its queued original visible and requires explicit retry", async t => {
+  const f = fixture(t, true);
+  f.sessions.enqueue(id, "refused-queue", "keep the original");
+  await tick(); await tick();
+  assert.equal(f.sessions.summaryOf(id)?.queueHeld, true);
+  assert.equal(f.sessions.summaryOf(id)?.queue?.[0]?.text, "keep the original");
+  f.sessions.pollQueued();
+  await f.sessions.pollDesktop();
+  await tick();
+  assert.equal(f.posts.length, 1);
 });
 
 // The queue for a Claude app session goes over Remote Control when the app says the turn ended,

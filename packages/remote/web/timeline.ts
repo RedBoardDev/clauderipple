@@ -1,16 +1,36 @@
 // Events → what the timeline shows. Pure, so the same reduction runs in tests and in the app.
 import type { PermissionContent, RuleStatus, Effort, Figures, ImagePart, SessionFile, SessionEvent, SessionState, Text, ToolCall } from "../src/protocol.ts";
 import { WRAP_TOOL, wrapUpFields, type WrapUpReply } from "../src/wrap-up.ts";
+import { stringField, toolInput } from "../src/tool-details.ts";
+import { settingsOutcome } from "../src/settings-notice.ts";
 
 export interface ToolView extends ToolCall { result?: { ok: boolean; text: Text; images?: ImagePart[]; files?: SessionFile[] } }
 
+/**
+ * A session command the person sent, drawn as what it does rather than as their words: compaction,
+ * a fresh conversation, and rewinding to an earlier point are things that happen to the session,
+ * not messages in it. The state is what is known — the turn it started has not finished, finished,
+ * or failed. Nothing here can be pressed: the file-level undo a rewind implies is designed apart.
+ */
+export type ControlCommand = "compact" | "clear" | "rewind";
+
+/** The command a message holds, when the whole message is one, or null for ordinary words. */
+export function controlCommand(text: string): ControlCommand | null {
+  const value = text.trim().toLowerCase();
+  if (value === "/compact") return "compact";
+  if (value === "/clear") return "clear";
+  if (value === "/rewind") return "rewind";
+  return null;
+}
+
 export type Item =
-  | { type: "user"; key: string; ver: string; text: string; images?: ImagePart[]; files?: SessionFile[]; at: number; queued?: "pending" | "sending" }
+  | { type: "user"; key: string; ver: string; text: string; images?: ImagePart[]; files?: SessionFile[]; at: number; queued?: "pending" | "sending"; /** the host refused it, in the host's own words: it will not go out by itself */ error?: string }
+  | { type: "control"; key: string; ver: string; command: ControlCommand; state: "running" | "done" | "failed"; at: number }
   | { type: "assistant"; key: string; ver: string; text: Text; images?: ImagePart[]; files?: SessionFile[]; streaming: boolean; tools: ToolView[]; model: string; at: number }
   | { type: "thinking"; key: string; ver: string; text: Text; streaming: boolean; msg: string; at: number }
-  | { type: "subagent"; key: string; ver: string; toolUseId: string; sub: string; description: string; model: string | null; status: "running" | "done" | "failed"; steps: number }
+  | { type: "subagent"; key: string; ver: string; toolUseId: string; sub: string; description: string; model: string | null; status: "running" | "done" | "failed" | "stopped"; steps: number }
   | (PermissionContent & { type: "permission"; key: string; ver: string; id: string; tool: string; title: string; summary: string; input: Text; canAlways: boolean; decision: null | "allow" | "allow_always" | "deny" | "expired"; ruleStatus?: RuleStatus; reason?: string; at: number })
-  | { type: "result"; key: string; ver: string; ok: boolean; error?: string; ms: number; model: string; effort: Effort | null }
+  | { type: "result"; key: string; ver: string; ok: boolean; error?: string; ms: number; model: string; effort: Effort | null; /** which finished turn this is, when the conversation's first page is loaded; absent otherwise */ turn?: number }
   | { type: "notice"; key: string; ver: string; code: string; text?: string }
   | { type: "start"; key: string; ver: string };
 
@@ -27,7 +47,9 @@ export interface SessionView {
   lastSeq: number;
 }
 
-export interface Outgoing { clientMsgId: string; text: string; at: number; state: "pending" | "sending" }
+/** A message this phone is holding for the host. `error` is the host's reason for refusing it: the
+ * words stay, and it is not sent again on its own until the person retries or takes them back. */
+export interface Outgoing { clientMsgId: string; text: string; at: number; state: "pending" | "sending"; error?: string }
 
 /**
  * Reduce a session's loaded events (ascending seq; gaps allowed, duplicates ignored) and the
@@ -44,7 +66,28 @@ export function reduce(events: readonly SessionEvent[], outbox: readonly Outgoin
   let effort: Effort | null = null;
   let turnStartedAt: number | null = null;
   let lastSeq = 0;
+  // A main response has one current text/thinking segment, independent of turn activity.
+  let streamingKey: string | null = null;
+  // The session commands still waiting for their turn to end, and how many turns have finished.
+  // Turns are numbered only when the conversation's first page is loaded (atStart), so a scrolled
+  // window does not claim to be the whole story.
+  let awaiting: number[] = [];
+  let turns = 0;
+  const finishStream = (): void => {
+    if (streamingKey === null) return;
+    const index = byKey.get(streamingKey);
+    const item = index === undefined ? undefined : items[index];
+    if (item?.type === "assistant" || item?.type === "thinking") {
+      item.streaming = false;
+      item.ver += "s";
+    }
+    streamingKey = null;
+  };
   const put = (item: Item): void => {
+    if (item.type === "assistant" || item.type === "thinking") {
+      if (streamingKey !== item.key || !item.streaming) finishStream();
+      streamingKey = item.streaming ? item.key : null;
+    }
     const at = byKey.get(item.key);
     if (at === undefined) { byKey.set(item.key, items.length); items.push(item); }
     else items[at] = item;
@@ -55,12 +98,23 @@ export function reduce(events: readonly SessionEvent[], outbox: readonly Outgoin
     lastSeq = e.seq;
     switch (e.kind) {
       case "user":
+        finishStream();
         seenUser.add(e.clientMsgId);
         // The app counts "working for" from the person's message; Mac sessions have no turn event to say so.
         turnStartedAt = e.at;
+        // A session command is a thing that happens to the conversation, not a message in it.
+        {
+          const command = controlCommand(e.text);
+          if (command) {
+            awaiting.push(items.length);
+            put({ type: "control", key: `c${e.clientMsgId}`, ver: `u${e.seq}`, command, state: "running", at: e.at });
+            break;
+          }
+        }
         put({ type: "user", key: `u${e.clientMsgId}`, ver: `u${e.seq}`, text: e.text, ...(e.images ? { images: e.images } : {}), ...(e.files ? { files: e.files } : {}), at: e.at });
         break;
       case "turn":
+        finishStream();
         model = e.model; effort = e.effort; turnStartedAt = e.at;
         break;
       case "thinking": {
@@ -68,6 +122,13 @@ export function reduce(events: readonly SessionEvent[], outbox: readonly Outgoin
         const prev = byKey.has(key) ? items[byKey.get(key)!] : undefined;
         const text = e.delta ? (prev?.type === "thinking" && typeof prev.text === "string" ? prev.text : "") + (typeof e.text === "string" ? e.text : e.text.preview) : e.text;
         put({ type: "thinking", key, ver: `h${e.seq}`, msg: e.msg, text, streaming: e.delta === true, at: e.at });
+        break;
+      }
+      case "narration": {
+        // A progress sentence between tool calls is the model's words, drawn where it wrote them: the
+        // tool runs on either side stay separate, and the thinking that streamed here stops being live.
+        finishStream();
+        put({ type: "assistant", key: `n${e.msg}:${e.block}`, ver: `n${e.seq}`, text: e.text, streaming: false, tools: [], model: model ?? "", at: e.at });
         break;
       }
       case "delta": {
@@ -101,6 +162,7 @@ export function reduce(events: readonly SessionEvent[], outbox: readonly Outgoin
         put({ type: "subagent", key: `s${e.toolUseId}`, ver: `${e.seq}`, toolUseId: e.toolUseId, sub: e.sub, description: e.description, model: e.model, status: e.status, steps: e.steps });
         break;
       case "permission":
+        finishStream();
         put({ type: "permission", key: `p${e.id}`, ver: `${e.seq}`, id: e.id, tool: e.tool, title: e.title, summary: e.summary, input: e.input, canAlways: e.canAlways, ...(e.alwaysAllow ? { alwaysAllow: e.alwaysAllow } : {}), ...(e.requestKind ? { requestKind: e.requestKind } : {}), ...(e.questions ? { questions: e.questions } : {}), decision: null, at: e.at });
         break;
       case "permission_decided": {
@@ -109,15 +171,25 @@ export function reduce(events: readonly SessionEvent[], outbox: readonly Outgoin
         if (item?.type === "permission") items[at!] = { ...item, decision: e.decision, ...(e.ruleStatus ? { ruleStatus: e.ruleStatus } : {}), ...(e.reason ? { reason: e.reason } : {}), ver: `${item.ver}d${e.seq}` };
         break;
       }
-      case "result":
+      case "result": {
         // A queued next turn can already be running in the final snapshot.
         // Completion belongs to this point in the log, not only to the final state.
-        for (const item of items) if ((item.type === "thinking" || item.type === "assistant") && item.streaming) { item.streaming = false; item.ver += "s"; }
-        put({ type: "result", key: `r${e.seq}`, ver: "1", ok: e.ok, ...(e.error ? { error: e.error } : {}), ms: e.ms, model: model ?? "", effort });
+        finishStream();
+        turns++;
+        const turn = atStart ? turns : undefined;
+        put({ type: "result", key: `r${e.seq}`, ver: "1", ok: e.ok, ...(e.error ? { error: e.error } : {}), ms: e.ms, model: model ?? "", effort, ...(turn === undefined ? {} : { turn }) });
+        // The commands that started this turn are answered by its end, each in its own words.
+        for (const index of awaiting) {
+          const item = items[index];
+          if (item?.type === "control" && item.state === "running") items[index] = { ...item, state: e.ok ? "done" : "failed", ver: `${item.ver}:${e.ok ? "ok" : "no"}` };
+        }
+        awaiting = [];
         turnStartedAt = null;
         break;
+      }
       case "state":
         state = e.state;
+        if (state !== "running" && state !== "starting") finishStream();
         // Idle ends a Mac session's turn (it has no result event); "stopped" is a host restart's blip, not an end.
         if (e.state === "idle" || e.state === "error") turnStartedAt = null;
         else if (e.state === "running" && turnStartedAt === null) turnStartedAt = e.at;
@@ -125,21 +197,26 @@ export function reduce(events: readonly SessionEvent[], outbox: readonly Outgoin
       case "figures":
         figures = e.figures;
         break;
-      case "settings":
+      case "settings": {
         // One durable row per operation: a late answer replaces its earlier unknown result.
-        put({ type: "notice", key: `settings:${e.reqId}`, ver: `${e.seq}`, code: `settings_${e.status}`,
-          text: [e.model, e.effort, e.permissionMode, ...Object.values(e.errors ?? {})].filter(Boolean).join(" · ") });
+        // A pending answer names what will apply, not the values it leaves in force until then.
+        const outcome = settingsOutcome(e);
+        const values = outcome === "pending" && e.pending ? e.pending : e;
+        put({ type: "notice", key: `settings:${e.reqId}`, ver: `${e.seq}`, code: `settings_${outcome}`,
+          text: [values.model, values.effort, e.permissionMode, ...Object.values(e.errors ?? {})].filter(Boolean).join(" · ") });
         break;
+      }
       case "notice":
+        if (e.code === "interrupted" || e.code === "host_restarted") finishStream();
         put({ type: "notice", key: `n${e.seq}`, ver: "1", code: e.code, ...(e.text ? { text: e.text } : {}) });
         break;
     }
   }
   for (const o of outbox) {
     if (seenUser.has(o.clientMsgId)) continue;
-    put({ type: "user", key: `u${o.clientMsgId}`, ver: o.state, text: o.text, at: o.at, queued: o.state });
+    put({ type: "user", key: `u${o.clientMsgId}`, ver: `${o.state}${o.error ? `:${o.error}` : ""}`, text: o.text, at: o.at, queued: o.state, ...(o.error ? { error: o.error } : {}) });
   }
-  for (const it of items) if ((it.type === "assistant" || it.type === "thinking") && it.streaming && state !== "running" && state !== "starting" && state !== "waiting") { it.streaming = false; it.ver += "s"; }
+  if (state !== "running" && state !== "starting") finishStream();
   const open = items.filter((i): i is Extract<Item, { type: "permission" }> => i.type === "permission" && i.decision === null);
   return { items, state, figures, model, effort, open, turnStartedAt, lastSeq };
 }
@@ -183,6 +260,9 @@ function wrapUpOf(tool: ToolView, ver: string): WrapUp | null | undefined {
   if (!ask && !replies.length) return null;
   return { type: "wrapUp", key: `w${tool.id}`, ver, recap, ask, replies, blocked, answered: false };
 }
+
+/** The i18n key for a command's state word, shared by both clients. */
+export const controlTextKey = (command: ControlCommand, state: Extract<Item, { type: "control" }>["state"]): string => `control.${command}.${state}`;
 
 /** Presentation only: text, permissions and turn boundaries separate consecutive activity. */
 export function timelineItems(view: Pick<SessionView, "items" | "state">): TimelineItem[] {
@@ -244,9 +324,10 @@ export function timelineItems(view: Pick<SessionView, "items" | "state">): Timel
       continue;
     }
     // As in the Claude app's default view, thinking is not drawn and does not split a run (most of it
-    // has its text withheld anyway). Only thinking still streaming at the very end shows, as a live line.
+    // has its text withheld anyway). Narration is not thinking at this point: it became an assistant
+    // row above. Only thinking still streaming at the very end shows, as a live line.
     if (item.type === "thinking") continue;
-    if (item.type === "user" || item.type === "result") flushWrap();
+    if (item.type === "user" || item.type === "result" || item.type === "control") flushWrap();
     group = null;
     result.push(item);
   }
@@ -267,6 +348,26 @@ export function timelineItems(view: Pick<SessionView, "items" | "state">): Timel
     last.ver += "running";
   }
   return result;
+}
+
+export type WorkerItem = Extract<ActivityRow, { type: "subagent" }>;
+
+/** Resolve within the conversation that launched the worker, retaining the full launch input. */
+export function workerFor(items: readonly TimelineItem[], sub: string, label: string, status: WorkerItem["status"] = "running"): WorkerItem {
+  for (const item of items) {
+    if (item.type === "subagent" && item.sub === sub) return item.status === "running" && status !== "running" ? { ...item, status } : item;
+    if (item.type === "toolGroup") for (const row of item.rows) if (row.type === "subagent" && row.sub === sub) return row.status === "running" && status !== "running" ? { ...row, status } : row;
+  }
+  return { type: "subagent", key: `s${sub}`, ver: "0", toolUseId: sub, sub, description: label, model: null, status, steps: 0 };
+}
+
+/** Labels are not instructions; a later follow-up must not replace the worker's actual launch prompt. */
+export function workerPrompt(input: string): string { return stringField(toolInput(input), "prompt"); }
+export function workerConversationItems(events: readonly SessionEvent[], prompt: string): TimelineItem[] {
+  const items = timelineItems(reduce(events));
+  const first = items.find(item => item.type === "user" || item.type === "assistant" || item.type === "toolGroup");
+  if (first?.type === "user" || !prompt.trim()) return items;
+  return [{ type: "user", key: "worker-prompt", ver: prompt, text: prompt, at: 0 }, ...items];
 }
 
 /** Merge a page into a sorted event list without duplicates (pages may overlap after a reconnect). */
