@@ -13,6 +13,10 @@
       "name": "Opus 5.5"
     },
     {
+      "id": "claude-fable-5-2",
+      "name": "Fable 5.2"
+    },
+    {
       "id": "claude-fable-5-1",
       "name": "Fable 5.1"
     },

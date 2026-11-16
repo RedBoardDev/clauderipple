@@ -97,7 +97,7 @@ test("real admin GET contracts and native-client writes", async t => {
     const gpt = chatgpt.saveChatGptAccount(home, { accessToken: "fake-chatgpt-access", refreshToken: "fake-chatgpt-refresh", idToken: `fake.${claims}.unsigned`, expiresAt: instant + 3_600_000, accountId: "contract-chatgpt" });
     const { syncAgentFiles } = await import("../../../packages/router/src/agents.ts");
     syncAgentFiles(initial, path.join(home, "agents"));
-    claude.setCurrentClaudeLoginPaused(home, false);
+    claude.setCurrentClaudeAccountPaused(home, false);
     const observed = new ObservedClaudeCodeAuth();
     observed.observe(["authorization", "Bearer fake-observed-credential"]);
     const quota = { at: instant, plan_type: "contract-plan", rate_limits: { primary: { used_percent: 24, window_minutes: 300, reset_at: instant / 1000 + 3600 }, secondary: { used_percent: 42, window_minutes: 10080, reset_at: instant / 1000 + 86400 } } };
@@ -154,7 +154,7 @@ test("real admin GET contracts and native-client writes", async t => {
       credentials: () => {
         const accounts = claude.listClaudeAccounts(home);
         return { claude: [
-          { id: "current", label: "Current login", state: claude.isCurrentClaudeLoginPaused(home) ? "paused" : "ready", failures: 0, inUse: !claude.isCurrentClaudeLoginPaused(home) && !accounts.some(account => account.preferred) },
+          { id: "current", label: "Current login", state: claude.isCurrentClaudeAccountPaused(home) ? "paused" : "ready", failures: 0, inUse: !claude.isCurrentClaudeAccountPaused(home) && !accounts.some(account => account.preferred) },
           ...accounts.map(account => ({ id: account.id, label: account.label, state: account.paused ? "paused" : "ready", failures: 0, inUse: account.preferred && !account.paused })),
         ] };
       },

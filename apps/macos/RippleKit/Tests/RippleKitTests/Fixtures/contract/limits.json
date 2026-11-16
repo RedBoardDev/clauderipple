@@ -4,17 +4,45 @@
       "accounts": [
         {
           "account": 0,
+          "active": true,
           "at": 1800000000000,
+          "fetchedAt": 1800000000000,
+          "health": {
+            "state": "ready"
+          },
+          "id": "current",
           "inUse": true,
+          "label": "Current Claude login",
+          "preferred": true,
+          "stale": false,
+          "unknown": false,
+          "usageWindows": {
+            "fiveHour": {
+              "resetAt": 1800003600000,
+              "usedPercent": 24,
+              "windowMinutes": 300
+            },
+            "weekly": {
+              "resetAt": 1800086400000,
+              "usedPercent": 42,
+              "windowMinutes": 10080
+            }
+          },
+          "weeklyPace": {
+            "expectedPercent": 85.71428571428571,
+            "paceDelta": -43.71428571428571
+          },
           "windows": [
             {
               "kind": "five_hour",
+              "projected_percent": 30,
               "reset_at": 1800003600,
               "used_percent": 24,
               "window_minutes": 300
             },
             {
               "kind": "seven_day",
+              "projected_percent": 49,
               "reset_at": 1800086400,
               "used_percent": 42,
               "window_minutes": 10080
@@ -23,17 +51,44 @@
         },
         {
           "account": 1,
+          "active": false,
           "at": 1800000000000,
+          "fetchedAt": 1800000000000,
+          "health": {
+            "state": "ready"
+          },
+          "id": "00000000-0000-4000-8000-000000000001",
           "label": "claude@example.test",
+          "preferred": false,
+          "stale": false,
+          "unknown": false,
+          "usageWindows": {
+            "fiveHour": {
+              "resetAt": 1800003600000,
+              "usedPercent": 24,
+              "windowMinutes": 300
+            },
+            "weekly": {
+              "resetAt": 1800086400000,
+              "usedPercent": 42,
+              "windowMinutes": 10080
+            }
+          },
+          "weeklyPace": {
+            "expectedPercent": 85.71428571428571,
+            "paceDelta": -43.71428571428571
+          },
           "windows": [
             {
               "kind": "five_hour",
+              "projected_percent": 30,
               "reset_at": 1800003600,
               "used_percent": 24,
               "window_minutes": 300
             },
             {
               "kind": "seven_day",
+              "projected_percent": 49,
               "reset_at": 1800086400,
               "used_percent": 42,
               "window_minutes": 10080
@@ -49,18 +104,46 @@
       "accounts": [
         {
           "account": 0,
+          "active": true,
           "at": 1800000000000,
+          "fetchedAt": 1800000000000,
+          "health": {
+            "pausedUntil": 1800000060000,
+            "state": "paused-until"
+          },
+          "id": "00000000-0000-4000-8000-000000000002",
           "inUse": true,
           "label": "gpt@example.test",
+          "preferred": false,
+          "stale": false,
+          "unknown": false,
+          "usageWindows": {
+            "fiveHour": {
+              "resetAt": 1800003600000,
+              "usedPercent": 24,
+              "windowMinutes": 300
+            },
+            "weekly": {
+              "resetAt": 1800086400000,
+              "usedPercent": 42,
+              "windowMinutes": 10080
+            }
+          },
+          "weeklyPace": {
+            "expectedPercent": 85.71428571428571,
+            "paceDelta": -43.71428571428571
+          },
           "windows": [
             {
               "kind": "five_hour",
+              "projected_percent": 30,
               "reset_at": 1800003600,
               "used_percent": 24,
               "window_minutes": 300
             },
             {
               "kind": "seven_day",
+              "projected_percent": 49,
               "reset_at": 1800086400,
               "used_percent": 42,
               "window_minutes": 10080

@@ -7,13 +7,16 @@
       "cached": 900,
       "cacheHitPercent": 85.7,
       "cacheWrite": 50,
+      "costUsd": 0,
       "count": 1,
+      "estimatedRequests": 0,
       "failed": 0,
       "input": 100,
       "model": "gpt-6-1-sol",
       "ok": 1,
       "output": 75,
-      "provider": "chatgpt"
+      "provider": "chatgpt",
+      "unpricedRequests": 1
     }
   ],
   "providers": {
@@ -23,12 +26,15 @@
       "cacheHitPercent": 85.7,
       "cacheWrite": 50,
       "conversationTokens": 1125,
+      "costUsd": 0,
       "count": 1,
+      "estimatedRequests": 0,
       "failed": 0,
       "input": 100,
       "ok": 1,
       "output": 75,
-      "ungroupedRequests": 1
+      "ungroupedRequests": 1,
+      "unpricedRequests": 1
     }
   },
   "to": 1800000001000,
@@ -38,11 +44,14 @@
     "cacheHitPercent": 85.7,
     "cacheWrite": 50,
     "conversationTokens": 1125,
+    "costUsd": 0,
     "count": 1,
+    "estimatedRequests": 0,
     "failed": 0,
     "input": 100,
     "ok": 1,
     "output": 75,
-    "ungroupedRequests": 1
+    "ungroupedRequests": 1,
+    "unpricedRequests": 1
   }
 }

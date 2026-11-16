@@ -13,6 +13,12 @@
       "model": "claude-fable-5-1",
       "provider": null
     },
+    "claude-fable-5-2": {
+      "compactWindow": null,
+      "contextWindow": null,
+      "model": "claude-fable-5-2",
+      "provider": null
+    },
     "claude-haiku-4-5": {
       "compactWindow": null,
       "contextWindow": null,

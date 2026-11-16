@@ -98,7 +98,7 @@ final class ContractTests: XCTestCase {
         XCTAssertTrue(capabilities.canSearch(provider: "chatgpt", model: "gpt-6-1-sol"))
     }
 
-    func testLimitsContractExplicitlyUsesAnonymousFallback() throws {
+    func testLimitsContractBuildsEveryAccountUsage() throws {
         let limits: LimitsResponse = try decode("limits")
         XCTAssertEqual(limits.providers.count, 2)
         let provider = try XCTUnwrap(limits.providers.first)
@@ -112,7 +112,15 @@ final class ContractTests: XCTestCase {
         XCTAssertEqual(account.windows.map(\.usedPercent), [24, 42])
         XCTAssertEqual(account.windows.map(\.windowMinutes), [300, 10080])
         XCTAssertEqual(account.windows.last?.resetAt, 1_800_086_400)
-        XCTAssertNil(UsageBuilder.fromLimits(limits, now: Date(timeIntervalSince1970: 1_800_000_000)))
+        // The fork's limits rows carry ids, labels and health, so every account is built from them.
+        let usage = try XCTUnwrap(UsageBuilder.fromLimits(limits, now: Date(timeIntervalSince1970: 1_800_000_000)))
+        XCTAssertEqual(usage.map(\.accountId), ["current", "00000000-0000-4000-8000-000000000001", "00000000-0000-4000-8000-000000000002"])
+        XCTAssertEqual(usage.map(\.kind), [.claude, .claude, .chatgpt])
+        XCTAssertEqual(usage.map(\.isActive), [true, false, true])
+        XCTAssertEqual(usage.map(\.isPreferred), [true, false, false])
+        XCTAssertEqual(usage.first?.health, .ready)
+        XCTAssertEqual(usage.map { $0.fiveHour?.usedPercent }, [24, 24, 24])
+        XCTAssertEqual(usage.map { $0.weekly?.usedPercent }, [42, 42, 42])
     }
 
     func testConfigAndCatalogContracts() throws {

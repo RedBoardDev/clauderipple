@@ -205,5 +205,5 @@
   "statusMod": false,
   "uiRevision": "contract-ui",
   "upstream": "api.anthropic.com",
-  "version": "0.12.33"
+  "version": "0.12.36"
 }
