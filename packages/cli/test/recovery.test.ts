@@ -726,7 +726,11 @@ test("CLI: uninstall cleans owned picker integrations after checking the router 
   // Stand-ins for the login keychain and launchd, logging to one file so their order shows.
   fs.writeFileSync(path.join(bin, "security"), `#!/bin/sh\necho "security $*" >> "${calls}"\ncase "$1" in\n  find-certificate) printf 'SHA-1 hash: ${fingerprint}\\n' ;;\n  trust-settings-export) printf '<key>${fingerprint}</key>\\n' ;;\nesac\nexit 0\n`, { mode: 0o755 });
   fs.writeFileSync(path.join(bin, "launchctl"), `#!/bin/sh\necho "launchctl $*" >> "${calls}"\nexit 113\n`, { mode: 0o755 });
-  const env: NodeJS.ProcessEnv = { ...process.env, CLAUDERIPPLE_HOME: ctx.home, CLAUDERIPPLE_LAUNCHCTL: path.join(bin, "launchctl"), CODEX_HOME: path.join(ctx.home, "codex"), PATH: `${bin}${path.delimiter}${process.env.PATH ?? ""}` };
+  // The phone host service is account-wide (~/Library/LaunchAgents under the user's home), so the
+  // child gets a home of its own: it must never read or remove the machine's real host service.
+  const userHome = path.join(root, "uninstall-user-home");
+  fs.mkdirSync(userHome, { recursive: true });
+  const env: NodeJS.ProcessEnv = { ...process.env, HOME: userHome, CLAUDERIPPLE_HOME: ctx.home, CLAUDERIPPLE_LAUNCHCTL: path.join(bin, "launchctl"), CODEX_HOME: path.join(ctx.home, "codex"), PATH: `${bin}${path.delimiter}${process.env.PATH ?? ""}` };
   delete env.NODE_OPTIONS;
   // The real `security` would remove the user's own CA: refuse to go on unless the stand-in wins.
   const resolved = await promisify(execFile)("/bin/sh", ["-c", "command -v security"], { env });
