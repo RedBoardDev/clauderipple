@@ -460,7 +460,8 @@ function numberedAccounts<T extends { state: string }>(accounts: readonly T[]): 
 
 /**
  * Whether a stored Claude account is the app's current login: by subject hash when it has one, by
- * email (case-insensitive) when it predates hashes. Used by the dashboard's `sameAsCurrent` flag.
+ * email (case-insensitive) when it predates hashes. The dashboard's `sameAsCurrent` and the limits
+ * share this, so a copy is hidden in one place exactly when it is flagged in the other.
  */
 function isSameAsCurrentLogin(account: { subjectHash?: string | undefined; email?: string | undefined }, identity: { email: string; subjectHash: string }): boolean {
   return account.subjectHash !== undefined
@@ -471,36 +472,54 @@ function isSameAsCurrentLogin(account: { subjectHash?: string | undefined; email
 /**
  * Keep the upstream rotation numbering, then append unavailable accounts for native account cards.
  * Unknown usage remains an explicit empty row. The compatibility `active` flag is derived only
- * from upstream `inUse`, never from the last successful responder. Unlike upstream's deduplicated
- * limits view, the personal API lists every stored owner, including a copy of the current login;
- * selection therefore stays on the actual owner rather than being remapped to the current row.
+ * from upstream `inUse`, never from the last successful responder. A stored copy of the current
+ * login is the same upstream account: as upstream does, it is left out behind a current row that
+ * shows figures, keeping its number, and the pool spending on it marks the current row.
  */
 async function anthropicLimitAccounts(deps: AdminDeps, name: string, refresh: boolean): Promise<LimitsAccount[]> {
   const usage: Record<string, Record<string, unknown>> = await deps.claudeUsage?.(refresh).catch(() => ({})) ?? {};
   const liveReports = deps.credentials?.()[name];
   const reports = liveReports ?? claudePoolReports(deps, name);
-  const inUse = claudeInUseId(deps, name);
   const stored = listClaudeAccounts(homeDir());
   const numbered = claudeNumberedAccounts();
   const source = claudeAuthStore(deps).describeSource();
   const identity = source ? (await deps.claudeIdentity?.().catch(() => null)) ?? null : null;
   const hasCurrent = !!usage.current || reports.some((row) => row.id === "current") || source !== null;
+  const currentPaused = isCurrentClaudeAccountPaused(homeDir());
+  const now = Date.now();
+  const stateOf = (id: string): string => {
+    const saved = stored.find((account) => account.id === id);
+    if (id === "current" ? currentPaused : saved?.paused === true) return "paused";
+    if (saved && (saved.needsReauth || saved.expiresAt <= now)) return "needs-login";
+    return reports.find((row) => row.id === id)?.state ?? (id === "current" && liveReports !== undefined ? "needs-login" : "ready");
+  };
+  // A paused or signed-out account shows no figures, even cached ones.
+  const quotaOf = (id: string): Record<string, unknown> | undefined => {
+    const state = stateOf(id);
+    return state === "paused" || state === "needs-login" ? undefined : usage[id];
+  };
+  // The copy is hidden only behind a current row that shows figures: without them, the copy's are
+  // the account's only ones, so it stays (with its own in-use mark).
+  const currentQuota = hasCurrent ? quotaOf("current") : undefined;
+  const currentShown = !!currentQuota && claudeLimitWindows(currentQuota).length > 0;
+  const copies = new Set(identity && currentShown
+    ? listClaudeAccountsWithSubject(homeDir()).filter((account) => isSameAsCurrentLogin(account, identity)).map((account) => account.id)
+    : []);
+  const served = claudeInUseId(deps, name);
+  const inUse = served !== undefined && copies.has(served) ? "current" : served;
   const owners = [
     ...numbered.filter((owner) => owner.id !== "current" || hasCurrent),
-    ...(isCurrentClaudeAccountPaused(homeDir()) && hasCurrent ? [{ id: "current" }] : []),
+    ...(currentPaused && hasCurrent ? [{ id: "current" }] : []),
     ...stored.filter((owner) => !numbered.some((row) => row.id === owner.id)),
-  ];
-  const now = Date.now();
+  ].filter((owner) => !copies.has(owner.id));
   const numbers = new Map(numbered.map((owner, index) => [owner.id, index]));
   let nextNumber = numbered.length;
   return owners.map((owner) => {
     const index = numbers.get(owner.id) ?? nextNumber++;
     const saved = stored.find((account) => account.id === owner.id);
     const report = reports.find((row) => row.id === owner.id);
-    const paused = owner.id === "current" ? isCurrentClaudeAccountPaused(homeDir()) : saved?.paused === true;
-    const state = paused ? "paused" : saved && (saved.needsReauth || saved.expiresAt <= now) ? "needs-login"
-      : report?.state ?? (owner.id === "current" && liveReports !== undefined ? "needs-login" : "ready");
-    const quota = state === "paused" || state === "needs-login" ? undefined : usage[owner.id];
+    const state = stateOf(owner.id);
+    const quota = quotaOf(owner.id);
     const row = buildLimitsAccount({
       id: owner.id, label: saved?.label ?? identity?.email ?? "Current Claude login",
       preferred: report?.preferred ?? saved?.preferred ?? !stored.some((account) => account.preferred),

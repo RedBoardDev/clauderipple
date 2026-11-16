@@ -37,8 +37,9 @@ credential-pool row; successful-response health accounting is separate from acco
 - `packages/router/src/admin.ts`: `GET /api/limits` now lists **every** Claude account (the current
   login plus stored accounts, including ones awaiting a first snapshot or a new sign-in) and every
   ChatGPT account (paused and signed-out accounts are listed with their state and no windows).
-  `?refresh=1` forces a fresh read. Only one Claude account keeps the legacy `windows`, so the mod
-  status bar still shows Claude as one group.
+  `?refresh=1` forces a fresh read. Since the official 0.12.36 merge every account with a reading
+  keeps its `windows` (the official per-account gauges read them), and, as officially, a stored copy
+  of the current login is left out behind a current row that shows figures, keeping its number.
 - `packages/router/src/providers/anthropic-usage.ts`: `snapshot(force)`, per-account refresh
   schedule (15 s retry only for a failed account, 5 min TTL for healthy ones), `stale` marking
   instead of dropping last-known figures, and per-snapshot `at`.

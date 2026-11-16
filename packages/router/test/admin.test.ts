@@ -4238,7 +4238,7 @@ test("GET /api/limits and /api/status follow the Claude account the pool is usin
   }, { credentials: () => reports, claudeUsage: async () => usage });
 });
 
-test("GET /api/limits names the current login while retaining every stored owner and its selection", async () => {
+test("GET /api/limits names the current login and leaves out stored copies of it, without renumbering", async () => {
   const now = Date.now();
   const uuid = "current-login-uuid";
   const cfg = makeCfg({ providers: { anthropic: { type: "anthropic", auth: "claude-code", accountPool: true } } });
@@ -4256,15 +4256,21 @@ test("GET /api/limits names the current login while retaining every stored owner
     const rows = async () => (await (await fetch(`${base()}:${port}/api/limits`)).json() as { providers: LimitsProvider[] }).providers[0]!.accounts;
 
     let got = await rows();
-    assert.deepEqual(got.map((a) => [a.account, a.id, a.label]), [[0, "current", "Person@Example.Test"], [1, copy.id, "copy@example.test"], [2, other.id, "person@example.test"]], "the personal API keeps every owner, including stored copies, in stable order");
+    assert.deepEqual(got.map((a) => [a.account, a.id, a.label]), [[0, "current", "Person@Example.Test"], [2, other.id, "person@example.test"]], "the login carries its email; its stored copy is gone; the other keeps its number");
 
-    // Every owner stays visible, so selection follows the actual stored owner rather than the login.
+    // The pool answering on the copy is the login's account spending: the remaining row carries the mark.
+    reports = { anthropic: [{ id: "current", state: "ready", failures: 0 }, { id: copy.id, state: "ready", failures: 0, inUse: true }] };
+    got = await rows();
+    assert.deepEqual(got.filter((a) => a.inUse).map((a) => a.id), ["current"]);
+    // A pool that lists no login shows it as needing a sign-in, without figures: the copy keeps the account's.
     reports = { anthropic: [{ id: copy.id, state: "ready", failures: 0, inUse: true }] };
     got = await rows();
+    assert.deepEqual(got.map((a) => [a.id, a.health?.state]), [["current", "needs-login"], [copy.id, "ready"], [other.id, "ready"]]);
     assert.deepEqual(got.filter((a) => a.inUse).map((a) => a.id), [copy.id]);
     reports = {};
 
-    // The current login remains an explicit unknown row before its first usage reading.
+    // Without a reading of the login itself the copy's figures are the account's only ones: keep it,
+    // and the login stays an explicit unknown row.
     usage = { [copy.id]: quota(81), [other.id]: quota(15) };
     got = await rows();
     assert.deepEqual(got.map((a) => a.id), ["current", copy.id, other.id]);
