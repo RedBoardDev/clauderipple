@@ -8,13 +8,13 @@ copy of the official release history. See `CLAUDE.md` for the branch and deploym
 
 | Item | Value |
 | --- | --- |
-| Official reference | `refs/remotes/upstream/main` = `a7eb091361bfe20a5ae42429b0c4ae3960f58974` (2026-10-24) |
-| Official content | 0.12.14 plus the subsequent official uninstall fix (`a7eb091`) |
-| Integration branch | `integration/personal-main-2026-10-24` |
-| Integration inputs | Oxion commit `f75b1a4`, official merge `a612a0e`, personal fork merge `4203a83`, native app branch `feature/macos-app` (`df0e76a`) |
-| Last verified router deployment | 2026-10-24: personal build 0.12.14 from `91de284e17c3a47cab24dec1381b24a580d1e99e`, installed and drain-restarted. The real admin instance on port 8791 reports 0.12.14 and offers Oxion AI. Accounts/configuration were not reset. The separately built Swift application was not replaced during this router deployment. |
-| Validation | Node: 1,873 passed, 12 skipped, 0 failed. Swift: 103 passed, 0 failed. Typecheck, npm build, native Release build, JavaScript syntax and diff checks passed. |
-| Upstream PRs | None opened and none implied. Keeping a feature personal is a normal outcome (`CLAUDE.md`). |
+| Official reference | `refs/remotes/upstream/main` = `e7420ab5` (0.12.36, 2026-11-16) |
+| Official content | 0.12.36 |
+| Integration branch | `integration/personal-main-2026-11-16`, pushed as `main` = `75c4b22c` |
+| Integration inputs | `feature/fork-upstream-01233-reconcile` (`a66325cf`: previous `main` + official 0.12.33), official merge `879145a0`, macOS admin-API contract cherry-picked from `release/fork-0.12.33` (`e9966120` → `e9f0053b`), contributions `contrib/mapping-effort-follows-app` (`0e66cf49`) and `contrib/logs-purpose-tags` (`60802be8`). The rest of `release/fork-0.12.33` (paused current login, request-log account) reached the official repository and arrives with it. |
+| Router deployment | 2026-11-16: package 0.12.36 built from `75c4b22c` installed into `~/.clauderipple/lib`, replacing 0.12.33 from local `release/fork-0.12.33` (`d236c7cf`); rollback copy `~/.clauderipple/backups/lib-0.12.33-d236c7cf-before-75c4b22c`. Accounts/configuration were not touched. The drain restart was not run from this session. The Swift application was built, not installed. |
+| Validation | Node: 3,733 passed, 17 skipped, 0 failed. Swift: 121 passed, 0 failed. Admin-API contract: 8 passed. Typecheck, npm build, native Release build and diff checks passed. |
+| Upstream PRs | Opened at the user's request: PBJ-2/clauderipple#172 (mapping effort follows the app), PBJ-2/clauderipple#173 (Logs purpose tags). |
 
 The set of differences below is measured against the reference above. An official version number
 alone does not identify which personal features a build carries; use the Git revision.
