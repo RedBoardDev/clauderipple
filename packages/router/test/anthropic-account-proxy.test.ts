@@ -182,7 +182,9 @@ test("a native Claude turn survives 429, keeps the replacement account, and pres
     : { status: 200 });
   try {
     assert.equal(await rig.send(), 200, "the first client request survives the first account's limit");
-    assert.deepEqual(rig.proxy.credentialHealth().claude?.filter((c) => c.inUse).map((c) => c.id), [rig.stored.id]);
+    // A model-family rest leaves the current account ready for other families. The global
+    // report previews that account; the next turn below verifies this conversation's affinity.
+    assert.deepEqual(rig.proxy.credentialHealth().claude?.filter((c) => c.inUse).map((c) => c.id), ["current"]);
     assert.equal(await rig.send(), 200, "the conversation remains on the account that answered");
     assert.deepEqual(rig.seen.map((item) => item.authorization), ["Bearer current-token", "Bearer stored-token", "Bearer stored-token"]);
     assert.equal(rig.seen[0]!.currentOnly, "current-fingerprint");
