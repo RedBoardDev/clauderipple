@@ -17,7 +17,7 @@ import type { RecentSource } from "./folders.ts";
 import { diffScope, diffView } from "./diff.ts";
 import { gitInfo } from "./worktree.ts";
 import { ATTACHMENT_CAP, CHUNK_MESSAGE_MAX, FRAME_CAP, PING_MS, SLOW_STALE_MS, STALE_MS } from "./protocol.ts";
-import type { BlobChunk, ClientMsg, HostInfo, HostMsg, ProviderGroup, ReqOp, RippleStatus } from "./protocol.ts";
+import type { BlobChunk, ClientMsg, HostInfo, HostMsg, ProviderGroup, ReqOp, RippleStatus, SessionEvent } from "./protocol.ts";
 import { SEEN_MS, SLOW_VISIBLE_MS, VISIBLE_MS } from "./push.ts";
 import type { Notifier } from "./push.ts";
 import { OutcomeUnknownError } from "./receipts.ts";
@@ -29,6 +29,15 @@ import type { Sessions } from "./sessions.ts";
 const HIGH_WATER = 1024 * 1024;
 /** A reconnecting client further behind than this many frames gets the tail instead of a replay. */
 const CATCHUP_FRAMES = 4;
+/** Ordinary events wait this long for company, so a burst of them is one `events` frame, not one per event. */
+const BATCH_MS = 80;
+/** Sent at once, with nothing held back: a permission request the phone must answer, and the decision that clears it. */
+const URGENT_EVENTS: ReadonlySet<SessionEvent["kind"]> = new Set(["permission", "permission_decided"]);
+/** A failure's machine code for the phone (`desktop_busy`, `desktop_approval_local`, ...), or undefined: other codes are internal. */
+const machineCode = (e: unknown): string | undefined => {
+  const code = (e as { code?: unknown }).code;
+  return typeof code === "string" && code.startsWith("desktop_") ? code : undefined;
+};
 /** `/api/limits` makes the router read each provider's quota; once a minute is plenty for percentages. */
 const LIMITS_MS = 60_000;
 const BLOB_CHUNK_CHARS = 60_000;
@@ -98,6 +107,8 @@ interface Client {
   pumping: Set<string>;
   pendingTail: Set<string>;
   retries: Map<string, ReturnType<typeof setTimeout>>;
+  /** session → the timer of the window holding its ordinary events (BATCH_MS) */
+  batches: Map<string, ReturnType<typeof setTimeout>>;
   /** The session list waiting for a backed-up connection to drain. */
   sessionsRetry: ReturnType<typeof setTimeout> | null;
   features: ReturnType<typeof clientFeatures>;
@@ -242,6 +253,8 @@ export class HostServer {
         this.timers.push(setInterval(() => void this.checkRouter(), 15_000));
         this.timers.push(setInterval(() => this.pollDesktop(), 3000));
         this.timers.push(setInterval(() => { if (!this.refreshing) this.opts.sessions.pollQueued(); }, 1000));
+        // Attached sessions whose transcript watch is down: a 1 s tail instead of the 3 s poll (no-op with no phone).
+        this.timers.push(setInterval(() => this.opts.sessions.tailUnwatched(), 1000));
         void this.checkRouter();
         resolve();
       });
@@ -270,6 +283,12 @@ export class HostServer {
     for (const t of this.timers) clearInterval(t);
     if (this.sessionsTimer) clearTimeout(this.sessionsTimer);
     this.sessionsTimer = null;
+    // Events still held in a window go out before the sockets close. A phone that misses them replays by seq on reconnect.
+    // The host shuts the sessions (and their logs) down first, so a flush can find its log closed: that window is
+    // dropped here, never the shutdown — the events are on disk and replay on reconnect.
+    for (const c of this.clients) for (const session of [...c.batches.keys()]) {
+      try { this.pumpNow(c, session); } catch { /* log already closed; replayed by seq on reconnect */ }
+    }
     for (const c of this.clients) { c.attached.clear(); c.ws.terminate(); }
     this.syncWatches();
     return Promise.all([this.http, this.localHttp].filter((server): server is http.Server => server !== null)
@@ -280,14 +299,34 @@ export class HostServer {
 
   // ---- session events in, frames out ---------------------------------------------------------
 
-  /** Called for every appended event: push it to every client attached to that session. */
-  onEvent(session: string): void {
+  /**
+   * Called for every appended event: push it to every client attached to that session. An ordinary event waits
+   * up to BATCH_MS, so a burst leaves as one frame. A permission request or decision, or a call that names no
+   * event, goes now; whatever the window held goes first, because pump sends from the client's cursor in seq order.
+   */
+  onEvent(session: string, event?: SessionEvent): void {
     const snapshot = this.opts.sessions.summaryOf(session)?.origin === "desktop";
+    const urgent = !event || URGENT_EVENTS.has(event.kind);
     for (const c of this.clients) {
       if (!c.authed || !c.attached.has(session)) continue;
       if (snapshot) this.attach(c, session, undefined, undefined);
-      else this.pump(c, session);
+      else if (urgent) this.pumpNow(c, session);
+      else this.pumpLater(c, session);
     }
+  }
+
+  /** Schedules one send of the session's unsent events at the end of its window (at most one window per client and session). */
+  private pumpLater(c: Client, session: string): void {
+    if (c.batches.has(session)) return;
+    c.batches.set(session, setTimeout(() => this.pumpNow(c, session), BATCH_MS));
+  }
+
+  /** Cancels the session's window, if one is open, and sends everything the client is owed, in order. */
+  private pumpNow(c: Client, session: string): void {
+    const timer = c.batches.get(session);
+    if (timer) clearTimeout(timer);
+    c.batches.delete(session);
+    this.pump(c, session);
   }
 
   /** Session list changed (state, pending count, a new one). Coalesced; lists are small but frequent. */
@@ -360,6 +399,9 @@ export class HostServer {
     void this.opts.sessions.syncBridge(session).catch(error => {
       this.opts.log?.(`bridge sync failed: ${error instanceof Error ? error.message : String(error)}`);
     });
+    // Starts the background restatement of a refusal recorded under older rules; returns at once. What it
+    // finds is served in place by the log's reads, and reaches this phone as a live event when appended.
+    this.opts.sessions.repairFiles(session);
     const log = this.opts.sessions.log(session);
     c.attached.set(session, c.attached.get(session) ?? { epoch: log.epoch, seq: 0 });
     this.syncWatches();
@@ -409,7 +451,7 @@ export class HostServer {
 
   /** A phone connected, directly or through the relay; it must say hello with the token within 10 s. */
   connected(ws: Peer): void {
-    const c: Client = { ws, authed: false, clientId: "", visibleAt: 0, lastRx: Date.now(), attached: new Map(), pumping: new Set(), pendingTail: new Set(), retries: new Map(), sessionsRetry: null, features: new Set() };
+    const c: Client = { ws, authed: false, clientId: "", visibleAt: 0, lastRx: Date.now(), attached: new Map(), pumping: new Set(), pendingTail: new Set(), retries: new Map(), batches: new Map(), sessionsRetry: null, features: new Set() };
     this.clients.add(c);
     const helloTimer = setTimeout(() => { if (!c.authed) ws.close(4001, "hello"); }, 10_000);
     ws.on("message", (data) => {
@@ -424,6 +466,8 @@ export class HostServer {
       clearTimeout(helloTimer);
       for (const timer of c.retries.values()) clearTimeout(timer);
       c.retries.clear();
+      for (const timer of c.batches.values()) clearTimeout(timer);
+      c.batches.clear();
       c.pendingTail.clear();
       if (c.sessionsRetry) clearTimeout(c.sessionsRetry);
       c.sessionsRetry = null;
@@ -498,6 +542,9 @@ export class HostServer {
         const retry = c.retries.get(msg.session);
         if (retry) clearTimeout(retry);
         c.retries.delete(msg.session);
+        const batch = c.batches.get(msg.session);
+        if (batch) clearTimeout(batch);
+        c.batches.delete(msg.session);
         this.syncWatches();
         return;
       }
@@ -546,8 +593,13 @@ export class HostServer {
           const desktop = s.list().some(session => session.id === msg.session && session.origin === "desktop");
           const id = await s.orderedSend(msg.session, msg.clientMsgId, msg.text, msg.attachments, msg.behavior);
           // A message the person sends after a Stop is them carrying on: the queue goes on after it.
-          s.resumeQueue(msg.session);
-          this.send(c, { t: "ack", clientMsgId: msg.clientMsgId, session: id });
+          // `id` is the session the message went to (a session the app moved on from answers at its new id).
+          s.resumeQueue(id);
+          // The message's own echo may sit in a window; it goes before the ack, so the phone never drops the
+          // optimistic bubble before the real one has arrived.
+          if (c.batches.has(id)) this.pumpNow(c, id);
+          const queued = s.takeQueued(id, msg.clientMsgId);
+          this.send(c, { t: "ack", clientMsgId: msg.clientMsgId, session: id, ...(queued ? { queued: true as const } : {}) });
           if (desktop && id === msg.session) this.attach(c, id, undefined, undefined);
         } catch (e) {
           if (e instanceof OutcomeUnknownError) {
@@ -565,8 +617,9 @@ export class HostServer {
           if (!await s.decide(msg.session, msg.id, msg.decision, msg.message, msg.answers, msg.reqId)) throw new Error("이미 처리됨");
           if (msg.reqId) this.send(c, { t: "res", reqId: msg.reqId, ok: true, data: null });
         } catch (e) {
-          if (msg.reqId) this.send(c, { t: "res", reqId: msg.reqId, ok: false, error: (e as Error).message });
-          else this.send(c, { t: "error", code: "permission", message: (e as Error).message, session: msg.session });
+          const code = machineCode(e);
+          if (msg.reqId) this.send(c, { t: "res", reqId: msg.reqId, ok: false, error: (e as Error).message, ...(code ? { code } : {}) });
+          else this.send(c, { t: "error", code: code ?? "permission", message: (e as Error).message, session: msg.session });
         }
         return;
       case "set_mode":
@@ -599,7 +652,9 @@ export class HostServer {
         try {
           this.send(c, { t: "res", reqId: msg.reqId, ok: true, data: await this.request(msg.op, c) });
         } catch (e) {
-          this.send(c, { t: "res", reqId: msg.reqId, ok: false, error: (e as Error).message });
+          // A failure that names a machine code (a busy app session, a mod that is offline) keeps it for the phone.
+          const code = machineCode(e);
+          this.send(c, { t: "res", reqId: msg.reqId, ok: false, error: (e as Error).message, ...(code ? { code } : {}) });
         }
         return;
     }
@@ -665,7 +720,7 @@ export class HostServer {
       }
       case "enqueue": await s.enqueue(op.session, op.clientMsgId, op.text, op.attachments ?? []); return { queued: true };
       case "queue_remove": return s.removeQueued(op.session, op.id);
-      case "queue_send": return { session: await s.sendQueued(op.session, op.id) };
+      case "queue_send": return { session: await s.sendQueued(op.session, op.id, { interrupt: op.interrupt === true }) };
       case "queue_resume": s.resumeQueue(op.session); return null;
       case "blob": {
         if (!s.has(op.session)) throw new Error("no such session");

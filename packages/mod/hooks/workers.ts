@@ -1,5 +1,6 @@
 import type { Billing, Domain, Effort, LadderChoice, LadderOptions, ModelScore, ProviderAvailability, RouterModel, Rule, Rung, Settings, TierTarget, WorkerCandidate, WorkerPick, WorkerVerdict } from '../types'
-import { CLAUDE_WORKERS, EFFORTS, candidateKey, isAllowed } from './settings'
+import type { ClaudeLatest } from './settings'
+import { EFFORTS, candidateKey, claudeWorkers, isAllowed, latestClaudeIds } from './settings'
 import { MARKER, providerModelId } from './worker'
 import { t } from './i18n'
 import type { Lang } from './i18n'
@@ -167,8 +168,8 @@ export function allowed(candidate: WorkerCandidate, allow: readonly string[], kn
   return isAllowed(candidateKey(candidate.target), candidate.provider, allow, known)
 }
 /** Claude's own models as candidates: general-purpose on each. */
-export function claudeCandidates(): WorkerCandidate[] {
-  return CLAUDE_WORKERS.map(w => ({ target: { ...w.target }, model: w.model, provider: w.provider }))
+export function claudeCandidates(latest?: ClaudeLatest): WorkerCandidate[] {
+  return claudeWorkers(latest).map(w => ({ target: { ...w.target }, model: w.model, provider: w.provider }))
 }
 const BILLINGS: readonly Billing[] = ['free', 'payg', 'subscription']
 /**
@@ -198,7 +199,10 @@ export function ladderOptionsFrom(raw: unknown, until: number, allow: readonly s
     const models = unavailableModels(p.models)
     return [[p.name, { usable: p.usable, ...(typeof p.reason === 'string' ? { reason: p.reason } : {}), ...(typeof p.exhaustedUntil === 'number' ? { exhaustedUntil: p.exhaustedUntil } : {}), ...(Object.keys(models).length ? { models } : {}) }]]
   }))
-  return { until, choices: tickedChoices([...choices, ...claudeChoices(efforts(root.claudeEfforts))], allow, allowKnown), providers }
+  // Only family ids the router read from Anthropic's list; anything else is dropped, so a bad body cannot rename a worker.
+  const claude = latestClaudeIds(Object.values(record(root.claudeLatest)).filter((id): id is string => typeof id === 'string'))
+  const live = Object.keys(claude).length ? claude : undefined
+  return { until, choices: tickedChoices([...choices, ...claudeChoices(efforts(root.claudeEfforts), live)], allow, allowKnown), providers, ...(live ? { claude: live } : {}) }
 }
 /**
  * A provider's models that are out while it answers others (GET /api/mod-options `models`): a spent
@@ -294,18 +298,45 @@ export function ladderFallbackModels(rule: Rule, pick: Resolution, candidates: r
 }
 
 /** Resolve only native family aliases; explicit versions, custom ids and inheritance stay intact. */
-export function resolveClaudeModel(model: string | undefined): string | undefined {
+export function resolveClaudeModel(model: string | undefined, latest?: ClaudeLatest): string | undefined {
   if (!model) return model
   const alias = baseModel(model).replace(/\[1m\]$/, '')
-  const worker = CLAUDE_WORKERS.find(w => w.target.model === alias)
+  const worker = claudeWorkers(latest).find(w => w.target.model === alias)
   return worker ? worker.model + model.slice(alias.length) : model
 }
 
-export function spawnModel(target: TierTarget, effort: Effort, fileModel?: string): string | undefined {
-  return resolveClaudeModel(fileModel && target.agent !== 'general-purpose' ? `${baseModel(fileModel)}@${effort}` : target.model)
+export function spawnModel(target: TierTarget, effort: Effort, fileModel?: string, latest?: ClaudeLatest): string | undefined {
+  return resolveClaudeModel(fileModel && target.agent !== 'general-purpose' ? `${baseModel(fileModel)}@${effort}` : target.model, latest)
 }
 /** A prefix this mod (or the retired agent-title hook) put on a title: "Sol·high · ". */
-const TITLE_PREFIX = /^[^\s·]+(?:·[a-z]+)? · /
+const EFFORT_WORD = 'low|medium|high|xhigh|max'
+// What the title forms are, so a parent's own heading ("UI·UX · Review nav") is left alone:
+// "Sol · ", "Sol·high · ", a Claude title with its account ("Opus5.5·Work-account · ", "…·high · "),
+// and any title with account and effort ("Sol·Work-account·high · "). A title the generator
+// writes with an account and no effort ("5.5·Work-account · ", "Sol·Work-account · ") has no shape
+// of its own, so it is recognised by an account the worker files name (`titlePrefix`).
+const TITLE_PREFIX = new RegExp(`^(?:[^\\s·]+(?:·(?:${EFFORT_WORD}))?|(?:Opus|Sonnet|Haiku|Fable|Mythos)[\\d.]*·[^\\s·]+(?:·(?:${EFFORT_WORD}))?|[^\\s·]+·[^\\s·]+·(?:${EFFORT_WORD})) · `)
+
+const closeUp = (account: string): string => account.replace(/[\s·]+/g, '-')
+
+/** TITLE_PREFIX, widened by the accounts the worker files name: "<title>·<account>(·<effort>) · ". */
+function titlePrefix(accounts: readonly string[]): RegExp {
+  const named = accounts.map(closeUp).filter(Boolean).map(a => a.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
+  if (!named.length) return TITLE_PREFIX
+  return new RegExp(`${TITLE_PREFIX.source.slice(0, -4)}|[^\\s·]+·(?:${named.join('|')})(?:·(?:${EFFORT_WORD}))?) · `)
+}
+
+/** Every account display name the generated worker files state ("Runs on X (account PIN)"). */
+export function pinnedAccountNames(files: Iterable<string>): string[] {
+  const names = new Set<string>()
+  for (const file of files) {
+    const head = /^---\r?\n([\s\S]*?)\r?\n---/.exec(file)?.[1]
+    const description = head && /^description:\s*(.*)$/m.exec(head)?.[1]
+    const found = description && /\bRuns on (.+?) \(account [A-Za-z0-9._-]+\)/.exec(description)
+    if (found) names.add(found[1]!)
+  }
+  return [...names]
+}
 
 /**
  * The model a title names: a Claude id or alias as its family and version ("Opus5.5"), a routed id
@@ -313,7 +344,8 @@ const TITLE_PREFIX = /^[^\s·]+(?:·[a-z]+)? · /
  * the id.
  */
 export function titleName(model: string, models: readonly RouterModel[] = []): string {
-  const id = baseModel(model).replace(/\[.*?\]/g, '')
+  // A pinned worker's id ("anthropic#f952fac6:claude-opus-5-5") names its model after the pin.
+  const id = baseModel(model).replace(PINNED_PREFIX, '').replace(/\[.*?\]/g, '')
   const claude = /^(?:claude-)?(opus|sonnet|haiku|fable|mythos)(?:-(\d+)(?:-(\d{1,2}))?)?/i.exec(id)
   if (claude) return claude[1]!.charAt(0).toUpperCase() + claude[1]!.slice(1).toLowerCase() + (claude[2] ? claude[2] + (claude[3] ? '.' + claude[3] : '') : '')
   // A hosted id's vendor path ("deepseek-ai/") is dropped: the title has room for the model only.
@@ -328,14 +360,40 @@ export function titleName(model: string, models: readonly RouterModel[] = []): s
  * The app names only Claude models, and for a routed one shows the parent's; the mod is the one
  * that knows, since it picks. A prefix already there (the parent's guess) is replaced.
  */
-export function spawnTitle(description: string, model: string, effort: string | undefined, models: readonly RouterModel[] = []): string {
-  const tag = titleName(model, models) + (effort ? '·' + effort : '')
-  return `${tag} · ${bareTitle(description)}`
+export function spawnTitle(description: string, model: string, effort: string | undefined, models: readonly RouterModel[] = [], account?: string, accounts: readonly string[] = []): string {
+  const tag = titleName(model, models) + (account ? '·' + closeUp(account) : '') + (effort ? '·' + effort : '')
+  return `${tag} · ${bareTitle(description, accounts)}`
+}
+
+/** The `<provider>#<account pin>:` a pinned worker's model id starts with. */
+const PINNED_PREFIX = /^[A-Za-z0-9._-]+#[A-Za-z0-9._-]+:/
+
+/** The account pin a worker's model id carries, if it is pinned. */
+export function modelPin(model: string): { provider: string; pin: string } | undefined {
+  const m = /^([A-Za-z0-9._-]+)#([A-Za-z0-9._-]+):/.exec(model)
+  return m ? { provider: m[1]!, pin: m[2]! } : undefined
+}
+
+/**
+ * The account display name a generated pinned worker's file states ("Runs on mambo20211 (account
+ * f952fac6)", agents.ts fileContent), found by the pin of a model id. Undefined for an unpinned
+ * model or a pin no worker file names: the title then names only the model, never the pin.
+ */
+export function pinnedAccountName(model: string, files: Iterable<string>): string | undefined {
+  const pin = modelPin(model)?.pin
+  if (!pin) return undefined
+  for (const file of files) {
+    const head = /^---\r?\n([\s\S]*?)\r?\n---/.exec(file)?.[1]
+    const description = head && /^description:\s*(.*)$/m.exec(head)?.[1]
+    const found = description && /\bRuns on (.+?) \(account ([A-Za-z0-9._-]+)\)/.exec(description)
+    if (found && found[2] === pin) return found[1]
+  }
+  return undefined
 }
 
 /** A title without the model tag spawnTitle put in front ("Sol·high · Port it" → "Port it"). */
-export function bareTitle(description: string): string {
-  const bare = description.replace(TITLE_PREFIX, '')
+export function bareTitle(description: string, accounts: readonly string[] = []): string {
+  const bare = description.replace(titlePrefix(accounts), '')
   return bare.trim() ? bare : description
 }
 

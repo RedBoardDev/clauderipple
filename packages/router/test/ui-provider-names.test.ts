@@ -6,7 +6,8 @@ import fs from "node:fs";
 // (providerDisplayName), Status's provider rows (renderHealthProviders) and the Logs provider menu
 // (renderProviderFilter). Two ChatGPT providers keyed "work" and "personal" must never read the same.
 
-const source = fs.readFileSync(new URL("../../ui/app.js", import.meta.url), "utf8");
+// Some block markers below span lines, and a Windows checkout (core.autocrlf) ends lines with CRLF.
+const source = fs.readFileSync(new URL("../../ui/app.js", import.meta.url), "utf8").replaceAll("\r\n", "\n");
 function block(from: string, to: string): string {
   const start = source.indexOf(from), end = source.indexOf(to, start);
   if (start < 0 || end <= start) throw new Error(`missing UI block: ${from}`);
@@ -75,7 +76,7 @@ function harness() {
     const providerHue = () => "#000";
     const providerState = () => el("span", null);
     const providerLimits = () => null;
-    const quotaLine = () => null;
+    const quotaLine = () => null, renderQuotaViewToggle = () => {};
     const credentialLine = () => null;
     const limitsAccountRow = () => el("div", null);
     const chevronIcon = () => el("span", null);

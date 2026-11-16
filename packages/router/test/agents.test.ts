@@ -493,11 +493,11 @@ test("(p1) each stored Claude account gets a pinned worker per model, named and 
   assert.match(file, /\nname: claude-opus-5-5-3f2a9c1b\n/, "the file name is the stable id prefix, not the label");
   assert.match(file, /\nmodel: anthropic#3f2a9c1b:claude-opus-5-5\n/, "the pin is the account's stable id prefix");
   assert.match(file, /Runs on mambo20211 \(account 3f2a9c1b\)/, "the description says which account");
-  assert.match(file, /Start the Agent description with "5\.5 · mambo20211 · "/, "the account label still joins the title");
+  assert.match(file, /Start the Agent description with "5\.5·mambo20211 · "/, "the account label still joins the title, in the form the mod reads back");
   assert.deepEqual(JSON.parse(fs.readFileSync(manifest, "utf8")).agents, ["claude-opus-5-5", "claude-opus-5-5-3f2a9c1b"]);
   assert.deepEqual(generatedAgents(cfg, dir, manifest, undefined, () => accounts), [
     { name: "claude-opus-5-5", model: "claude-opus-5-5", provider: "anthropic" },
-    { name: "claude-opus-5-5-3f2a9c1b", model: "claude-opus-5-5", provider: "anthropic", account: "mambo20211" },
+    { name: "claude-opus-5-5-3f2a9c1b", model: "claude-opus-5-5", provider: "anthropic", account: "mambo20211", accountPin: "3f2a9c1b" },
   ]);
 });
 
@@ -570,7 +570,7 @@ test("(p4) a relabel, or removing an account that shares its label, never rename
   assert.equal(fs.existsSync(path.join(dirA, "claude-opus-5-5-mambo20211.md")), false, "no second worker appears under the label");
   const relabelled = fs.readFileSync(fileA, "utf8");
   assert.match(relabelled, /Runs on mambo20211 \(account aaaaaaaa\)/, "the description follows the label");
-  assert.match(relabelled, /Start the Agent description with "claude-opus-5-5 · mambo20211 · "/, "the title prefix follows the label");
+  assert.match(relabelled, /Start the Agent description with "claude-opus-5-5·mambo20211 · "/, "the title prefix follows the label");
 
   // Dir B: two accounts sharing a label. Removing one leaves the survivor byte-identical.
   const dirB = tmp(); t.after(() => fs.rmSync(dirB, { recursive: true, force: true }));
@@ -638,8 +638,14 @@ test("(p5) a CLI account change is picked up on the next check and tells the tun
   assert.equal(fs.existsSync(file), false, "the removed account's worker is gone");
 });
 
+// The three tests below make a folder refuse a new file or a removal with chmod. Windows has no such
+// mode: a folder's read-only attribute does not stop files being created or deleted inside it, so
+// the refusal never happens there and there is no failed pass to retry.
+const READ_ONLY_IGNORED = "Windows writes through a read-only folder";
+
 test("(p6) a pass that could not write keeps the old account signature, so the next check retries", t => {
   if (process.getuid?.() === 0) { t.skip("root writes through a read-only folder"); return; }
+  if (process.platform === "win32") { t.skip(READ_ONLY_IGNORED); return; }
   const home = tmp(); t.after(() => { fs.chmodSync(path.join(home, "agents"), 0o755); fs.rmSync(home, { recursive: true, force: true }); });
   const dir = path.join(home, "agents");
   const cfg = cfgWith({ chatgpt: { type: "chatgpt", auth: "own", models: [{ id: "gpt-6.1-sol" }] } });
@@ -659,6 +665,7 @@ test("(p6) a pass that could not write keeps the old account signature, so the n
 
 test("(p7) a worker that could not be removed stays owned, and a manifest that could not be written is retried", t => {
   if (process.getuid?.() === 0) { t.skip("root writes through a read-only folder"); return; }
+  if (process.platform === "win32") { t.skip(READ_ONLY_IGNORED); return; }
   const home = tmp();
   const dir = path.join(home, "agents");
   const manifest = path.join(home, "generated-agents.json");
@@ -694,6 +701,7 @@ test("(p7) a worker that could not be removed stays owned, and a manifest that c
 
 test("(p8) a failed rewrite keeps the old worker owned; a failed config-only pass is retried too", t => {
   if (process.getuid?.() === 0) { t.skip("root writes through read-only files"); return; }
+  if (process.platform === "win32") { t.skip(READ_ONLY_IGNORED); return; }
   const home = tmp();
   const dir = path.join(home, "agents");
   t.after(() => { try { fs.chmodSync(dir, 0o755); } catch {} fs.rmSync(home, { recursive: true, force: true }); });

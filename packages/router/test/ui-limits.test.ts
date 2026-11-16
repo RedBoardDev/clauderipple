@@ -5,7 +5,8 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const uiDir = path.join(path.dirname(fileURLToPath(import.meta.url)), "../../ui");
-const source = fs.readFileSync(path.join(uiDir, "app.js"), "utf8");
+// Some block markers below span lines, and a Windows checkout (core.autocrlf) ends lines with CRLF.
+const source = fs.readFileSync(path.join(uiDir, "app.js"), "utf8").replaceAll("\r\n", "\n");
 const i18nSource = fs.readFileSync(path.join(uiDir, "i18n.js"), "utf8");
 const start = i18nSource.indexOf("const I18N = {");
 const end = i18nSource.indexOf("/** The languages offered", start);
@@ -27,7 +28,15 @@ class Element {
   }
   appendChild(child: Element) { this.children.push(child); }
   replaceChildren(...children: Element[]) { this.children = children; }
-  addEventListener() {}
+  #listeners: Record<string, () => void> = {};
+  addEventListener(name: string, listener: () => void) { this.#listeners[name] = listener; }
+  click() { this.#listeners.click?.(); }
+  querySelector(selector: string) { return findAll(this, hasClass(selector.slice(1)))[0] ?? null; }
+  setAttribute(name: string, value: unknown) { this.attrs[name] = value; }
+  getAttribute(name: string) { return this.attrs[name]; }
+  get dataset() { return { quotaWindows: this.attrs["data-quota-windows"] }; }
+  get title() { return this.attrs.title; }
+  set title(value: unknown) { this.attrs.title = value; }
   set innerHTML(_value: string) { throw new Error("innerHTML is forbidden"); }
 }
 const el = (tag: string, attrs: Record<string, unknown> = {}, children: Element[] = []) => new Element(tag, attrs, children);
@@ -49,40 +58,253 @@ type LimitsUi = {
   settleLimits(): Promise<unknown>;
   providerLimits(name: string): { accounts: Record<string, unknown>[] } | null;
   limitsSnapshotPeek(): unknown;
+  quotaMeters(windows: unknown, at?: number): Element | null;
+  claudeQuotaNode(account: unknown): Element | null;
+  renderChatgptAccountRows(target: Element, data: unknown, name: string, generation: number): void;
+  quotaWindowsText(windows: unknown): string;
+  setQuotaRemaining(remaining: boolean): void;
+  quotaLine(name: string): string | null;
+  providersUsageTitle(): string;
+  selectProvider(name: string): void;
+  renderCount(): number;
 };
 const defaultConfig = { providers: { claude: { type: "anthropic", auth: "claude-code" }, gpt: { type: "chatgpt" }, other: { type: "openai-compatible" } } };
 // `config` null is the screen before the config has loaded: the status alone names the providers.
-function limitsUi(api: (path: string) => Promise<unknown>, status: Record<string, unknown> = {}, config: Record<string, unknown> | null = defaultConfig) {
-  const card = el("div"), desktop = el("div");
-  const build = new Function("api", "el", "t", "$", "status", "config", "Date", `
+function limitsUi(api: (path: string) => Promise<unknown>, status: Record<string, unknown> = {}, config: Record<string, unknown> | null = defaultConfig, storage = { getItem: (_key: string): string | null => null, setItem: (_key: string, _value: string) => {} }) {
+  const card = el("div"), desktop = el("div"), header = el("div"), meters = el("div");
+  const selectAll = () => [card, desktop, meters].flatMap((root) => findAll(root, (node) => node.attrs["data-quota-windows"] !== undefined));
+  const build = new Function("api", "el", "t", "$", "status", "config", "localStorage", "$all", `
     let currentConfig = config;
     const stateFor = () => null, chevronIcon = () => null, openProvider = () => {}, refreshProviderUsage = () => {}, chatgptLoginButton = () => el("button", { text: "Sign in" }), chatgptLoginMessage = "", providerLabel = (name) => name, providerTitle = (name) => name, providerDisplayName = (name) => name, offline = () => false, providerHue = () => "#000";
+    const svgIcon = () => el("svg", { "aria-hidden": "true" });
     const APP = null, clientsLoaded = false, modState = {}, updateState = {}, renderDiagnostics = () => {}, modRedraw = () => {}, versionRow = () => null, autoUpdateRow = () => null, priorityRow = () => null;
     let loadedUiRevision = null;
+    let selectedProviderName = null, providerDetailRenders = 0, providerDetailTab = "overview";
+    const renderProviderDetail = () => { providerDetailRenders += 1; };
     ${block("function badge(", "/** A titled group")}
     ${block("let limitsSnapshot = null;", "// ---- Diagnostics:")}
-    ${block("function quotaLine(", "/**\n * One line a person can read")}
+    ${block("const QUOTA_VIEW_STORE =", "/**\n * One line a person can read")}
     ${block("function credentialLine(", "/**\n * One verdict")}
     ${block("function providerConnection(", "let statusModBusy")}
     ${block("function claudeAccountLabel(", '/** "5h 14%')}
     ${block("function chatgptQuotaText(", "async function patchChatgptAccount(")}
-    return { refreshHealth, renderHealthProviders, limitsAccountRow, limitsWindowRow, limitsUsageWindow, settleLimits: () => limitsRead ?? Promise.resolve(), providerLimits, limitsSnapshotPeek: () => limitsSnapshot };
+    ${block("function claudeQuotaNode(", '/** "Use first"')}
+    ${block("function accountPoolBadges(", "function renderClaudeAccountRows(")}
+    ${block("function renderChatgptAccountRows(", "let googleLoginBusy")}
+    const providerDetailGeneration = 0;
+    return { refreshHealth, renderHealthProviders, limitsAccountRow, limitsWindowRow, limitsUsageWindow, settleLimits: () => limitsRead ?? Promise.resolve(), providerLimits, limitsSnapshotPeek: () => limitsSnapshot, quotaMeters, quotaWindowsText, setQuotaRemaining, claudeQuotaNode, renderChatgptAccountRows, quotaLine, providersUsageTitle, selectProvider: (name) => { selectedProviderName = name; }, renderCount: () => providerDetailRenders };
   `) as (...args: unknown[]) => LimitsUi;
   const ui = build(async (path: string) => {
     // The config a status poll may re-read answers with the config this screen was given, or fails while it has none.
     if (path === "/api/config") { if (!config) throw new Error("config not loaded"); return config; }
     const response = await api(path);
     return path === "/api/status" ? { settings: {}, ...status, ...(response && typeof response === "object" ? response : {}) } : response;
-  }, el, t, (selector: string) => selector === "#health-providers" ? card : selector === "#health-desktop" ? desktop : el("div"), status, config, class extends Date { static now() { return now; } });
+  }, el, t, (selector: string) => selector === "#health-providers" ? card : selector === "#health-desktop" ? desktop : selector === "#health-quota-toggle" ? header : el("div"), status, config, storage, selectAll);
   // A poll draws the status at once and the gauges when the limits read lands; tests wait for both.
-  return { ...ui, card, desktop, refresh: async () => { await ui.refreshHealth(); await ui.settleLimits(); } };
+  return { ...ui, card, desktop, header, meters, refresh: async () => { await ui.refreshHealth(); await ui.settleLimits(); } };
 }
-// Freeze the render path's clock alongside the fixture resets and health deadlines.
-const now = Date.UTC(2026, 10, 10, 12);
+// The render path reads the real clock, so the fixtures' resets must be ahead of it. They are whole
+// seconds, as the servers send them, so the clock they start from is too: the account meters round
+// a reset to the second, and a fractional one rounded across a minute made the meter and the line
+// name different minutes (11/14 01:29 PM against 01:28 PM on Windows CI, 2026-11-13).
+const now = Math.floor(Date.now() / 1000) * 1000;
 const five = { kind: "five_hour", used_percent: 23, window_minutes: 300, reset_at: (now + 255 * 60_000) / 1000 };
 const weekly = { kind: "seven_day", used_percent: 125, window_minutes: 10080, reset_at: (now + 86400_000) / 1000 };
 const current = { id: "current", account: 0, inUse: true, at: now, windows: [weekly, five] };
 const connected = { claude: { reachable: true }, gpt: { reachable: true }, other: { reachable: true } };
+
+test("Status's header toggle stays mounted and changes figures, not account states or source data", async () => {
+  const accounts = [
+    { id: "a", label: "Work", inUse: true, stale: true, windows: [{ ...five, used_percent: 93 }] },
+    { id: "b", label: "Spare", inUse: false, paused: true, windows: [{ ...weekly, used_percent: 100 }] },
+  ];
+  const limits = { providers: [{ type: "chatgpt", provider: "gpt", title: "GPT", accounts }] };
+  const status = { providers: connected };
+  const before = JSON.stringify({ status, limits });
+  const ui = limitsUi(async (route) => route === "/api/limits" ? limits : {}, status);
+  await ui.refresh();
+  const button = ui.header.children[0]!;
+  assert.equal(button.attrs.type, "button");
+  assert.equal(text(button), "");
+  assert.equal(button.children[0]!.tag, "svg");
+  assert.equal(findAll(ui.card, hasClass("quota-view-toggle")).length, 0);
+  assert.equal(button.attrs["aria-label"], t("quota.showRemaining"));
+  const markers = () => findAll(ui.card, (node) => node.tag === "strong" || hasClass("badge")(node) || hasClass("limits-window-foot")(node)).map(text);
+  const originalMarkers = markers();
+  const tones = () => findAll(ui.card, hasClass("limits-window")).map((node) => node.attrs.class);
+  const originalTones = tones();
+  const meters = ui.quotaMeters(accounts.flatMap((account) => account.windows))!;
+  ui.meters.appendChild(meters);
+  for (const remaining of [true, false]) {
+    button.click();
+    assert.equal(ui.header.children[0], button, "a poll or toggle must never replace the focused button");
+    assert.equal(ui.header.children.length, 1);
+    assert.equal(button.attrs["aria-pressed"], String(remaining));
+    assert.equal(button.title, t(remaining ? "quota.showUsed" : "quota.showRemaining"));
+    const values = remaining ? [7, 0] : [93, 100];
+    // Personal account cards hide paused figures; the separate raw meter keeps both windows.
+    assert.deepEqual(findAll(ui.card, (node) => node.attrs.role === "progressbar").map((node) => node.attrs["aria-valuenow"]), values.slice(0, 1));
+    assert.deepEqual(findAll(meters, hasClass("meter-fill")).map((node) => node.style.width), values.map((n) => `${n}%`));
+    assert.equal(meters.attrs["aria-label"], ui.quotaWindowsText(accounts.flatMap((account) => account.windows)));
+    assert.deepEqual(markers(), originalMarkers);
+    assert.deepEqual(tones(), originalTones);
+    await ui.refresh();
+    assert.equal(ui.header.children[0], button);
+  }
+  assert.equal(JSON.stringify({ status, limits }), before);
+  const html = fs.readFileSync(path.join(uiDir, "index.html"), "utf8");
+  assert.match(html, /class="section-head health-providers-head"[^\n]*data-i18n="health.providers"[^\n]*id="health-quota-toggle"/);
+});
+
+test("toggling account meters keeps their original reset instants as the clock advances", (context) => {
+  const fetchedAt = Date.UTC(2026, 10, 12, 13, 28);
+  context.mock.timers.enable({ apis: ["Date"], now: fetchedAt });
+  const windows = Object.freeze([
+    Object.freeze({ used_percent: 100, window_minutes: 300, reset_after_seconds: 600 }),
+    Object.freeze({ used_percent: 100, window_minutes: 10080, reset_at: fetchedAt / 1000 + 3600 }),
+    Object.freeze({ used_percent: 82, window_minutes: 300, reset_after_seconds: 600 }),
+    Object.freeze({ used_percent: 100, window_minutes: 300 }),
+  ]);
+  const before = JSON.stringify(windows);
+  const ui = limitsUi(async () => ({}));
+  const meters = ui.quotaMeters(windows)!;
+  ui.meters.appendChild(meters);
+  const resets = () => findAll(meters, hasClass("account-meter-reset")).map(text);
+  const initialResets = resets();
+  assert.equal(initialResets.length, 2);
+  const expectedReset = t("quota.resetAt", { time: new Date(fetchedAt + 600_000).toLocaleString([], { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" }) });
+  assert.equal(initialResets[0], expectedReset);
+  const tones = findAll(meters, hasClass("account-meter")).map((node) => node.attrs.class);
+  const stored = String(meters.dataset.quotaWindows);
+  for (const remaining of [true, false, true, false]) {
+    context.mock.timers.tick(300_000);
+    ui.setQuotaRemaining(remaining);
+    assert.deepEqual(resets(), initialResets, "toggling must not move a full window's reset into the future");
+    assert.ok(String(meters.title).includes(expectedReset));
+    assert.equal(meters.attrs["aria-label"], meters.title);
+    assert.deepEqual(findAll(meters, hasClass("account-meter-figure")).map(text), remaining ? ["0% remaining", "0% remaining", "18% remaining", "0% remaining"] : ["100%", "100%", "82%", "100%"]);
+    assert.deepEqual(findAll(meters, hasClass("account-meter")).map((node) => node.attrs.class), tones);
+    assert.equal(meters.dataset.quotaWindows, stored);
+  }
+  const saved = JSON.parse(stored);
+  assert.equal(saved[0].reset_at, fetchedAt / 1000 + 600);
+  assert.equal(saved[2].reset_at, fetchedAt / 1000 + 600, "relative resets are fixed even before a window is full");
+  assert.ok(saved.every((window: Record<string, unknown>) => !("reset_after_seconds" in window)));
+  assert.equal(JSON.stringify(windows), before, "normalization never changes the API response");
+});
+
+test("new account readings establish new reset instants without changing older meters", (context) => {
+  const fetchedAt = Date.UTC(2026, 10, 12, 13, 28);
+  context.mock.timers.enable({ apis: ["Date"], now: fetchedAt });
+  const ui = limitsUi(async () => ({}));
+  const window = Object.freeze({ used_percent: 100, window_minutes: 300, reset_after_seconds: 600 });
+  const first = ui.quotaMeters([window])!;
+  ui.meters.appendChild(first);
+  const originalReset = text(findAll(first, hasClass("account-meter-reset"))[0]!);
+  context.mock.timers.tick(300_000);
+  const next = ui.quotaMeters([window])!;
+  ui.meters.appendChild(next);
+  const nextReset = text(findAll(next, hasClass("account-meter-reset"))[0]!);
+  assert.notEqual(nextReset, originalReset, "a newly received relative duration starts from its own reading time");
+  ui.setQuotaRemaining(true);
+  assert.equal(text(findAll(first, hasClass("account-meter-reset"))[0]!), originalReset);
+  assert.equal(text(findAll(next, hasClass("account-meter-reset"))[0]!), nextReset);
+  assert.equal(JSON.parse(String(next.dataset.quotaWindows))[0].reset_at, (fetchedAt + 900_000) / 1000);
+});
+
+test("account meters prefer the server reset used by Status over a cached relative duration", (context) => {
+  const fetchedAt = Date.UTC(2026, 10, 12, 13, 28);
+  context.mock.timers.enable({ apis: ["Date"], now: fetchedAt + 39 * 60_000 });
+  const ui = limitsUi(async () => ({}));
+  const resetAt = fetchedAt / 1000 + 3600;
+  for (const absolute of [resetAt, resetAt * 1000]) {
+    const window = Object.freeze({ used_percent: 100, window_minutes: 300, reset_at: absolute, reset_after_seconds: 3600 });
+    const before = JSON.stringify(window);
+    const meters = ui.quotaMeters([window], fetchedAt)!;
+    ui.meters.appendChild(meters);
+    assert.equal(JSON.parse(String(meters.dataset.quotaWindows))[0].reset_at, resetAt);
+    const expected = ui.quotaWindowsText([{ ...window, reset_at: resetAt, reset_after_seconds: undefined }]);
+    assert.equal(meters.title, expected, "the account card uses the same absolute deadline as Status");
+    context.mock.timers.tick(300_000);
+    ui.setQuotaRemaining(true);
+    const saved = JSON.parse(String(meters.dataset.quotaWindows));
+    assert.equal(saved[0].reset_at, resetAt);
+    assert.ok(!("reset_after_seconds" in saved[0]));
+    assert.equal(JSON.stringify(window), before);
+    ui.setQuotaRemaining(false);
+  }
+});
+
+test("ChatGPT and Claude cards anchor cached relative resets to the quota snapshot time", (context) => {
+  const fetchedAt = Date.UTC(2026, 10, 12, 13, 28);
+  context.mock.timers.enable({ apis: ["Date"], now: fetchedAt + 39 * 60_000 });
+  const ui = limitsUi(async () => ({}));
+  const resetAt = fetchedAt / 1000 + 3600;
+  for (const absolute of [undefined, resetAt]) {
+    const primary = Object.freeze({ used_percent: 100, window_minutes: 300, reset_after_seconds: 3600, ...(absolute === undefined ? {} : { reset_at: absolute }) });
+    const quota = Object.freeze({ at: fetchedAt, rate_limits: Object.freeze({ primary }) });
+    const account = Object.freeze({ id: "cached", label: "Cached", source: "codex", state: "ready", quota });
+    const before = JSON.stringify(account);
+    const target = el("div");
+    ui.renderChatgptAccountRows(target, { accounts: [account] }, "gpt", 0);
+    const chatgpt = findAll(target, hasClass("account-meters"))[0]!;
+    const claude = ui.claudeQuotaNode(account)!;
+    const expected = ui.quotaWindowsText([{ used_percent: 100, window_minutes: 300, reset_at: resetAt }]);
+    for (const meter of [chatgpt, claude]) {
+      assert.equal(meter.title, expected);
+      assert.equal(JSON.parse(String(meter.dataset.quotaWindows))[0].reset_at, resetAt);
+      ui.meters.appendChild(meter);
+    }
+    context.mock.timers.tick(300_000);
+    ui.setQuotaRemaining(true);
+    for (const meter of [chatgpt, claude]) {
+      assert.equal(JSON.parse(String(meter.dataset.quotaWindows))[0].reset_at, resetAt);
+      assert.equal(meter.attrs["aria-label"], ui.quotaWindowsText([{ used_percent: 100, window_minutes: 300, reset_at: resetAt }]));
+    }
+    assert.equal(JSON.stringify(account), before);
+    ui.setQuotaRemaining(false);
+  }
+});
+
+test("quota display preference persists locally, tolerates blocked storage and filters nonfinite figures", () => {
+  const data = new Map<string, string>();
+  const storage = { getItem: (key: string) => data.get(key) ?? null, setItem: (key: string, value: string) => { data.set(key, value); } };
+  const ui = limitsUi(async () => ({}), {}, defaultConfig, storage);
+  ui.setQuotaRemaining(true);
+  assert.equal(data.get("clauderipple_quota_remaining"), "true");
+  const reloaded = limitsUi(async () => ({}), {}, defaultConfig, storage);
+  assert.match(text(reloaded.quotaMeters([{ used_percent: 93 }])!), /7% remaining/);
+  const blocked = limitsUi(async () => ({}), {}, defaultConfig, { getItem: () => { throw Error("blocked"); }, setItem: () => { throw Error("blocked"); } });
+  assert.doesNotThrow(() => blocked.setQuotaRemaining(true));
+  assert.equal(blocked.quotaMeters([{ used_percent: NaN }, { used_percent: Infinity }]), null);
+  assert.match(text(blocked.quotaMeters([{ used_percent: 125 }])!), /0% remaining/);
+  for (const dict of Object.values(dictionaries)) {
+    for (const key of ["quota.remainingLine", "quota.showUsed", "quota.showRemaining", "providers.usage", "providers.remaining"]) assert.ok(dict[key]);
+  }
+});
+
+test("the used/remaining toggle reaches the one-line quota text and the overview's usage heading, and redraws the open overview", () => {
+  const status = { chatgpt: { quota: { gpt: { rate_limits: { primary: { ...five, used_percent: 80 } } } } } };
+  const ui = limitsUi(async () => ({}), status);
+  assert.equal(ui.quotaLine("gpt"), t("health.quota", { percent: 80, reset: "" }));
+  assert.equal(ui.quotaLine("missing"), null);
+  assert.equal(ui.providersUsageTitle(), t("providers.usage"));
+  // No provider open: nothing is drawn on the hidden page; the toggle only redraws what is open.
+  ui.setQuotaRemaining(true);
+  assert.equal(ui.renderCount(), 0);
+  ui.setQuotaRemaining(false);
+  ui.selectProvider("gpt");
+  const before = ui.renderCount();
+  ui.setQuotaRemaining(true);
+  assert.equal(ui.quotaLine("gpt"), "20% remaining");
+  assert.equal(ui.providersUsageTitle(), t("providers.remaining"));
+  assert.equal(ui.providersUsageTitle(), "Remaining limits");
+  assert.equal(ui.renderCount(), before + 1, "the open overview is drawn again");
+  ui.setQuotaRemaining(false);
+  assert.equal(ui.quotaLine("gpt"), t("health.quota", { percent: 80, reset: "" }));
+  assert.equal(ui.providersUsageTitle(), t("providers.usage"));
+  assert.equal(ui.renderCount(), before + 2);
+});
 
 test("Status replaces subscription text lines with per-account gauges, leaving other providers alone", async () => {
   const paths: string[] = [];
@@ -732,7 +954,7 @@ test("the windows read as a table that folds on a narrow card, never a fixed pai
   const rule = css.match(/\.limits-windows \{([^}]*)\}/);
   assert.ok(rule, "the window grid has its rule");
   // A line per window: name, bar, figure, reset — the columns line up across accounts.
-  assert.match(rule[1]!, /grid-template-columns: [\d.]+em minmax\(48px, 1fr\) [\d.]+em minmax\(0, [\d.]+fr\)/);
+  assert.match(rule[1]!, /grid-template-columns: [\d.]+em minmax\(48px, 1fr\) minmax\(4em, max-content\) minmax\(0, [\d.]+fr\)/);
   assert.doesNotMatch(rule[1]!, /repeat\(2/, "no fixed two-column grid is left in the window grid");
   // On a narrow card (the provider's own width, not the window's) the reset drops under the bar.
   const narrow = css.match(/@container \(max-width: 780px\) \{([\s\S]*?)\n\}/);

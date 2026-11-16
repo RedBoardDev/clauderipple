@@ -5,7 +5,9 @@ import {
   claudeSupportsEffort,
   chatToAnthropic,
   responsesEventsToChatChunks,
+  responsesToChatCompletion,
   responsesToAnthropic,
+  type Json,
 } from "../src/ingress/translate.ts";
 
 const request = {
@@ -24,6 +26,55 @@ const request = {
   temperature: 0.2,
   stream: true,
 };
+
+test("Responses accepts messages without a type and preserves transcript roles and content", () => {
+  const body = { input: [
+    { role: "user", content: "first" },
+    { role: "assistant", content: [{ type: "output_text", text: "reply" }] },
+    { role: "user", content: [{ type: "input_text", text: "look" }, { type: "input_image", image_url: "https://example.test/a.png" }] },
+    { type: "unknown_item", role: "user", content: "not a message" },
+    { content: "not a message either" },
+  ] };
+  const out = responsesToAnthropic(body, "claude-sonnet-5");
+  assert.deepEqual(out.messages, [
+    { role: "user", content: [{ type: "text", text: "first" }] },
+    { role: "assistant", content: [{ type: "text", text: "reply" }] },
+    { role: "user", content: [
+      { type: "text", text: "look" },
+      { type: "image", source: { type: "url", url: "https://example.test/a.png" }, cache_control: { type: "ephemeral" } },
+    ] },
+  ]);
+  assert.equal(JSON.stringify(out), JSON.stringify(responsesToAnthropic(body, "claude-sonnet-5")), "cache prefix stays deterministic");
+  assert.equal(body.input[0]!.type, undefined, "the caller's input is not rewritten");
+});
+
+for (const typed of [false, true]) for (const prefix of [undefined, "identity"]) {
+  test(`Responses routes system/developer instructions through the existing policy (${typed ? "typed" : "easy"}, ${prefix ? "borrowed login" : "API key"})`, () => {
+    const input = [
+      { role: "system", content: "System rule" },
+      { role: "developer", content: [{ type: "input_text", text: "Developer rule" }] },
+      { role: "user", content: "go" },
+    ].map((message) => typed ? { type: "message", ...message } : message);
+    const body = { instructions: "Top-level rule", input };
+    const before = structuredClone(body);
+    const out = responsesToAnthropic(body, "claude-sonnet-5", prefix);
+    const instructions = "Top-level rule\n\nSystem rule\n\nDeveloper rule";
+    assert.deepEqual(out.system, [{ type: "text", text: prefix ?? instructions, cache_control: { type: "ephemeral" } }]);
+    assert.deepEqual(out.messages, [{ role: "user", content: [
+      ...(prefix ? [{ type: "text", text: `<operator_instructions>\n${instructions}\n</operator_instructions>`, cache_control: { type: "ephemeral" } }] : []),
+      { type: "text", text: "go", cache_control: { type: "ephemeral" } },
+    ] }]);
+    assert.deepEqual(body, before);
+  });
+}
+
+for (const prefix of [undefined, "identity"]) {
+  test(`Responses input instructions work without top-level instructions (${prefix ? "borrowed login" : "API key"})`, () => {
+    const out = responsesToAnthropic({ input: [{ role: "developer", content: "Rule" }] }, "claude-sonnet-5", prefix);
+    assert.deepEqual(out.system, [{ type: "text", text: prefix ?? "Rule", cache_control: { type: "ephemeral" } }]);
+    assert.deepEqual(out.messages, prefix ? [{ role: "user", content: [{ type: "text", text: "<operator_instructions>\nRule\n</operator_instructions>", cache_control: { type: "ephemeral" } }] }] : []);
+  });
+}
 
 test("Responses request becomes cache-friendly Anthropic Messages request", () => {
   const out = responsesToAnthropic(request, "claude-sonnet-5");
@@ -193,6 +244,148 @@ test("Anthropic SSE maps to Responses and Chat stream events with usage", () => 
   assert.ok(chat.some((chunk) => JSON.stringify(chunk).includes('"content":"ok"')));
   assert.ok(chat.some((chunk) => JSON.stringify(chunk).includes('"finish_reason":"tool_calls"')));
 });
+
+const initialUsage = { input_tokens: 10, cache_read_input_tokens: 90, cache_creation_input_tokens: 20, output_tokens: 1 };
+
+for (const scenario of [
+  { name: "message_start alone includes cache creation", deltas: [], input: 120, cached: 90, output: 1 },
+  { name: "repeated full usage is not added twice (JSON response path)", deltas: [initialUsage], input: 120, cached: 90, output: 1 },
+  { name: "output-only deltas are cumulative and preserve input counters", deltas: [{ output_tokens: 2 }, { output_tokens: 7 }], input: 120, cached: 90, output: 7 },
+  { name: "partial uncached input update preserves both cache counters", deltas: [{ input_tokens: 12 }], input: 122, cached: 90, output: 1 },
+  { name: "partial cache-read update preserves uncached and cache-created input", deltas: [{ cache_read_input_tokens: 80 }], input: 110, cached: 80, output: 1 },
+  { name: "partial cache-creation update preserves uncached and cache-read input", deltas: [{ cache_creation_input_tokens: 30 }], input: 130, cached: 90, output: 1 },
+  { name: "explicit zero replaces uncached input", deltas: [{ input_tokens: 0 }], input: 110, cached: 90, output: 1 },
+  { name: "explicit zero replaces cache-read input", deltas: [{ cache_read_input_tokens: 0 }], input: 30, cached: 0, output: 1 },
+  { name: "explicit zero replaces cache-created input", deltas: [{ cache_creation_input_tokens: 0 }], input: 100, cached: 90, output: 1 },
+  { name: "explicit zero replaces output", deltas: [{ output_tokens: 0 }], input: 120, cached: 90, output: 0 },
+  { name: "absent usage and empty usage preserve all counters", deltas: [undefined, {}], input: 120, cached: 90, output: 1 },
+]) {
+  test(`ingress accounting: ${scenario.name}`, () => {
+    const mapper = new ResponsesEventMapper("claude-sonnet-5");
+    const events = [
+      { type: "message_start", message: { usage: initialUsage } },
+      ...scenario.deltas.map((usage) => ({ type: "message_delta", ...(usage === undefined ? {} : { usage }) })),
+      { type: "message_stop" },
+    ].flatMap((event) => mapper.feed(event));
+    const expected = {
+      input_tokens: scenario.input,
+      input_tokens_details: { cached_tokens: scenario.cached },
+      output_tokens: scenario.output,
+      total_tokens: scenario.input + scenario.output,
+    };
+    assert.deepEqual(mapper.usage, expected);
+    assert.deepEqual(mapper.response("completed").usage, expected);
+    const completed = events.find((event) => event.type === "response.completed")!;
+    assert.deepEqual((completed.response as { usage: unknown }).usage, expected);
+    const chatUsage = {
+      prompt_tokens: scenario.input,
+      prompt_tokens_details: { cached_tokens: scenario.cached },
+      completion_tokens: scenario.output,
+      total_tokens: scenario.input + scenario.output,
+    };
+    assert.deepEqual(responsesToChatCompletion(mapper).usage, chatUsage);
+    assert.deepEqual(responsesEventsToChatChunks(events, mapper).at(-1)?.usage, chatUsage);
+  });
+}
+
+test("ingress accounting: absent initial counters default to zero", () => {
+  const mapper = new ResponsesEventMapper("claude-sonnet-5");
+  mapper.feed({ type: "message_start", message: { usage: { output_tokens: 1 } } });
+  mapper.feed({ type: "message_delta", usage: { output_tokens: 4 } });
+  assert.deepEqual(mapper.usage, { input_tokens: 0, input_tokens_details: { cached_tokens: 0 }, output_tokens: 4, total_tokens: 4 });
+});
+
+for (const batched of [false, true]) {
+  test(`Chat streaming keeps parallel tool indexes independent of content indexes (${batched ? "batched" : "incremental"})`, () => {
+    const mapper = new ResponsesEventMapper("claude-sonnet-5");
+    const source: Json[] = [
+      { type: "content_block_start", index: 0, content_block: { type: "thinking", thinking: "" } },
+      { type: "content_block_stop", index: 0 },
+      { type: "content_block_start", index: 2, content_block: { type: "text", text: "" } },
+      { type: "content_block_delta", index: 2, delta: { type: "text_delta", text: "Checking." } },
+      { type: "content_block_stop", index: 2 },
+      { type: "content_block_start", index: 4, content_block: { type: "tool_use", id: "call_a", name: "Read", input: {} } },
+      { type: "content_block_start", index: 7, content_block: { type: "tool_use", id: "call_b", name: "Read", input: {} } },
+      { type: "content_block_delta", index: 4, delta: { type: "input_json_delta", partial_json: '{"path":' } },
+      { type: "content_block_delta", index: 7, delta: { type: "input_json_delta", partial_json: '{"path":"b.ts"}' } },
+      { type: "content_block_delta", index: 4, delta: { type: "input_json_delta", partial_json: '"a.ts"}' } },
+      { type: "content_block_stop", index: 7 },
+      { type: "content_block_stop", index: 4 },
+      { type: "message_delta", delta: { stop_reason: "tool_use" } },
+      { type: "message_stop" },
+    ];
+    const events: Json[] = [];
+    const chunks: Json[] = [];
+    for (const event of source) {
+      const mapped = mapper.feed(event);
+      if (batched) events.push(...mapped);
+      else chunks.push(...responsesEventsToChatChunks(mapped, mapper));
+    }
+    if (batched) chunks.push(...responsesEventsToChatChunks(events, mapper));
+    const calls = new Map<number, { id: string; type: string; function: { name: string; arguments: string } }>();
+    for (const chunk of chunks) {
+      const choice = (chunk.choices as { index: number; delta: { tool_calls?: { index: number; id?: string; type?: string; function: { name?: string; arguments: string } }[] } }[])[0]!;
+      assert.equal(choice.index, 0, "one completion choice, independent of tool indexes");
+      for (const delta of choice.delta.tool_calls ?? []) {
+        if (delta.id) {
+          assert.equal(calls.has(delta.index), false, "a tool index must not be reused");
+          calls.set(delta.index, { id: delta.id, type: delta.type!, function: { name: delta.function.name!, arguments: "" } });
+        }
+        const call = calls.get(delta.index);
+        assert.ok(call, "arguments belong to an announced tool");
+        call.function.arguments += delta.function.arguments;
+      }
+    }
+    assert.deepEqual([...calls.keys()], [0, 1]);
+    assert.deepEqual([...calls.values()], [
+      { id: "call_a", type: "function", function: { name: "Read", arguments: '{"path":"a.ts"}' } },
+      { id: "call_b", type: "function", function: { name: "Read", arguments: '{"path":"b.ts"}' } },
+    ]);
+    const completion = responsesToChatCompletion(mapper);
+    assert.deepEqual((completion.choices as { message: Json }[])[0]!.message.tool_calls, [...calls.values()]);
+  });
+}
+
+for (const tool of [false, true]) for (const reason of ["max_tokens", "end_turn", "tool_use", "stop_sequence"]) {
+  test(`stop reason ${reason} maps consistently to Responses and Chat (${tool ? "tool" : "text"})`, () => {
+    const mapper = new ResponsesEventMapper("claude-sonnet-5");
+    const events = [
+      { type: "content_block_start", index: 0, content_block: tool ? { type: "tool_use", id: "call_x", name: "Read", input: {} } : { type: "text", text: "" } },
+      { type: "content_block_delta", index: 0, delta: tool ? { type: "input_json_delta", partial_json: reason === "max_tokens" ? '{"path":' : "{}" } : { type: "text_delta", text: "partial" } },
+      { type: "content_block_stop", index: 0 },
+      { type: "message_delta", delta: { stop_reason: reason } },
+      { type: "message_stop" },
+    ].flatMap((event) => mapper.feed(event));
+    const truncated = reason === "max_tokens";
+    const terminal = events.at(-1)!;
+    assert.equal(terminal.type, truncated ? "response.incomplete" : "response.completed");
+    const response = terminal.response as Json;
+    assert.equal(response.status, truncated ? "incomplete" : "completed");
+    if (truncated) assert.deepEqual(response.incomplete_details, { reason: "max_output_tokens" });
+    else assert.equal(response.incomplete_details, undefined);
+    assert.deepEqual(mapper.response("completed"), response, "the server's non-streaming serialization keeps the terminal status");
+    const expected = truncated ? "length" : tool ? "tool_calls" : "stop";
+    const completion = responsesToChatCompletion(mapper);
+    assert.equal((completion.choices as Json[])[0]!.finish_reason, expected);
+    const chunks = responsesEventsToChatChunks(events, mapper);
+    assert.equal(((chunks.at(-1)!.choices as Json[])[0]!).finish_reason, expected);
+    assert.deepEqual(mapper.finish(), [], "EOF after a terminal message emits nothing else");
+  });
+}
+
+for (const kind of ["empty", "text", "function_call", "error"]) {
+  test(`EOF without message_stop never becomes a successful response (${kind})`, () => {
+    const mapper = new ResponsesEventMapper("claude-sonnet-5");
+    if (kind === "text" || kind === "function_call") {
+      mapper.feed({ type: "content_block_start", index: 0, content_block: kind === "text" ? { type: "text", text: "" } : { type: "tool_use", id: "call_x", name: "Read", input: {} } });
+      mapper.feed({ type: "content_block_delta", index: 0, delta: kind === "text" ? { type: "text_delta", text: "partial" } : { type: "input_json_delta", partial_json: '{"path":' } });
+      mapper.feed({ type: "content_block_stop", index: 0 });
+      mapper.feed({ type: "message_delta", delta: { stop_reason: "end_turn" } });
+    }
+    if (kind === "error") mapper.feed({ type: "error", error: { type: "api_error", message: "upstream failed" } });
+    assert.throws(() => mapper.finish(), /ended before message_stop/);
+  });
+}
 
 test("borrowed login: system is the identity line only, client instructions become the first user block", () => {
   const out = responsesToAnthropic(

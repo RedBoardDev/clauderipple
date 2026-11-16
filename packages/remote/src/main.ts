@@ -31,6 +31,7 @@ import type { WsLike } from "./relay.ts";
 import { DesktopProblemAlert, RelayWatch } from "./watch.ts";
 import { OUTAGE_COPY, WATCH_TTL_S, recoveredBody } from "./protocol.ts";
 import { RouterClient } from "./router.ts";
+import { keepWorkerAccountsFresh } from "./worker-labels.ts";
 import { HostServer } from "./server.ts";
 import { LocalControl } from "./local-control.ts";
 import { findClaude, specFor, cliLoginWarning } from "./service.ts";
@@ -45,6 +46,10 @@ import { ConfigStore, configPath as routerConfigPath, homeDir } from "../../rout
 import { VERSION } from "../../router/src/version.ts";
 import { requestHostUpdate, refreshHostUpdate } from "./host-update.ts";
 import { applyProcessPriority } from "../../router/src/process-priority.ts";
+import { processSnapshot } from "./processes.ts";
+
+/** How long the host waits for the first process list before it starts anyway with an empty one. */
+const PROCESS_PRIME_WAIT_MS = 10_000;
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const out = (s: string): void => { process.stdout.write(s); };
@@ -130,10 +135,15 @@ async function runHost(): Promise<void> {
   if (!process.stderr.isTTY) stampLines(process.stderr);
   const log = (line: string): void => { process.stderr.write(`${line}\n`); };
   applyProcessPriority(new ConfigStore(routerConfigPath()).get().processPriority, { log });
+  // The desktop registry needs the process list to tell a live Claude app session from a closed one
+  // (issue #70). Read it in the background while the rest of the setup runs; it is awaited, bounded,
+  // before the host serves. A PowerShell that hangs costs this wait, not the host (#162).
+  const processesPrimed = processSnapshot.prime(PROCESS_PRIME_WAIT_MS);
   const dir = remoteHome();
   const cfg = configFromArgs(dir);
   const where = resolveBind(cfg.bind);
   const router = new RouterClient(cfg.adminUrl);
+  keepWorkerAccountsFresh(() => router.workerAccounts(), log);
   const permissions = PermissionQueue.deferred(path.join(dir, "permissions.json"));
   let server: HostServer | null = null;
   const claudePath = findClaude(cfg.claudePath);
@@ -205,7 +215,7 @@ async function runHost(): Promise<void> {
     log,
     // A Claude app turn that closed on a wrap_up question pushes that question, not its result.
     onEvent: (id, event) => {
-      server?.onEvent(id);
+      server?.onEvent(id, event);
       const push = sessions?.pushEvent(id, event) ?? event;
       void notifier.onEvent(id, push);
       void expoNotifier.onEvent(id, push);
@@ -234,6 +244,7 @@ async function runHost(): Promise<void> {
       phones: () => server?.phones() ?? [],
       inbox: live.modInbox,
       settingsJobs: live.settingsJobs,
+      mod: live,
       rotate: token => { server?.rotateToken(token); },
       shutdown: () => stop(),
       busy: () => live.busy(),
@@ -242,6 +253,7 @@ async function runHost(): Promise<void> {
     }),
   });
   server = host;
+  await processesPrimed;
   await host.listen();
   // Recovery writes restart notices and stopped states. A competing foreground process
   // must fail to bind before it can append to the running host's session logs.

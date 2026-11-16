@@ -384,6 +384,18 @@ código QR una vez. iPhone: [App Store](https://apps.apple.com/es/app/id68230637
 [Google Play](https://play.google.com/store/apps/details?id=com.clauderipple.remote&hl=es). Las sesiones de la app de Claude funcionan en
 macOS; la app incluye una demo para probarla sin computadora.
 
+## Hoja de ruta
+
+El plan completo, con las issues que respaldan cada punto, está en [docs/ROADMAP.md](docs/ROADMAP.md) (en inglés). En este orden:
+
+1. **Ver en qué consumes tu cuota.** Por qué una petición no aprovechó la caché, de qué se compone cada petición, una previsión de cuándo agotarás tu cuota, con avisos, avisos de tarea terminada, una protección contra comandos peligrosos y descripciones de imágenes para modelos que no pueden leerlas.
+2. **La configuración en un solo lugar.** Una página para plugins, servidores MCP, skills y hooks, con los tokens que cuesta realmente cada uno; paquetes populares en un clic; un único archivo de reglas para Claude y Codex.
+3. **Memoria.** Cada sesión resumida a diario en decisiones, registros y pendientes, y solo lo que importa recuperado al iniciar una sesión, al preguntar sobre ello o justo antes de editar un archivo.
+4. **Cuentas gestionadas automáticamente.** Usar primero la cuenta cuyo límite semanal se reinicia antes; retener una petición cuando todas las cuentas están agotadas y enviarla cuando una se reinicie; importar cuentas desde otras herramientas.
+5. **Ahorrar tokens, midiendo con honestidad.** Primero un medidor de coste antes y después; después, ahorros en el router que no rompan la caché.
+
+Las ideas y los votos son bienvenidos en las [issues](https://github.com/PBJ-2/clauderipple/issues).
+
 ## Instalación
 
 **macOS**
@@ -578,6 +590,19 @@ elige el mismo proveedor de ChatGPT como backend de búsqueda en `config.json`:
 
 Es opcional. Sin el ajuste `webSearch`, la ruta de búsqueda actual de Claude Code no
 cambia.
+
+Si un slot se redirige a un proveedor que no puede ejecutar herramientas de servidor
+(por ejemplo, uno `openai-compatible`) y no hay un backend de búsqueda, sus búsquedas
+se rechazan en lugar de responderse con resultados inventados. Para que solo esas
+búsquedas vayan a Anthropic y el resto de solicitudes del slot sigan redirigidas, usa:
+
+```jsonc
+{ "webSearch": "native" }
+```
+
+La búsqueda se envía sin cambios, con su id de modelo Claude original, con el inicio de
+sesión de la propia app. Una búsqueda cuyo id de modelo no empiece por `claude-` se
+sigue rechazando. `webSearch` admite un objeto de backend o `"native"`, no ambos.
 
 ### App de Codex y Codex CLI
 

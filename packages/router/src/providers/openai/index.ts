@@ -2,6 +2,7 @@
 // Responses SSE out, translated back to Anthropic Messages. It never synthesizes
 // cache figures; the request log reflects cached tokens only when the vendor sends them.
 
+import { createHash } from "node:crypto";
 import http from "node:http";
 import type { OpenAiCompatibleProvider } from "../../config.ts";
 import type { Logger } from "../../log.ts";
@@ -35,7 +36,7 @@ function anthropicError(status: number, type: string, message: string): { status
 
 /** The HTTP status Anthropic uses for each error type a mapper can report. */
 function failureStatus(failure: { type: string } | undefined): number {
-  return failure?.type === "overloaded_error" ? 529 : failure?.type === "rate_limit_error" ? 429 : 502;
+  return failure?.type === "invalid_request_error" ? 400 : failure?.type === "overloaded_error" ? 529 : failure?.type === "rate_limit_error" ? 429 : 502;
 }
 
 function vendorMessage(text: string): string {
@@ -87,6 +88,12 @@ export function mapHttpError(status: number, text: string, label = "OpenAI-compa
   }
   if (status === 429) return anthropicError(429, "rate_limit_error", message);
   if (status >= 500) return anthropicError(529, "api_error", message);
+  // Keep auth, permission, rate-limit and server statuses above unchanged. Only a typed request
+  // overflow gets the same compaction prefix as ChatGPT; arbitrary provider prose is not evidence.
+  try {
+    const error = (JSON.parse(text) as { error?: { code?: unknown } } | null)?.error;
+    if (error?.code === "context_length_exceeded") return anthropicError(400, "invalid_request_error", `prompt is too long: ${message}`);
+  } catch { /* not a typed JSON error */ }
   return anthropicError(400, "invalid_request_error", message);
 }
 
@@ -221,7 +228,9 @@ export class OpenAiCompatibleAdapter {
     const upstreamSecrets = new Set<string>();
     const redact = (text: string): string => redactErrorText(text, [...upstreamSecrets], 2000);
     // Same input floor behavior as the ChatGPT adapter: the CLI snapshots message_start before usage arrives.
-    const key = JSON.stringify({ model, wire, system: json.system ?? "", user: json.messages.find((message) => message.role === "user")?.content ?? "" });
+    // Keep the same identity without retaining potentially large system prompts or base64 images
+    // in StartInputs' bounded maps after the request ends.
+    const key = createHash("sha256").update(JSON.stringify({ model, wire, system: json.system ?? "", user: json.messages.find((message) => message.role === "user")?.content ?? "" })).digest("hex");
     const startInput = this.startInputs.start(key, estimateTokens(json));
     const controller = new AbortController();
     const onClose = (): void => controller.abort();

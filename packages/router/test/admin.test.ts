@@ -48,6 +48,7 @@ async function withAdmin(
     claudeOAuthFetch?: (url: string, init: RequestInit) => Promise<Response>;
     openBrowser?: (url: string) => boolean;
     observedClaudeCodeAuth?: ObservedClaudeCodeAuth;
+    claudeCodeCredentialReaders?: NonNullable<AdminDeps["claudeCodeCredentialReaders"]>;
     probeFetch?: (url: string, init: RequestInit) => Promise<Response>;
     measureFetch?: (url: string, init: RequestInit) => Promise<Response>;
     modelCatalog?: () => Promise<unknown>;
@@ -59,6 +60,7 @@ async function withAdmin(
     minimaxUsage?: NonNullable<AdminDeps["minimaxUsage"]>;
     claudeUsage?: NonNullable<AdminDeps["claudeUsage"]>;
     claudeIdentity?: NonNullable<AdminDeps["claudeIdentity"]>;
+    claudeModels?: NonNullable<AdminDeps["claudeModels"]>;
     googleOAuthFetch?: (url: string, init?: RequestInit) => Promise<Response>;
     googleOAuthPort?: number;
     agentsChanged?: () => void;
@@ -102,6 +104,36 @@ async function withAdmin(
 }
 
 const base = () => `http://127.0.0.1`;
+
+for (const signedIn of [false, true]) {
+  test(`status polls reuse the Claude source cache across admin endpoints (signed in: ${signedIn})`, async () => {
+    let keychainReads = 0;
+    let fileReads = 0;
+    const cfg = makeCfg({ providers: { claude: { type: "anthropic", auth: "claude-code" } } });
+    await withAdmin(cfg, async ({ port }) => {
+      for (let call = 0; call < 5; call++) {
+        const response = await fetch(`${base()}:${port}/api/status`);
+        assert.equal(response.status, 200);
+        const status = await response.json() as { providers: Record<string, { authSource: string | null }> };
+        assert.equal(status.providers.claude?.authSource, signedIn ? "keychain" : null);
+      }
+      for (const endpoint of ["claude-accounts", "claude-oauth", "mod-options", "limits"]) {
+        const response = await fetch(`${base()}:${port}/api/${endpoint}`);
+        assert.equal(response.status, 200);
+        await response.arrayBuffer();
+      }
+      assert.deepEqual([keychainReads, fileReads], [1, signedIn ? 0 : 1], "all polls share one store, including negative results");
+    }, {
+      claudeCodeCredentialReaders: {
+        keychain: () => {
+          keychainReads++;
+          return signedIn ? JSON.stringify({ claudeAiOauth: { accessToken: "fake-keychain", expiresAt: Date.now() + 3_600_000 } }) : null;
+        },
+        credentialsFile: () => { fileReads++; return null; },
+      },
+    });
+  });
+}
 
 for (const kind of ["chatgpt", "claude", "google"]) {
   test(`${kind} account HTTP controls validate, persist one preference, pause, resume and clear cooldown`, async () => {
@@ -174,6 +206,20 @@ test("relabelling or removing a Claude account re-derives the generated workers 
   }, { agentsChanged: () => sync!.regenerate() });
 });
 
+test("mod-options names each Claude family's newest id from the live list, whatever its order", async () => {
+  const live = ["claude-fable-5-1", "claude-opus-5-5", "claude-fable-5-3", "claude-fable-5-2", "claude-sonnet-5-5", "claude-haiku-5-5", "claude-haiku-4-5", "claude-mythos-5-1"]
+    .map((id) => ({ id, name: id }));
+  await withAdmin(makeCfg(), async ({ port }) => {
+    const options = await (await fetch(`${base()}:${port}/api/mod-options`)).json() as ModOptions;
+    assert.deepEqual(options.claudeLatest, { fable: "claude-fable-5-3", opus: "claude-opus-5-5", sonnet: "claude-sonnet-5-5", haiku: "claude-haiku-5-5" });
+  }, { claudeModels: async () => live });
+  // No live list (signed out, offline): nothing is claimed, and the mod keeps its own table.
+  await withAdmin(makeCfg(), async ({ port }) => {
+    const options = await (await fetch(`${base()}:${port}/api/mod-options`)).json() as ModOptions;
+    assert.deepEqual(options.claudeLatest, {});
+  }, { claudeModels: async () => null });
+});
+
 test("mod-options lists a pinned Claude worker with the account it runs on", async () => {
   const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "cr-pinned-mod-"));
   const cfg = makeCfg({ providers: { anthropic: { type: "anthropic", auth: "claude-code", accountPool: true, models: [{ id: "claude-opus-5-5", name: "Claude Opus 5.5" }] } } });
@@ -215,6 +261,12 @@ test("mod-options numbers a pinned worker's account as the limits do", async () 
       assert.deepEqual([before.first, before.second, before.bare], [2, 3, undefined], "the app login is account 1; an ordinary worker has no number");
       assert.deepEqual(before.accounts?.map((account) => account.number), [1, 2, 3]);
       assert.equal(before.accounts?.[1]?.label, accountLabel(home, first.id));
+      // A tab is named, not numbered: each account carries the short name its pinned workers go by,
+      // and the app login is marked so the dashboard can call it "Current Claude login".
+      assert.deepEqual(before.accounts?.[0], { number: 1, label: "current@example.test", name: "current", current: true });
+      assert.deepEqual(before.accounts?.slice(1).map((account) => [account.name, account.current]), [["first", undefined], ["second", undefined]]);
+      const pinnedFirst = (await (await fetch(`${base()}:${port}/api/mod-options`)).json() as ModOptions).agents.find((agent) => agent.name === `claude-opus-5-5-${first.id.slice(0, 8)}`);
+      assert.equal(pinnedFirst?.account, before.accounts?.[1]?.name, "the tab and the worker's own account name agree");
       const paused = await fetch(`${base()}:${port}/api/claude-accounts/${first.id}`, { method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify({ paused: true }) });
       assert.equal(paused.status, 200);
       const after = await read();
@@ -224,6 +276,7 @@ test("mod-options numbers a pinned worker's account as the limits do", async () 
       assert.deepEqual([noCurrent.first, noCurrent.second], [2, 1], "pausing the app login leaves no gap or replacement by its cached identity");
       assert.deepEqual(noCurrent.accounts?.map((account) => account.number), [1, 2]);
       assert.equal(noCurrent.accounts?.[0]?.label, accountLabel(home, second.id));
+      assert.deepEqual([noCurrent.accounts?.[0]?.name, noCurrent.accounts?.[0]?.current], ["second", undefined], "a stored account in first place is not the app login");
     }, { agentDir, claudeIdentity: async () => ({ email: "current@example.test", subjectHash: subjectHash("current")! }) });
   } finally {
     fs.rmSync(agentDir, { recursive: true, force: true });
@@ -961,6 +1014,17 @@ test("the Claude subscription sign-in runs from the GUI: start, state, pasted co
   }, { claudeOAuthFetch, openBrowser: (url) => { opened.push(url); return true; } });
 });
 
+test("the Claude sign-in start rejects a replaceId that is not a non-empty string", async () => {
+  await withAdmin(makeCfg(), async ({ port }) => {
+    for (const replaceId of [5, null, ["x"], "", "x".repeat(201)]) {
+      const r = await fetch(`${base()}:${port}/api/claude-oauth`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ manual: true, replaceId }) });
+      assert.equal(r.status, 400, JSON.stringify(replaceId)?.slice(0, 20));
+    }
+    const idle = (await (await fetch(`${base()}:${port}/api/claude-oauth`)).json()) as { running: boolean };
+    assert.equal(idle.running, false, "a rejected start opens no sign-in");
+  }, { openBrowser: () => true });
+});
+
 test("Claude account admin endpoints expose no secrets and rename or remove only stored accounts", async () => {
   await withAdmin(makeCfg(), async ({ port, home }) => {
     const account = saveClaudeOAuthAccount(home, {
@@ -1343,6 +1407,37 @@ test("GET /api/claude-models uses named entries from code and ccd picker surface
   }
 });
 
+test("GET /api/ping answers from memory, and /api/status in picker mode does not wait for or report the unfinished certificate check (#159)", async () => {
+  const cfg = makeCfg();
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "cr-ping-admin-"));
+  const prevHome = process.env.CLAUDERIPPLE_HOME;
+  process.env.CLAUDERIPPLE_HOME = home; // no CA file here: the background check ends without running a command
+  const configFile = path.join(home, "config.json");
+  fs.writeFileSync(configFile, JSON.stringify(cfg));
+  const admin = await startAdmin({
+    config: () => cfg,
+    configFile,
+    log: new Logger(null, 1_000_000, 1, false),
+    stats: () => ({ inFlight: 0, messagesInFlight: 0, started: 0, completed: 0, failed: 0 }),
+    health: () => 0,
+    version: "0.0.0-test",
+    requests: new RequestLog(path.join(home, "logs", "requests.jsonl")),
+    picker: () => ({ enabled: true, hosts: [], last: null }),
+  });
+  try {
+    const ping = await fetch(`${base()}:${admin.port}/api/ping`);
+    assert.equal(ping.status, 200);
+    assert.deepEqual(await ping.json(), { ok: true });
+    assert.equal((await fetch(`${base()}:${admin.port}/api/ping`, { method: "HEAD" })).status, 200);
+    const status = await (await fetch(`${base()}:${admin.port}/api/status`)).json() as { readiness: { problems: string[] } };
+    assert.ok(!status.readiness.problems.includes("picker-ca"), "the first answer is unknown, not 'not trusted'");
+  } finally {
+    admin.close();
+    if (prevHome === undefined) delete process.env.CLAUDERIPPLE_HOME; else process.env.CLAUDERIPPLE_HOME = prevHome;
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
 test("POST /api/image answers with the image bytes, and refuses a bad request before generating", async () => {
   const cfg = makeCfg();
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "cr-image-admin-"));
@@ -1582,7 +1677,7 @@ test("POST /api/providers/probe accepts native Claude Code auth and reports only
   await withAdmin(makeCfg(), async ({ port, home }) => {
     const missing = await fetch(`${base()}:${port}/api/providers/probe`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ type: "anthropic", auth: "claude-code" }) });
     assert.deepEqual(await missing.json(), { ok: false, auth: "missing", source: null, signedIn: null, accountCount: 0, models: [
-      { id: "claude-haiku-5-5", name: "Haiku 5.5" }, { id: "claude-sonnet-5-5", name: "Sonnet 5.5" }, { id: "claude-opus-5-5", name: "Opus 5.5" }, { id: "claude-fable-5-1", name: "Fable 5.1" }, { id: "claude-opus-5", name: "Opus 5" }, { id: "claude-sonnet-5", name: "Sonnet 5" }, { id: "claude-fable-5", name: "Fable 5" }, { id: "claude-opus-4-8", name: "Opus 4.8" }, { id: "claude-opus-4-7", name: "Opus 4.7" }, { id: "claude-sonnet-4-6", name: "Sonnet 4.6" }, { id: "claude-opus-4-6", name: "Opus 4.6" }, { id: "claude-haiku-4-5", name: "Haiku 4.5" },
+      { id: "claude-haiku-5-5", name: "Haiku 5.5" }, { id: "claude-sonnet-5-5", name: "Sonnet 5.5" }, { id: "claude-opus-5-5", name: "Opus 5.5" }, { id: "claude-fable-5-2", name: "Fable 5.2" }, { id: "claude-fable-5-1", name: "Fable 5.1" }, { id: "claude-opus-5", name: "Opus 5" }, { id: "claude-sonnet-5", name: "Sonnet 5" }, { id: "claude-fable-5", name: "Fable 5" }, { id: "claude-opus-4-8", name: "Opus 4.8" }, { id: "claude-opus-4-7", name: "Opus 4.7" }, { id: "claude-sonnet-4-6", name: "Sonnet 4.6" }, { id: "claude-opus-4-6", name: "Opus 4.6" }, { id: "claude-haiku-4-5", name: "Haiku 4.5" },
     ] });
     saveClaudeAuthFile(home, "test-token", "2026-09-13T00:00:00.000Z");
     const available = await fetch(`${base()}:${port}/api/providers/probe`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ type: "anthropic", auth: "claude-code" }) });
@@ -1627,7 +1722,7 @@ test("POST /api/providers/probe sends Anthropic API-key headers and treats a mod
   try {
     const res = await fetch(`${base()}:${admin.port}/api/providers/probe`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ type: "anthropic", auth: "api-key", apiKey: "secret-key" }) });
     assert.deepEqual(await res.json(), { ok: true, auth: "ok", models: [
-      { id: "claude-haiku-5-5", name: "Haiku 5.5" }, { id: "claude-sonnet-5-5", name: "Sonnet 5.5" }, { id: "claude-opus-5-5", name: "Opus 5.5" }, { id: "claude-fable-5-1", name: "Fable 5.1" }, { id: "claude-opus-5", name: "Opus 5" }, { id: "claude-sonnet-5", name: "Sonnet 5" }, { id: "claude-fable-5", name: "Fable 5" }, { id: "claude-opus-4-8", name: "Opus 4.8" }, { id: "claude-opus-4-7", name: "Opus 4.7" }, { id: "claude-sonnet-4-6", name: "Sonnet 4.6" }, { id: "claude-opus-4-6", name: "Opus 4.6" }, { id: "claude-haiku-4-5", name: "Haiku 4.5" },
+      { id: "claude-haiku-5-5", name: "Haiku 5.5" }, { id: "claude-sonnet-5-5", name: "Sonnet 5.5" }, { id: "claude-opus-5-5", name: "Opus 5.5" }, { id: "claude-fable-5-2", name: "Fable 5.2" }, { id: "claude-fable-5-1", name: "Fable 5.1" }, { id: "claude-opus-5", name: "Opus 5" }, { id: "claude-sonnet-5", name: "Sonnet 5" }, { id: "claude-fable-5", name: "Fable 5" }, { id: "claude-opus-4-8", name: "Opus 4.8" }, { id: "claude-opus-4-7", name: "Opus 4.7" }, { id: "claude-sonnet-4-6", name: "Sonnet 4.6" }, { id: "claude-opus-4-6", name: "Opus 4.6" }, { id: "claude-haiku-4-5", name: "Haiku 4.5" },
     ] });
     assert.equal(seen.url, "https://api.anthropic.com/v1/messages");
     assert.equal(seen.headers?.get("x-api-key"), "secret-key");
@@ -1825,6 +1920,55 @@ test("POST /api/providers/probe reads context_window only when context_length is
     });
   } finally {
     await new Promise<void>((resolveP, reject) => upstream.close((error) => error ? reject(error) : resolveP()));
+  }
+});
+
+// A key limited to some models answers 403 model_not_allowed on the catalogue's head, which read as
+// a rejected key (#164). The model the operator chose is tested ahead of the head.
+test("POST /api/providers/probe tests the operator's chosen model ahead of the catalogue's first", async () => {
+  const seen: string[] = [];
+  const upstream = http.createServer((req, res) => {
+    if (req.url === "/v1/models") {
+      res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ data: [{ id: "head-model" }, { id: "allowed-model" }, { id: "deepseek-v4.1-flash" }, { id: "muse-spark-1.3-contributor" }] }));
+      return;
+    }
+    const chunks: Buffer[] = [];
+    req.on("data", (chunk: Buffer) => chunks.push(chunk));
+    req.on("end", () => {
+      const model = (JSON.parse(Buffer.concat(chunks).toString("utf8")) as { model: string }).model;
+      seen.push(model);
+      if (model === "head-model") res.writeHead(403, { "content-type": "application/json" }).end(JSON.stringify({ error: { code: "model_not_allowed" } }));
+      else res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ choices: [] }));
+    });
+  });
+  await new Promise<void>((resolveP) => upstream.listen(0, "127.0.0.1", resolveP));
+  const address = upstream.address();
+  assert.ok(address && typeof address === "object");
+  const origin = `http://127.0.0.1:${address.port}/v1`;
+  const probe = async (port: number, extra: Record<string, unknown>) => (await (await fetch(`${base()}:${port}/api/providers/probe`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ type: "openai-compatible", url: origin, headers: { authorization: "Bearer secret-key" }, modelsUrl: `${origin}/models`, modelsAuthHeader: "authorization-bearer", ...extra }),
+  })).json()) as { ok: boolean; auth: string };
+  try {
+    await withAdmin(makeCfg(), async ({ port }) => {
+      assert.equal((await probe(port, { probeModel: "allowed-model" })).auth, "ok");
+      assert.equal(seen.at(-1), "allowed-model");
+      assert.equal((await probe(port, {})).auth, "bad-key", "without a choice the catalogue's head is still what is tried");
+      assert.equal(seen.at(-1), "head-model");
+      // A preset's own Chat pick keeps standing in for a choice this test cannot speak (Responses-only).
+      await probe(port, { preset: "opencode-go", probeModel: "muse-spark-1.3-contributor" });
+      assert.notEqual(seen.at(-1), "muse-spark-1.3-contributor");
+      assert.notEqual(seen.at(-1), "head-model");
+      // A Chat model the operator kept ticked is used on a preset too, not only the preset's head pick.
+      await probe(port, { preset: "opencode-go", probeModel: "deepseek-v4.1-flash" });
+      assert.equal(seen.at(-1), "deepseek-v4.1-flash");
+      // One the preset does not name rides its default wire (Responses here), so the Chat pick stands.
+      await probe(port, { preset: "opencode-go", probeModel: "allowed-model" });
+      assert.notEqual(seen.at(-1), "allowed-model");
+    });
+  } finally {
+    await new Promise<void>((resolveP, reject) => upstream.close((error) => (error ? reject(error) : resolveP())));
   }
 });
 
@@ -4092,6 +4236,49 @@ test("GET /api/limits and /api/status follow the Claude account the pool is usin
     const empty = await (await fetch(`${base()}:${port}/api/status`)).json() as { claude: { accounts: { id: string; inUse?: boolean; quota?: Record<string, unknown> }[] } };
     assert.deepEqual(empty.claude.accounts[0], { id: "current", label: "Current Claude login", quota: {}, inUse: true });
   }, { credentials: () => reports, claudeUsage: async () => usage });
+});
+
+test("GET /api/limits names the current login while retaining every stored owner and its selection", async () => {
+  const now = Date.now();
+  const uuid = "current-login-uuid";
+  const cfg = makeCfg({ providers: { anthropic: { type: "anthropic", auth: "claude-code", accountPool: true } } });
+  const quota = (used: number) => ({ at: now, rate_limits: { primary: { used_percent: used, window_minutes: 300 } } });
+  let usage: Awaited<ReturnType<NonNullable<AdminDeps["claudeUsage"]>>> = {};
+  type Identity = { email: string; subjectHash: string } | null;
+  let lookup: () => Promise<Identity> = async () => ({ email: "Person@Example.Test", subjectHash: subjectHash(uuid)! });
+  let reports: ReturnType<NonNullable<AdminDeps["credentials"]>> = {};
+  await withAdmin(cfg, async ({ port, home }) => {
+    saveClaudeAuthFile(home, "current-login-token", "2026-10-23T00:00:00.000Z");
+    const grant = (n: number, extra: { accountId?: string; email?: string }) => ({ accessToken: `a${n}`, refreshToken: `r${n}`, expiresAt: now + 3_600_000, ...extra });
+    const copy = saveClaudeOAuthAccount(home, grant(1, { accountId: uuid, email: "copy@example.test" }));
+    const other = saveClaudeOAuthAccount(home, grant(2, { accountId: "someone-else", email: "person@example.test" }));
+    usage = { current: quota(81), [copy.id]: quota(81), [other.id]: quota(15) };
+    const rows = async () => (await (await fetch(`${base()}:${port}/api/limits`)).json() as { providers: LimitsProvider[] }).providers[0]!.accounts;
+
+    let got = await rows();
+    assert.deepEqual(got.map((a) => [a.account, a.id, a.label]), [[0, "current", "Person@Example.Test"], [1, copy.id, "copy@example.test"], [2, other.id, "person@example.test"]], "the personal API keeps every owner, including stored copies, in stable order");
+
+    // Every owner stays visible, so selection follows the actual stored owner rather than the login.
+    reports = { anthropic: [{ id: copy.id, state: "ready", failures: 0, inUse: true }] };
+    got = await rows();
+    assert.deepEqual(got.filter((a) => a.inUse).map((a) => a.id), [copy.id]);
+    reports = {};
+
+    // The current login remains an explicit unknown row before its first usage reading.
+    usage = { [copy.id]: quota(81), [other.id]: quota(15) };
+    got = await rows();
+    assert.deepEqual(got.map((a) => a.id), ["current", copy.id, other.id]);
+    assert.equal(got[0]?.unknown, true);
+    usage = { current: quota(81), [copy.id]: quota(81), [other.id]: quota(15) };
+
+    // An unreadable identity keeps the personal fallback label and every stored copy.
+    lookup = async () => null;
+    got = await rows();
+    assert.deepEqual(got.map((a) => [a.account, a.id, a.label]), [[0, "current", "Current Claude login"], [1, copy.id, "copy@example.test"], [2, other.id, "person@example.test"]]);
+    lookup = async () => { throw new Error("offline"); };
+    got = await rows();
+    assert.deepEqual(got.map((a) => a.id), ["current", copy.id, other.id]);
+  }, { claudeIdentity: () => lookup(), claudeUsage: async () => usage, credentials: () => reports });
 });
 
 test("GET /api/limits lists every Claude account with usage, in a stable order, with labels and the in-use mark", async () => {

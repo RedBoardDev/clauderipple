@@ -375,6 +375,10 @@ export function providerFor(provider: Provider, model: string | undefined): Prov
       : {}),
   };
 
+  // An endpoint or auth override alone does not select another protocol. Keep the provider's
+  // adapter and its capabilities unless the model explicitly asks for a different wire.
+  if (entry.wire === undefined) return shared;
+
   // Anthropic Messages needs no translation, so this model is served by the anthropic-compatible
   // adapter instead. The two `caps` shapes do not describe the same things, and only an effort
   // ladder carries over; the rest fall back to the strict defaults `resolveCompatibleCaps` applies,
@@ -445,6 +449,31 @@ export type CliModel = {
   contextWindow?: number;
 };
 
+/** A provider and model whose hosted search answers a `WebSearch` (`Config.webSearch`). */
+export interface WebSearchBackend {
+  /**
+   * A key of `providers`. The backend follows how that provider is spoken to: an
+   * `anthropic-compatible` one is handed Anthropic's `web_search` server tool (only where its
+   * preset or caps measured support), an `openai-compatible` one is asked through its Chat
+   * Completions web plugin, and a `chatgpt` provider uses its own hosted search.
+   */
+  provider: string;
+  /** The model that runs the search. Its hosted search does the work, so a small one is enough. */
+  model: string;
+  maxResults?: number;
+}
+
+/** The search backend `webSearch` names, or undefined when it is absent or `"native"`. */
+export function webSearchBackend(cfg: Pick<Config, "webSearch">): WebSearchBackend | undefined {
+  const setting = cfg.webSearch;
+  return setting && typeof setting === "object" ? setting : undefined;
+}
+
+/** Whether `webSearch` is `"native"`: a search no route target can run goes to Anthropic as sent. */
+export function webSearchNative(cfg: Pick<Config, "webSearch">): boolean {
+  return cfg.webSearch === "native";
+}
+
 export type Config = {
   /** Install new versions while idle. Omitted means enabled; hot-reloaded. */
   autoUpdate?: boolean;
@@ -512,19 +541,13 @@ export type Config = {
    * model, so by default it costs Claude quota whatever the session is routed to — a routed setup
    * that still cannot search without a Claude subscription. Set this and the named provider's own
    * hosted search answers instead. Absent, nothing is intercepted and the search behaves as before.
+   *
+   * `"native"` names no backend. It only changes what happens to a search whose route target runs
+   * no server tools (an `openai-compatible` slot, say): instead of being refused it is passed to
+   * Anthropic unchanged, on the app's own login, so one slot can route its other requests away and
+   * still search. Read the setting through `webSearchBackend` / `webSearchNative`, not as an object.
    */
-  webSearch?: {
-    /**
-     * A key of `providers`. The backend follows how that provider is spoken to: an
-     * `anthropic-compatible` one is handed Anthropic's `web_search` server tool (only where its
-     * preset or caps measured support), an `openai-compatible` one is asked through its Chat
-     * Completions web plugin, and a `chatgpt` provider uses its own hosted search.
-     */
-    provider: string;
-    /** The model that runs the search. Its hosted search does the work, so a small one is enough. */
-    model: string;
-    maxResults?: number;
-  };
+  webSearch?: WebSearchBackend | "native";
   health: {
     /** Consecutive upstream connect/DNS failures before the process exits for the supervisor to restart it. */
     maxConsecutiveUpstreamFailures: number;
@@ -765,9 +788,9 @@ function foldSplitProviders(c: Config): Config {
       if (models.some((m) => m.id === model.id)) continue;
       models.push({
         ...model,
-        wire: split.wire,
-        authHeader: split.authHeader,
-        ...("url" in p ? { url: p.url } : {}),
+        wire: model.wire === undefined ? split.wire : model.wire,
+        authHeader: model.authHeader === undefined ? split.authHeader : model.authHeader,
+        ...(model.url === undefined && "url" in p ? { url: p.url } : {}),
         // The merged provider's caps no longer describe this model, so the ladder its own endpoint
         // published travels with it. Inheriting the Responses one would start sending an effort to
         // an endpoint that never accepted one.
@@ -784,9 +807,22 @@ function foldSplitProviders(c: Config): Config {
   // provider the user never removed.
   const moved = new Map(parts.map(([n]) => [n, name] as const).filter(([from, to]) => from !== to));
   const renamed = (of: string): string => moved.get(of) ?? of;
+  const renamedTarget = <T extends { provider?: string }>(target: T): T => {
+    // Migration precedes validation. Leave malformed targets intact so validation still reports them.
+    if (!target || typeof target !== "object" || Array.isArray(target) || typeof target.provider !== "string") return target;
+    return { ...target, provider: renamed(target.provider) };
+  };
+  const classifier = c.autoModeClassifier;
   return {
     ...c,
     providers,
+    ...(c.webSearch !== undefined ? { webSearch: c.webSearch === "native" ? c.webSearch : renamedTarget(c.webSearch) } : {}),
+    ...(classifier && typeof classifier === "object" && !Array.isArray(classifier) ? {
+      autoModeClassifier: {
+        ...renamedTarget(classifier),
+        ...(classifier.stage1 && typeof classifier.stage1 === "object" ? { stage1: renamedTarget(classifier.stage1) } : {}),
+      },
+    } : {}),
     direct: c.direct.map((d) => ({ ...d, provider: renamed(d.provider) })),
     routes: Object.fromEntries(Object.entries(c.routes).map(([alias, r]) => [alias, {
       ...r,
@@ -827,10 +863,10 @@ export function validate(c: Config): string[] {
       if (!routesRest && !routesStage1) errors.push("autoModeClassifier names no target");
     }
   }
-  if (c.webSearch !== undefined) {
+  if (c.webSearch !== undefined && c.webSearch !== "native") {
     // Hand-edited config.json reaches here as whatever JSON held, not the declared type.
     const target = c.webSearch as { provider?: unknown; model?: unknown; maxResults?: unknown } | null;
-    if (!target || typeof target !== "object" || Array.isArray(target)) errors.push("webSearch must be an object");
+    if (!target || typeof target !== "object" || Array.isArray(target)) errors.push('webSearch must be an object or "native"');
     else {
       if (typeof target.provider !== "string" || !target.provider.trim()) errors.push("webSearch: missing provider");
       else if (!c.providers[target.provider]) errors.push(`webSearch: unknown provider "${target.provider}"`);
@@ -988,6 +1024,13 @@ export function validate(c: Config): string[] {
     }
   }
   if (!(c.listen.port > 0 && c.listen.port < 65536)) errors.push("listen.port out of range");
+  if (!Array.isArray(c.cli.extraModels) || !c.cli.extraModels.every((entry) => {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) return false;
+    if (typeof entry.model !== "string" || !entry.model.trim() || typeof entry.name !== "string") return false;
+    if (entry.description !== undefined && typeof entry.description !== "string") return false;
+    if (entry.contextWindow !== undefined && !(typeof entry.contextWindow === "number" && Number.isFinite(entry.contextWindow) && entry.contextWindow > 0)) return false;
+    return true;
+  })) errors.push("cli.extraModels must be a list of entries with a non-empty string model, string name, optional string description and positive finite contextWindow");
   if (c.cli.agentFiles !== undefined && typeof c.cli.agentFiles !== "boolean") errors.push("cli.agentFiles must be true or false");
   if (c.cli.limitWorkerTools !== undefined && typeof c.cli.limitWorkerTools !== "boolean") errors.push("cli.limitWorkerTools must be true or false");
   if (c.listen.openaiPort !== undefined && !(c.listen.openaiPort >= 0 && c.listen.openaiPort < 65536)) errors.push("listen.openaiPort out of range");

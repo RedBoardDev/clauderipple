@@ -9,7 +9,7 @@ import os from "node:os";
 import path from "node:path";
 import tls from "node:tls";
 import { CertStore } from "../src/certs.ts";
-import { DEFAULTS, type Config } from "../src/config.ts";
+import { DEFAULTS, webSearchBackend, type Config } from "../src/config.ts";
 import { UpstreamHealth } from "../src/health.ts";
 import { Logger } from "../src/log.ts";
 import { Proxy } from "../src/proxy.ts";
@@ -96,7 +96,8 @@ async function rig(wire: Wire = "chatgpt") {
     secure.write(`POST ${pathname} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nx-claude-code-session-id: webfetch-session\r\nauthorization: Bearer original-auth\r\ncontent-type: application/json\r\ncontent-length: ${Buffer.byteLength(raw)}\r\n\r\n${raw}`);
     const text = await result;
     secure.destroy();
-    // Response completion does not await the caller-login metadata used to write its row.
+    // A row for the caller's own login is written once its email lookup settles, which can be after
+    // the response: wait for it as a drain does, or there is no row to read yet.
     await proxy.rows.settled();
     return { text, record: requests.list(1)[0]! };
   }
@@ -117,7 +118,7 @@ for (const wire of ["chatgpt", "chat", "responses", "compatible"] as const) {
       assert.equal(r.native.length, 0);
       assert.equal(r.seen.length, 1);
       const { body, headers, url } = r.seen[0]!;
-      assert.equal(body.model, r.cfg.webSearch!.model);
+      assert.equal(body.model, webSearchBackend(r.cfg)!.model);
       assert.notEqual(headers.authorization, "Bearer original-auth", "routed auth, not caller auth");
       if (wire === "chatgpt" || wire === "responses") {
         assert.ok(Array.isArray(body.input), "ordinary Responses translation");
@@ -128,7 +129,7 @@ for (const wire of ["chatgpt", "chat", "responses", "compatible"] as const) {
       assert.equal(record.purpose, "web-fetch");
       assert.equal(record.provider, "web");
       assert.equal(record.source, "claude-haiku-5-5");
-      assert.equal(record.target, r.cfg.webSearch!.model);
+      assert.equal(record.target, webSearchBackend(r.cfg)!.model);
       assert.equal(record.session, "webfetch-session");
       assert.match(record.note!, /web fetch via web/);
       assert.equal(record.usage?.output, 3);

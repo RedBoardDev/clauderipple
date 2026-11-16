@@ -4,10 +4,14 @@ import fs from "node:fs";
 import { execFileSync } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
-import { EventLog } from "./eventlog.ts";
+import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
+import { Worker } from "node:worker_threads";
+import { deliveredFiles, EventLog, imageBlobId } from "./eventlog.ts";
 import { creationDateToFileTime, parseFileTime, processCommands, processSnapshot, sameFileTime, type ProcessSnapshot } from "./processes.ts";
-import { fileImages, messageContent, sessionFileTool, type ImageSink } from "./images.ts";
+import { fileImages, messageContent, sessionFileTool, unshownFiles, type ImageSink } from "./images.ts";
 import { narrationBody } from "./narration.ts";
+import { artifactOf } from "./artifact.ts";
 import { PERMISSION_MODES, type BackgroundTask, type EventBody, type Figures, type PermissionMode, type PlanStep, type SessionSummary, type ToolCall } from "./protocol.ts";
 import { WRAP_TOOL, wrapUpFields, type WrapUpFields } from "./wrap-up.ts";
 import { TaskPlan } from "./task-plan.ts";
@@ -18,6 +22,8 @@ export { nextPlan } from "./task-plan.ts";
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const WINDOW = 256 * 1024;
 const RECENT_MS = 14 * 24 * 60 * 60 * 1000;
+/** How long a session the host was told of (DesktopSessions.rediscover) stays listed while the sidebar lags. */
+const NAMED_MS = 10 * 60 * 1000;
 type RecordValue = Record<string, unknown>;
 type Summarize = (tool: string, input: RecordValue, cwd: string) => string;
 interface Source { file: string; size: number; mtime: number; unfinished: boolean; summary: SessionSummary }
@@ -117,6 +123,9 @@ export interface DesktopOptions {
   /** The latest figures the host read for a session. A snapshot is rebuilt from the transcript
    * whenever it grows, so the figures are put back at the end of every rebuild. */
   figures?: (id: string) => Figures | undefined;
+  /** The events the host holds for a session beyond its transcript (a held approval's card and its
+   * decision): a snapshot is rebuilt from the transcript, so these are put back at the end of every rebuild. */
+  held?: (id: string) => EventBody[];
   /** The phone's id for a user line the app's mod typed in (by the line's uuid and text), so the
    * phone can tell its own message when it comes back in a rebuilt snapshot. */
   userId?: (id: string, uuid: string, text: string) => string | undefined;
@@ -181,7 +190,11 @@ function title(value: string): string { return value.trim().replace(/\s+/g, " ")
 
 /** A subagent's running state while its parent transcript is converted; `input` lets a terminal
  * event re-resolve its model once its own transcript has written one. */
-export interface SubagentState { description: string; model: string | null; steps: number; bytes: number; input: RecordValue; taskId?: string }
+export interface SubagentState { description: string; model: string | null; steps: number; bytes: number; input: RecordValue; taskId?: string; /** started in the background: the call asked for it, or its launch result said it was async */ background?: boolean }
+/** Workers a notification has ended, by call id and by task id, for the notifications that repeat
+ * (keyed by the scan's state map, which lives as long as the scan or the live tail does). */
+type EndedWorker = SubagentState & { toolUseId: string };
+const endedWorkers = new WeakMap<Map<string, SubagentState>, Map<string, EndedWorker>>();
 /** How to convert one transcript. Omitting it is the top-level session: sidechain records are skipped
  * and no subagent events are produced. The sub pass reads a subagent's own transcript instead. */
 export interface SubagentContext {
@@ -191,7 +204,7 @@ export interface SubagentContext {
   state?: Map<string, SubagentState>;
   /** What a subagent's own transcript reports: the model that answered, its steps, its description
    * (meta.json), and its confirmed terminal state, if any. */
-  resolve?: (toolUseId: string, input: RecordValue) => { model: string | null; steps: number; description: string; terminal: AgentTerminal; bytes?: number };
+  resolve?: (toolUseId: string, input: RecordValue) => { model: string | null; effort?: string; steps: number; description: string; terminal: AgentTerminal; bytes?: number };
 }
 
 /**
@@ -285,17 +298,31 @@ export function transcriptEvents(line: string, cwd: string, summarize: Summarize
     if (notification) {
       for (const [notice] of p.matchAll(/<task-notification>[\s\S]*?<\/task-notification>/g)) {
         const taskId = /<task-id>([^<]+)<\/task-id>/.exec(notice)?.[1];
-        const toolUseId = /<tool-use-id>([^<]+)<\/tool-use-id>/.exec(notice)?.[1] ??
-          (taskId ? [...(state ?? [])].find(([, worker]) => worker.taskId === taskId)?.[0] : undefined);
+        const named = /<tool-use-id>([^<]+)<\/tool-use-id>/.exec(notice)?.[1];
         const result = /<result>([\s\S]*?)<\/result>/.exec(notice)?.[1];
         const status = /<status>([^<]+)<\/status>/.exec(notice)?.[1];
+        const ended = state ? endedWorkers.get(state) : undefined;
+        // The app notifies again each time the worker stops with nothing of its own running, often without
+        // its call's id: the worker it ended for is remembered by task id once it is no longer running.
+        const again = named ? ended?.get(named) : taskId ? ended?.get(taskId) : undefined;
+        const toolUseId = named ?? (taskId ? [...(state ?? [])].find(([, worker]) => worker.taskId === taskId)?.[0] : undefined) ?? again?.toolUseId;
         // A notification without its tool call has nothing to attach to; it is not the user's words.
         if (!toolUseId) continue;
-        bodies.push({ kind: "tool_result", toolUseId, ok: status === "completed", text: result ?? notice });
-        const running = state?.get(toolUseId);
+        const terminal = status === "completed" ? "done" as const : status === "killed" || status === "stopped" ? "stopped" as const : "failed" as const;
+        // A repeat that names no call keeps the report the first one gave; only the end is told again.
+        if (named || !again) bodies.push({ kind: "tool_result", toolUseId, ok: status === "completed", text: result ?? notice });
+        const running = state?.get(toolUseId) ?? again;
         if (running && resolve) {
           const info = resolve(toolUseId, running.input);
-          bodies.push({ kind: "subagent", toolUseId, sub: `sub-${toolUseId}`, description: running.description, model: info.model ?? running.model, status: status === "completed" ? "done" : status === "killed" || status === "stopped" ? "stopped" : "failed", steps: info.steps });
+          bodies.push({ kind: "subagent", toolUseId, sub: `sub-${toolUseId}`, description: running.description, model: info.model ?? running.model, ...effortField(info), ...backgroundField(running), status: terminal, steps: info.steps });
+        }
+        const gone = state?.get(toolUseId);
+        if (state && gone) {
+          const kept = endedWorkers.get(state) ?? new Map<string, EndedWorker>();
+          const worker: EndedWorker = { ...gone, toolUseId };
+          kept.set(toolUseId, worker);
+          if (gone.taskId) kept.set(gone.taskId, worker);
+          endedWorkers.set(state, kept);
         }
         state?.delete(toolUseId);
       }
@@ -307,19 +334,21 @@ export function transcriptEvents(line: string, cwd: string, summarize: Summarize
       const b = object(value);
       if (b?.type === "tool_result" && typeof b.tool_use_id === "string") {
         const converted = messageContent(b.content, sink, scope);
-        bodies.push({ kind: "tool_result", toolUseId: b.tool_use_id, ok: b.is_error !== true, ...converted });
+        const artifact = b.is_error === true ? undefined : artifactOf(r.toolUseResult);
+        bodies.push({ kind: "tool_result", toolUseId: b.tool_use_id, ok: b.is_error !== true, ...converted, ...(artifact ? { artifact } : {}) });
         // A synchronous worker finishes at its tool result; an async one only launches here and ends at its notification.
         const running = state?.get(b.tool_use_id);
         const resultText = typeof converted.text === "string" ? converted.text : "";
         const result = object(r.toolUseResult) ?? toolInput(resultText);
-        const launched = result?.isAsync === true || /(?:launched asynchronously|async(?: agent)? launched)/i.test(resultText);
+        const launched = result?.isAsync === true || ["async_launched", "remote_launched", "teammate_spawned"].includes(str(result?.status)) || /(?:launched asynchronously|async(?: agent)? launched)/i.test(resultText);
         if (running && launched) {
           const taskId = str(result?.agentId) || str(result?.taskId) || /(?:agentId|task[_ -]?id):\s*([\w-]+)/i.exec(resultText)?.[1];
           if (taskId) running.taskId = taskId;
+          running.background = true;
         }
         if (running && resolve && !launched) {
           const info = resolve(b.tool_use_id, running.input);
-          bodies.push({ kind: "subagent", toolUseId: b.tool_use_id, sub: `sub-${b.tool_use_id}`, description: running.description, model: info.model ?? running.model, status: b.is_error === true ? "failed" : "done", steps: info.steps });
+          bodies.push({ kind: "subagent", toolUseId: b.tool_use_id, sub: `sub-${b.tool_use_id}`, description: running.description, model: info.model ?? running.model, ...effortField(info), status: b.is_error === true ? "failed" : "done", steps: info.steps });
           state?.delete(b.tool_use_id);
         }
       }
@@ -344,13 +373,15 @@ export function transcriptEvents(line: string, cwd: string, summarize: Summarize
       // The top-level pass still skips sidechain records before reaching this point.
       if (worker && state && resolve) {
         const info = resolve(b.id, input);
-        const running: SubagentState = { description: info.description || summary || str(input.subagent_type) || b.name, model: info.model, steps: info.steps, bytes: info.bytes ?? 0, input };
+        const running: SubagentState = { description: info.description || summary || str(input.subagent_type) || b.name, model: info.model, steps: info.steps, bytes: info.bytes ?? 0, input, ...(input.run_in_background === true ? { background: true } : {}) };
         state.set(b.id, running);
-        bodies.push({ kind: "subagent", toolUseId: b.id, sub: `sub-${b.id}`, description: running.description, model: running.model, status: "running", steps: running.steps });
+        bodies.push({ kind: "subagent", toolUseId: b.id, sub: `sub-${b.id}`, description: running.description, model: running.model, ...effortField(info), ...backgroundField(running), status: "running", steps: running.steps });
       }
     }
     const body = messageContent(message.content, sink, scope);
-    body.images.push(...fileImages(tools.flatMap(tool => tool.files ?? [])));
+    const delivered = tools.flatMap(tool => tool.files ?? []);
+    body.images.push(...fileImages(delivered));
+    body.files.push(...unshownFiles(delivered));
     if (body.text || body.images.length || body.files.length || tools.length) bodies.push({ kind: "assistant", msg: str(r.uuid) || str(message.id), model: str(message.model), ...body, tools });
   } else if (r.type === "result") {
     const ok = r.subtype === "success" && r.is_error !== true;
@@ -448,6 +479,17 @@ function stripModelPrefix(description: string): string {
 function withoutEffort(model: string): string {
   return model.replace(/@[^@]*$/, "");
 }
+/** The levels a title's last component can be; anything else there is an account name. */
+const EFFORT_WORDS = new Set(["low", "medium", "high", "xhigh", "max"]);
+/** A worker's effort as its meta.json records it: the `@effort` suffix of its model, else the level ending the hook's "Model·account·effort · " prefix. Empty when neither says so. */
+export function effortOf(model: string, description: string): string {
+  const last = /^\S*·(\S*) · /.exec(description)?.[1]?.split("·").pop() ?? "";
+  return /@([^@\s]+)$/.exec(model)?.[1] ?? (EFFORT_WORDS.has(last) ? last : "");
+}
+/** The subagent event's effort, only when a real one was recorded. */
+const effortField = (info: { effort?: string }): { effort?: string } => info.effort ? { effort: info.effort } : {};
+/** The subagent event's `background` mark, once the worker is known to run in the background. */
+const backgroundField = (running: { background?: boolean }): { background?: true } => running.background ? { background: true } : {};
 
 /** Top-level task lifecycle only; synchronous workers and nested subagents are not background tasks.
  * Also the main turn's start as the app counts it: the person's last message (origin "human"; compaction
@@ -515,9 +557,14 @@ export class DesktopSessions {
   private tailCopies = new Map<string, LineCopies>();
   /** session → toolUseId → agentId, rebuilt when the subagents directory changes. */
   private agentMaps = new Map<string, { at: number; map: Map<string, string> }>();
+  /** A worker's recorded effort by meta.json path: a found one never changes, a missing one is asked again after a while. */
+  private efforts = new Map<string, { at: number; effort: string | undefined }>();
   private temp: string | null = null;
   private scannedAt = -Infinity;
   private checkedAt = -Infinity;
+  /** Transcripts the host was told the Claude app moved on to (a /clear in place): listed at once, even
+   * before the app's sidebar names them. id → when it was named; forgotten once the sidebar lists it. */
+  private named = new Map<string, number>();
 
   constructor(opts: DesktopOptions) {
     this.opts = opts;
@@ -558,6 +605,14 @@ export class DesktopSessions {
     if (!UUID.test(id) || this.opts.excluded().has(id)) return false;
     this.refresh();
     return this.sources.has(id);
+  }
+
+  /** The Claude app moved a session on to `id` (a /clear in place): rediscover now, not at the next 30 s
+   * scan, and keep listing `id` until the app's sidebar names it. */
+  rediscover(id: string): void {
+    if (!UUID.test(id)) return;
+    this.named.set(id, (this.opts.now ?? Date.now)());
+    this.scannedAt = -Infinity;
   }
 
   liveProcess(id: string, maxAgeMs = 1000): DesktopProcess | undefined {
@@ -646,7 +701,7 @@ export class DesktopSessions {
         running.model = model;
         running.steps = info.steps;
         running.bytes = info.bytes ?? 0;
-        visit({ kind: "subagent", toolUseId, sub: `sub-${toolUseId}`, description: running.description, model, status: info.terminal ?? "running", steps: info.steps });
+        visit({ kind: "subagent", toolUseId, sub: `sub-${toolUseId}`, description: running.description, model, ...effortField(info), ...backgroundField(running), status: info.terminal ?? "running", steps: info.steps });
         if (info.terminal) state.delete(toolUseId);
       }
       return next;
@@ -660,14 +715,35 @@ export class DesktopSessions {
    * parent tracker: a later continuation must be allowed to make that worker active again. */
   private backgroundState(id: string): { active: BackgroundTask[]; history: BackgroundTask[] } {
     const tracker = this.scan(id);
-    const active: BackgroundTask[] = [], history = tracker?.history ?? [];
     const source = this.sources.get(id);
-    for (const task of tracker?.list ?? []) {
+    // The scanner reads the launch lines only, so a worker's effort comes from its own meta.json.
+    const withEffort = (task: BackgroundTask): BackgroundTask => {
+      const effort = source && task.kind === "agent" ? this.recordedEffort(source, task.id) : undefined;
+      return effort ? { ...task, effort } : task;
+    };
+    const active: BackgroundTask[] = [], history = (tracker?.history ?? []).map(withEffort);
+    for (const task of (tracker?.list ?? []).map(withEffort)) {
       const state = source && task.kind === "agent" ? agentStatus(path.join(this.subagentsDir(source), `agent-${task.id}.jsonl`)) : null;
       if (state) history.unshift({ ...task, state });
       else active.push(task);
     }
     return { active, history: history.slice(0, 40) };
+  }
+
+  /** A worker's effort as its own meta.json records it (the same record subInfo reads), by agent id. Undefined when the record does not say. */
+  private recordedEffort(source: Source, agentId: string): string | undefined {
+    if (!/^[\w-]+$/.test(agentId)) return undefined;
+    // Read on every session-list build (several a second while a plan changes), so the file is read
+    // once per worker: a recorded effort is fixed for the worker's life; an absent one may still be written.
+    const file = path.join(this.subagentsDir(source), `agent-${agentId}.meta.json`);
+    const now = Date.now();
+    const known = this.efforts.get(file);
+    if (known && (known.effort !== undefined || now - known.at < 30_000)) return known.effort;
+    const meta = record(safeRead(file));
+    const effort = effortOf(str(meta?.model), str(meta?.description)) || undefined;
+    this.efforts.set(file, { at: now, effort });
+    if (this.efforts.size > 2_000) this.efforts.delete(this.efforts.keys().next().value!);
+    return effort;
   }
   turnStartedAt(id: string): number | null { return this.scan(id)?.turnStartedAt ?? null; }
   plan(id: string): PlanStep[] { return this.scan(id)?.plan ?? []; }
@@ -702,15 +778,16 @@ export class DesktopSessions {
   }
 
   /** What a worker's own transcript reports, for its parent's subagent events. */
-  private subInfo(id: string, toolUseId: string, input: RecordValue): { model: string | null; steps: number; description: string; terminal: AgentTerminal; bytes?: number } {
+  private subInfo(id: string, toolUseId: string, input: RecordValue): { model: string | null; effort?: string; steps: number; description: string; terminal: AgentTerminal; bytes?: number } {
     const source = this.sources.get(id);
     const agentId = source ? this.agentMap(id).get(toolUseId) : undefined;
-    let model = "", steps = 0, description = "", bytes = 0;
+    let model = "", steps = 0, description = "", bytes = 0, effort = "";
     let terminal: AgentTerminal = null;
     if (source && agentId) {
       const dir = this.subagentsDir(source);
       const meta = record(safeRead(path.join(dir, `agent-${agentId}.meta.json`)));
       if (meta) {
+        effort = effortOf(str(meta.model), str(meta.description));
         model = withoutEffort(str(meta.model));
         description = stripModelPrefix(str(meta.description));
       }
@@ -720,7 +797,7 @@ export class DesktopSessions {
       terminal = read.terminal;
       bytes = read.bytes;
     }
-    return { model: model || str(input.model) || null, steps, description, terminal, bytes };
+    return { model: model || str(input.model) || null, ...(effort ? { effort } : {}), steps, description, terminal, bytes };
   }
 
   /** The model that answered, its step count and terminal state, streamed without a full-file buffer. */
@@ -796,7 +873,7 @@ export class DesktopSessions {
       for (const [toolUseId, running] of state) {
         const info = resolve(toolUseId, running.input);
         if (info.terminal) {
-          log.append({ kind: "subagent", toolUseId, sub: `sub-${toolUseId}`, description: running.description, model: info.model ?? running.model, status: info.terminal, steps: info.steps });
+          log.append({ kind: "subagent", toolUseId, sub: `sub-${toolUseId}`, description: running.description, model: info.model ?? running.model, ...effortField(info), ...backgroundField(running), status: info.terminal, steps: info.steps });
           state.delete(toolUseId);
         }
       }
@@ -833,6 +910,49 @@ export class DesktopSessions {
   }
 
   transcriptSize(id: string): number { return this.sources.get(id)?.size ?? 0; }
+
+  /**
+   * The events of the transcript lines a persisted log holds a refused file for, converted again with
+   * today's file rules. `want.lines` are transcript line uuids (an event's `src`); `want.calls` are
+   * tool-use ids, for an event that has no `src`. The work (reading hundreds of MB, decoding the wanted
+   * lines, checking and reading each file the way a live conversion does, which is minutes of CPU
+   * for a large picture) runs in a worker thread, so the host's own loop is never held by it. Each
+   * wanted line's events reach `onLine` as they are converted, with the bytes of the files that are
+   * delivered now under the ids they carry (`imageBlobId` of `epoch`); no other image is kept. False
+   * when the transcript is gone: nothing can be said then.
+   */
+  async reconvertFiles(id: string, want: { lines: ReadonlySet<string>; calls: ReadonlySet<string> }, cwd: string, epoch: string, onLine: (bodies: EventBody[], data: Map<string, string>) => void): Promise<boolean> {
+    if (!UUID.test(id)) return false;
+    let file = this.sources.get(id)?.file;
+    if (!file) {
+      try {
+        for (const project of fs.readdirSync(this.projects, { withFileTypes: true })) {
+          if (!project.isDirectory()) continue;
+          const candidate = path.join(this.projects, project.name, `${id}.jsonl`);
+          try { if (fs.lstatSync(candidate).isFile()) { file = candidate; break; } } catch (error) { if (!missing(error)) throw error; }
+        }
+      } catch (error) { if (!missing(error)) throw error; }
+    }
+    if (!file) return false;
+    // The same checks as every transcript read; the worker opens the path again, without following a link.
+    fs.closeSync(this.open(file));
+    const folder = this.liveProcess(id)?.cwd ?? this.sources.get(id)?.summary.cwd ?? cwd;
+    const ext = path.extname(fileURLToPath(import.meta.url));
+    const worker = new Worker(new URL(`./file-repair-worker${ext}`, import.meta.url), { workerData: { file, want: { lines: [...want.lines], calls: [...want.calls] }, cwd: folder, epoch } });
+    try {
+      await new Promise<void>((resolve, reject) => {
+        worker.on("error", reject);
+        worker.on("exit", code => reject(new Error(`file repair worker exited with ${code}`)));
+        worker.on("message", (message: { done?: true; bodies?: EventBody[]; data?: [string, string][] }) => {
+          if (message.done) { resolve(); return; }
+          try { onLine(message.bodies ?? [], new Map(message.data ?? [])); } catch (error) { reject(error); return; }
+          // One line at a time: the worker goes on when the host has taken this one, with the loop free in between.
+          setImmediate(() => worker.postMessage("next"));
+        });
+      });
+    } finally { void worker.terminate(); }
+    return true;
+  }
 
   /** The current end of a known transcript, including writes newer than the discovery cache. */
   transcriptEnd(id: string): number | undefined {
@@ -982,7 +1102,7 @@ export class DesktopSessions {
       for (const [toolUseId, running] of state) {
         const info = resolve(toolUseId, running.input);
         if (info.terminal) {
-          log.append({ kind: "subagent", toolUseId, sub: `sub-${toolUseId}`, description: running.description, model: info.model ?? running.model, status: info.terminal, steps: info.steps });
+          log.append({ kind: "subagent", toolUseId, sub: `sub-${toolUseId}`, description: running.description, model: info.model ?? running.model, ...effortField(info), ...backgroundField(running), status: info.terminal, steps: info.steps });
           state.delete(toolUseId);
         }
       }
@@ -990,6 +1110,7 @@ export class DesktopSessions {
       this.tailSubs.set(id, state);
       this.tailCopies.delete(id); // an import writes line identities to the log, which dedupes from here
       importing = false;
+      for (const body of this.opts.held?.(id) ?? []) log.append(body);
       const figures = this.opts.figures?.(id);
       if (figures) log.append({ kind: "figures", figures });
       return log;
@@ -1026,6 +1147,7 @@ export class DesktopSessions {
     const candidates: { id: string; file: string; stat: fs.Stats }[] = [];
     const excluded = this.opts.excluded();
     const sidebar = this.opts.sidebarIds?.();
+    for (const [id, at] of this.named) if (sidebar?.has(id) || now - at > NAMED_MS) this.named.delete(id);
     try {
       for (const project of fs.readdirSync(this.projects, { withFileTypes: true })) {
         if (!project.isDirectory()) continue; // Never follow project symlinks or recurse.
@@ -1035,7 +1157,7 @@ export class DesktopSessions {
           if (!entry.isFile() || !entry.name.endsWith(".jsonl") || !UUID.test(id) || excluded.has(id)) continue;
           const file = path.join(dir, entry.name);
           const stat = fs.lstatSync(file);
-          if (stat.isFile() && (sidebar?.size ? sidebar.has(id) : stat.mtimeMs >= now - RECENT_MS)) candidates.push({ id, file, stat });
+          if (stat.isFile() && (this.named.has(id) || (sidebar?.size ? sidebar.has(id) : stat.mtimeMs >= now - RECENT_MS))) candidates.push({ id, file, stat });
         }
       }
     } catch (error) { if (!missing(error)) throw error; }
@@ -1148,6 +1270,73 @@ export class DesktopSessions {
     this.agentMaps.clear();
     if (this.temp) fs.rmSync(this.temp, { recursive: true, force: true });
     this.temp = null;
+  }
+}
+
+/**
+ * The transcript side of `DesktopSessions.reconvertFiles`, run in the worker thread: the lines of `file`
+ * that name an id in `want` (and carry a file mark) converted with the current rules. `onLine` gets each
+ * line's events with the bytes of the files that are delivered under their ids; every other image the
+ * conversion meets (an inline picture) is hashed for its id and dropped.
+ */
+export async function reconvertTranscript(file: string, want: { lines: ReadonlySet<string>; calls: ReadonlySet<string> }, cwd: string, epoch: string, onLine: (bodies: EventBody[], data: Map<string, string>) => void | Promise<void>): Promise<void> {
+  const fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+  const marks = [Buffer.from("SendUserFile"), Buffer.from("[Image: source:")];
+  const uuidKey = [Buffer.from('"uuid":"')];
+  const callKeys = [Buffer.from('"id":"'), Buffer.from('"tool_use_id":"')];
+  const stash = new Map<string, string>();
+  const sink: ImageSink = data => { const id = imageBlobId(epoch, data); stash.set(id, data); return id; };
+  try {
+    await scanLinesAsync(fd, fs.fstatSync(fd).size, async line => {
+      const r = record(line);
+      if (!r || r.isSidechain === true) return;
+      const content = object(r.message)?.content;
+      const named = Array.isArray(content) && content.some(value => { const b = object(value); return want.calls.has(str(b?.id)) || want.calls.has(str(b?.tool_use_id)); });
+      if (!want.lines.has(str(r.uuid)) && !named) return;
+      // The tool summaries of this conversion are never read: only the files are.
+      const bodies = transcriptEvents(line, cwd, () => "", sink).bodies;
+      const data = new Map<string, string>();
+      for (const delivered of deliveredFiles(bodies)) { const bytes = stash.get(delivered.id); if (bytes !== undefined) data.set(delivered.id, bytes); }
+      stash.clear();
+      await onLine(bodies, data);
+    // The raw bytes decide what is decoded: a file mark, and one of the ids asked for as a value of its key.
+    }, bytes => marks.some(mark => bytes.includes(mark)) && (carries(bytes, uuidKey, want.lines) || carries(bytes, callKeys, want.calls)));
+  } finally { fs.closeSync(fd); }
+}
+
+/** Whether the raw line holds a `key` whose string value is one of `ids` (the line is not decoded). */
+function carries(bytes: Buffer, keys: readonly Buffer[], ids: ReadonlySet<string>): boolean {
+  if (!ids.size) return false;
+  for (const key of keys) {
+    for (let at = bytes.indexOf(key); at !== -1; at = bytes.indexOf(key, at + key.length)) {
+      const from = at + key.length;
+      const end = bytes.indexOf(34, from);
+      if (end !== -1 && end - from <= 128 && ids.has(bytes.toString("latin1", from, end))) return true;
+    }
+  }
+  return false;
+}
+
+const CHUNK = 1024 * 1024;
+/** `scanLines` for a background pass: reads asynchronously and yields to the event loop after every
+ * chunk, and decodes only the lines `wanted` (judged on the raw bytes) accepts. */
+async function scanLinesAsync(fd: number, size: number, visit: (line: string) => void | Promise<void>, wanted: (line: Buffer) => boolean): Promise<void> {
+  const read = promisify(fs.read);
+  const buffer = Buffer.alloc(CHUNK);
+  let carry = Buffer.alloc(0);
+  for (let offset = 0; offset < size;) {
+    const { bytesRead: n } = await read(fd, buffer, 0, Math.min(buffer.length, size - offset), offset);
+    if (!n) break;
+    offset += n;
+    const data = carry.length ? Buffer.concat([carry, buffer.subarray(0, n)]) : buffer.subarray(0, n);
+    let start = 0;
+    for (let end = data.indexOf(10); end !== -1; end = data.indexOf(10, start)) {
+      const line = data.subarray(start, end);
+      if (wanted(line)) await visit(line.toString("utf8"));
+      start = end + 1;
+    }
+    carry = Buffer.from(data.subarray(start));
+    await new Promise<void>(resolve => setImmediate(resolve));
   }
 }
 

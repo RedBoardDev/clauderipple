@@ -20,7 +20,7 @@ import net from "node:net";
 import tls from "node:tls";
 import zlib from "node:zlib";
 import type { Duplex } from "node:stream";
-import type { Config, ProviderModel } from "./config.ts";
+import type { Config, ProviderModel, WebSearchBackend } from "./config.ts";
 import type { Logger } from "./log.ts";
 import { exhaustionHeaders, ModelHealth, modelDeprecation, ProviderHealth, providerExhaustion, UpstreamHealth } from "./health.ts";
 import type { HoldGate } from "./hold.ts";
@@ -45,7 +45,7 @@ import { MiniMaxUsage, isMiniMaxPlan, type MiniMaxWindow } from "./providers/min
 import { GrokAdapter } from "./providers/grok/index.ts";
 import type { GrokWindow } from "./providers/grok/usage.ts";
 import { conversationKey, type AnthropicRequest } from "./providers/chatgpt/translate.ts";
-import { adminPort, providerFor, searchProviderFor, terminateHosts } from "./config.ts";
+import { adminPort, providerFor, searchProviderFor, terminateHosts, webSearchBackend, webSearchNative } from "./config.ts";
 import type { CertStore } from "./certs.ts";
 import { chatPickerModels, injectPickerModels, isBootstrapPath } from "./picker.ts";
 import { effortLevelsForModel } from "./admin.ts";
@@ -56,7 +56,7 @@ import type { ObservedClaudeCodeAuth } from "./providers/anthropic-observed.ts";
 import { nativeAnthropicHeaders, type ClaudeCodeCredentialReaders } from "./providers/anthropic.ts";
 import { ClaudeAccountAuthPool } from "./providers/anthropic-account-pool.ts";
 import { ClaudeModelCatalog } from "./providers/anthropic-models.ts";
-import { ClaudeUsage, claudeLimitResetMs } from "./providers/anthropic-usage.ts";
+import { ClaudeUsage, claudeLimitResetMs, claudeModelFamily } from "./providers/anthropic-usage.ts";
 import { ClaudeCurrentIdentity, LoginEmailWatch, PendingRowWrites } from "./providers/anthropic-identity.ts";
 import { dropForeignThinking, ThinkingOrigins } from "./thinking.ts";
 
@@ -332,6 +332,12 @@ export class Proxy {
   private readonly healthConfig = new Map<string, { config: string; credentials: string; keys: Record<string, string> }>();
   /** Agent/session-scoped spawn snapshots survive compaction, never shared by model id. */
   private readonly workerLadders = new Map<string, WorkerLadderRoute>();
+  /**
+   * Where a ladder worker went when its primary could not serve it, by the same session:agentId key.
+   * The worker stays there while that target is still on its current ladder and usable, even after the
+   * primary recovers: going back every cooldown would discard the prompt cache each time (#164).
+   */
+  private readonly ladderSticky = new Map<string, { provider: string; model: string; effort?: string | undefined }>();
 
   /** Latest rate-limit snapshot reported by any chatgpt provider (for the admin GUI). */
   get chatgptRateLimits(): Record<string, Record<string, unknown> | null> {
@@ -747,6 +753,10 @@ export class Proxy {
       const colon = target.lastIndexOf(":");
       const host = colon > 0 ? target.slice(0, colon) : target;
       const port = colon > 0 ? Number(target.slice(colon + 1)) : 443;
+      if (!Number.isInteger(port) || port < 1 || port > 65535) {
+        sock.end("HTTP/1.1 400 Bad Request\r\ncontent-length: 0\r\nconnection: close\r\n\r\n");
+        return;
+      }
       sock.write("HTTP/1.1 200 Connection Established\r\n\r\n");
       if (rest.length > 0) sock.unshift(rest);
       if (terminateHosts(this.deps.config()).includes(host)) {
@@ -1042,6 +1052,9 @@ export class Proxy {
     // backend is configured: `cfg.webSearch` decides who answers it, but knowing that this is a
     // search is what lets the guard below refuse a provider that cannot run one. Tying the two
     // together meant an unconfigured router could not tell a search from any other turn.
+    // `webSearch: "native"` names no backend, so nothing is intercepted for it: `searchBackend` is
+    // the object form only, and the native form is read where a refusal would otherwise be written.
+    const searchBackend = webSearchBackend(cfg);
     if (json) {
       record.source = record.target = typeof model === "string" ? model : "-";
       record.stream = json.stream === true;
@@ -1050,7 +1063,7 @@ export class Proxy {
         if (conversation) record.conversation = conversation;
       }
       if (kind === "auto-mode-classifier") record.purpose = "auto-mode-classifier";
-      if (cfg.webSearch && kind === "web-fetch") record.purpose = "web-fetch";
+      if (searchBackend && kind === "web-fetch") record.purpose = "web-fetch";
     }
     // Pool affinity must distinguish workers whose injected first 4000 characters are identical.
     // Capture before routing/sanitizing rewrites the prompt; retries use exactly this same identity.
@@ -1068,6 +1081,12 @@ export class Proxy {
       delete record.accountEmail;
       delete record.borrowedLabel;
     };
+    /**
+     * The model family a native Claude pool turn is picked and charged under (`fable`, `opus`, …), so
+     * one family's spent weekly window rests that family on the account and not the account itself.
+     * Set only on the account-pool path; every other provider keeps the whole-credential behaviour.
+     */
+    let poolScope: string | undefined;
     const recordCredential = (name: string, using: Credential, credentials: readonly Credential[], retry = false, pinned = false): void => {
       // count_tokens is answered locally by the translated adapters: no key was actually sent.
       const type = cfg.providers[name]?.type;
@@ -1091,9 +1110,14 @@ export class Proxy {
         loginWatch = new LoginEmailWatch(() => this.claudeIdentity.identifyWith(using.headers));
         loginWatchFor = using.id;
       }
-      const first = this.pool.pick(name, credentials);
+      const first = this.pool.pick(name, credentials, undefined, poolScope);
       const reason = pinned ? "account-pin" : retry ? "retry" : !first ? "all-unavailable" : first.id !== using.id ? "affinity" : "configured-order";
-      const states = this.pool.report(name, credentials).map((row, i) => `${this.credentialLabel(name, credentials[i]!, credentials)}:${row.paused ? "paused" : row.state}`).join(", ");
+      // A resting model scope reads beside the state (`ready[fable 3600s]`): the account answers
+      // other models, and the log must not say it is cooling.
+      const states = this.pool.report(name, credentials).map((row, i) => {
+        const resting = poolScope ? Object.entries(this.pool.scopeCooldowns(name, credentials[i]!.id)).map(([scope, seconds]) => `${scope} ${seconds}s`).join(" ") : "";
+        return `${this.credentialLabel(name, credentials[i]!, credentials)}:${row.paused ? "paused" : row.state}${resting ? `[${resting}]` : ""}`;
+      }).join(", ");
       log.info(`KEY ${name} credential=${label} conversation=${affinity ?? "-"} reason=${reason} candidates=[${states}]`);
     };
     const search = kind === "web-search" ? webSearchQuery(json!) : null;
@@ -1101,25 +1125,25 @@ export class Proxy {
     const markSearchAttempted = (): void => { searchAttempted = true; };
     /** Why the configured search backend did not answer, for the note a Claude fallback leaves. */
     let searchBackendWhy: string | undefined;
-    if (search && cfg.webSearch) {
+    if (search && searchBackend) {
       // A backend whose provider is already spent (a weekly quota, every key cooling) is not asked:
       // the call would fail the same way, and the next option is what answers the search.
-      if (!this.targetUsable(cfg.webSearch, cfg)) {
-        searchBackendWhy = `${cfg.webSearch.provider} unusable`;
-        log.warn(`web search via ${cfg.webSearch.provider}: provider unusable; not asked`);
+      if (!this.targetUsable(searchBackend, cfg)) {
+        searchBackendWhy = `${searchBackend.provider} unusable`;
+        log.warn(`web search via ${searchBackend.provider}: provider unusable; not asked`);
       } else {
-        const served = await this.serveWebSearch(res, json!, search, cfg.webSearch, record, finish, markSearchAttempted);
+        const served = await this.serveWebSearch(res, json!, search, searchBackend, record, finish, markSearchAttempted);
         if (served) return;
-        searchBackendWhy = `${cfg.webSearch.provider} failed`;
+        searchBackendWhy = `${searchBackend.provider} failed`;
         // Fall through on failure: the ordinary path still answers, and a search that quietly
         // returns nothing is worse than one that costs what it always cost.
       }
     }
 
-    const webFetch = !!cfg.webSearch && kind === "web-fetch";
+    const webFetch = !!searchBackend && kind === "web-fetch";
     let fetchRoute: Resolved | null = null;
-    if (webFetch && cfg.webSearch) {
-      const settings = cfg.webSearch;
+    if (webFetch && searchBackend) {
+      const settings = searchBackend;
       if (this.targetUsable(settings, cfg)) {
         const ladder = effortLevels(cfg).providers[settings.provider];
         const levels = ladder?.models?.[settings.model] ?? ladder?.default ?? [];
@@ -1161,7 +1185,7 @@ export class Proxy {
       }
     }
     type Override = { route: Resolved | null; model: string; label: string; purpose: "web-fetch" | "compaction"; refusal?: string | null };
-    const compactDecision = compactModel ? decide(compactModel, {}, cfg, "compaction") : null;
+    const compactDecision = compactModel ? decide(compactModel, {}, cfg, "compaction", true) : null;
     const override: Override | null = compactModel && compactDecision
       ? { ...compactDecision, model: compactModel, label: `compact→${compactModel}`, purpose: "compaction" }
       : fetchRoute ? { route: fetchRoute, model: fetchRoute.model, label: `web fetch via ${fetchRoute.provider}`, purpose: "web-fetch" } : null;
@@ -1221,12 +1245,20 @@ export class Proxy {
         delete output.effort;
         json.output_config = output;
       }
+      // The pool takes an unlisted Claude id (routing.ts `pooled`) only for a model turn on
+      // /v1/messages itself, the request that spends a window and must rotate. Not the continue of a
+      // turn a vendor answered: that has no marker to route by and the pool has no such thread, so it
+      // stays un-routed for the refusal below that makes the CLI resend the turn whole. Not a native
+      // web search, which keeps the app's own login (`webSearch: "native"`), and not count_tokens,
+      // which spends nothing and must not be refused when every account is paused.
+      const poolUnlisted = pathname === "/v1/messages" && kind !== "web-search" && !!json && !continuesTranslatedTurn(json, this.routedMessageIds);
       const decision = override
         ? { route: fetchTarget, refusal: override.refusal ?? null }
-        : json ? decide(model, json, cfg, kind) : { route: null, refusal: null };
+        : json ? decide(model, json, cfg, kind, poolUnlisted) : { route: null, refusal: null };
       let resolved = decision.route;
+      const ladderKey = subagent && record.session ? `${record.session}:${agentId}` : undefined;
       if (!fetchTarget && subagent && resolved && json) {
-        resolved = this.workerFallbacks(resolved, json, cfg, typeof model === "string" ? model : "", record.session && `${record.session}:${agentId}`);
+        resolved = this.workerFallbacks(resolved, json, cfg, typeof model === "string" ? model : "", ladderKey);
       }
 
       // A non-Claude model this router cannot route is refused here, by name, instead of being
@@ -1275,9 +1307,10 @@ export class Proxy {
           claudeLast = true;
         }
       }
-      let route = placed ? this.chooseTarget(placed, cfg, log) : null;
+      const why: { reason?: string } = {};
+      let route = placed ? this.chooseTarget(placed, cfg, log, ladderKey, why) : null;
       if (resolved?.ladderPick && route && (route.provider !== resolved.provider || route.model !== resolved.model)) {
-        unwrittenFallbackNote = `ladder pick=${resolved.ladderPick} fallback ${resolved.provider}/${resolved.model} → ${route.provider}/${route.model}: ${this.unavailableReason(resolved) ?? "provider_unusable"}`;
+        unwrittenFallbackNote = `ladder pick=${resolved.ladderPick} fallback ${resolved.provider}/${resolved.model} → ${route.provider}/${route.model}: ${why.reason ?? this.unavailableReason(resolved) ?? "provider_unusable"}`;
       }
       if (claudeLast && resolved && route && route.model === CLAUDE_SMALL_MODEL && route.provider !== resolved.provider &&
           cfg.providers[route.provider]?.type === "anthropic") {
@@ -1324,7 +1357,7 @@ export class Proxy {
         // backend on this same provider has already had its try above.
         // The same holds for a plan that searches on another of its endpoints (`anthropicSearch`).
         const own = (cfg.providers[route.provider]?.type === "chatgpt" || searchProviderFor(cfg.providers[route.provider], route.model) !== undefined) &&
-          cfg.webSearch?.provider !== route.provider;
+          searchBackend?.provider !== route.provider;
         let ownWhy: string | undefined;
         if (own) {
           // A route whose provider is spent is not asked either; the call would fail the same way.
@@ -1335,9 +1368,20 @@ export class Proxy {
         // Nothing of the configured providers could search. Claude runs Anthropic's own `web_search`
         // server tool on its small model, so it is the last resort before refusing: the request keeps
         // its tool and body, only the model changes. Refused as before only when no Claude is usable.
-        const claude = this.claudeLastResort(cfg);
-        if (claude) {
-          const why = [searchBackendWhy, ownWhy ?? (cfg.webSearch?.provider === route.provider ? undefined : `${route.provider} runs no server tools`)]
+        //
+        // `webSearch: "native"` is asked for before that: the user said searches belong to Anthropic,
+        // on the app's own login and the model Claude Code asked for, so the request goes on as
+        // sent and only the route is dropped — the slot's other requests keep theirs. A model that
+        // is not a Claude id would 404 there, so it falls through to the paths below as before.
+        const native = webSearchNative(cfg) && typeof json.model === "string" && json.model.startsWith("claude-");
+        const claude = native ? null : this.claudeLastResort(cfg);
+        if (native) {
+          unwrittenFallbackNote = "web search passed to Anthropic (webSearch: native)";
+          log.info(`web search passed to Anthropic (webSearch: native): ${route.provider} runs no server tools; ${String(json.model)} sent unchanged`);
+          route = null;
+          record = { ...record, purpose: "web-search" };
+        } else if (claude) {
+          const why = [searchBackendWhy, ownWhy ?? (searchBackend?.provider === route.provider ? undefined : `${route.provider} runs no server tools`)]
             .filter(Boolean).join(", ");
           unwrittenFallbackNote = `fallback to Claude (${why})`;
           log.warn(`web search: ${why}; falling back to Claude (${claude.provider}/${claude.model})`);
@@ -1670,12 +1714,16 @@ export class Proxy {
             // paused, cooling, quarantined or removed account falls back to the ordinary pool order,
             // and the turn is never refused because of the pin (zero vanished requests). Choosing it
             // directly leaves the conversation's sticky claim and the provider's preference untouched.
-            const pinned = pinnedCredential(route.provider, credentials, route.accountPin, this.pool);
+            // The model's family decides which weekly window this turn spends. An account whose latest
+            // usage reading already shows that window spent is rested for the family before it is tried.
+            poolScope = claudeModelFamily(route.model);
+            this.restSpentScopes(route.provider, credentials, poolScope);
+            const pinned = pinnedCredential(route.provider, credentials, route.accountPin, this.pool, poolScope);
             const pinnedUsable = pinned !== undefined;
             if (pinnedUsable) {
               chosen = pinned;
             } else {
-              chosen = this.pool.pick(route.provider, credentials, affinity);
+              chosen = this.pool.pick(route.provider, credentials, affinity, poolScope);
               if (route.accountPin) log.info(`account-pin fallback ${route.accountPin} → ${chosen?.ownerId?.slice(0, 8) ?? "configured-order"}`);
             }
             const using = chosen ?? credentials[0]!;
@@ -1896,8 +1944,10 @@ export class Proxy {
         if (rest.length === 0) return null;
         // A retry keeps honouring the pin first; once that account was spent, it falls back to the
         // same pool order the first attempt would have used.
-        const pinned = native ? pinnedCredential(route.provider, rest, route.accountPin, this.pool) : undefined;
-        const next = pinned ?? this.pool.pick(route.provider, rest, affinity);
+        const scope = native ? poolScope : undefined;
+        if (native) this.restSpentScopes(route.provider, rest, scope);
+        const pinned = native ? pinnedCredential(route.provider, rest, route.accountPin, this.pool, scope) : undefined;
+        const next = pinned ?? this.pool.pick(route.provider, rest, affinity, scope);
         return next && native ? { ...next, headers: withClientBetas(next.headers, req.headers["anthropic-beta"]) } : next;
       };
 
@@ -2028,15 +2078,30 @@ export class Proxy {
         const statedRetryMs = retryAfterMs(upRes.headers);
         const claudeLimitMs = status === 429 && isApiHost && (!route || cfg.providers[route.provider]?.type === "anthropic")
           ? claudeLimitResetMs(upRes.headers) : undefined;
-        const restMs = claudeLimitMs !== undefined ? Math.max(statedRetryMs ?? 0, claudeLimitMs) : statedRetryMs;
+        // A pool 429 that is not the account's 5h/7d window being spent (`claudeLimitMs` undefined) is
+        // the model family's own limit — Fable has a weekly window of its own — so it rests that
+        // family on this account and leaves the account's other models, and the conversations
+        // sticky to it, where they are. The family's real reset comes from the account's latest usage
+        // reading when that says the window is spent; otherwise the stated `retry-after`, else the
+        // pool's default. The refresh is asked at most once per usage interval, so the next request
+        // after a reading-less rest finds the real reset.
+        const scope = status === 429 && poolScope && claudeLimitMs === undefined && penalised ? poolScope : undefined;
+        let scopedResetMs: number | undefined;
+        if (scope && penalised) {
+          scopedResetMs = chosen ? this.claudeUsage.spentScopeResetMs(chosen, scope) : undefined;
+          if (scopedResetMs === undefined) void this.claudeUsage.snapshot().catch(() => undefined);
+        }
+        const restMs = claudeLimitMs !== undefined ? Math.max(statedRetryMs ?? 0, claudeLimitMs)
+          : scopedResetMs !== undefined ? Math.max(statedRetryMs ?? 0, scopedResetMs) : statedRetryMs;
+        const limitMs = claudeLimitMs ?? scopedResetMs;
         // Charge the answer to the credential that produced it. A rate limit parks this one until its
         // stated reset so the next request takes another; an answer clears whatever it was carrying.
         // A 400 is our own request and is charged to nobody (see `classify`).
         if (penalised) {
           if (status >= 400) {
-            this.pool.penalise(penalised.provider, penalised.id, status, restMs, errBody);
+            this.pool.penalise(penalised.provider, penalised.id, status, restMs, errBody, scope);
             if (status === 401 && cfg.providers[penalised.provider]?.type === "anthropic") this.claudeAccounts.reject(penalised.id);
-          } else this.pool.succeed(penalised.provider, penalised.id);
+          } else this.pool.succeed(penalised.provider, penalised.id, poolScope);
           if (cfg.providers[penalised.provider]?.type === "anthropic") {
             // An answer on the app's own login is what keeps it in the pool; a 401 drops it
             // (issue #123, 2026-11-05). A message answer also states its window usage in the
@@ -2061,7 +2126,7 @@ export class Proxy {
         const retry = status >= 400 ? nextCredential(status, errBody) : null;
         if (retry) {
           const credentials = credentialCandidates;
-          log.info(`RETRY ${route!.provider}: ${this.credentialLabel(route!.provider, chosen!, credentials)} answered ${status}, trying ${this.credentialLabel(route!.provider, retry, credentials)}`);
+          log.info(`RETRY ${route!.provider}: ${this.credentialLabel(route!.provider, chosen!, credentials)} answered ${status}${scope ? ` (${scope})` : ""}, trying ${this.credentialLabel(route!.provider, retry, credentials)}`);
           recordCredential(route!.provider, retry, credentials, true);
           tried.add(retry.id);
           usedCredentialHeaders = { ...usedCredentialHeaders, ...(chosen?.headers ?? {}), ...retry.headers };
@@ -2151,14 +2216,14 @@ export class Proxy {
         // must not spend its own retry ladder until a reset hours away (2026-11-07).
         if (headFilled) {
           const exhaustion = providerExhaustion(status, errBody, statedRetryMs);
-          if (exhaustion || claudeLimitMs !== undefined) {
+          if (exhaustion || limitMs !== undefined) {
             for (let i = outHeaders.length - 2; i >= 0; i -= 2) {
               const name = outHeaders[i]!.toLowerCase();
               if (name === "retry-after" || name === "x-should-retry") outHeaders.splice(i, 2);
             }
             if (exhaustion) {
               for (const [name, value] of Object.entries(exhaustionHeaders(exhaustion))) outHeaders.push(name, value);
-            } else if (claudeLimitMs !== undefined && restMs !== undefined) {
+            } else if (limitMs !== undefined && restMs !== undefined) {
               // The stated reset itself. The pool clamps its own rest to 6 h and asks again then;
               // the caller, told not to retry, is told the real reset (a weekly window can be days).
               outHeaders.push("x-should-retry", "false", "retry-after", String(Math.max(1, Math.ceil(restMs / 1000))));
@@ -2260,7 +2325,7 @@ export class Proxy {
     res: http.ServerResponse,
     json: Record<string, unknown>,
     query: WebSearchQuery,
-    settings: NonNullable<Config["webSearch"]>,
+    settings: WebSearchBackend,
     record: { source?: string; target?: string; provider?: string; account?: string; borrowedLabel?: string; purpose?: RequestRecord["purpose"] },
     finish: (status: string, bytes: number, note?: string, failed?: boolean, extra?: { usage?: RequestUsage }) => void,
     markAttempted: () => void,
@@ -2347,10 +2412,20 @@ export class Proxy {
     if (!snapshot && Array.isArray(json.messages)) {
       // register.tsx prepends this line to the spawn prompt, not to later history or blocks.
       // Only leading engine reminders may precede it; removing reminders elsewhere can expose prose.
+      // Claude Code 2.1.321 sends each reminder as its own leading text block (#164), so blocks whose
+      // whole text is reminders are skipped and the first other block is the one that is read.
       const content: unknown = json.messages.find(message => message?.role === "user")?.content;
-      const first: unknown = Array.isArray(content) ? content[0] : undefined;
-      const text = typeof content === "string" ? content : first && typeof first === "object" &&
-        "type" in first && first.type === "text" && "text" in first && typeof first.text === "string" ? first.text : "";
+      const blockText = (block: unknown): string | undefined => block && typeof block === "object" &&
+        "type" in block && block.type === "text" && "text" in block && typeof block.text === "string" ? block.text : undefined;
+      let text = "";
+      if (typeof content === "string") text = content;
+      else if (Array.isArray(content)) {
+        const first = content.find(block => {
+          const t = blockText(block);
+          return t === undefined || !onlyReminders(t);
+        });
+        text = blockText(first) ?? "";
+      }
       snapshot = readWorkerLadder(text.replace(/^(?:\s*<system-reminder>[\s\S]*?<\/system-reminder>)+\s*/, ""));
     }
     // Never override an explicit marker/rule that resolved somewhere other than the spawn's model.
@@ -2410,33 +2485,67 @@ export class Proxy {
    * When nothing anywhere is usable the primary is kept: the provider gets to refuse the request
    * rather than the router inventing a refusal, and the answer it gives is what updates the pool.
    */
-  private chooseTarget(resolved: Resolved, cfg: Config, log: Logger): Resolved {
-    if (!resolved.fallbacks?.length) return resolved;
+  private chooseTarget(resolved: Resolved, cfg: Config, log: Logger, ladderKey?: string, why?: { reason?: string }): Resolved {
+    if (!resolved.fallbacks?.length) {
+      // The turn runs on the primary, so a remembered fallback is over: re-ticking it later must not
+      // pull this worker off a primary that is usable. Only the worker's own ladder turn says so: a
+      // side request on the same key (WebFetch's reader) carries no ladder and must not end it.
+      if (resolved.ladderPick && ladderKey) this.ladderSticky.delete(ladderKey);
+      return resolved;
+    }
+    // A ladder worker with a key keeps the fallback it already moved to (#164). The fallback must
+    // still be on the CURRENT ladder (`fallbacks` was filtered against it) and usable; otherwise the
+    // normal selection below runs again and its outcome replaces the remembered one.
+    const sticky = resolved.ladderPick && ladderKey ? this.ladderSticky.get(ladderKey) : undefined;
+    if (sticky) {
+      const f = resolved.fallbacks.find(x => x.provider === sticky.provider && x.model === sticky.model &&
+        (x.effort ?? resolved.effort) === sticky.effort && !(x.provider === resolved.provider && x.model === resolved.model));
+      if (f && this.targetUsable({ ...f, effort: f.effort ?? resolved.effort }, cfg)) {
+        log.info(`LADDER pick=${resolved.ladderPick} ${resolved.provider}/${resolved.model} → ${f.provider}/${f.model} reason=sticky`);
+        if (why) why.reason = "sticky";
+        return this.fallbackRoute(resolved, f);
+      }
+    }
+    const route = this.selectTarget(resolved, cfg, log, why);
+    if (resolved.ladderPick && ladderKey) {
+      this.ladderSticky.delete(ladderKey);
+      if (route !== resolved) {
+        this.ladderSticky.set(ladderKey, { provider: route.provider, model: route.model, effort: route.effort });
+        if (this.ladderSticky.size > 10_000) this.ladderSticky.delete(this.ladderSticky.keys().next().value!);
+      }
+    }
+    return route;
+  }
+
+  private selectTarget(resolved: Resolved, cfg: Config, log: Logger, why?: { reason?: string }): Resolved {
     const reason = this.unavailableReason(resolved);
-    const provider = cfg.providers[resolved.provider];
-    // An ordinary API rate limit is not definite exhaustion. OAuth adapters additionally know
-    // when every account (or the model's quota group) is unavailable without a billing error.
-    const accounts = provider?.type === "chatgpt" || provider?.type === "anthropic" || provider?.type === "google" && provider.auth === "antigravity";
-    if (resolved.ladderPick && !reason && !accounts) return resolved;
+    // A ladder worker is not held on a primary just because nothing has been declared exhausted: an
+    // API key that every credential of is cooling after a 429 would stall it. `targetUsable` below
+    // keeps a primary with any usable credential, and moves one with none to the first usable fallback.
     if (this.targetUsable(resolved, cfg)) return resolved;
-    for (const f of resolved.fallbacks) {
+    for (const f of resolved.fallbacks ?? []) {
       if (f.provider === resolved.provider && f.model === resolved.model) continue;
       if (!this.targetUsable({ ...f, effort: f.effort ?? resolved.effort }, cfg)) continue;
       log.info(`${resolved.ladderPick ? `LADDER pick=${resolved.ladderPick}` : "FAILOVER"} ${resolved.provider}/${resolved.model} → ${f.provider}/${f.model} reason=${reason ?? "provider_unusable"}`);
-      // The tag names the model that answers, not the one that could not: a log line saying `->m1`
-      // for a turn that ran on m2 is the kind of thing that costs an hour to disbelieve.
-      return {
-        provider: f.provider,
-        model: f.model,
-        effort: f.effort ?? resolved.effort,
-        // A fallback to a pinned worker goes out on that worker's account, as a direct pick would.
-        ...(f.accountPin ? { accountPin: f.accountPin } : {}),
-        tag: `${resolved.asked}->${f.model} (failover from ${resolved.provider})`,
-        kind: resolved.kind,
-        asked: resolved.asked,
-      };
+      if (why) why.reason = reason ?? "provider_unusable";
+      return this.fallbackRoute(resolved, f);
     }
     return resolved;
+  }
+
+  private fallbackRoute(resolved: Resolved, f: NonNullable<Resolved["fallbacks"]>[number]): Resolved {
+    // The tag names the model that answers, not the one that could not: a log line saying `->m1`
+    // for a turn that ran on m2 is the kind of thing that costs an hour to disbelieve.
+    return {
+      provider: f.provider,
+      model: f.model,
+      effort: f.effort ?? resolved.effort,
+      // A fallback to a pinned worker goes out on that worker's account, as a direct pick would.
+      ...(f.accountPin ? { accountPin: f.accountPin } : {}),
+      tag: `${resolved.asked}->${f.model} (failover from ${resolved.provider})`,
+      kind: resolved.kind,
+      asked: resolved.asked,
+    };
   }
 
   /** Only configured route fallbacks, not another account or an invented provider. */
@@ -2471,8 +2580,16 @@ export class Proxy {
     const provider = providerFor(configured, target.model);
     if (provider.type === "anthropic") {
       if (!isTargetProvider(provider)) return false;
+      if (provider.auth === "api-key") {
+        try { nativeAnthropicHeaders(provider); return true; }
+        catch { return false; }
+      }
       const accounts = this.claudeAccounts.peekCredentials();
-      return accounts.length > 0 && this.pool.hasUsable(target.provider, accounts);
+      // A pool whose accounts have all spent this model's own weekly window cannot answer it, though
+      // each can answer other models: the ladder must see that, or a Fable slot never falls over.
+      const family = claudeModelFamily(target.model);
+      this.restSpentScopes(target.provider, accounts, family);
+      return accounts.length > 0 && this.pool.hasUsable(target.provider, accounts, family);
     }
     if (provider.type === "chatgpt") return this.chatgpt(target.provider, provider).hasUsable();
     if (provider.type === "google" && provider.auth === "antigravity") return this.google(target.provider, provider).hasUsable(target.model, target.effort);
@@ -2548,6 +2665,20 @@ export class Proxy {
     }
   }
 
+  /**
+   * Rest a model family on every account whose latest usage reading already shows that family's weekly
+   * window spent with its reset ahead, so the account is skipped for that family before a request is
+   * spent on it. Reads the cached readings only; nothing is fetched. A family the pool has no scope for
+   * (undefined) rests nothing.
+   */
+  private restSpentScopes(provider: string, credentials: readonly Credential[], family: string | undefined): void {
+    if (!family) return;
+    for (const credential of credentials) {
+      const wait = this.claudeUsage.spentScopeResetMs(credential, family);
+      if (wait !== undefined) this.pool.restScope(provider, credential, family, wait);
+    }
+  }
+
   /** Health of every credential the config declares, for the dashboard. */
   credentialHealth(): Record<string, ReturnType<CredentialPool["report"]>> {
     const cfg = this.deps.config();
@@ -2557,8 +2688,13 @@ export class Proxy {
         ? this.claudeAccounts.peekCredentials()
         : this.credentialsOf(name, provider, true);
       if (!(provider.type === "anthropic" && provider.accountPool) && !("credentials" in provider && provider.credentials?.length)) continue;
-      out[name] = this.pool.report(name, creds).map((report) => {
-        const credential = creds.find((candidate) => candidate.id === report.id);
+      const claudePool = provider.type === "anthropic" && provider.accountPool === true;
+      out[name] = this.pool.report(name, creds).map((base) => {
+        const credential = creds.find((candidate) => candidate.id === base.id);
+        // A Claude account whose one model family is resting is still ready for the rest; the resting
+        // family is shown beside it rather than by cooling the whole account.
+        const scopes = claudePool ? this.pool.scopeCooldowns(name, base.id) : {};
+        const report = Object.keys(scopes).length > 0 ? { ...base, scopes } : base;
         return credential?.ownerId ? { ...report, id: credential.ownerId } : report;
       });
     }
@@ -2573,6 +2709,21 @@ export class Proxy {
       this.providerAgents.set(key, a);
     }
     return a;
+  }
+}
+
+/** True when the text is one or more `<system-reminder>…</system-reminder>` elements and whitespace, nothing else. */
+function onlyReminders(text: string): boolean {
+  let at = 0;
+  let found = false;
+  for (;;) {
+    while (at < text.length && /\s/.test(text[at]!)) at++;
+    if (at >= text.length) return found;
+    if (!text.startsWith("<system-reminder>", at)) return false;
+    const end = text.indexOf("</system-reminder>", at);
+    if (end < 0) return false;
+    at = end + "</system-reminder>".length;
+    found = true;
   }
 }
 

@@ -364,10 +364,17 @@ request went, and a `Pane` holds the request log.
   `model: "sonnet"` plus the marker on the second line reached the router as
   `deepseek-v4.1-flash@low`, effort low. Without the mod, the first-line rule
   and the no-`model` rule stand as before.
-- **Native Claude worker versions** come from `CLAUDE_WORKERS` in
-  `hooks/settings.ts`. The mod resolves family aliases (`haiku`, `sonnet`, `opus`,
-  `fable`) to that table's concrete IDs before dispatch, so the advertised worker
-  and the requested model agree even when the CLI's alias defaults differ.
+- **Native Claude worker versions** are the newest id per family on the router's
+  live Anthropic model list (`/api/mod-options` `claudeLatest`, from
+  `latestClaudeIds`: highest version, never list order), else the static
+  `CLAUDE_WORKERS` table in `hooks/settings.ts` (a family the live list lacks
+  keeps the table's id). The mod resolves family aliases (`haiku`, `sonnet`,
+  `opus`, `fable`) to those concrete IDs before dispatch, so the advertised worker
+  and the requested model agree even when the CLI's alias defaults differ. Stored
+  settings keep the alias (`general-purpose:fable`), never a pinned id, so a new
+  release needs no migration (issue #168: Fable 5.2 was passed over for 5.1).
+  The table, `CLAUDE_MODEL_FALLBACK` (admin.ts) and the dashboard's
+  `MOD_CLAUDE_IDS` are only the offline fallback: add a release to them too.
   Explicit versioned IDs and inherited models stay unchanged. This does not
   change Claude Code's separate Auto mode security classifier.
 - **Where it can draw.** The desktop app's header icons (terminal, diff,
@@ -1107,6 +1114,21 @@ must preserve **Data: Artificial Analysis (artificialanalysis.ai)** attribution.
          same way instead of back to the slot's route.
       Every such fallback logs a line and leaves the record note `fallback to Claude (<provider>
       unusable|failed)`. Tests: `packages/router/test/proxy-claude-last-resort.test.ts`.
+    - **`webSearch: "native"` hands such a search to Anthropic as sent (issue #158, 2026-11-11).**
+      `webSearch` is a backend object or the string `"native"` (read through `webSearchBackend` /
+      `webSearchNative`, config.ts; `autoModeClassifier.stage1` is the other `"native"` option).
+      `"native"` names no backend, so nothing is intercepted and `WebFetch` is not overridden. It
+      only changes the guard above: after a route's own search has had its try, a search whose
+      route target runs no server tools and whose requested model id starts with `claude-` is not
+      refused and not rewritten to `CLAUDE_SMALL_MODEL` — the route is dropped (`route = null`)
+      and the request takes the ordinary `PASS` path with its original model id on the app's own
+      login. It is asked for before the Claude last resort, because the user opted in to
+      Anthropic answering with the model Claude Code chose. Only that request loses its route; the
+      slot's other requests keep theirs. A non-`claude-*` id would 404 at Anthropic, so it falls
+      through to the last resort / refusal as before. Unset, nothing changes. Log line `web search
+      passed to Anthropic (webSearch: native): …`, record note `web search passed to Anthropic
+      (webSearch: native)`. The Clients screen drops "no web search here" from a `claude-*` option
+      when it is set. Tests: `packages/router/test/proxy-websearch-native.test.ts`.
     - **The backend is chosen by how the provider is spoken to, not by vendor.**
       `anthropic-compatible` → server tool, `openai-compatible` → web plugin. Anything else refuses
       and leaves the request alone.
@@ -1248,15 +1270,35 @@ its prompt tokens (`input + cached + cacheWrite`) and output: a Claude model (pr
 `anthropic`, or a `claude-*` id with an optional date, account or `@effort` suffix) takes the
 official table in `prices.ts`, where Haiku 5.5 switches to its long-prompt rate above 100K
 prompt tokens. Every other model takes input and output from the Artificial Analysis dataset
-(`priceIn`/`priceOut`, matched by `normalizeAaBase` as the score table is). Its cache-read price
-is the provider's own pricing page where the page gives one (`cacheReadOfficial`), and otherwise
-the AA input price. Its cache-write price is the AA input price and is official (`cacheWriteOfficial`)
-only where the provider's page says writes are billed as normal input. None does so far: OpenAI's
-page prices cache writes at a model-dependent rate, Google's implicit-caching page does not say how
-writes are billed, the xAI page could not be read, and MiniMax and Z.AI show no cache-write price.
-So a non-Claude request is `estimated` only when it had cache reads without an official read price,
-or cache writes at all. A request with no cache tokens priced from AA input and output alone is not
-estimated.
+(`priceIn`/`priceOut`, matched by `normalizeAaBase` as the score table is). Both tables find a
+base through `aaBaseIndex`: a base answers to its own name, and a base ending in a release stamp
+(`-1017`, `-20261017`) also answers to the undated name when no base has that name and no second
+stamped base shares it. Measured 2026-11-14: AA files `deepseek-v4-1-flash-1017` (it filed
+`deepseek-v4-1-flash` a month before) while OpenCode Go serves `deepseek-v4.1-flash`, so 734
+requests of 30 days had no price.
+
+A model AA has no record of takes input and output from `PAGE_PRICES`, a provider page's own
+figures; AA wins where it has a record. The entries are OpenCode Go's table
+(https://opencode.ai/docs/go/, "Usage limits", read 2026-11-14). Its `muse-spark-1.3-contributor`
+is $0.10 in, $0.20 out, a discounted offer AA does not list: AA's `muse-spark-1-3` ($1.25, $4.25)
+is the plain model and is not its price. The table also prices the other models AA lacked that
+day (GLM-5.2, Kimi K2.7 Code, LongCat-2.0, Step 5 Preview, MiMo-V2.5 and -Pro, Qwen3.8 Flash,
+Qwen3.7 Plus with its 256K tier, Hy4, Hy4 preview, Hy3), and its three free models at zero: a
+free request costs nothing, which is not `unpricedRequests`.
+
+A model's cache-read price is a provider page's figure where `OFFICIAL_CACHE_READ` has one
+(`cacheReadOfficial`), and otherwise its input price. An entry is found by model id alone, so
+OpenCode Go's rows, which agree with the provider pages wherever both give a figure, price that
+id on any provider. DeepSeek's entries are the page's Peak row, the rate AA's input and output
+already are; off-peak hours cost half and no record's hour is priced. Gemini 4 Argon has no
+entry: the table halves it through 2026-11-30. The cache-write price is the input price and is
+official (`cacheWriteOfficial`) only where a page prices a write at the input price: Kimi K3 and
+K3.1 Pro on OpenCode Go's table. No other page does: OpenAI's page prices cache writes at a
+model-dependent rate, Google's implicit-caching page does not say how writes are billed, the xAI
+page could not be read, MiniMax and Z.AI show no cache-write price, and OpenCode Go's Qwen rows
+price a write above input. So a non-Claude request is `estimated` only when it had cache reads
+without an official read price, or cache writes without an official write price. A request with
+no cache tokens priced from input and output alone is not estimated.
 
 An image (`kind: "image"`, target `image`) is billed per image, not per token: it costs nothing and
 is neither unpriced nor estimated. A `count_tokens` call and a record without tokens cost nothing
@@ -1346,8 +1388,11 @@ tight, and nothing at 100 or more.
   fallback ids also go into the existing pick log. Explicit model/pin choices that
   did not use the ladder get no snapshot. No tier is inferred from the model id.
   Only a request with the subagent header consumes it, from the first user message's
-  first text block (or string content), at its start after any leading engine reminders;
-  later messages, quoted metadata and later blocks are never scanned. It must match the original
+  string content or its first text block that is not made only of `<system-reminder>`
+  elements (Claude Code 2.1.321 sends each reminder as its own leading block, #164, 2026-11-13),
+  at its start after any leading reminders in that block; a non-text block there means no
+  snapshot. Later messages, quoted metadata, later blocks and reminders in the middle of
+  prose are never scanned or stripped. It must match the original
   requested model and resolved provider/model/effort. The router binds the snapshot
   to session + agent (bounded to 10,000 entries), so later compacted requests retain
   it without sharing another worker's tier. Restart loses this binding; a request
@@ -1359,9 +1404,20 @@ tight, and nothing at 100 or more.
   no ladder reroute. The snapshot preserves spawn order but never authorizes a removed rung.
   Before sending upstream, definite provider exhaustion, model retirement, or an
   OAuth adapter with no usable account/quota group permits the existing `chooseTarget`
-  path to select the first usable remaining entry. Ordinary API-key rate limits do
-  not trigger this worker preflight. The first request that *discovers* exhaustion
+  path to select the first usable remaining entry. Since #164 (2026-11-13) an API-key
+  primary whose credentials are ALL cooling or quarantined (a 429 such as `model_busy`
+  cools the key, §4 Credential pools) counts as unusable too, while one with any usable
+  credential stays. The first request that *discovers* the problem
   still returns the existing non-retryable error; the next request skips it.
+  A worker that moved to a fallback **stays there** while that fallback is still among its
+  CURRENT allowed fallbacks and usable, even after the primary recovers: going back each
+  cooldown (about a minute) would discard the prompt cache every time. The remembered
+  choice is a process-local map keyed by the same `session:agentId` as the snapshot
+  binding, bounded to 10,000 entries (oldest dropped); a request with no key is never
+  sticky and a new worker starts on its primary. A sticky target that became unusable or
+  is no longer on the ladder is dropped and normal selection runs again; its result
+  (a fallback, or the primary) replaces the remembered one. The LADDER log line and
+  request note then read `reason=sticky`. A restart forgets it.
   Fallback ids must still resolve through current config: ambiguous, removed, and
   ingress-only native Claude targets are not invented as outbound providers (§5).
   With no usable fallback the original provider keeps its existing refusal contract.
@@ -2194,17 +2250,29 @@ They were not live-tested during the original implementation. Files are under `s
   request-specific refusal in that measurement, not Google's internal policy or every account's
   quota. Related independent reports: [OpenCodex #2899](https://github.com/lidge-jun/opencodex/issues/2899),
   [Magpie #666](https://github.com/yetone/magpie/issues/666).
-  The SDK paragraph alone does not distinguish refusal from exhaustion: SDK clients send it on
+  Gemini 4 Argon was also observed refusing it (issue #170, reporter's 4-probe table: of four
+  probes, only adding the SDK `systemInstruction` turned a 200 into a 429).
+  The SDK sentence alone does not distinguish refusal from exhaustion: SDK clients send it on
   every request, and Google can use the same generic 429 for real limits. `prompt-refusal.ts`
-  checks the outbound paragraph, exact generic `RESOURCE_EXHAUSTED` JSON, and absence of a
-  retry header or nonempty error details. The adapter additionally requires a **fresh successful
+  checks the outbound system text, exact generic `RESOURCE_EXHAUSTED` JSON, and absence of a
+  retry header or nonempty error details. The system text matches when any line of any system
+  part, trimmed, starts with the SDK sentence: a paragraph of its own, a block whose next line
+  carries more text, and the sentence run straight into the following text all count; the
+  sentence in the middle of a line does not. The adapter additionally requires a **fresh successful
   usage snapshot for the attempted account and project**, with quota remaining in every required
   window of the requested model's known quota group: both 5h and weekly for Gemini or Claude/GPT,
   or the single explicitly reported weekly bucket for Argon.
   Evidence expires after five minutes or a bucket's reset time, and a failed refresh invalidates
   it even when the dashboard retains old values. Missing, malformed, ambiguous, stale or exhausted
-  evidence follows ordinary 429 cooldown/account rotation. This is a cache-only check; it does
-  not probe quota per request. Group-level quota is supporting evidence, not proof about every
+  evidence follows ordinary 429 cooldown/account rotation. Evidence is otherwise filled only by
+  `usageSnapshot()`, which runs when something polls `GET /api/limits` (the dashboard); a
+  headless install never does (issue #170, measured 2026-11-15 on Gemini 4 Argon: every
+  refusal rested the account and rotated). So when the refusal shape matches and the cached
+  evidence is missing or stale, the adapter refreshes the shared usage snapshot once (a failed
+  lookup is ignored; a turn aborted meanwhile ends as aborted) and checks again. The snapshot
+  is TTL-cached (five minutes) with one shared in-flight lookup, so this costs at most one
+  lookup per TTL however many refusals arrive. A response that does not have the refusal shape
+  never triggers the lookup. Group-level quota is supporting evidence, not proof about every
   model or concurrent request; unknown groups/models are not classified.
   With that evidence the adapter leaves the prompt intact and returns a distinct **unwritten**
   `prompt-incompatible` outcome, without cooling the account or trying the prompt on its peers.
@@ -2391,11 +2459,14 @@ plan unless marked otherwise.
 | The current Claude login vanished from Providers → Claude → Accounts and got no traffic while it was being used through the pool (2026-11-01/02, issue #123): `ObservedClaudeCodeAuth` held it 12 h from the last **un-routed** `/v1/messages` only, so 12 h after that request it dropped out of the accounts list and the pool, and the router logged 27,252 routed and 0 un-routed `/v1/messages` in between; a later router restart plus one un-routed request was the only way back. Its usage card also stayed at the last successful `/api/oauth/usage` reading (5h 58%) for hours while the account was at 100% and the endpoint answered 429 | The app's own login is observed on every `/v1/messages` it carries, routed or not, and an answer on it through the pool (proxy or OpenAI ingress) refreshes the same 12 h idle guard, so the guard counts from the last evidence of that token rather than from the last un-routed request; a different token (sign-in, account switch) replaces it on the next request. The login is not kept past its validity: a 401 for that exact token drops the observed copy, the rejected token is not re-adopted, and only a different token becomes current again. A refused usage lookup keeps the last numbers but marks the snapshot `stale` with `failed_at`/`failed_status`, backs off for the 429's `retry-after` (or a doubling wait) and logs it, and the unified limit headers on any Messages answer — fractions 0..1 and epoch-second resets, measured in the installed CLI 2.1.317 — refill the windows while the body source is stale. Tests: `anthropic-account-pool.test.ts`, `anthropic-account-proxy.test.ts`, `anthropic-usage.test.ts`. |
 | Named Claude workers fell back to DeepSeek although Claude answered (2026-11-05 14:07–14:12 KST): a script in another project's session, inheriting the session's `HTTPS_PROXY`, called `api.anthropic.com/v1/messages` on its own API key (`x-api-key`, no `?beta=true`, `Python-urllib`). The pool dropped the key and sent it on the subscription accounts (`account=current`), which answered `429 rate_limit_error`; both accounts cooled for 60 s, `/api/mod-options` reported `anthropic` unusable, and the mod replaced `claude-opus-5-5`/`claude-sonnet-5-5` with the ladder. The script's calls were also billed to the subscription instead of its key | A Messages request that carries its own `x-api-key`, no `Authorization`, and neither `x-app: cli` nor a `claude-cli/` user agent is not routed (a login beside a key keeps the old path: a real Bearer with a placeholder key is common): it takes the un-routed path on its own headers, byte for byte, with no pool, no mapping, no search or compaction override (`callerOwnsKey`, log tag `PASS caller-key`). Its answers touch no account's cooldown. Claude Code on an API key keeps the pool path as before. Tests: `anthropic-account-proxy.test.ts`. |
 | A Claude subscription 429 without `retry-after` cooled the account for 60 s although `anthropic-ratelimit-unified-status: rejected` with `-5h-utilization: 1` said its window was spent until a reset hours away; a token refresh during that rest produced a fresh credential id with no cooldown, so the spent account was tried again (2026-11-06/07, account-pool audit) | A rejected unified window rests the account until the soonest stated reset (`claudeLimitResetMs` in `anthropic-usage.ts`; the documented 6 h clamp still bounds it). A rest belongs to the durable account, so a token refresh never clears it; a quarantine still belongs to the token generation, so a re-login does not inherit it (pool.ts). A shorter `retry-after` on the same answer cannot shorten that rest: the account cools for the later of the two, and when no account can take the turn the 429 carries `x-should-retry: false` and `retry-after` with that same value, so pool and caller agree on the reset. Tests: `pool.test.ts`, `anthropic-usage.test.ts`, `anthropic-account-pool.test.ts`, `anthropic-account-proxy.test.ts`. |
+| A Claude account's per-model weekly window (Fable's `weekly_scoped` entry) was spent while its 5h and 7d windows were not. The Fable 429 rested the whole account, so Opus/Sonnet conversations sticky to it left for the rest period and lost their prompt cache; and because the 429 carried no 5h/7d reset the rest was `retry-after` or 60 s although Fable stayed spent for days, so every minute the next Fable turn or pinned Fable worker was sent to the spent account first (found by reading the code, 2026-11-14) | A native pool 429 whose unified headers do not show 5h/7d spent (`claudeLimitResetMs` undefined) rests the account only under the request's model family (`claudeModelFamily` of the routed upstream id: fable, opus, sonnet, haiku; unknown → whole account as before), through the pool's existing `provider/account#scope` health. Every pick honours it: `pick` (new and sticky), the in-turn retry, `pinnedCredential`, and the ladder's `targetUsable`. The rest lasts until the family window's reset when the account's cached body usage reading (`ClaudeUsage.spentScopeResetMs`, kept apart from the display snapshot because a header reading replaces that one) shows it at 100% with a reset ahead, else the stated `retry-after`, else the pool default; the 6 h clamp stays. The same cached reading rests a spent family before the account is tried (`restSpentScopes`, no fetch). A 5h/7d spent window still rests the whole account. A scope never shows the account as cooling: `credentialHealth` keeps `state: "ready"` and lists the resting scopes in `scopes`. Tests: `anthropic-account-proxy.test.ts`, `pool.test.ts`, `anthropic-usage.test.ts`. |
 | OpenCode Go answered 429 `{"error":{"type":"server_error","message":"Upstream request failed: [prefill_cap_refused] the cell is at capacity; retry shortly (after 5 s)"}}` (2026-11-06 15:34:34; `[overloaded] … retry shortly` the same day) for its own failing upstream. The key was charged a rate-limit cooldown and the turn reached the user as a 429, though the same key answered 200 five seconds later | A 429 whose body matches `RELAY_UPSTREAM_FAILED` is transient: zero cooldown, and `fetchWithRetry` retries it in-turn on the same ladder as a relay 403/402. Tests: `pool.test.ts`, `retry.test.ts`. |
 | Google answered 403 `PERMISSION_DENIED` with ErrorInfo `reason: "TOS_VIOLATION"` ("This service has been disabled in this account for violation of Terms of Service…", 2026-11-06, router.log.1; 73 such 403s and 39 refresh+replays on one account in one night) and the auth heuristic refreshed and replayed the token, rested the account 60 s and kept it in rotation | A 403 with `TOS_VIOLATION` parks the account as a dead credential (pool quarantine, one warn naming the account and the reason, no refresh or replay); the account reads as not ready until an operator clears it. Tests: `google-quota-scope.test.ts`. |
 | After an in-turn retry the completion line still named the account the turn started on, and a credential refreshed between the first pick and the retry was printed as `#0` in the RETRY line and `requests.jsonl` (2026-11-07) | The `CLAUDE` completion tag is updated to the credential that answered, and `credentialLabel` falls back to the durable owner when the runtime id is not in the first pick's list. Tests: `anthropic-account-proxy.test.ts`. |
+| Claude account rotation did not take over when the app's own login hit its 5h limit at 100% (2026-11-14, user report; a black-box test showed the Claude client does not block sending, so the turn went out un-routed on the app's own login): a bare `claude-*` id reached the pool only when exactly one provider declared it in `models`, and that list is a snapshot of what Anthropic listed when the provider was saved. A model the person unticked, one released later, the Haiku side-request model, or an id two providers declare (two pools, a pool beside an ingress-only `anthropic`, a third party listing a Claude id) fell to `noRoute()`, `PASS`, no retry — the 429 went to the client while the other accounts sat idle | With a pool on (an `anthropic` provider, `auth: "claude-code"`, `accountPool: true`, a target), a live request's bare `claude-*` id that nothing else routes goes to the first such provider in config order (`claudePoolProvider`), model id unchanged and `@effort` handled as for a declared id. Only the proxy asks (`decide(…, claudePool = true)`, native Messages and compaction); `resolve()` and everything that lists or scores models (picker, `/api/mod-options`, scores, context windows, OpenAI ingress) still answer from `models`, so unticked models are not listed. Unchanged: qualified ids, slots, routes and direct rules, an id exactly one routable provider declares, metered keys (never take a bare id), rotation off or ingress-only with no pool (pass-through, row above), caller-key requests, `webSearch: "native"`, the `ownSignIn` fallback with zero credentials. Tests: `routing.test.ts`, `targets.test.ts`, `anthropic-account-proxy.test.ts`. |
 | Three failovers measured on 2026-11-06 each harmed the connection they meant to protect (owner's MacBook, router.log + `log show` of airportd/WiFiAgent/sharingd). On the iPhone hotspot "PBJ" from 18:32: (1) a directed scan said a known Wi-Fi was visible at 18:37/18:39; the router disassociated at 18:39:25, then every `sudo networksetup -setairportnetwork en0 PBJ` failed ("Failed to join network PBJ", then "Could not find network PBJ") because an idle iPhone stops advertising, and each call cancelled macOS's own Instant Hotspot auto-join (`Auto-join COMPLETED … error=(53 'Auto-join disabled'), wasCancelled=1`), leaving the Mac offline until the owner rejoined from Control Center at 18:43:28. airportd's own auto-join right after the scan found `candidateBSSCount=0`, and a CoreWLAN answer measured then is airportd's cache (~25ms, ~8-10s old) whose membership differed from the next real scan's (13 vs 11). (2) At 19:43:45, 37s after the owner joined home Wi-Fi, the 5-probe window still held the hotspot period's and the switch's failures (probes bound to the old address: `EADDRNOTAVAIL`), so the router joined PBJ over a working home Wi-Fi and disassociated it at 19:44:01. | macOS with no address at all leaves the first `HOTSPOT_JOIN_GRACE_MS` (60s) to macOS and then tries at most once a minute — no 10s ladder — because macOS's auto-join can wake the iPhone and ours cannot and cancels it. A return requires a saved non-hotspot SSID at `RETURN_MIN_RSSI_DBM` (-70 dBm; measured in range -36..-40, merely heard -69..-92) seen by a scan that took at least `SCAN_FRESH_MIN_MS` (1s); a cached answer is re-asked after `SCAN_CACHE_TTL_MS` (10s), else the return is refused. Nothing associated within `JOIN_KNOWN_AFTER_MS` (8s) of leaving → rejoin the hotspot at once while the iPhone still advertises. A change of the Wi-Fi address, subnet or class empties the probe window, and one that brought an address also gives the new network `NETWORK_SETTLE_MS` (30s) in which failures do not count — so a network the OS or the person joined is never failed over in that period, while losing the address keeps the old failover timing (the third failed round). The address is read again after the probe and before the join, so a Wi-Fi joined mid-tick is not evicted. Tests: `tether.test.ts`, `tether-win.test.ts`. |
 | Windows auto-update left the router down until logon (#131, 2026-10-29 to 11-07, 8 of 8 updates): the launcher ran `Start-Process -Wait`, which on PowerShell 5.1 also waits for the router's detached update installer, and the installer's `restartWindowsRouter` waits for the task to end, so each side waited on the other | The launcher waits on its own process handle only (`$null = $p.Handle; $p.WaitForExit()`), never `-Wait`; `schtasks-definition.test.ts` asserts the form and the exit-code handling. |
+| Windows: a router that was alive but frozen was never restarted (#159, 2026-11-11, two stalls, 19 min and 3 min until a user killed the process): `/api/status` ran a PowerShell certificate check with `execFileSync` and no timeout on the event loop the proxy shares, and the launcher only waits for the router to exit. The host had the same shape (#162): its process-list PowerShell was `execFileSync` with `timeout: 5000`, and the host did not answer for 7-8 minutes after start. Node's `timeout` kills only the direct child and the call then waits for stdio to close, so a WMI/PowerShell grandchild holding the pipes defeats it, sync or async | No child process on a request path or a timer path of a long-running process. `execBounded` (`cli/src/bounded-exec.ts`) is the one way those run: its own deadline timer, on expiry `taskkill /T /F` (POSIX: the process group), the pipes destroyed and the promise rejected without waiting for `close`; measured in the Windows 11 VM (`Start-Sleep 60`, and a `ping` grandchild holding the pipe, both cut at 3.0 s, nothing left running). The router answers the certificate question from the last background result (`picker-trust.ts`; unknown, not "not trusted", until the first check lands). The host primes its process snapshot asynchronously and waits at most 10 s before it serves; Windows never reads it synchronously. The router's launcher probes the admin port's `/api/ping` every 15 s and ends its own child with `Kill()` after 4 misses in a row (any HTTP answer counts as alive; a router that never answered gets 5 min; an unreadable config switches the probe off), so the existing relaunch loop restarts it; the host's launcher has no watchdog. Measured in the VM with a router whose event loop was blocked: ended 75 s after the freeze, relaunched 2 s later, the relaunched one left alone while it answered. Tests: `bounded-exec.test.ts`, `picker-trust.test.ts`, `picker-async.test.ts`, `bridge-windows.test.ts`, `schtasks-definition.test.ts`, `admin.test.ts`. |
 
 ### Router-owned automatic updates (2026-10-21)
 

@@ -285,6 +285,56 @@ test("marker only scans the first five user messages", () => {
   assert.equal(markerOverride(msgs, cfg.aliases), null);
 });
 
+test("decide scans each eligible user message only once, with or without a marker", () => {
+  for (const markerAt of [0, 4, 5, -1]) {
+    let reads = 0;
+    const request = {
+      messages: [
+        { role: "assistant", content: "[[ripple: sol]] is quoted prose" },
+        ...Array.from({ length: 7 }, (_, i) => ({
+          role: "user",
+          get content() {
+            reads++;
+            return i === markerAt ? "[[ripple: luna@high]] task" : "ordinary text";
+          },
+        })),
+      ],
+    };
+    const decision = decide("gpt-5.6-sol@medium", request, cfg, "turn");
+    const found = markerAt >= 0 && markerAt < 5;
+    assert.equal(decision.route?.model, found ? "gpt-5.6-luna" : "gpt-5.6-sol");
+    assert.equal(decision.route?.effort, found ? "high" : "medium");
+    assert.equal(reads, found ? markerAt + 1 : 5, `one scan, marker at ${markerAt}`);
+  }
+});
+
+test("marker alias effort is overridden by explicit marker effort, but not the requested effort", () => {
+  const configured: Config = { ...cfg, aliases: { luna: "gpt-5.6-luna@low" } };
+  for (const [text, effort] of [["[[ripple: luna]] task", "low"], ["[[ripple: luna@high]] task", "high"]]) {
+    const request = body(text!);
+    assert.deepEqual(markerOverride(request, configured.aliases), { model: "gpt-5.6-luna", effort });
+    assert.equal(decide("gpt-5.6-sol@medium", request, configured, "turn").route?.effort, effort);
+  }
+});
+
+test("a reused marker result preserves slot precedence and qualified account pins", () => {
+  const configured: Config = {
+    ...cfg,
+    providers: {
+      ...cfg.providers,
+      anthropic: { type: "anthropic", auth: "claude-code", accountPool: true, models: [{ id: "claude-opus-5-5" }] },
+    },
+    aliases: { pinned: "anthropic#3f2a9c1b:claude-opus-5-5@low" },
+  };
+  const request = body("[[ripple: pinned@high]] task");
+  const slot = decide("claude-opus-4-8", request, configured, "turn").route!;
+  assert.deepEqual([slot.provider, slot.model, slot.accountPin, slot.effort], ["chatgpt", "gpt-6-astra", undefined, undefined]);
+  for (const model of ["gpt-5.6-sol", "anthropic:claude-opus-5-5", "claude-sonnet-5-5"]) {
+    const route = decide(model, request, configured, "turn").route!;
+    assert.deepEqual([route.provider, route.model, route.accountPin, route.effort], ["anthropic", "claude-opus-5-5", "3f2a9c1b", "high"], model);
+  }
+});
+
 test("rewriteBody sets model, effort and clamps ultra", () => {
   const j = rewriteBody({ model: "claude-opus-4-8", output_config: { effort: "ultra" } }, resolve("claude-opus-4-8", body("hi"), cfg)!, cfg.effortClamp);
   assert.equal(j.model, "gpt-6-astra");
@@ -615,4 +665,57 @@ test("a continue of a turn this router minted is recognised; Anthropic's own ids
   assert.equal(continuesTranslatedTurn({ thread: { type: "continue", previous_message_id: "msg_011CgJN1qQSD73cvPhge2Cri" } }), false);
   assert.equal(continuesTranslatedTurn({ thread: { type: "create" } }), false);
   assert.equal(continuesTranslatedTurn({}), false);
+});
+
+// A pool's `models` list is a snapshot, so a Claude id it does not list (unticked, or released after
+// the provider was saved) used to go out on the app's own login with no rotation (§5, 2026-11-14).
+// Only the proxy asks for the pool (`decide`'s last argument); every other caller keeps "declared".
+test("a bare Claude id nothing routes belongs to the account pool, for a live request only", () => {
+  const pool: Config["providers"][string] = { type: "anthropic", auth: "claude-code", accountPool: true, models: [{ id: "claude-opus-5" }] };
+  const withPool: Config = { ...DEFAULTS, providers: { pool, deepseek: { type: "anthropic-compatible", url: "http://127.0.0.1:8789", models: [{ id: "deepseek-v4-pro" }] } } };
+  const live = (model: string, config: Config, request: unknown = body("hi")) => decide(model, request, config, "turn", true);
+
+  const unticked = live("claude-sonnet-5-5@high", withPool).route!;
+  assert.deepEqual([unticked.provider, unticked.model, unticked.effort, unticked.tag], ["pool", "claude-sonnet-5-5", "high", "claude-sonnet-5-5@high->claude-sonnet-5-5"]);
+  assert.equal(live("claude-opus-5", withPool).route!.provider, "pool", "a declared id still routes there");
+  assert.equal(resolve("claude-sonnet-5-5", body("hi"), withPool), null, "pickers, scores and the OpenAI ingress keep asking what is declared");
+  assert.equal(decide("claude-sonnet-5-5", body("hi"), withPool, "turn").route, null);
+
+  assert.equal(live("claude-sonnet-5-5", { ...withPool, providers: { ...withPool.providers, other: { type: "anthropic-compatible", url: "http://127.0.0.1:8790", models: [{ id: "claude-sonnet-5-5" }] } } }).route!.provider, "other", "a third party that alone declares it keeps it");
+  const twice: Config = { ...withPool, providers: { ...withPool.providers, pool: { ...pool, models: [{ id: "claude-opus-5" }, { id: "claude-sonnet-5-5" }] }, other: { type: "anthropic-compatible", url: "http://127.0.0.1:8790", models: [{ id: "claude-opus-5" }, { id: "claude-sonnet-5-5" }] } } };
+  assert.equal(live("claude-sonnet-5-5", twice).route!.provider, "pool", "an id a third party also declares is not left on the app's login");
+  assert.equal(live("claude-opus-5", twice).route!.provider, "pool");
+  assert.equal(live("claude-opus-5", { ...twice, providers: { pool: { ...pool, models: [] }, other: twice.providers.other! } }).route!.provider, "other", "one routable owner keeps it");
+
+  const ingress: Config = { ...DEFAULTS, providers: { pool: { ...pool, models: [] }, native: { type: "anthropic", auth: "claude-code", models: [{ id: "claude-sonnet-5-5" }] } } };
+  assert.equal(live("claude-sonnet-5-5", ingress).route!.provider, "pool", "an ingress-only owner does not keep it from the pool");
+
+  const first: Config = { ...DEFAULTS, providers: { second: { ...pool, models: [] }, third: { ...pool, models: [] } } };
+  assert.equal(live("claude-sonnet-5-5", first).route!.provider, "second", "several pools: the first in config order");
+});
+
+test("a bare Claude id stays un-routed without a pool, and never goes to a metered key", () => {
+  const rotationOff: Config = { ...DEFAULTS, providers: { native: { type: "anthropic", auth: "claude-code", models: [{ id: "claude-opus-5" }] } } };
+  assert.deepEqual(decide("claude-opus-5", body("hi"), rotationOff, "turn", true), { route: null, refusal: null });
+  assert.deepEqual(decide("claude-sonnet-5-5", body("hi"), rotationOff, "turn", true), { route: null, refusal: null });
+  const metered: Config = { ...DEFAULTS, providers: { key: { type: "anthropic", auth: "api-key", apiKey: "sk-test", models: [{ id: "claude-opus-5" }] } as Config["providers"][string] } };
+  assert.deepEqual(decide("claude-opus-5", body("hi"), metered, "turn", true), { route: null, refusal: null });
+  assert.deepEqual(decide("claude-sonnet-5-5", body("hi"), metered, "turn", true), { route: null, refusal: null });
+});
+
+test("the pool does not take what a rule, a slot or a provider prefix already decided", () => {
+  const pool: Config["providers"][string] = { type: "anthropic", auth: "claude-code", accountPool: true };
+  const withRules: Config = {
+    ...DEFAULTS,
+    providers: { pool, chatgpt: { type: "chatgpt", models: [{ id: "gpt-5.6-terra" }] } },
+    routes: { "claude-opus-4-8": { provider: "chatgpt", model: "gpt-5.6-terra" } },
+    direct: [{ prefix: "gpt-", provider: "chatgpt" }],
+  };
+  assert.equal(decide("claude-opus-4-8", body("hi"), withRules, "turn", true).route!.provider, "chatgpt");
+  assert.equal(decide("gpt-9", body("hi"), withRules, "turn", true).route!.provider, "chatgpt");
+  assert.deepEqual(decide("mystery-model", body("hi"), withRules, "turn", true), { route: null, refusal: 'no provider declares "mystery-model"' });
+  const marked = decide("claude-opus-5", body("[[ripple: claude-sonnet-5-5@low]] go"), withRules, "turn", true).route!;
+  assert.deepEqual([marked.provider, marked.model, marked.effort], ["pool", "claude-sonnet-5-5", "low"], "a Claude worker's marker target goes to the pool too");
+  const unresolved = decide("claude-opus-5", body("[[ripple: standard]] go"), withRules, "turn", true).route!;
+  assert.deepEqual([unresolved.provider, unresolved.model], ["pool", "claude-opus-5"], "a delegation marker no model answers leaves the Claude model as it was, now on the pool");
 });

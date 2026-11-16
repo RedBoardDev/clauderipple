@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
 import { EventLog } from "../src/eventlog.ts";
-import { attachmentContent, messageContent, sessionFiles, sessionFileTool } from "../src/images.ts";
+import { attachmentContent, claudeSessionTemp, messageContent, sessionFiles, sessionFileTool } from "../src/images.ts";
 import { transcriptEvents } from "../src/desktop.ts";
 import { summarize } from "../src/sessions.ts";
 import { ATTACHMENT_CAP, ATTACHMENT_COUNT, SESSION_FILE_NAME, SESSION_FILE_TOTAL } from "../src/protocol.ts";
@@ -128,6 +128,34 @@ test("Windows session temp rejects writable ACLs and junctions without opening o
   assert.equal(sessionFiles([file], { cwd, sessionId: id }, sink)[0]?.status, "blocked");
   fs.unlinkSync(session);
   fs.renameSync(session + "-saved", session);
+});
+
+test("Windows session temp also accepts the engine's spare-folder slug, and drops only the candidates that fail", { skip: process.platform !== "win32" }, t => {
+  const { cwd, sink } = fixture(t), outside = directory(t);
+  const id = "2b2b2b2b-1111-4222-8333-944455556666", other = "2b2b2b2b-1111-4222-8333-999999999999";
+  const claude = path.join(os.tmpdir(), "claude");
+  const spare = path.join(claude, `C--ripple-test-spare-${process.pid}`), foreign = path.join(claude, `C--ripple-test-foreign-${process.pid}`);
+  const linked = path.join(claude, `C--ripple-test-linked-${process.pid}`), writable = path.join(claude, `C--ripple-test-writable-${process.pid}`);
+  const exact = path.join(claude, cwd.replace(/[^A-Za-z0-9]/g, "-"));
+  t.after(() => { for (const dir of [spare, foreign, linked, writable, exact]) fs.rmSync(dir, { recursive: true, force: true }); });
+  const make = (project: string, session: string) => { fs.mkdirSync(path.join(project, session), { recursive: true }); fs.writeFileSync(path.join(project, session, "a.png"), png); return path.join(project, session, "a.png"); };
+  const spareFile = make(spare, id), foreignFile = make(foreign, other), writableFile = make(writable, id), exactFile = make(exact, id);
+  fs.mkdirSync(linked, { recursive: true }); fs.writeFileSync(path.join(outside, "a.png"), png); fs.symlinkSync(outside, path.join(linked, id), "junction");
+  const status = (file: string, session = id) => sessionFiles([file], { cwd, sessionId: session }, sink)[0]?.status;
+  const roots = () => claudeSessionTemp({ cwd, sessionId: id }).map(root => path.relative(claude, root));
+  assert.equal(status(spareFile), "ready");
+  assert.equal(status(exactFile), "ready");
+  // A slug that only holds another session, and a session folder that is a junction, stay closed.
+  assert.equal(status(foreignFile), "blocked");
+  assert.equal(status(path.join(linked, id, "a.png")), "blocked");
+  assert.ok(!roots().some(root => root.includes("foreign") || root.includes("linked")), roots().join(","));
+  // A writable ACL on one candidate drops that one; the others keep working.
+  const icacls = path.join(process.env.SystemRoot!, "System32", "icacls.exe");
+  execFileSync(icacls, [path.join(writable, id), "/grant", "*S-1-1-0:(OI)(CI)M"], { stdio: "ignore" });
+  assert.equal(status(writableFile), "blocked");
+  assert.equal(status(spareFile), "ready");
+  assert.equal(status(exactFile), "ready");
+  assert.deepEqual(roots().sort(), [path.join(path.basename(exact), id), path.join(path.basename(spare), id)].sort());
 });
 
 test("a project folder whose own name looks secret still sends its ordinary files", t => {
@@ -368,4 +396,44 @@ test("summarize names a SendUserFile's files and caption without a caption, and 
   assert.equal(summarize("SendUserFile", { files: ["a.png", path.join(cwd, "b.jpg")], caption: "before vs after" }, cwd), "a.png, b.jpg, before vs after");
   assert.equal(summarize("SendUserFile", { files: ["only.gif"], status: "proactive" }, cwd), "only.gif");
   assert.equal(summarize("SendUserFile", {}, cwd), "");
+});
+
+// The Claude app starts its engine from a spare folder, so the engine names the temp folder after
+// that folder and not after the cwd the transcript records (2026-11-13, a tabripple session whose
+// SendUserFile screenshots never reached the phone).
+test("a SendUserFile from the engine's own temp folder under another project slug reaches the phone, and nothing else does", { skip: process.platform === "win32" }, t => {
+  const { cwd, log, sink } = fixture(t);
+  const root = path.join(fs.existsSync("/private/tmp") ? "/private/tmp" : "/tmp", `claude-${process.getuid!()}`);
+  if (!fs.existsSync(root)) { fs.mkdirSync(root, { mode: 0o700 }); t.after(() => fs.rmSync(root, { recursive: true, force: true })); }
+  const id = "1a1b1c1d-1111-4222-8333-944455556666", other = "1a1b1c1d-1111-4222-8333-999999999999";
+  const spare = path.join(root, `-ripple-test-spare-${process.pid}`);
+  t.after(() => fs.rmSync(spare, { recursive: true, force: true }));
+  const files = [path.join(spare, id, "scratchpad", "out", "16-side.png"), path.join(spare, id, "scratchpad", "out", "1-side.png")];
+  const foreign = path.join(spare, other, "scratchpad", "x.png");
+  for (const file of [...files, foreign]) { fs.mkdirSync(path.dirname(file), { recursive: true }); fs.writeFileSync(file, png); }
+  const send = (input: object) => JSON.stringify({ type: "assistant", uuid: "a1", sessionId: id, message: { content: [{ type: "text", text: "비교입니다." }, { type: "tool_use", id: "send", name: "SendUserFile", input }] } });
+  const parsed = transcriptEvents(send({ files: [...files, foreign], caption: "왼쪽이 원본", display: "render" }), cwd, summarize, sink);
+  const event = log.append(parsed.bodies[0]!);
+  assert.ok(event.kind === "assistant");
+  assert.deepEqual(event.tools[0]?.files?.map(file => file.status), ["ready", "ready", "blocked"]);
+  // Both pictures sit inline under the text; the refused one says so as a file card instead of vanishing.
+  assert.equal(event.images?.length, 2);
+  assert.equal(log.blob(event.images![1]!.blob!), data);
+  assert.deepEqual(event.files?.map(file => [file.name, file.status]), [["x.png", "blocked"]]);
+  // The same files with another session's id are refused, and so is a file that only shares the slug.
+  const wrong = transcriptEvents(JSON.stringify({ type: "assistant", uuid: "a2", sessionId: other, message: { content: [{ type: "tool_use", id: "s2", name: "SendUserFile", input: { files: [files[0]] } }] } }), cwd, summarize, sink);
+  assert.equal(wrong.bodies[0]?.kind === "assistant" && wrong.bodies[0].images?.length, 0);
+  assert.deepEqual(wrong.bodies[0]?.kind === "assistant" && wrong.bodies[0].files?.map(file => file.status), ["blocked"]);
+});
+
+test("a Read of a picture reaches the timeline as the tool result's image, for the row thumbnail", t => {
+  const { cwd, log, sink } = fixture(t);
+  const call = transcriptEvents(JSON.stringify({ type: "assistant", uuid: "a1", message: { content: [{ type: "tool_use", id: "read", name: "Read", input: { file_path: "/x/shot.png" } }] } }), cwd, summarize, sink);
+  const result = transcriptEvents(JSON.stringify({ type: "user", uuid: "u1", message: { content: [{ type: "tool_result", tool_use_id: "read", content: [image] }] } }), cwd, summarize, sink);
+  const view = reduce([...call.bodies, ...result.bodies].map(body => log.append(body)));
+  const row = timelineItems(view).find(item => item.type === "toolGroup");
+  assert.ok(row?.type === "toolGroup" && row.rows[0]?.type === "tool");
+  const images = row.rows[0].tool.result?.images;
+  assert.equal(images?.length, 1);
+  assert.equal(log.blob(images![0]!.blob!), data);
 });

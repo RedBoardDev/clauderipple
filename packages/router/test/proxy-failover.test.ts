@@ -80,8 +80,34 @@ type Rig = {
   stop: () => Promise<void>;
 };
 
+/**
+ * One HTTP response read to its end: its declared length, the last chunk, or the connection's close,
+ * whichever the response says it uses. A fixed wait read whatever had come by then, and a Windows
+ * runner that took longer than 250 ms to relay a 403 left nothing to read: status 0 (2026-11-13).
+ */
+function wholeResponse(socket: tls.TLSSocket, limitMs = 5000): Promise<Buffer> {
+  return new Promise((resolve) => {
+    const chunks: Buffer[] = [];
+    const done = () => { clearTimeout(timer); socket.off("data", data); resolve(Buffer.concat(chunks)); };
+    const timer = setTimeout(done, limitMs);
+    const data = (d: Buffer) => {
+      chunks.push(d);
+      const all = Buffer.concat(chunks);
+      const split = all.indexOf("\r\n\r\n");
+      if (split < 0) return;
+      const head = all.subarray(0, split).toString("latin1");
+      const length = /\r\ncontent-length:\s*(\d+)/i.exec(head);
+      if (length) { if (all.length - split - 4 >= Number(length[1])) done(); return; }
+      if (/\r\ntransfer-encoding:\s*chunked/i.test(head) && (all.subarray(split + 4).includes("\r\n0\r\n\r\n") || all.subarray(split + 4).toString("latin1").startsWith("0\r\n\r\n"))) done();
+    };
+    socket.on("data", data);
+    socket.once("close", done);
+    socket.once("end", done);
+  });
+}
+
 /** A live proxy in front of `providers`, reachable the way Claude Code reaches it. */
-async function rig(providers: Config["providers"], routes: Config["routes"]): Promise<Rig> {
+async function rig(providers: Config["providers"], routes: Config["routes"], native: { upstreamPort?: number; upstreamAgent?: https.Agent } = {}): Promise<Rig> {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "cr-failover-"));
   const ca = createCa({ cn: "clauderipple test" });
   fs.writeFileSync(path.join(home, "ca.pem"), ca.certPem);
@@ -96,6 +122,7 @@ async function rig(providers: Config["providers"], routes: Config["routes"]): Pr
     home,
     requests: new RequestLog(path.join(home, "requests.jsonl")),
     claudeCodeCredentialReaders: noClaudeCodeCredentialReaders,
+    ...native,
   });
   await proxy.listen();
 
@@ -160,11 +187,8 @@ async function rig(providers: Config["providers"], routes: Config["routes"]): Pr
     secure.write(
       `POST /v1/messages HTTP/1.1\r\nHost: api.anthropic.com\r\ncontent-type: application/json\r\ncontent-length: ${Buffer.byteLength(body)}\r\n\r\n${body}`,
     );
-    const chunks: Buffer[] = [];
-    secure.on("data", (d: Buffer) => chunks.push(d));
-    await new Promise<void>((r) => setTimeout(r, 250));
+    const all = await wholeResponse(secure);
     secure.destroy();
-    const all = Buffer.concat(chunks);
     const split = all.indexOf("\r\n\r\n");
     const head = all.subarray(0, split < 0 ? all.length : split).toString("latin1");
     const headers: Record<string, string> = {};
@@ -714,6 +738,47 @@ test("an exhausted provider hands the turn to its fallback, and a healthy one ke
     assert.equal(backup.seen.length, 2);
   } finally { await r.stop(); await primary.close(); await backup.close(); }
 });
+
+for (const available of [true, false]) {
+  test(`Anthropic API-key fallback ${available ? "answers without an OAuth account" : "is skipped without a key despite a ready OAuth account"}`, async (t) => {
+    for (const [name, value] of Object.entries({ CLAUDE_CODE_OAUTH_TOKEN: available ? "" : "fake-oauth-token", ANTHROPIC_API_KEY: "" })) {
+      const before = process.env[name];
+      process.env[name] = value;
+      t.after(() => { if (before === undefined) delete process.env[name]; else process.env[name] = before; });
+    }
+    const primary = await upstream(() => ({ status: 429, headers: { "retry-after": "300" }, body: "{}" }));
+    const backup = await upstream(() => ({ status: 200 }));
+    const ca = createCa({ cn: "clauderipple API-key fallback test" });
+    const leaf = createLeaf({ host: "api.anthropic.com", caCertPem: ca.certPem, caKeyPem: ca.keyPem });
+    const native = await recorder((hit) => anthropicReply(hit, "API-key answer"), { cert: leaf.certPem, key: leaf.keyPem });
+    const agent = new https.Agent({ ca: ca.certPem, lookup: (_host, _options, callback) => callback(null, [{ address: "127.0.0.1", family: 4 }]) });
+    const r = await rig({
+      primary: { type: "anthropic-compatible", url: `http://127.0.0.1:${primary.port}`, headers: { "x-api-key": "fake-primary-key" } },
+      api: { type: "anthropic", auth: "api-key", apiKey: available ? "fake-native-key" : "" },
+      backup: { type: "anthropic-compatible", url: `http://127.0.0.1:${backup.port}` },
+    }, {
+      "claude-opus-4-8": { provider: "primary", model: "m1", fallbacks: [
+        { provider: "api", model: "claude-opus-5" }, { provider: "backup", model: "m2" },
+      ] },
+    }, { upstreamPort: native.port, upstreamAgent: agent });
+    try {
+      assert.equal(await r.send(), 429, "the first turn discovers the primary's rate limit");
+      assert.equal(await r.send(), 200, "the first usable configured fallback answers");
+      assert.equal(primary.seen.length, 1);
+      assert.equal(native.hits.length, available ? 1 : 0);
+      assert.equal(backup.seen.length, available ? 0 : 1);
+      if (available) {
+        assert.equal(native.hits[0]!.headers["x-api-key"], "fake-native-key");
+        assert.equal(native.hits[0]!.headers.authorization, undefined, "billing stays on the explicitly selected key");
+        assert.equal(native.hits[0]!.body.model, "claude-opus-5");
+      }
+    } finally {
+      await r.stop();
+      agent.destroy();
+      await Promise.all([primary.close(), backup.close(), native.close()]);
+    }
+  });
+}
 
 test("one client request survives a rate-limited credential without the client seeing it", async () => {
   // The turn that discovers a limit used to be spent: the client got the 429 and had to retry it
@@ -1382,11 +1447,29 @@ test("dispatch to a ChatGPT fallback keeps the original model, effort and tools"
   } finally { await r.stop(); }
 });
 
+// Issue #170: a headless install never polls /api/limits, so no lookup has happened when the first
+// refusal arrives. The refusal shape itself triggers one lookup (TTL-cached), and room in it is evidence.
+test("no quota lookup has happened: the refusal shape fetches one, finds room, and uses the fallback", async () => {
+  const r = await frig({ routes: () => route([{ provider: "c", model: "fb-model" }]), quota: "none", accounts: 2 });
+  try {
+    assert.equal(r.quotaCalls(), 0, "nothing polled the dashboard");
+    const res = await r.post(turn({ stream: false }));
+    assert.equal(res.status, 200);
+    assert.match(res.text, /compat answer/);
+    assert.equal(r.google.hits.length, 1, "the refused prompt was not walked across accounts");
+    assert.equal(r.compat.hits.length, 1);
+    assert.deepEqual(r.states(), ["ready", "ready"]);
+    const callsAfterFirst = r.quotaCalls();
+    assert.ok(callsAfterFirst > 0, "the refusal fetched the usage snapshot");
+    assert.equal((await r.post(turn({ stream: false }))).status, 200);
+    assert.equal(r.quotaCalls(), callsAfterFirst, "the second refusal reuses the TTL-cached snapshot");
+  } finally { await r.stop(); }
+});
+
 // The refusal is only believed when the lookup shows room, because the same 429 body is also what a
 // spent account says. Without exact evidence the old handling stands: rest the account, walk the
 // pool, and leave the route fallback to the next turn (chooseTarget), not to this one.
 for (const [label, quota] of [
-  ["no quota lookup has happened", "none"],
   ["the five-hour window is spent", { body: quotaBody({ five: 0 }) }],
   ["the weekly window is spent", { body: quotaBody({ weekly: 0 }) }],
   ["a window is missing", { body: quotaBody({ weekly: null }) }],
@@ -1408,7 +1491,6 @@ for (const [label, quota] of [
       assert.equal(rec!.refusal, undefined);
       assert.equal(rec!.status, 429);
       assert.doesNotMatch(rec!.note ?? "", /fallback/);
-      if (quota === "none") assert.equal(r.quotaCalls(), 0);
     } finally { await r.stop(); }
   });
 }

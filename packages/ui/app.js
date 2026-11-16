@@ -492,7 +492,8 @@ function limitsReset(window, weekly, now) {
  * `accountName` puts whose gauge it is into the accessible name.
  */
 function limitsWindowRow(label, window, now, accountName = "") {
-  const percent = `${Math.round(window.usedPercent * 10) / 10}%`;
+  const shown = quotaShownPercent(window.usedPercent);
+  const percent = t(quotaRemaining ? "quota.remainingLine" : "quota.line", { window: "", percent: Math.round(shown * 10) / 10 }).trim();
   // A window of a day or more reads its reset as a weekday and clock; a shorter one as the time left.
   const reset = limitsReset(window, window.kind === "seven_day" || window.windowMinutes >= 1440, now);
   const name = accountName ? `${accountName} · ${label}` : label;
@@ -506,11 +507,11 @@ function limitsWindowRow(label, window, now, accountName = "") {
   const track = el("div", {
     class: "limits-track meter", role: "progressbar", tabindex: "0",
     "aria-label": name, "aria-valuemin": "0", "aria-valuemax": "100",
-    "aria-valuenow": Math.max(0, Math.min(100, window.usedPercent)),
+    "aria-valuenow": Math.max(0, Math.min(100, shown)),
     "aria-valuetext": [percent, reset, pace, note].filter(Boolean).join(" · "), title: [name, percent, reset].join(" · "),
   });
   const fill = el("span", { class: "limits-fill meter-fill", "aria-hidden": "true" });
-  fill.style.width = `${Math.max(0, Math.min(100, window.usedPercent))}%`;
+  fill.style.width = `${Math.max(0, Math.min(100, shown))}%`;
   track.appendChild(fill);
   const parts = [el("span", { text: reset })];
   if (passed) parts.push(el("span", { class: "warn-text", text: t("limits.stale") }));
@@ -1238,13 +1239,60 @@ if (APP) {
   void APP.state().then((next) => { shellState = next; renderConnection(); applyOffline(); });
 }
 
+const QUOTA_VIEW_STORE = "clauderipple_quota_remaining";
+let quotaRemaining = false;
+try { quotaRemaining = localStorage.getItem(QUOTA_VIEW_STORE) === "true"; } catch { /* unavailable */ }
+
+/** A display preference only: warnings, forecasts and routing keep the backend's used share. */
+function quotaShownPercent(used) {
+  return quotaRemaining ? Math.max(0, Math.min(100, 100 - used)) : used;
+}
+function setQuotaRemaining(remaining) {
+  quotaRemaining = remaining;
+  try { localStorage.setItem(QUOTA_VIEW_STORE, String(remaining)); } catch { /* unavailable */ }
+  for (const node of $all("[data-quota-windows]")) {
+    const meters = quotaMeters(JSON.parse(node.dataset.quotaWindows));
+    node.replaceChildren(...meters.children);
+    node.setAttribute("aria-label", meters.getAttribute("aria-label"));
+    node.title = meters.title;
+  }
+  renderHealthProviders();
+  // The overview's heading, its one-line figure and its gauges are all built with the view, so that
+  // tab is drawn again. Only that tab: the accounts tab can hold a half-typed key form, and its
+  // meters were switched in place above.
+  if (currentConfig && selectedProviderName && providerDetailTab === "overview") renderProviderDetail();
+  else refreshProviderUsage();
+}
+/** The header stays mounted across polls, so keyboard focus stays on the same button. */
+function renderQuotaViewToggle() {
+  const host = $("#health-quota-toggle");
+  if (!host) return;
+  let button = host.querySelector(".quota-view-toggle");
+  if (!button) {
+    button = el("button", { class: "icon-btn quota-view-toggle", type: "button" }, [
+      svgIcon("0 0 24 24", ["M4 7h16m-4-4 4 4-4 4", "M20 17H4m4-4-4 4 4 4"]),
+    ]);
+    button.addEventListener("click", () => setQuotaRemaining(!quotaRemaining));
+    host.appendChild(button);
+  }
+  const label = t(quotaRemaining ? "quota.showUsed" : "quota.showRemaining");
+  button.setAttribute("aria-label", label);
+  button.setAttribute("aria-pressed", String(quotaRemaining));
+  button.title = label;
+}
+
 function quotaLine(name) {
   const quota = status && status.chatgpt && status.chatgpt.quota && status.chatgpt.quota[name];
   const primary = quota && quota.rate_limits && quota.rate_limits.primary;
   if (!primary) return null;
   // The usage figure is what anyone acts on. The reset countdown was a second number beside it
   // that nobody does anything with, so it is left out.
+  if (quotaRemaining) return t("quota.remainingLine", { window: "", percent: Math.round(quotaShownPercent(primary.used_percent)) }).trim();
   return t("health.quota", { percent: primary.used_percent, reset: "" });
+}
+/** The overview's usage heading and one-line label: the figures under it are the remaining share while the toggle shows that. */
+function providersUsageTitle() {
+  return t(quotaRemaining ? "providers.remaining" : "providers.usage");
 }
 /**
  * One line a person can read. Vendors answer with a JSON body and sometimes an escaped one inside
@@ -1388,6 +1436,7 @@ function refreshProviderConfig() {
   return providerConfigRead;
 }
 function renderHealthProviders() {
+  renderQuotaViewToggle();
   const box = $("#health-providers");
   // The router's live list decides which providers show: one added or removed elsewhere appears or goes on the
   // next poll. The config supplies each provider's label and preset; one it does not have yet is drawn from the status.
@@ -1682,6 +1731,16 @@ function providerCannotSearch(name, model) {
 // The web search row names a provider as well as a model: one id can be offered by two providers
 // and only one of them may be able to run a search. JSON keeps the two apart whatever they contain.
 function webSearchChoice(provider, model) { return JSON.stringify([provider, model]); }
+
+// `webSearch` is a backend object, or the string "native": no backend, searches that no route
+// target can run go to Claude as sent. Only a Claude model id can be passed on that way (anything
+// else would 404 there), so the router still refuses a search for any other id.
+function webSearchBackendOf(config) {
+  return config && config.webSearch && typeof config.webSearch === "object" ? config.webSearch : null;
+}
+function webSearchPassesToClaude(config, modelId) {
+  return Boolean(config) && config.webSearch === "native" && /^claude-/.test(String(modelId || ""));
+}
 function parseWebSearchChoice(value) {
   if (!value) return null;
   try {
@@ -1696,12 +1755,14 @@ function renderModelSlots() {
   const chosen = (currentConfig.cli && currentConfig.cli.models) || {};
   // With a web search backend set, the search is intercepted before routing and never reaches
   // `smallFast`, so the "no web search here" label there would be false.
-  const searchIntercepted = Boolean(currentConfig.webSearch);
+  const searchBackend = webSearchBackendOf(currentConfig);
+  const searchIntercepted = Boolean(searchBackend);
   const groups = groupedModels(currentConfig);
   const key = JSON.stringify([
     MODEL_SLOTS.map((slot) => chosen[slot] || ""),
     searchIntercepted ? 1 : 0,
-    currentConfig.webSearch ? [currentConfig.webSearch.provider, currentConfig.webSearch.model] : null,
+    currentConfig.webSearch === "native" ? "native" : null,
+    searchBackend ? [searchBackend.provider, searchBackend.model] : null,
     groups.map((group) => [group.name, providerDisplayName(group.name, group.provider), group.models.map((model) => [
       model.id, labelOf(model), providerCannotSearch(group.name, model.id),
       Boolean(currentConfig.providers[group.name] && currentConfig.providers[group.name].type === "anthropic"),
@@ -1719,7 +1780,8 @@ function renderModelSlots() {
       // `smallFast` is what a WebSearch runs on, so an inability to search is fatal there and
       // merely worth knowing everywhere else.
       if (slot === "smallFast" && !searchIntercepted && providerCannotSearch(group.name, model.id)) {
-        option.textContent += ` — ${t("slots.noWebSearch")}`;
+        // With `webSearch: "native"` a Claude id's search is handed to Claude, so it does work.
+        option.textContent += ` — ${t(webSearchPassesToClaude(currentConfig, model.id) ? "slots.webSearchNativeTag" : "slots.noWebSearch")}`;
       }
       select.appendChild(option);
     }
@@ -1743,9 +1805,15 @@ function renderModelSlots() {
 // router knows which models it can actually search with — that comes from `/api/status`, never
 // from a model's name — so an unsearchable model is not offered here at all.
 function renderWebSearchSlot() {
-  const saved = currentConfig.webSearch || null;
+  const saved = webSearchBackendOf(currentConfig);
   const select = el("select", {});
   select.appendChild(el("option", { value: "", text: t("slots.webSearchFollow") }));
+  // `"native"` set in the config file must not read as "follows the small, fast model": say what it does.
+  if (currentConfig.webSearch === "native") {
+    const native = el("option", { value: "native", text: t("slots.webSearchNative") });
+    native.selected = true;
+    select.appendChild(native);
+  }
   let found = false;
   for (const group of groupedModels(currentConfig)) for (const model of group.models) {
     if (providerCannotSearch(group.name, model.id)) continue;
@@ -1763,7 +1831,8 @@ function renderWebSearchSlot() {
     orphan.selected = true;
     select.appendChild(orphan);
   }
-  select.onchange = () => void saveWebSearch(select.value);
+  // Re-picking the shown "native" entry is no change; only a different choice rewrites the setting.
+  select.onchange = () => { if (select.value !== "native") void saveWebSearch(select.value); };
   select.dataset.webSearch = "true";
   select.setAttribute("aria-label", t("slots.webSearch"));
   return cell(t("slots.webSearch"), select, t("slots.webSearchHelp"), "slot-row");
@@ -1774,7 +1843,7 @@ async function saveWebSearch(value) {
   const next = clone(await latestConfig());
   const picked = parseWebSearchChoice(value);
   // `webSearch` is the only setting this row owns; an existing `maxResults` survives the change.
-  const maxResults = (next.webSearch && next.webSearch.maxResults) ?? (currentConfig.webSearch && currentConfig.webSearch.maxResults);
+  const maxResults = (webSearchBackendOf(next) || {}).maxResults ?? (webSearchBackendOf(currentConfig) || {}).maxResults;
   if (picked) next.webSearch = { provider: picked.provider, model: picked.model, ...(maxResults !== undefined ? { maxResults } : {}) };
   else delete next.webSearch;
   try {
@@ -1803,7 +1872,7 @@ async function saveModelSlots() {
     // a session that already had it selected. With a web search backend set the search never
     // reaches `smallFast`, so there is nothing to warn about.
     const savedModels = next.cli.models;
-    const owners = savedModels.smallFast && !next.webSearch ? providersOffering(next, savedModels.smallFast) : [];
+    const owners = savedModels.smallFast && !webSearchBackendOf(next) && !webSearchPassesToClaude(next, savedModels.smallFast) ? providersOffering(next, savedModels.smallFast) : [];
     const warning = owners.length && providerCannotSearch(owners[0], savedModels.smallFast) ? t("slots.noWebSearchWarn") : undefined;
     configSaved(out, t("slots.slotSaved"), warning);
   } catch (error) { toast(t("common.saveFailed"), true, error.message); }
@@ -3353,7 +3422,7 @@ function providerOverview(name, provider) {
       running ? el("span", { class: "cell-sub", text: t("measure.running", { done: measuring.done, total: measuring.total }) }) : null,
       running ? el("span", { class: "cell-sub", text: t("measure.help") }) : null,
     ]),
-    !gauges && quota ? providerFact(t("providers.usage"), [el("span", { text: quota })]) : null,
+    !gauges && quota ? providerFact(providersUsageTitle(), [el("span", { text: quota })]) : null,
   ]);
   return el("div", { class: "provider-panel" }, [facts, providerUsageSection(name)]);
 }
@@ -3369,7 +3438,7 @@ function providerUsageSection(name) {
   const now = Date.now();
   const credentials = (status && status.credentials && status.credentials[name]) || [];
   return el("section", { class: "section", id: "provider-usage-section" }, [
-    el("div", { class: "section-head" }, [el("h3", { class: "section-title", text: t("providers.usage") })]),
+    el("div", { class: "section-head" }, [el("h3", { class: "section-title", text: providersUsageTitle() })]),
     el("div", { class: "group provider-limits provider-usage" }, gauges.accounts.map((account) =>
       limitsAccountRow(gauges, account, now, account.id === undefined ? undefined : credentials.find((c) => c.id === account.id)))),
   ]);
@@ -3429,7 +3498,7 @@ function claudeAccountLabel(account) {
 /** "5h 14% · weekly 10%" under a Claude account, or nothing while its usage is unknown. */
 function claudeQuotaNode(account) {
   const text = chatgptQuotaText(account && account.quota);
-  return text ? quotaMeters([account.quota.rate_limits.primary, account.quota.rate_limits.secondary]) : null;
+  return text ? quotaMeters([account.quota.rate_limits.primary, account.quota.rate_limits.secondary], account.quota.at) : null;
 }
 
 /** "Use first" for an account the pool does not lead with; `null` hands first place back to the current login. */
@@ -3554,7 +3623,7 @@ function renderClaudeAccountRows(target, data, name, generation) {
     }), rename, remove];
     if (unavailable) {
       const reauth = el("button", { class: "btn secondary compact", type: "button", text: t("providers.reauthAction") });
-      reauth.addEventListener("click", () => openClaudeAccountConsent(name));
+      reauth.addEventListener("click", () => openClaudeAccountConsent(name, account.id));
       actions.unshift(reauth);
     }
     rows.push(el("article", { class: "cell account-card" }, [
@@ -3647,8 +3716,8 @@ function chatgptQuotaText(quota) {
 }
 /** The same line for any list of usage windows (`/api/limits` windows included). */
 function quotaWindowsText(windows) {
-  return (windows || []).filter((w) => w && typeof w.used_percent === "number").map((w) => {
-    const line = t("quota.line", { window: quotaWindowName(w), percent: Math.round(w.used_percent) }).trim();
+  return (windows || []).filter((w) => w && Number.isFinite(w.used_percent)).map((w) => {
+    const line = t(quotaRemaining ? "quota.remainingLine" : "quota.line", { window: quotaWindowName(w), percent: Math.round(quotaShownPercent(w.used_percent)) }).trim();
     const reset = quotaFullReset(w);
     return reset ? `${line} · ${reset}` : line;
   }).join(" · ");
@@ -3673,19 +3742,27 @@ function quotaFullReset(w) {
  * thin meter and its share, amber from 80% and red from 95% as on Status; a full window keeps its reset.
  * The whole line is the group's accessible name. Nothing when no window has a share.
  */
-function quotaMeters(windows) {
-  const shown = (windows || []).filter((w) => w && typeof w.used_percent === "number");
+function quotaMeters(windows, at) {
+  const readAt = Number.isFinite(at) ? at : Date.now();
+  const shown = (windows || []).filter((w) => w && Number.isFinite(w.used_percent)).map((w) => {
+    // Keep Status's server deadline, or anchor a relative reset to the snapshot, never a redraw.
+    const { reset_after_seconds, ...window } = w;
+    const reset = Number.isFinite(w.reset_at) ? Math.round(w.reset_at > 1e12 ? w.reset_at / 1000 : w.reset_at)
+      : typeof reset_after_seconds === "number" ? readAt / 1000 + reset_after_seconds : undefined;
+    return reset === undefined ? window : { ...window, reset_at: reset };
+  });
   if (!shown.length) return null;
   const text = quotaWindowsText(shown);
-  return el("div", { class: "account-quota account-meters", role: "img", "aria-label": text, title: text }, shown.map((w) => {
+  return el("div", { class: "account-quota account-meters", "data-quota-windows": JSON.stringify(shown), role: "img", "aria-label": text, title: text }, shown.map((w) => {
     const percent = Math.round(w.used_percent);
+    const figure = Math.round(quotaShownPercent(w.used_percent));
     const fill = el("span", { class: "meter-fill" });
-    fill.style.width = `${Math.max(0, Math.min(100, w.used_percent))}%`;
+    fill.style.width = `${Math.max(0, Math.min(100, quotaShownPercent(w.used_percent)))}%`;
     const reset = quotaFullReset(w);
     return el("span", { class: `account-meter${percent >= 95 ? " tone-bad" : percent >= 80 ? " tone-warn" : ""}`, "aria-hidden": "true" }, [
       el("span", { class: "account-meter-name", text: quotaWindowName(w) }),
       el("span", { class: "meter" }, [fill]),
-      el("span", { class: "account-meter-figure", text: `${percent}%` }),
+      el("span", { class: "account-meter-figure", text: t(quotaRemaining ? "quota.remainingLine" : "quota.line", { window: "", percent: figure }).trim() }),
       reset ? el("span", { class: "account-meter-reset", text: reset }) : null,
     ]);
   }));
@@ -3754,7 +3831,7 @@ function renderChatgptAccountRows(target, data, name, generation) {
       el("div", { class: "cell-text account-card-copy" }, [
         el("strong", { text: account.label }),
         detail ? el("span", { class: "small", text: detail }) : null,
-        quota ? quotaMeters([account.quota.rate_limits.primary, account.quota.rate_limits.secondary]) : null,
+        quota ? quotaMeters([account.quota.rate_limits.primary, account.quota.rate_limits.secondary], account.quota.at) : null,
         help ? hint(help) : null,
         actions.length ? el("div", { class: "account-card-actions" }, actions) : null,
       ]),
@@ -4377,12 +4454,12 @@ window.addEventListener("keydown", (event) => {
   if (action && !action.disabled) { event.preventDefault(); action.click(); }
 });
 
-function openClaudeAccountConsent(providerName) {
+function openClaudeAccountConsent(providerName, replaceId) {
   const accepted = el("input", { type: "checkbox" });
   const proceed = el("button", { class: "btn", type: "button", "data-default-action": "", text: t("providers.anthropicOAuthContinue") });
   proceed.disabled = true;
   accepted.addEventListener("change", () => { proceed.disabled = !accepted.checked; });
-  proceed.addEventListener("click", () => void openClaudeAccountSignIn(providerName, false));
+  proceed.addEventListener("click", () => void openClaudeAccountSignIn(providerName, false, replaceId));
   showModal(el("div", { class: "oauth-consent" }, [
     el("h1", { id: "modal-title", text: t("providers.anthropicOAuthTitle") }),
     el("div", { class: "notice warn" }, [el("strong", { text: t("providers.anthropicOAuthTitle") }), el("span", { text: t("providers.anthropicOAuthWarning") })]),
@@ -4391,7 +4468,7 @@ function openClaudeAccountConsent(providerName) {
   ]));
 }
 
-async function openClaudeAccountSignIn(providerName, manual) {
+async function openClaudeAccountSignIn(providerName, manual, replaceId) {
   let active = true;
   let poll = null;
   const body = el("div", { class: "oauth-progress" });
@@ -4400,7 +4477,7 @@ async function openClaudeAccountSignIn(providerName, manual) {
     stopPolling();
     if (!active) return;
     const retry = el("button", { class: "btn secondary", type: "button", text: t("providers.anthropicSignInManual") });
-    retry.addEventListener("click", () => void openClaudeAccountSignIn(providerName, true));
+    retry.addEventListener("click", () => void openClaudeAccountSignIn(providerName, true, replaceId));
     body.replaceChildren(el("span", { class: "bad-text", text: t("providers.anthropicSignInFailed") }), state.error ? el("p", { class: "small", text: state.error }) : null, retry);
   }
   async function finish(state) {
@@ -4441,7 +4518,7 @@ async function openClaudeAccountSignIn(providerName, manual) {
   });
   body.replaceChildren(el("p", { class: "small", text: t("providers.checking") }));
   try {
-    const state = await api("/api/claude-oauth", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ manual: Boolean(manual) }) });
+    const state = await api("/api/claude-oauth", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ manual: Boolean(manual), ...(replaceId ? { replaceId } : {}) }) });
     if (!active) return;
     renderState(state);
     poll = setInterval(async () => {
@@ -5237,7 +5314,12 @@ const MOD_LANGUAGES = [["ko", "한국어"], ["en", "English"], ["zh", "简体中
 // Claude Code's own agent with a model: what the mod offers besides the generated workers, smallest
 // first, and their current model ids (packages/mod/hooks/settings.ts CLAUDE_WORKERS).
 const MOD_CLAUDE_MODELS = ["haiku", "sonnet", "opus", "fable"];
-const MOD_CLAUDE_IDS = { haiku: "claude-haiku-5-5", sonnet: "claude-sonnet-5-5", opus: "claude-opus-5-5", fable: "claude-fable-5-1" };
+const MOD_CLAUDE_IDS = { haiku: "claude-haiku-5-5", sonnet: "claude-sonnet-5-5", opus: "claude-opus-5-5", fable: "claude-fable-5-2" };
+// The newest id of a family on the router's live Anthropic list (/api/mod-options `claudeLatest`), else the table above.
+function modClaudeId(alias) {
+  const live = modState.options && modState.options.claudeLatest;
+  return (live && typeof live[alias] === "string" && live[alias]) || MOD_CLAUDE_IDS[alias];
+}
 // The four workers, low to max (the mod's rung ids: light, standard, hard, plan).
 const MOD_RUNGS = ["light", "standard", "hard", "plan"];
 // A domain ladder has two levels: light work (the light rung) and heavy work (standard, hard, plan).
@@ -5591,7 +5673,7 @@ function modChoices() {
     };
   });
   const claude = MOD_CLAUDE_MODELS.map((alias) => ({
-    value: `general-purpose+${alias}`, label: `Claude ${modCap(alias)}`, model: MOD_CLAUDE_IDS[alias], provider: "anthropic",
+    value: `general-purpose+${alias}`, label: `Claude ${modCap(alias)}`, model: modClaudeId(alias), provider: "anthropic",
     billing: "subscription", usable: true, efforts: claudeEfforts, claude: true,
   }));
   const session = { value: "general-purpose", label: t("mod.sessionModel"), model: null, provider: null, billing: null, usable: true, efforts: claudeEfforts, claude: true };
@@ -5641,6 +5723,8 @@ function modGroupHead(group) {
 // (preferred account, else the saved order). Accounts 2… list their pinned workers. The numbers are
 // the limits' "Claude n"/"GPT n" (/api/mod-options `accounts`). The pinned workers of account 1, and
 // of an account no longer stored, are not listed; they stay valid where a setting already names them.
+// An account is shown by its name, not its number (modAccountNames): "Account 2" says nothing about
+// whose it is, and the number stays on the tab's tooltip.
 
 /** The account tab a provider group shows, kept while the page is open; never saved. @type {Map<string, number>} */
 const modAccountTabs = new Map();
@@ -5648,11 +5732,47 @@ const modAccountTabs = new Map();
 function modAccountOf(choice) { return choice.pinned ? choice.accountNumber : 1; }
 /** Whether a choice is listed at all: an ordinary worker, or a pinned one on account 2 or later. */
 function modListed(choice) { return !choice.pinned || choice.accountNumber > 1; }
+/**
+ * What each of a provider's accounts is called wherever a model's account is said: its tab, the
+ * worker menus, a checkbox's accessible name. That is the account's own short name, the one its
+ * pinned workers' "Runs on …" carries; the Claude app login is named as the Status screen names it.
+ * Accounts whose short names match take their full label (name and email) instead, and an account
+ * with no name at all keeps "Account n"; a label the router made up for an unnamed account ("Claude
+ * account 2", counted from the stored ones) is no name, as on the Status screen. Names still alike
+ * after that lead with their number, where a tab cut short keeps it, so no two ever read the same.
+ * @returns {Map<number, string>}
+ */
+function modAccountNames(provider) {
+  const info = modProviderInfo(provider);
+  const accounts = info && Array.isArray(info.accounts) ? info.accounts : [];
+  const clashing = (names) => {
+    const seen = new Map();
+    for (const name of names) if (name) seen.set(name.toLowerCase(), (seen.get(name.toLowerCase()) || 0) + 1);
+    return (name) => Boolean(name) && seen.get(name.toLowerCase()) > 1;
+  };
+  const own = (value) => {
+    const text = String(value || "").trim();
+    return LIMITS_PLACEHOLDER.test(text) ? "" : text;
+  };
+  let names = accounts.map((account) => account.current ? t("providers.anthropicCurrentLogin") : own(account.name));
+  let clash = clashing(names);
+  names = names.map((name, at) => clash(name) && own(accounts[at].label) || name);
+  names = names.map((name, at) => name || t("mod.accountTab", { n: accounts[at].number }));
+  // A number makes two names differ from each other, but may make one match a third: look again.
+  for (let pass = 0; pass <= accounts.length; pass += 1) {
+    clash = clashing(names);
+    if (!names.some(clash)) break;
+    names = names.map((name, at) => clash(name) ? `${accounts[at].number} · ${name}` : name);
+  }
+  return new Map(accounts.map((account, at) => [account.number, names[at]]));
+}
+/** One account's name (modAccountNames); an account the provider no longer lists keeps its number. */
+function modAccountName(provider, number) { return modAccountNames(provider).get(number) || t("mod.accountTab", { n: number }); }
 /** A choice's name where its account is not otherwise shown (a pick no longer offered, a hidden pin). */
 function modChoiceName(choice) {
   if (!choice.pinned || !choice.accountNumber && !choice.accountName) return choice.label;
-  const account = choice.accountNumber > 1 || !choice.accountName ? t("mod.accountTab", { n: choice.accountNumber }) : choice.accountName;
-  return `${choice.label} · ${account}`;
+  // A pin whose account has no number (no longer stored) still has the name it was made with.
+  return `${choice.label} · ${choice.accountNumber ? modAccountName(choice.provider, choice.accountNumber) : choice.accountName}`;
 }
 /** A worker group's account tabs (`{number, label}`), or null when it has one account to show. */
 function modAccountTabsOf(group) {
@@ -5697,9 +5817,11 @@ function modTickRows() {
   const onCount = choices.filter(modTicked).length;
   return modGroups(choices).map((group) => {
     const tabs = modAccountTabsOf(group);
+    const names = tabs ? modAccountNames(group.items[0].provider) : new Map();
+    const accountName = (number) => names.get(number) || t("mod.accountTab", { n: number });
     const box = (choice) => {
       const on = modTicked(choice);
-      const account = tabs ? ` · ${t("mod.accountTab", { n: modAccountOf(choice) })}` : "";
+      const account = tabs ? ` · ${accountName(modAccountOf(choice))}` : "";
       const input = el("input", { type: "checkbox", "data-key": `tick:${modTickKey(choice)}`, "aria-label": `${choice.label} · ${group.name}${account}`, checked: on });
       if (on && onCount === 1) input.disabled = true;
       input.addEventListener("change", () => modTick(choice, input.checked));
@@ -5714,11 +5836,16 @@ function modTickRows() {
     // block keeps the tallest list's height and switching accounts moves nothing below it.
     const shown = modAccountTab(group, tabs);
     const id = (number) => `mod-account-${group.name}-${number}`;
-    const tabList = el("div", { class: "segmented account-tabs", role: "tablist", "aria-label": group.name }, tabs.map((tab) => el("button", {
-      type: "button", role: "tab", class: tab.number === shown ? "active" : "", "aria-selected": String(tab.number === shown), "aria-controls": id(tab.number),
-      "data-key": `account-tab:${group.name}:${tab.number}`, text: t("mod.accountTab", { n: tab.number }), ...(tab.label ? { title: tab.label } : {}),
-      onclick: () => { if (tab.number !== shown) { modAccountTabs.set(group.name, tab.number); modRefresh(); } },
-    })));
+    const tabList = el("div", { class: "segmented account-tabs", role: "tablist", "aria-label": group.name }, tabs.map((tab) => {
+      // The tab says whose account it is; its number (the limits' "GPT n") and whole label are on the tooltip.
+      const name = accountName(tab.number);
+      const title = [t("mod.accountTab", { n: tab.number }), tab.label && !LIMITS_PLACEHOLDER.test(String(tab.label).trim()) ? tab.label : ""].filter(Boolean).join(" · ");
+      return el("button", {
+        type: "button", role: "tab", class: tab.number === shown ? "active" : "", "aria-selected": String(tab.number === shown), "aria-controls": id(tab.number),
+        "data-key": `account-tab:${group.name}:${tab.number}`, text: name, ...(title !== name ? { title } : {}),
+        onclick: () => { if (tab.number !== shown) { modAccountTabs.set(group.name, tab.number); modRefresh(); } },
+      });
+    }));
     const panels = tabs.map((tab) => {
       const panel = el("div", { class: `model-checklist${tab.number === shown ? "" : " account-hidden"}`, id: id(tab.number), role: "tabpanel" }, listed.filter((choice) => modAccountOf(choice) === tab.number).map(box));
       if (tab.number !== shown) { panel.inert = true; panel.setAttribute("aria-hidden", "true"); }
@@ -5749,16 +5876,22 @@ function modTwoLevelRungs(rungs) {
   if (heavy) { out.hard = clone(heavy); out.plan = clone(heavy); }
   return out;
 }
-/** One menu of `model · effort` for the ticked models, effort limited to what each model takes; the session's model too. */
+/** Two menus side by side: the ticked models (one line per model and account; the session's model too), and the effort levels that model takes. */
 function modPickSelect(key, step, shown, label, onPick) {
   const picked = step ? modTargetValue(step.target) : "";
   // An unlisted pinned worker (account 1's, see modListed) is offered only where it is the pick already.
   const choices = modChoices().filter((choice) => choice.value === "general-purpose" || modTicked(choice) && (modListed(choice) || choice.value === picked));
-  const entries = (list) => list.flatMap((choice) => {
+  // One read of a provider's account names for the whole menu, however many options name one.
+  const named = new Map();
+  const accountName = (provider, number) => {
+    if (!named.has(provider)) named.set(provider, modAccountNames(provider));
+    return named.get(provider).get(number) || t("mod.accountTab", { n: number });
+  };
+  const entries = (list) => list.map((choice) => {
     // A closed menu shows the option alone, not its group: a pinned worker names its account there.
     const number = modListed(choice) ? modAccountOf(choice) : null;
-    const name = modListed(choice) ? (number && number > 1 ? `${choice.label} · ${t("mod.accountTab", { n: number })}` : choice.label) : modChoiceName(choice);
-    return modLadderOf(choice).map((effort) => ({ value: `${choice.value}|${effort}`, label: `${name} · ${modEffortName(effort)}${choice.usable ? "" : t("mod.unavailableNow")}` }));
+    const name = modListed(choice) ? (number && number > 1 ? `${choice.label} · ${accountName(choice.provider, number)}` : choice.label) : modChoiceName(choice);
+    return { value: choice.value, label: `${name}${choice.usable ? "" : t("mod.unavailableNow")}` };
   });
   // A provider with account tabs gets one group per account, named as its tab is.
   const all = modGroups(modTickable());
@@ -5766,20 +5899,22 @@ function modPickSelect(key, step, shown, label, onPick) {
     const whole = all.find((entry) => entry.name === group.name);
     const tabs = whole ? modAccountTabsOf(whole) : null;
     if (!tabs) return [{ group: modGroupLabel(group), items: entries(group.items) }];
-    return tabs.map((tab) => ({ group: `${modGroupLabel(group)} · ${t("mod.accountTab", { n: tab.number })}`, items: entries(group.items.filter((choice) => modAccountOf(choice) === tab.number)) }));
+    return tabs.map((tab) => ({ group: `${modGroupLabel(group)} · ${accountName(whole.items[0].provider, tab.number)}`, items: entries(group.items.filter((choice) => modAccountOf(choice) === tab.number)) }));
   });
-  const current = step ? `${picked}|${shown}` : "";
   const items = [...(step ? [] : [{ value: "", label: "—" }]), ...groups];
   // A pick that is not on offer now (its model unticked, or gone) keeps showing rather than a wrong neighbour.
-  if (step && !groups.some((group) => group.items.some((item) => item.value === current))) {
+  if (step && !groups.some((group) => group.items.some((item) => item.value === picked))) {
     const choice = modChoiceOf(step.target);
-    items.unshift({ value: current, label: `${choice ? modChoiceName(choice) : picked} · ${modEffortName(shown)}${t("mod.unavailable")}` });
+    items.unshift({ value: picked, label: `${choice ? modChoiceName(choice) : picked}${t("mod.unavailable")}` });
   }
-  return modSelect(key, items, current, label, (value) => {
+  const model = modSelect(key, items, picked, label, (value) => {
     if (!value) return;
-    const bar = value.lastIndexOf("|");
-    onPick(modTargetOf(value.slice(0, bar)), value.slice(bar + 1));
+    const target = modTargetOf(value);
+    const ladder = modLadderOf(modChoiceOf(target));
+    onPick(target, modNearest(shown, ladder));
   }, "rung-model");
+  const effort = step ? modSelect(`${key}:effort`, modLadderOf(modChoiceOf(step.target)).map((level) => ({ value: level, label: modEffortName(level) })), shown, `${label} ${t("mod.effort")}`, (value) => onPick(step.target, value), "rung-effort") : null;
+  return el("div", { class: "rung-pick" }, [model, effort]);
 }
 /** @typedef {"general" | "ui" | "backend" | "review"} WorkerRuleKey */
 /** Domain selection is local UI state, independently retained for each saved worker set.
@@ -6559,7 +6694,12 @@ function requestRow(record) {
   const rate = outputRateOf(record);
   // A row without usage keeps an empty pill, so its dash lines up with the figures above it.
   const input = record.usage
-    ? el("span", { class: "token-cell", text: formatNumber(totalInput) }, [el("span", { class: "cache-pill", text: t("logs.cacheHit", { percent: Math.round(record.usage.cached / Math.max(1, totalInput) * 100) }) })])
+    ? el("span", { class: "token-cell", text: formatNumber(totalInput) }, [
+      el("span", { class: "cache-pill", text: t("logs.cacheHit", { percent: Math.round(record.usage.cached / Math.max(1, totalInput) * 100) }) }),
+      // Only Anthropic reports what a turn wrote to its cache; the translated providers cache on
+      // their own and report reads alone, so their rows carry no write pill (2026-11-11).
+      record.usage.cacheWrite > 0 ? el("span", { class: "cache-pill cache-write", text: `${t("logs.detail.cacheWrite")} ${formatNumber(record.usage.cacheWrite)}` }) : null,
+    ].filter(Boolean))
     : el("span", { class: "no-usage", text: t("common.notAvailable") }, [el("span", { class: "cache-pill", "aria-hidden": "true" })]);
   const status = record.resent
     ? el("span", { class: "status-text resent", text: `${t("logs.status.resent")} ${record.status}`, title: t("logs.status.resentHelp") })

@@ -9,7 +9,8 @@ import { PermissionQueue } from "../src/permissions.ts";
 import { FRAME_CAP } from "../src/protocol.ts";
 import { BackgroundActivity } from "../src/background-activity.ts";
 import { reduce } from "../web/timeline.ts";
-import { BridgeClient, DESKTOP_BUSY } from "../src/bridge-client.ts";
+import { activityOverview } from "../web/activity.ts";
+import { BridgeClient } from "../src/bridge-client.ts";
 import { fileSymlinks } from "../../../test/capabilities.ts";
 import { signatureOf } from "./narration-signature.ts";
 
@@ -395,7 +396,7 @@ for (const mode of ["resume", "process", "recent"] as const) test(`desktop conti
   if (mode === "process") {
     await assert.rejects(sessions.setModel(id, "chosen-model", "high"), /Claude 앱/);
     assert.equal(sessions.send(id, "first-phone", "continue"), id);
-    assert.equal(sessions.summaryOf(id)?.queue?.[0]?.error, DESKTOP_BUSY, "an open process without registry status waits safely");
+    assert.equal(sessions.summaryOf(id)?.queue?.[0]?.wait, "desktop_busy", "an open process without registry status waits safely");
     assert.equal(options.length, 0);
     assert.equal(sessions.log(id).tail().events.some(e => e.kind === "user" && e.clientMsgId === "first-phone"), false);
     return;
@@ -461,7 +462,7 @@ function subagent(project: string, agentId: string, meta: Record<string, unknown
   fs.writeFileSync(path.join(dir, `agent-${agentId}.jsonl`), records.join(""));
 }
 const assistantTurn = (model: string, stop: string, content: unknown[]): string => line({ isSidechain: true, type: "assistant", message: { model, stop_reason: stop, content } });
-const subagentEvents = (log: { tail: (n?: number) => { events: { kind: string }[] } }) => log.tail(1 << 20).events.filter(e => e.kind === "subagent") as unknown as { toolUseId: string; description: string; model: string | null; status: string; steps: number }[];
+const subagentEvents = (log: { tail: (n?: number) => { events: { kind: string }[] } }) => log.tail(1 << 20).events.filter(e => e.kind === "subagent") as unknown as { toolUseId: string; description: string; model: string | null; effort?: string; status: string; steps: number }[];
 
 test("a Mac session opens a worker with the model its own transcript answered on", t => {
   const f = fixture(t);
@@ -477,12 +478,38 @@ test("a Mac session opens a worker with the model its own transcript answered on
     { type: "tool_use", id: "toolu_one", name: "Agent", input: { description: "Summarize the rules" } },
     { type: "tool_use", id: "toolu_two", name: "Task", input: {} },
   ] } }));
-  assert.deepEqual(subagentEvents(f.desktop.log(id)).map(e => [e.toolUseId, e.model, e.description, e.status]), [
-    ["toolu_one", "deepseek-v4.1-flash", "Summarize the rules", "running"],
-    ["toolu_two", "gpt-6.1-sol", "Long task", "running"],
+  // The effort comes from meta's model suffix (@medium) and the hook's prefix (Sol·medium); both say medium.
+  assert.deepEqual(subagentEvents(f.desktop.log(id)).map(e => [e.toolUseId, e.model, e.description, e.status, e.effort ?? null]), [
+    ["toolu_one", "deepseek-v4.1-flash", "Summarize the rules", "running", "medium"],
+    ["toolu_two", "gpt-6.1-sol", "Long task", "running", "medium"],
     // Its transcript ends on its own answer with no notification line: the worker is done.
-    ["toolu_one", "deepseek-v4.1-flash", "Summarize the rules", "done"],
+    ["toolu_one", "deepseek-v4.1-flash", "Summarize the rules", "done", "medium"],
   ]);
+});
+
+test("a Mac session's worker effort reaches the background list, the timeline and the overview row, and is never guessed", t => {
+  const f = fixture(t);
+  subagent(f.project, "effort", { toolUseId: "toolu_effort", model: "gpt-6.1-sol@high", description: "Sol·high · Review the diff" }, [
+    assistantTurn("gpt-6.1-sol", "tool_use", [{ type: "tool_use", id: "t", name: "Read", input: {} }]),
+  ]);
+  subagent(f.project, "plain", { toolUseId: "toolu_plain", model: "gpt-6.1-sol", description: "Plain task" }, [
+    assistantTurn("gpt-6.1-sol", "tool_use", [{ type: "tool_use", id: "t", name: "Read", input: {} }]),
+  ]);
+  const launch = (tid: string, agentId: string): string => [
+    line({ type: "assistant", message: { id: `m-${tid}`, model: "gpt-6.1-sol", content: [{ type: "tool_use", id: tid, name: "Agent", input: { description: tid, run_in_background: true } }] } }),
+    line({ type: "user", toolUseResult: { isAsync: true, agentId }, message: { content: [{ type: "tool_result", tool_use_id: tid, content: "Async agent launched successfully" }] } }),
+  ].join("");
+  fs.writeFileSync(path.join(f.project, `${id}.jsonl`), line(user) + launch("toolu_effort", "effort") + launch("toolu_plain", "plain"));
+  f.desktop.list();
+  // The raw-transcript scanner: the task list a Desktop-bridged session's summary carries.
+  const taskList = f.desktop.backgroundTaskList(id);
+  assert.deepEqual(taskList.map(task => [task.sub, task.effort ?? null]), [["sub-toolu_effort", "high"], ["sub-toolu_plain", null]]);
+  // The timeline reduction of the same session's events.
+  const view = reduce(f.desktop.log(id).tail(1 << 20).events);
+  assert.deepEqual(view.items.flatMap(item => item.type === "subagent" ? [[item.sub, item.effort ?? null]] : []), [["sub-toolu_effort", "high"], ["sub-toolu_plain", null]]);
+  // The overview row the phone's sheet and the web both read.
+  const rows = activityOverview(view.items, taskList, f.desktop.backgroundTaskHistory(id)).active;
+  assert.deepEqual(rows.map(task => [task.sub, task.model, task.effort ?? null]), [["sub-toolu_effort", "gpt-6.1-sol", "high"], ["sub-toolu_plain", "gpt-6.1-sol", null]]);
 });
 
 test("a Mac session's worker status follows its result, its notification, a queued notification, and agentEnded", t => {
@@ -699,4 +726,80 @@ test("processHasSession answers every session from one tokenization of the listi
   // A new listing replaces the memoized one.
   assert.equal(processHasSession(`1 claude --resume=${ids[0]}`, ids[0]!), true);
   assert.equal(processHasSession(`1 claude --resume=${ids[1]}`, ids[0]!), false);
+});
+
+test("a transcript the host was told of is listed at once, not at the next 30 s rediscovery", t => {
+  const f = fixture(t);
+  const moved = "cccccccc-cccc-cccc-cccc-cccccccccccc";
+  fs.writeFileSync(path.join(f.project, `${id}.jsonl`), line(user));
+  assert.deepEqual(f.desktop.list().map(s => s.id), [id]);
+  f.advance();
+  fs.writeFileSync(path.join(f.project, `${moved}.jsonl`), line(user));
+  assert.deepEqual(f.desktop.list().map(s => s.id), [id], "the scan waits out its 30 s");
+  f.desktop.rediscover(moved);
+  assert.deepEqual(f.desktop.list().map(s => s.id).sort(), [id, moved].sort());
+  f.desktop.rediscover("not-a-session");
+  assert.deepEqual(f.desktop.list().map(s => s.id).sort(), [id, moved].sort(), "an id that is not a session is ignored");
+});
+
+test("a named transcript stays listed while the app's sidebar lags, and is dropped after ten minutes without it", t => {
+  const f = fixture(t);
+  const listed = new Set([id]);
+  let now = Date.now();
+  const desktop = new DesktopSessions({ projects: f.projects, summarize, excluded: () => f.excluded, now: () => now, processes: () => "", sidebarIds: () => listed });
+  t.after(() => desktop.close());
+  fs.writeFileSync(path.join(f.project, `${id}.jsonl`), line(user));
+  assert.deepEqual(desktop.list().map(s => s.id), [id]);
+  fs.writeFileSync(path.join(f.project, `${other}.jsonl`), line(user));
+  desktop.rediscover(other);
+  assert.deepEqual(desktop.list().map(s => s.id).sort(), [id, other].sort(), "named at once, before the sidebar lists it");
+  now += 60_000;
+  assert.deepEqual(desktop.list().map(s => s.id).sort(), [id, other].sort(), "still named on a later scan");
+  now += 10 * 60_000;
+  assert.deepEqual(desktop.list().map(s => s.id), [id], "named for ten minutes only, then the sidebar alone decides");
+});
+
+test("once the sidebar lists a named transcript, the sidebar alone keeps it", t => {
+  const f = fixture(t);
+  const listed = new Set([id]);
+  let now = Date.now();
+  const desktop = new DesktopSessions({ projects: f.projects, summarize, excluded: () => f.excluded, now: () => now, processes: () => "", sidebarIds: () => listed });
+  t.after(() => desktop.close());
+  fs.writeFileSync(path.join(f.project, `${id}.jsonl`), line(user));
+  fs.writeFileSync(path.join(f.project, `${other}.jsonl`), line(user));
+  desktop.rediscover(other);
+  listed.add(other);
+  assert.deepEqual(desktop.list().map(s => s.id).sort(), [id, other].sort(), "the sidebar names it");
+  listed.delete(other);
+  now += 60_000;
+  assert.deepEqual(desktop.list().map(s => s.id), [id], "no longer named, and the sidebar no longer lists it");
+});
+
+test("an Artifact call's result carries the published page, and its row reads as the title", () => {
+  const call = line({ type: "assistant", uuid: "a1", message: { id: "m1", content: [{ type: "tool_use", id: "art", name: "Artifact", input: { file_path: "C:\\work\\report.html", description: "Sales report", icon: "chart" } }] } });
+  const result = (toolUseResult: unknown, isError = false) => line({ type: "user", uuid: "u1", toolUseResult, message: { content: [{ type: "tool_result", tool_use_id: "art", is_error: isError, content: "Published" }] } });
+  const published = { artifact_id: "abc", url: "https://claude.ai/artifact/abc", title: "Q3 sales", icon: "chart", version: 2, audience: "private", path: "C:\\work\\report.html" };
+  const events = (text: string) => transcriptEvents(text, "C:\\work", summarize).bodies;
+
+  const [assistant] = events(call);
+  assert.equal(assistant?.kind === "assistant" && assistant.tools[0]?.summary, "Sales report", "never the local path");
+  const [done] = events(result(published));
+  assert.deepEqual(done?.kind === "tool_result" && done.artifact, { title: "Q3 sales", url: "https://claude.ai/artifact/abc", icon: "chart", version: 2 });
+  const rows = reduce([assistant!, done!].map((b, i) => ({ ...b, seq: i + 1, at: 0 }))).items;
+  const item = rows.find(i => i.type === "assistant");
+  assert.equal(item?.type === "assistant" && item.tools[0]?.summary, "Q3 sales");
+  assert.equal(item?.type === "assistant" && item.tools[0]?.result?.artifact?.url, "https://claude.ai/artifact/abc");
+
+  const withoutOptional = events(result({ artifact_id: "abc", url: "https://claude.ai/artifact/abc", title: "T" }))[0];
+  assert.deepEqual(withoutOptional?.kind === "tool_result" && withoutOptional.artifact, { title: "T", url: "https://claude.ai/artifact/abc" });
+  const none = (value: unknown, error = false) => { const body = events(result(value, error))[0]; return body?.kind === "tool_result" && !("artifact" in body); };
+  assert.ok(none({ ...published, url: "http://claude.ai/artifact/abc" }), "plain http");
+  assert.ok(none({ ...published, url: "https://claude.ai.evil.example/artifact/abc" }), "look-alike host");
+  assert.ok(none({ ...published, url: "https://user@claude.ai/artifact/abc" }), "credentials");
+  assert.ok(none({ ...published, url: "javascript:alert(1)" }), "script address");
+  assert.ok(none({ ...published, url: "file:///C:/work/report.html" }), "local file");
+  assert.ok(none({ ...published, title: "  " }), "no title");
+  assert.ok(none({ url: "https://claude.ai/chat/1", title: "WebFetch page" }), "another tool's result");
+  assert.ok(none(published, true), "a failed call");
+  assert.ok(none(undefined), "no structured result");
 });

@@ -1450,6 +1450,66 @@ for (const [model, target] of [
   }
 })
 
+// #140: a Claude worker's first step runs as soon as its spawn's next() answers, before the spawn hook has
+// stored the worker's record. Each new record is stepped from inside its own write, which is that window.
+function firstStepsBeforeRecord(on: On, engine: Engine) {
+  const stepped = new Set<string>()
+  on('state.set', { plugin: 'ripple', key: 'agents' }, async (_, e, next) => {
+    for (const a of e.value as AgentRec[]) {
+      if (!a.pick || stepped.has(a.id)) continue
+      stepped.add(a.id)
+      await step(engine, 'claude-opus-5-5', 'low', a.id)
+    }
+    return next(e)
+  })
+}
+const REASONED = { messages: [{ role: 'user' as const, text: '솔한테 시켜', toolUses: [] }] }
+
+test('a Claude worker\'s first step carries the effort it was picked at, before its record is stored (#140)', async ($, on) => {
+  boundaries(on, {}, REASONED)
+  http(on)
+  judgeStub(on)
+  const sent = spawnStub(on)
+  const steps = stepStub(on, null)
+  firstStepsBeforeRecord(on, $)
+  await start($)
+  await $.agent.spawn({ ...SPAWN, prompt: '[[ripple: opus@xhigh]]\nModel reason: user "솔한테 시켜"\nReview this.' })
+  expect(sent[0]).toMatchObject({ subagentType: 'ripple:auto', model: 'claude-opus-5-5' })
+  expect(steps.map(s => [s.agentId, s.effort])).toEqual([['worker-1', 'xhigh']])
+})
+
+test('two Claude workers spawned together each keep their own picked effort on their first step (#140)', async ($, on) => {
+  boundaries(on, {}, REASONED)
+  http(on)
+  judgeStub(on)
+  on('agent.spawn', ($, e) => ({ model: e.model ?? 'claude-opus-5-5', agentId: e.prompt.includes('parser') ? 'worker-parser' : 'worker-cache' }))
+  const steps = stepStub(on, null)
+  firstStepsBeforeRecord(on, $)
+  await start($)
+  await Promise.all([
+    $.agent.spawn({ ...SPAWN, description: 'Parser review', prompt: '[[ripple: opus@xhigh]]\nModel reason: user "솔한테 시켜"\nReview the parser.' }),
+    $.agent.spawn({ ...SPAWN, description: 'Cache review', prompt: '[[ripple: sonnet@high]]\nModel reason: user "솔한테 시켜"\nReview the cache.' }),
+  ])
+  expect(steps.find(s => s.agentId === 'worker-parser')?.effort).toBe('xhigh')
+  expect(steps.find(s => s.agentId === 'worker-cache')?.effort).toBe('high')
+})
+
+test('a refused Claude worker leaves its effort behind for no later step (#140)', async ($, on) => {
+  boundaries(on, {}, REASONED)
+  http(on)
+  judgeStub(on)
+  on('agent.spawn', ($, e) => {
+    if (e.prompt.includes('Refused')) throw new Error('refused by the test')
+    return { model: e.model ?? 'claude-opus-5-5', agentId: 'worker-next' }
+  })
+  const steps = stepStub(on, null)
+  await start($)
+  const outcome = await $.agent.spawn({ ...SPAWN, prompt: '[[ripple: opus@xhigh]]\nModel reason: user "솔한테 시켜"\nRefused.' }).then(() => 'started', () => 'failed')
+  expect(outcome).toBe('failed')
+  await step($, 'claude-opus-5-5', 'low', 'worker-unknown')
+  expect(steps.map(s => [s.agentId, s.effort])).toEqual([['worker-unknown', 'low']])
+})
+
 test('a user reason is checked against the last ten human messages and the last two prompts', async ($, on) => {
   const older = 'an older line'
   const tenth = 'the tenth line says Sol'
@@ -2142,6 +2202,64 @@ test('a tidy turn that is stopped compacts nothing and says the chat was left al
   expect(notes).toEqual([])
   expect(b.toasts.some(text => text.includes('the tidy-up did not finish'))).toBe(true)
   expect(await ui.find({ type: 'Text', text: /did not finish, so the chat was not compacted/ })).toBeDefined()
+  await ui.unmount()
+})
+
+// 2026-11-16: a context already near full compacted on its own the moment the tidy prompt went in,
+// and the mod then ran /compact over the tidied turn too. A compaction of the main chat while the
+// tidy-up stands is the compaction; it is not done a second time, whatever the turn's end was.
+for (const when of ['before the prompt became a turn', 'while its turn runs'] as const) for (const reason of ['answer', 'aborted'] as const) {
+  test(`an automatic compaction ${when} leaves the tidy turn's end ${reason} without a second /compact`, async ($, on) => {
+    const b = boundaries(on)
+    http(on)
+    const notes = compacts(on)
+    on('session.compact', () => ({ messages: MESSAGES }))
+    await start($)
+    const ui = await pressCompact($, 'Keep the router decision.')
+    expect(b.submitted).toEqual([TIDY])
+    if (when === 'before the prompt became a turn') await $.session.compact({ trigger: 'auto', messages: MESSAGES })
+    await $.turn.start({ text: TIDY, turnId: 'turn-2' })
+    if (when === 'while its turn runs') await $.session.compact({ trigger: 'auto', messages: MESSAGES })
+    await $.turn.complete({ turnId: 'turn-2', answer: reason === 'answer' ? 'Done.' : '', reason, durationMs: 10, isAborted: reason !== 'answer' })
+    await b.clock.advance(10)
+    expect(notes).toEqual([])
+    expect(b.toasts.some(text => text.includes('the tidy-up did not finish'))).toBe(false)
+    expect(await ui.find({ type: 'Text', text: 'Compacted' })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /did not finish/ })).toBeUndefined()
+    await ui.unmount()
+  })
+}
+
+test('a tidy turn with no compaction meanwhile compacts exactly once', async ($, on) => {
+  const b = boundaries(on)
+  http(on)
+  const notes = compacts(on)
+  on('session.compact', () => ({ messages: MESSAGES }))
+  await start($)
+  const ui = await pressCompact($, 'Keep the router decision.')
+  await $.turn.start({ text: TIDY, turnId: 'turn-2' })
+  await $.turn.complete({ turnId: 'turn-2', answer: 'Done.', reason: 'answer', durationMs: 10, isAborted: false })
+  await b.clock.advance(10)
+  await b.clock.advance(10)
+  expect(notes).toEqual(['Keep the router decision.'])
+  expect(await ui.find({ type: 'Text', text: 'Compacted' })).toBeDefined()
+  await ui.unmount()
+})
+
+test('a precompute or a subagent compaction during the tidy-up does not stand in for the /compact', async ($, on) => {
+  const b = boundaries(on)
+  http(on)
+  const notes = compacts(on)
+  on('session.compact', () => ({ messages: MESSAGES }))
+  await start($)
+  const ui = await pressCompact($, 'Keep the router decision.')
+  await $.session.compact({ trigger: 'precompute', messages: MESSAGES })
+  await $.turn.start({ text: TIDY, turnId: 'turn-2' })
+  await $.session.compact({ trigger: 'auto', messages: MESSAGES, agentId: 'worker' })
+  await $.session.compact({ trigger: 'precompute', messages: MESSAGES })
+  await $.turn.complete({ turnId: 'turn-2', answer: 'Done.', reason: 'answer', durationMs: 10, isAborted: false })
+  await b.clock.advance(10)
+  expect(notes).toEqual(['Keep the router decision.'])
   await ui.unmount()
 })
 
@@ -3401,6 +3519,268 @@ test('the band Clear asks first, and confirming runs the clear once', async ($, 
   await ui.unmount()
 })
 
+// A Desktop approval the phone may hold (no Remote Control): the host decides hold or dialog.
+const jsonReply = (text: string) => ({ value: { ok: true, status: 200, headers: {}, text } })
+test('a permission the terminal asks is never sent to the host', async ($, on) => {
+  const calls: string[] = []
+  boundaries(on, {}, { env: { CLAUDE_CODE_ENTRYPOINT: 'sdk-ts' } })
+  on('classic.PermissionRequest', () => ({}))
+  on('http.fetch', { url: /\/api\/mod\/approval/ }, ($, e) => { calls.push(`${e.init?.method ?? 'GET'} ${new URL(e.url).pathname}`); return jsonReply('{"state":"hold"}') })
+  http(on)
+  await start($)
+  const answer = await $.classic.PermissionRequest({ tool_name: 'Bash', tool_input: { command: 'ls' }, permission_suggestions: [] } as never)
+  expect(answer.decision).toBeUndefined()
+  expect(calls).toEqual([])
+})
+test('a held Desktop permission waits for the phone and answers the hook with its allow', async ($, on) => {
+  const calls: string[] = []
+  let polls = 0
+  boundaries(on, {}, { env: APP_ENV })
+  on('http.fetch', { url: /\/api\/mod\/approval/ }, ($, e) => {
+    const method = e.init?.method ?? 'GET'
+    calls.push(`${method} ${new URL(e.url).pathname}`)
+    if (method === 'POST' && e.url.endsWith('/approval/done')) return jsonReply('{"ok":true}')
+    if (method === 'POST') return jsonReply('{"state":"hold"}')
+    polls += 1
+    return jsonReply(polls < 2 ? '{"state":"pending"}' : '{"state":"answered","answer":{"behavior":"allow"}}')
+  })
+  http(on)
+  await start($)
+  const answer = await $.classic.PermissionRequest({ tool_name: 'Bash', tool_input: { command: 'ls' }, permission_suggestions: [] } as never)
+  expect(answer.decision).toEqual({ behavior: 'allow' })
+  expect(calls).toEqual(['POST /api/mod/approval', 'GET /api/mod/approval', 'GET /api/mod/approval', 'POST /api/mod/approval/done'])
+})
+test('an approval the Mac answers first goes to the dialog, and the ask is forgotten after it', async ($, on) => {
+  const calls: string[] = []
+  boundaries(on, {}, { env: APP_ENV })
+  on('classic.PermissionRequest', () => ({}))
+  on('http.fetch', { url: /\/api\/mod\/approval/ }, ($, e) => {
+    calls.push(`${e.init?.method ?? 'GET'} ${new URL(e.url).pathname}`)
+    return jsonReply(e.url.endsWith('/approval/done') ? '{"ok":true}' : '{"state":"local"}')
+  })
+  http(on)
+  await start($)
+  const answer = await $.classic.PermissionRequest({ tool_name: 'Edit', tool_input: { file_path: 'a.txt' }, permission_suggestions: [] } as never)
+  // The Mac's dialog answers: the hook returns the engine's own answer, never one of its own.
+  expect(answer.decision).toBeUndefined()
+  expect(calls).toEqual(['POST /api/mod/approval', 'POST /api/mod/approval/done'])
+})
+test('a host without the approval route leaves every permission to the dialog', async ($, on) => {
+  const calls: string[] = []
+  boundaries(on, {}, { env: APP_ENV })
+  on('classic.PermissionRequest', () => ({}))
+  on('http.fetch', { url: /\/api\/mod\/approval/ }, ($, e) => { calls.push(`${e.init?.method ?? 'GET'} ${new URL(e.url).pathname}`); return { value: { ok: false, status: 404, headers: {}, text: '{"error":"unknown"}' } } })
+  http(on)
+  await start($)
+  const answer = await $.classic.PermissionRequest({ tool_name: 'Bash', tool_input: { command: 'ls' }, permission_suggestions: [] } as never)
+  expect(answer.decision).toBeUndefined()
+  expect(calls).toEqual(['POST /api/mod/approval'])
+})
+test('a hold the host stops answering is closed at the host before the dialog opens, and forgotten after it', async ($, on) => {
+  const calls: string[] = []
+  const b = boundaries(on, {}, { env: APP_ENV })
+  on('classic.PermissionRequest', () => { calls.push('dialog'); return {} })
+  on('http.fetch', { url: /\/api\/mod\/approval/ }, ($, e) => {
+    const method = e.init?.method ?? 'GET'
+    calls.push(`${method} ${new URL(e.url).pathname}`)
+    if (method === 'POST' && e.url.endsWith('/approval/done')) return jsonReply('{"ok":true}')
+    if (method === 'POST') return jsonReply('{"state":"hold"}')
+    return { value: { ok: false, status: 503, headers: {}, text: '{"error":"down"}' } }
+  })
+  http(on)
+  await start($)
+  const pending = $.classic.PermissionRequest({ tool_name: 'Bash', tool_input: { command: 'ls' }, permission_suggestions: [] } as never)
+  // The hook retries once a second until a window has passed since its last poll, then stops. That poll went out at 7 s,
+  // so the host fences the hold at 15 s, and the dialog opens a margin after that.
+  for (let step = 0; step < 15; step++) await b.clock.advance(1000)
+  expect(calls).not.toContain('dialog')
+  await b.clock.advance(250)
+  const answer = await pending
+  // The Mac's dialog answers, and the phone's card was closed before it opened.
+  expect(answer.decision).toBeUndefined()
+  expect(calls).toEqual(['POST /api/mod/approval', ...Array(8).fill('GET /api/mod/approval'), 'POST /api/mod/approval/done', 'dialog', 'POST /api/mod/approval/done'])
+})
+test('a hook the host cannot reach gives the dialog only a freshness window after its last answered poll', async ($, on) => {
+  const calls: string[] = []
+  const b = boundaries(on, {}, { env: APP_ENV })
+  let polls = 0
+  on('classic.PermissionRequest', () => { calls.push('dialog'); return {} })
+  on('http.fetch', { url: /\/api\/mod\/approval/ }, ($, e) => {
+    const method = e.init?.method ?? 'GET'
+    calls.push(`${method} ${new URL(e.url).pathname}`)
+    if (method === 'POST' && e.url.endsWith('/approval/done')) return jsonReply('{"ok":true}')
+    if (method === 'POST') return jsonReply('{"state":"hold"}')
+    polls += 1
+    return polls === 1 ? jsonReply('{"state":"pending"}') : { value: { ok: false, status: 503, headers: {}, text: '{"error":"down"}' } }
+  })
+  http(on)
+  await start($)
+  const pending = $.classic.PermissionRequest({ tool_name: 'Bash', tool_input: { command: 'ls' }, permission_suggestions: [] } as never)
+  // The last answered poll was the hold's first moment. The hook's last poll went out at 7 s, the host fences the hold
+  // at 15 s, so the dialog waits for that: at 15 s it is still closed, and it opens a margin later.
+  for (let step = 0; step < 15; step++) await b.clock.advance(1000)
+  expect(calls).not.toContain('dialog')
+  await b.clock.advance(250)
+  const answer = await pending
+  expect(answer.decision).toBeUndefined()
+  expect(calls).toEqual(['POST /api/mod/approval', ...Array(9).fill('GET /api/mod/approval'), 'POST /api/mod/approval/done', 'dialog', 'POST /api/mod/approval/done'])
+})
+test('a poll the host never answers is cut at the freshness window, and the dialog opens a margin after that poll\'s window', async ($, on) => {
+  const calls: string[] = []
+  const b = boundaries(on, {}, { env: APP_ENV })
+  on('classic.PermissionRequest', () => { calls.push('dialog'); return {} })
+  on('http.fetch', { url: /\/api\/mod\/approval/ }, ($, e) => {
+    const method = e.init?.method ?? 'GET'
+    calls.push(`${method} ${new URL(e.url).pathname}`)
+    if (method === 'POST' && e.url.endsWith('/approval/done')) return jsonReply('{"ok":true}')
+    if (method === 'POST') return jsonReply('{"state":"hold"}')
+    return new Promise(() => {})
+  })
+  http(on)
+  await start($)
+  const pending = $.classic.PermissionRequest({ tool_name: 'Bash', tool_input: { command: 'ls' }, permission_suggestions: [] } as never)
+  // Its one poll went out at 0 s and was cut at the window (8 s): the dialog opens a margin after that poll's window.
+  for (let step = 0; step < 8; step++) await b.clock.advance(1000)
+  expect(calls).not.toContain('dialog')
+  await b.clock.advance(250)
+  const answer = await pending
+  expect(answer.decision).toBeUndefined()
+  expect(calls).toEqual(['POST /api/mod/approval', 'GET /api/mod/approval', 'POST /api/mod/approval/done', 'dialog', 'POST /api/mod/approval/done'])
+})
+test('a hook the host cannot reach at first takes the host\'s answer when a poll gets through inside the window', async ($, on) => {
+  const calls: string[] = []
+  const b = boundaries(on, {}, { env: APP_ENV })
+  let polls = 0
+  on('classic.PermissionRequest', () => { calls.push('dialog'); return {} })
+  on('http.fetch', { url: /\/api\/mod\/approval/ }, ($, e) => {
+    const method = e.init?.method ?? 'GET'
+    calls.push(`${method} ${new URL(e.url).pathname}`)
+    if (method === 'POST' && e.url.endsWith('/approval/done')) return jsonReply('{"ok":true}')
+    if (method === 'POST') return jsonReply('{"state":"hold"}')
+    polls += 1
+    if (polls < 3) return { value: { ok: false, status: 503, headers: {}, text: '{"error":"down"}' } }
+    return jsonReply('{"state":"answered","answer":{"behavior":"allow"}}')
+  })
+  http(on)
+  await start($)
+  const pending = $.classic.PermissionRequest({ tool_name: 'Bash', tool_input: { command: 'ls' }, permission_suggestions: [] } as never)
+  for (let step = 0; step < 3; step++) await b.clock.advance(1000)
+  const answer = await pending
+  expect(answer.decision).toEqual({ behavior: 'allow' })
+  expect(calls).not.toContain('dialog')
+})
+test('a phone answer the host holds when the hook gives up is applied, and the dialog never opens', async ($, on) => {
+  const calls: string[] = []
+  const b = boundaries(on, {}, { env: APP_ENV })
+  on('classic.PermissionRequest', () => { calls.push('dialog'); return {} })
+  on('http.fetch', { url: /\/api\/mod\/approval/ }, ($, e) => {
+    const method = e.init?.method ?? 'GET'
+    calls.push(`${method} ${new URL(e.url).pathname}`)
+    if (method === 'POST' && e.url.endsWith('/approval/done')) return jsonReply('{"ok":true,"state":"answered","answer":{"behavior":"deny","message":"not now"}}')
+    if (method === 'POST') return jsonReply('{"state":"hold"}')
+    return { value: { ok: false, status: 503, headers: {}, text: '{"error":"down"}' } }
+  })
+  http(on)
+  await start($)
+  const pending = $.classic.PermissionRequest({ tool_name: 'Bash', tool_input: { command: 'ls' }, permission_suggestions: [] } as never)
+  for (let step = 0; step < 15; step++) await b.clock.advance(1000)
+  await b.clock.advance(250)
+  const answer = await pending
+  expect(answer.decision).toEqual({ behavior: 'deny', message: 'not now' })
+  // The answer branch's own done follows the give-up's; the host has already forgotten the ask, so it is a no-op.
+  expect(calls).toEqual(['POST /api/mod/approval', ...Array(8).fill('GET /api/mod/approval'), 'POST /api/mod/approval/done', 'POST /api/mod/approval/done'])
+})
+
+// The host's side of one hold, as packages/remote/src/mod-approval.ts keeps it: a poll dates the hold by the time the hook
+// sent it (never later than its arrival, never backwards), and a poll that arrives after the window revives nothing; a
+// hold is fenced one window after its latest poll; a phone answer is refused once fenced.
+const HOLD_WINDOW = 8_000
+function holdHost(now: () => number) {
+  let polledAt = now()
+  let state: 'pending' | 'answered' | 'local' = 'pending'
+  return {
+    poll(sentAt: number | null): string {
+      if (state === 'pending') {
+        if (now() - polledAt >= HOLD_WINDOW) state = 'local'
+        else polledAt = Math.max(polledAt, sentAt === null ? now() : Math.min(sentAt, now()))
+      }
+      return state === 'answered' ? '{"state":"answered","answer":{"behavior":"allow"}}' : `{"state":"${state}"}`
+    },
+    phone(): boolean {
+      if (state !== 'pending') return false
+      if (now() - polledAt >= HOLD_WINDOW) { state = 'local'; return false }
+      state = 'answered'
+      return true
+    },
+    done(): string {
+      if (state === 'pending') state = 'local'
+      return state === 'answered' ? '{"ok":true,"state":"answered","answer":{"behavior":"allow"}}' : '{"ok":true}'
+    },
+    fenced: (): boolean => now() - polledAt >= HOLD_WINDOW,
+    state: () => state,
+  }
+}
+
+// A hold through a router that flaps: the last good poll reply at 0 s, a retry at 7 s that reaches the host but whose reply
+// is lost, and every other approval request fails until `backAt` ms into the hold. The phone's answers come through the
+// phone's own route, not this one.
+async function flappingHold($: Engine, on: On, backAt: number) {
+  const b = boundaries(on, {}, { env: APP_ENV })
+  const host = holdHost(() => b.clock.now())
+  const started = b.clock.now()
+  const at = () => b.clock.now() - started
+  const calls: string[] = []
+  const down = { value: { ok: false, status: 503, headers: {}, text: '{"error":"down"}' } }
+  let answered = false
+  const dialog = { calls: 0, fenced: null as boolean | null }
+  on('classic.PermissionRequest', () => { calls.push('dialog'); dialog.calls++; dialog.fenced = host.fenced(); return {} })
+  on('http.fetch', { url: /\/api\/mod\/approval/ }, ($, e) => {
+    const method = e.init?.method ?? 'GET'
+    const url = new URL(e.url)
+    calls.push(`${method} ${url.pathname}@${at()}`)
+    if (method === 'POST' && url.pathname.endsWith('/approval/done')) return at() < backAt ? down : jsonReply(host.done())
+    if (method === 'POST') return jsonReply('{"state":"hold"}')
+    const sent = url.searchParams.get('sentAt')
+    const sentAt = sent === null ? null : Number(sent)
+    if (!answered) { answered = true; return jsonReply(host.poll(sentAt)) }
+    if (at() === 7_000) { host.poll(sentAt); return new Promise(() => {}) }
+    if (at() < backAt) return down
+    return jsonReply(host.poll(sentAt))
+  })
+  http(on)
+  await start($)
+  const pending = $.classic.PermissionRequest({ tool_name: 'Bash', tool_input: { command: 'ls' }, permission_suggestions: [] } as never)
+  return { b, host, calls, dialog, at, pending }
+}
+
+test('a lost poll reply does not open the dialog beside a hold the host still holds: the phone answer at 9 s is the one answer', async ($, on) => {
+  const { b, host, calls, dialog, at, pending } = await flappingHold($, on, 15_000)
+  for (let step = 0; step < 9; step++) await b.clock.advance(1000)
+  expect(at()).toBe(9_000)
+  expect(host.phone()).toBe(true)
+  for (let step = 0; step < 6; step++) await b.clock.advance(1000)
+  expect(calls).not.toContain('dialog')
+  await b.clock.advance(250)
+  const answer = await pending
+  expect(answer.decision).toEqual({ behavior: 'allow' })
+  expect(dialog.calls).toBe(0)
+  expect(host.state()).toBe('answered')
+})
+
+test('the dialog opens only after the host fences the hold, so a phone answer after the dialog opened is refused', async ($, on) => {
+  const { b, host, calls, dialog, at, pending } = await flappingHold($, on, 16_000)
+  for (let step = 0; step < 15; step++) await b.clock.advance(1000)
+  expect(dialog.calls).toBe(0)
+  await b.clock.advance(250)
+  const answer = await pending
+  expect(answer.decision).toBeUndefined()
+  expect(calls.filter(call => call === 'dialog')).toEqual(['dialog'])
+  expect(dialog.fenced).toBe(true)
+  await b.clock.advance(750)
+  expect(at()).toBe(16_000)
+  expect(host.phone()).toBe(false)
+  expect(host.state()).toBe('local')
+})
 // The phone inbox is a first-wins handoff, never a retry of a submitted prompt.
 // Only the app's own CLI process polls it: the app sets this entrypoint, the host's runs do not.
 const APP_ENV = { CLAUDE_CODE_ENTRYPOINT: 'claude-desktop' }

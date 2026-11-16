@@ -369,6 +369,18 @@ QR code once. iPhone: [App Store](https://apps.apple.com/us/app/id6823063731). A
 Claude app sessions are supported on macOS; the app has a demo you can try without a
 computer.
 
+## Roadmap
+
+The full plan, with the issues behind each item, is in [docs/ROADMAP.md](docs/ROADMAP.md). In order:
+
+1. **See where your limit goes.** Why a request missed the cache, what each request is made of, a limit forecast with alerts, task-finished alerts, a guard against dangerous commands, and image descriptions for models that cannot read images.
+2. **Settings in one place.** One page for plugins, MCP servers, skills and hooks, with the tokens each one really costs; popular bundles in one click; one rules file for Claude and Codex.
+3. **Memory.** Every session distilled daily into decisions, records and open items, and only the few that matter brought back when you start a session, ask about it, or are about to edit a file.
+4. **Accounts handled for you.** Use first the account whose weekly limit resets soonest; hold a request when every account is out and send it when one resets; import accounts from other tools.
+5. **Save tokens, measured honestly.** A before-and-after cost meter first, then savings in the router that do not break the cache.
+
+Ideas and votes are welcome in [issues](https://github.com/PBJ-2/clauderipple/issues).
+
 ## Install
 
 **macOS**
@@ -552,6 +564,19 @@ same ChatGPT provider as the search backend in `config.json`:
 This is opt-in. With no `webSearch` setting, Claude Code's existing search path
 is unchanged.
 
+When a slot is routed to a provider that cannot run server tools (an
+`openai-compatible` one, for example) and no search backend is set, its searches
+are refused rather than answered with invented results. To let only those
+searches go to Anthropic while the slot's other requests stay routed, set:
+
+```jsonc
+{ "webSearch": "native" }
+```
+
+The search is then sent unchanged, with its original Claude model id, on the
+app's own login. A search for a model id that does not start with `claude-` is
+still refused. `webSearch` takes either a backend object or `"native"`, not both.
+
 ### Remote (SSH) sessions
 
 Claude Desktop's Code tab can run a session on a remote Linux host over SSH.
@@ -712,6 +737,7 @@ In daily use by the author, but young. Expect rough edges:
 ## Community
 
 Questions and bug reports are on Discord: [https://discord.gg/R8ZgGSNHjw](https://discord.gg/R8ZgGSNHjw).
+What is planned next: [docs/ROADMAP.md](docs/ROADMAP.md).
 
 ## Not affiliated
 

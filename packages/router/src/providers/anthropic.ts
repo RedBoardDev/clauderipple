@@ -85,25 +85,51 @@ export function parseClaudeCodeCredentials(raw: string | null): ClaudeCodeCreden
 
 export class ClaudeCodeCredentialStore {
   private cached: ClaudeCodeCredentials | null = null;
-  private checkedAt = 0;
+  private checkedAt: number | undefined;
+  private source: "keychain" | "credentials-file" | null = null;
   private readonly read: CredentialReader;
   private readonly now: () => number;
 
-  constructor(read: CredentialReader = readClaudeCodeCredentials, now: () => number = Date.now) {
-    this.read = read;
+  constructor(read: CredentialReader | ClaudeCodeCredentialReaders = {
+    keychain: readClaudeCodeKeychain,
+    credentialsFile: readClaudeCodeCredentialsFile,
+  }, now: () => number = Date.now) {
+    this.read = typeof read === "function" ? read : () => {
+      const keychain = read.keychain();
+      if (parseClaudeCodeCredentials(keychain)) {
+        this.source = "keychain";
+        return keychain;
+      }
+      const file = read.credentialsFile();
+      this.source = parseClaudeCodeCredentials(file) ? "credentials-file" : null;
+      return file;
+    };
     this.now = now;
   }
 
   /** Valid credential or a client-safe error. This deliberately never refreshes it. */
   get(): ClaudeCodeCredentials | Error {
     const now = this.now();
-    if (!this.cached || now - this.checkedAt >= CACHE_MS) {
+    // A missing login is a cached result too: OS credential reads may spawn a synchronous process.
+    if (this.checkedAt === undefined || now < this.checkedAt || now - this.checkedAt >= CACHE_MS) {
       this.cached = parseClaudeCodeCredentials(this.read());
       this.checkedAt = now;
     }
     if (!this.cached) return new Error("Claude Code login unavailable — open Claude Code and sign in");
     if (now >= this.cached.expiresAt) return new Error("Claude Code login expired — open Claude Code once to refresh");
     return this.cached;
+  }
+
+  /** Source metadata shares the credential TTL, expiry checks and explicit invalidation. */
+  describeSource(): "keychain" | "credentials-file" | null {
+    return this.get() instanceof Error ? null : this.source;
+  }
+
+  /** Recheck after an explicit login change without retaining the previous credential. */
+  invalidate(): void {
+    this.cached = null;
+    this.source = null;
+    this.checkedAt = undefined;
   }
 }
 
@@ -113,7 +139,6 @@ export class ClaudeCodeCredentialStore {
  */
 export class ClaudeCodeAuthStore {
   private readonly credentials: ClaudeCodeCredentialStore;
-  private readonly credentialReaders: ClaudeCodeCredentialReaders;
   private readonly observed: ObservedClaudeCodeAuth | undefined;
   private readonly home: string;
   private readonly env: NodeJS.ProcessEnv;
@@ -123,11 +148,7 @@ export class ClaudeCodeAuthStore {
   private refreshing: Promise<void> | null = null;
 
   constructor(credentials: ClaudeCodeCredentialStore | undefined = undefined, options: ClaudeCodeAuthOptions = {}) {
-    this.credentialReaders = options.credentialReaders ?? {
-      keychain: readClaudeCodeKeychain,
-      credentialsFile: readClaudeCodeCredentialsFile,
-    };
-    this.credentials = credentials ?? new ClaudeCodeCredentialStore(() => readClaudeCodeCredentials(this.credentialReaders));
+    this.credentials = credentials ?? new ClaudeCodeCredentialStore(options.credentialReaders, options.now);
     this.observed = options.observed;
     this.home = options.home ?? (process.env.CLAUDERIPPLE_HOME?.trim() || path.join(os.homedir(), ".clauderipple"));
     this.env = options.env ?? process.env;
@@ -187,10 +208,8 @@ export class ClaudeCodeAuthStore {
   describeSource(): ClaudeCodeAuthSource | null {
     if (this.observed?.getFresh(this.now())) return "observed";
     if (this.env.CLAUDE_CODE_OAUTH_TOKEN?.trim()) return "env";
-    const keychain = parseClaudeCodeCredentials(this.credentialReaders.keychain());
-    if (keychain && this.now() < keychain.expiresAt) return "keychain";
-    const credentialsFile = parseClaudeCodeCredentials(this.credentialReaders.credentialsFile());
-    if (credentialsFile && this.now() < credentialsFile.expiresAt) return "credentials-file";
+    const stored = this.credentials.describeSource();
+    if (stored) return stored;
     return readClaudeAuthFile(this.home) ? "token-file" : null;
   }
 
