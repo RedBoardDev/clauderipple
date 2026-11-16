@@ -101,19 +101,15 @@ final class MappingEditor {
             let provider = configuration.providers.first(where: { !$0.models.isEmpty }),
             let target = provider.models.first
         else { return }
-        let levels = efforts?.levels(provider: provider.id, model: target) ?? target.effortLevels ?? []
-        change(
-            [
-                .add(
-                    source: source.id, provider: provider.id, model: target.id,
-                    effort: levels.contains("high") ? "high" : levels.first)
-            ], store: store)
+        // A new mapping leaves the effort to the Claude app, as the dashboard does.
+        change([.add(source: source.id, provider: provider.id, model: target.id, effort: nil)], store: store)
     }
 
     func selectTarget(route: ModelRoute, provider: String, model: String, store: RouterStore) {
         let target = configuration.providers.first { $0.id == provider }?.models.first { $0.id == model }
         let levels = efforts?.levels(provider: provider, model: target) ?? target?.effortLevels ?? []
-        let effort = route.effort.flatMap { levels.contains($0) ? $0 : nil } ?? (levels.contains("high") ? "high" : levels.first)
+        // A saved level the new target lacks falls back to the app's effort, never to a guessed one.
+        let effort = route.effort.flatMap { levels.contains($0) ? $0 : nil }
         change(
             [
                 .change(source: route.source, field: .provider, value: .string(provider)),

@@ -148,7 +148,8 @@ struct MappingPane: View {
                         [.change(source: route.source, field: .effort, value: value.isEmpty ? nil : .string(value))], store: store)
                 })
         ) {
-            Text(levels.isEmpty ? "Not available" : "Default").tag("")
+            // No effort saved: the request keeps the effort picked in the Claude app.
+            Text(levels.isEmpty ? "Not available" : "Same as the app").tag("")
             if let effort = route.effort, !levels.contains(effort) { Text("\(effort) (saved)").tag(effort) }
             ForEach(levels, id: \.self) { Text($0).tag($0) }
         }
