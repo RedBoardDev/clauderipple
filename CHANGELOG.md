@@ -18,6 +18,186 @@
   opens `com.clauderipple.mac`; if it is not installed, it points to `apps/macos/build.sh install`.
   Windows keeps the Electron tray, including its login item and router-down recovery.
 
+## 0.12.45 - 2026-11-20
+
+### Fixed
+
+- **A Claude app session whose turn ended no longer shows "working" while its background agents run.**
+  The app keeps a session busy for as long as any background agent runs, so the phone showed it
+  working for hours, and a question card's answer went as an interruption that could not stop
+  anything and stayed queued with "the mod is not responding". The phone now goes by the
+  conversation's own turn end (after its Stop hook), sends answers straight in, and holds a second
+  queued message until the turn the first one started has shown. The computer still counts the
+  background work as work.
+- **A finished task list leaves the phone.** A plan with every step done no longer stays under the
+  last message.
+- **Finished background work no longer piles up as "running" on the phone.** A wakeup the model
+  scheduled for itself moves to Recent once the turn it ran in has ended; the work of a conversation
+  no Claude process holds any more moves to Recent as unknown (a durable cron schedule stays); and a
+  shell command whose output merely quotes a worker's launch message is no longer listed as running.
+
+## 0.12.44 — 2026-11-19
+
+### Fixed
+
+- **Photos and slash commands from the phone reach Claude app sessions with Remote Control on.**
+  Like plain text in 0.12.43, they now go through the ripple mod. A photo is saved on the computer and
+  its file is named in the message; on native Claude models the router sends it to the model as the
+  image itself, so Claude sees it as it would a pasted one (other models open the file). The Claude
+  app shows a short `📷 Photo` line where the phone shows the thumbnail. A photo sent with a slash
+  command runs the command with the photo's file among its arguments. Slash commands run as if typed
+  in the app, and `/clear` empties the same session.
+- **A phone message no longer shows twice, or as sent when it never ran (#177).** When the mod did
+  not answer, a message to a Remote Control session was still posted to Remote Control, which now
+  drops it, and the phone kept a copy that never ran. Such a message now fails with a notice saying
+  the ripple mod is not answering, and nothing is left behind. "Interrupt" sends stop the running turn
+  through the mod and go next.
+- **The compaction summary no longer appears on the phone as your message.** The Claude app hides it;
+  the phone now does too, and a `/compact` at rest no longer looks like an unfinished turn.
+- **The remote web page is no longer blank in the installed package or on the relay (#174).** Three
+  browser modules the page loads were left out of the npm package, and one of them out of the relay.
+- **Background work a restarted Claude app lost no longer stays "running" on the phone (#176).** A
+  Monitor or background shell started before the session's current Claude process moves to Recent as
+  unknown, and a stop answered with "No task found" ends the task.
+
+## 0.12.43 — 2026-11-19
+
+### Fixed
+
+- **Phone messages reach Claude app sessions with Remote Control on again.** Since 2026-11-18,
+  Anthropic's server no longer marks a message the phone host posts to Remote Control as typed by a
+  person, so Claude Code treated it as a message from another session and never ran it: the phone
+  showed "thinking" and nothing happened. Plain text for such a session now goes through the ripple
+  mod inside the Claude app, as it already did for sessions without Remote Control, and waits in the
+  queue while the session is busy. Sending a new message still replaces an open permission prompt.
+  Photos and slash commands, and sessions without the mod, still go over Remote Control, so they do
+  not arrive until Anthropic accepts them again; messages from the official Claude app are not affected.
+- **The last turn's finished task list no longer stays under a new phone message.** A message the mod
+  runs for the phone now starts a new turn on the phone like one typed in the app.
+
+## 0.12.42 — 2026-11-18
+
+### Fixed
+
+- **A paused account no longer has workers in the worker menus.** A worker pinned to a paused
+  ChatGPT, Google or Claude account was still listed and could be picked for a worker rung, but a paused
+  account never runs a turn, so the work quietly went to another account. Those workers now leave the
+  menus while the account is paused and come back when you resume it. A rung that already names one shows
+  it as unavailable and is skipped until then. The "models to use" list remembers whether such a worker
+  was ticked, so it comes back as you left it.
+
+## 0.12.41 — 2026-11-18
+
+### Changed
+
+- **Idle compaction now yields to keep-warm chat by chat, not by a global switch.** In 0.12.40,
+  turning keep-warm on in Settings turned Claude Code's idle compaction off for every chat, and a chat
+  whose keep-warm you switched on or off with the band's flame was not followed. Now the "Compact ahead
+  while idle" switch alone decides Claude Code's `idleCompaction`, and in each chat the mod skips the
+  idle summary only while keep-warm is actually keeping that chat's cache (on for the chat, not stopped,
+  within its time limit and big enough). Other chats are compacted ahead as usual, and compaction at
+  the threshold or one you ask for is unchanged. Sessions already open pick this up when they restart.
+
+## 0.12.40 — 2026-11-17
+
+### Added
+
+- **A dashboard switch for Claude Code's idle compaction, and keep-warm is no longer pre-empted by it.**
+  Claude Code summarizes a conversation over 200K tokens that sits idle for close to an hour (at 90% of the
+  1-hour cache, about 54 minutes) and continues from that summary when you come back. Keep-warm pings at
+  about 56 minutes, so with keep-warm on, the conversation was still compacted. ClaudeRipple now writes
+  Claude Code's `idleCompaction` setting: on only when the new "Compact ahead while idle" switch (under
+  conversation compaction, on by default) is on and keep-warm is off. Running sessions pick the change up
+  within seconds. Uninstalling removes the `idleCompaction: false` ClaudeRipple wrote.
+
+## 0.12.39 — 2026-11-17
+
+### Changed
+
+- **An effort level asked for in chat now applies to that message only.** In 0.12.38 the asked level held
+  for the rest of the chat, so later prompts kept running at it while the bar showed automatic selection.
+  The level now covers the turn that asked for it; the next message, a short follow-up included, is judged
+  automatically again within your floor, ceiling and save mode. The effort descriptions in the dashboard
+  and the mod's settings panel say so.
+
+## 0.12.38 — 2026-11-17
+
+### Added
+
+- **An effort level asked for in chat is applied as asked.** With automatic reasoning effort on, tell the
+  agent in chat which level to use (for example "추론 강도 매우 높음으로", "매우높음으로", "set effort to
+  xhigh" or "use max effort") and the judge reads it and that exact level is used, even outside the floor and
+  ceiling you set (save mode still caps it). It holds for that chat until you ask for another level, ask to
+  go back to automatic, change the effort in the app, or run /clear; other chats and new chats are
+  unaffected. Questions ("why did it go to medium?"), negations ("don't use max") and level words about code
+  or config do not count as a request. The judge's verdict (level, confidence, whether a level was asked, and
+  the level applied) is now logged.
+
+### Fixed
+
+- **`uninstall --purge` on macOS 27 no longer fails with "launchd bootout failed … Input/output error" and
+  leaves the launch agent file behind.** A failed bootout is now checked against launchd, and only a job that
+  is really gone counts as removed.
+
+## 0.12.37 — 2026-11-17
+
+### Added
+
+- **Gemini 4 Hydrogen on Antigravity, and a model Google adds later is listed and called without a release.**
+  Google started serving `gemini-4-hydrogen-{low,medium,high,xhigh}` on 2026-11-12; it is now in the table
+  with its own quota scope and its spoken name in the mod's worker picker. Each Antigravity provider also
+  keeps what its catalogue listed outside the built-in tables, so a new `gemini-` model (a tier family, a
+  CLI-only model, the host that listed it) shows up in the list and can be called as soon as Google serves it,
+  and it is still resolved when the catalogue cannot be read at start. A new provider starts from the lists
+  of the provider that asks exactly its hosts, so a prod-pinned provider no longer sends an id the host no
+  longer lists (400), and a provider with no model list reads the default host's quota instead of showing 0%
+  used while it is nearly spent (#165, thanks @csa906).
+
+- **A model mapping can keep the reasoning effort chosen in the Claude app.** The Model mapping page used to
+  fill in a concrete level (`high` by default) for every target with an effort ladder, so each mapping
+  overrode the effort picked in the app even when you only wanted to send a model elsewhere. "Same as the
+  app" is now the first choice and the default for new mappings; mappings that name a level are unchanged
+  (#172, thanks @RedBoardDev).
+
+- **The Logs page names the purpose of Claude Code's background requests.** Auto mode's classifier calls
+  showed up as unexplained model usage (thousands of `claude-sonnet-5 → claude-sonnet-5` rows) because only
+  web searches carried a purpose tag. Requests and their details now name every known purpose with a short
+  explanation, in all six languages (#173, thanks @RedBoardDev).
+
+- **The remote list shows a live Claude Code CLI that runs outside the Claude app, read-only.** A session
+  started in a terminal or Paseo was hidden whenever the Claude app's sidebar was present, and the web UI forced
+  every row replyable. Such a session now appears while its process lives and is marked read-only; sending or
+  queueing a message to it is refused instead of being stranded when the CLI exits, and sessions in the
+  Claude app stay replyable (#171, thanks @122yjs).
+
+### Fixed
+
+- **The remote bridge no longer fails with a 404 when the terminal CLI is signed in to a different account
+  than the Claude app.** The bridge paired the app's organization with the CLI's keychain token, so the API
+  answered 404 to every session call and queued messages were held with a 404 error. On a 404 it now retries once with the Claude app's observed login and keeps using it while the
+  keychain still holds the token that was refused, so signing the CLI in again is honoured. A 404 to both
+  fails as before (#169, thanks @122yjs).
+
+- **On Windows, `clauderipple restart`, `update` and `stop` handle a router that runs outside the scheduled
+  task.** A router of this installation started by hand, or left behind when the task's launcher was gone,
+  was refused as "another installation", so the update carried on, the check passed against the old router and
+  it printed Done with the old version still running. Such a router is now drained through its own shutdown
+  call and the task is started; a router of a different installation is still refused. After every start the
+  install checks which version answers and does not report an update as applied when the old one still does,
+  and a tray update blocked by a running tray no longer fails the whole update.
+
+### Changed
+
+- **Far fewer Cloudflare relay wake-ups for remote control.** The relay's free tier ran out again because
+  four things woke it with nobody using it: the host's route check every 5 minutes, a hidden phone retrying
+  an offline host every 30 seconds, the foreground phone's ping and presence as two wakes a minute, and the
+  60-second dead-man renewals. The host now checks its route hourly (a phone connecting counts as proof, and
+  it re-checks after a sleep), a phone with the app hidden retries every 10 minutes, presence rides on the
+  existing ping, and the dead-man alarm is judged by the control socket's pings instead of renewals. A phone
+  that is in the foreground, changes network or taps the retry button still reconnects at once, and the
+  dead-man alert still arrives 140-150 seconds after the host vanishes, inside the old 120-180 seconds. Older
+  hosts and relays keep the previous timing.
+
 ## 0.12.36 — 2026-11-16
 
 ### Fixed

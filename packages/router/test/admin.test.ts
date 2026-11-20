@@ -270,10 +270,12 @@ test("mod-options numbers a pinned worker's account as the limits do", async () 
       const paused = await fetch(`${base()}:${port}/api/claude-accounts/${first.id}`, { method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify({ paused: true }) });
       assert.equal(paused.status, 200);
       const after = await read();
-      assert.deepEqual([after.first, after.second], [3, 2], "a paused account leaves the limits' numbering and follows the numbered ones");
+      assert.deepEqual([after.first, after.second], [undefined, 2], "a paused account has no pinned worker, and the other keeps its number");
+      assert.deepEqual(after.accounts?.map((account) => account.number), [1, 2, 3], "the paused account still follows the numbered ones in the list");
+      assert.equal(after.accounts?.[2]?.label, accountLabel(home, first.id));
       setCurrentClaudeAccountPaused(home, true);
       const noCurrent = await read();
-      assert.deepEqual([noCurrent.first, noCurrent.second], [2, 1], "pausing the app login leaves no gap or replacement by its cached identity");
+      assert.deepEqual([noCurrent.first, noCurrent.second], [undefined, 1], "pausing the app login leaves no gap or replacement by its cached identity");
       assert.deepEqual(noCurrent.accounts?.map((account) => account.number), [1, 2]);
       assert.equal(noCurrent.accounts?.[0]?.label, accountLabel(home, second.id));
       assert.deepEqual([noCurrent.accounts?.[0]?.name, noCurrent.accounts?.[0]?.current], ["second", undefined], "a stored account in first place is not the app login");
@@ -621,6 +623,39 @@ test("admin mod-settings returns full defaults before storage, normalizes writes
     if (process.platform !== "win32") assert.equal(fs.statSync(file).mode & 0o777, 0o600);
     assert.equal((await (await putModSettings(port, { settings })).json() as ModSettingsSnapshot).revision, 2);
     assert.deepEqual(fs.readdirSync(home).filter(name => /mod-settings.*(tmp|lock)/.test(name)), []);
+  });
+});
+
+test("admin mod-settings save derives Claude Code's idleCompaction from the toggle alone", async () => {
+  await withAdmin(makeCfg(), async ({ port }) => {
+    const file = process.env.CLAUDE_SETTINGS_PATH!;
+    fs.writeFileSync(file, JSON.stringify({ model: "opus" }));
+    const read = () => JSON.parse(fs.readFileSync(file, "utf8"));
+    assert.equal((await putModSettings(port, { settings: { keepWarm: false } })).status, 200);
+    assert.deepEqual(read(), { model: "opus" });
+    // Keep-warm is a per-chat decision inside the mod: turning it on globally leaves the key alone.
+    assert.equal((await putModSettings(port, { settings: { keepWarm: true } })).status, 200);
+    assert.deepEqual(read(), { model: "opus" });
+    assert.equal((await putModSettings(port, { settings: { keepWarm: true, idleCompact: false } })).status, 200);
+    assert.deepEqual(read(), { model: "opus", idleCompaction: false });
+    assert.equal((await putModSettings(port, { settings: { keepWarm: false, idleCompact: false } })).status, 200);
+    assert.deepEqual(read(), { model: "opus", idleCompaction: false });
+    assert.equal((await putModSettings(port, { settings: { keepWarm: false, idleCompact: true } })).status, 200);
+    assert.deepEqual(read(), { model: "opus" });
+    // A save from a mod that predates the toggle leaves it out: the stored choice stands.
+    assert.equal((await putModSettings(port, { settings: { keepWarm: false, idleCompact: false } })).status, 200);
+    const legacy = await putModSettings(port, { settings: { keepWarm: false } });
+    assert.equal(legacy.status, 200);
+    assert.equal((await legacy.json() as { settings: { idleCompact: boolean } }).settings.idleCompact, false);
+    assert.deepEqual(read(), { model: "opus", idleCompaction: false });
+    assert.equal((await putModSettings(port, { settings: { keepWarm: false, idleCompact: true } })).status, 200);
+    assert.deepEqual(read(), { model: "opus" });
+    // A stale save changes nothing; a settings.json that is not an object never fails the save itself.
+    assert.equal((await putModSettings(port, { settings: { keepWarm: true }, revision: 1 })).status, 409);
+    assert.deepEqual(read(), { model: "opus" });
+    fs.writeFileSync(file, "[1]");
+    assert.equal((await putModSettings(port, { settings: { keepWarm: true } })).status, 200);
+    assert.equal(fs.readFileSync(file, "utf8"), "[1]");
   });
 });
 
@@ -3528,6 +3563,41 @@ test("google (antigravity) probe reports no account with the static catalogue an
     assert.match(body.error, /clauderipple google-login/);
     assert.ok(body.models.some((m) => m.id === "gemini-3.8-flash"));
   });
+});
+
+test("google (antigravity) probe lists the catalogue of the provider being configured, not of the first one", async () => {
+  // Each provider learns its own catalogue: a list read through another provider offers models the
+  // one being configured never learns, and it then sends them as an unknown id.
+  const asked: string[] = [];
+  const account = { id: "acct-1", label: "g@example.test", email: "g@example.test", projectId: "proj-1", expiresAt: Date.now() + 3_600_000, needsReauth: false, paused: false, preferred: false, inUse: true, state: "ready" as const, active: true };
+  const google = () => ({
+    accounts: () => ({ first: [account], pinned: [account] }),
+    models: async (name: string) => { asked.push(name); return [{ id: name === "first" ? "gemini-5-neon" : "gemini-5-prod-only" }]; },
+    clearCooldown: () => {},
+  });
+  const prod = "https://cloudcode-pa.googleapis.com";
+  const providers = { first: { type: "google" as const, auth: "antigravity" as const }, pinned: { type: "google" as const, auth: "antigravity" as const, url: `${prod}/` } };
+  await withAdmin(makeCfg({ providers }), async ({ port }) => {
+    const probe = async (more: Record<string, unknown>): Promise<string[]> => {
+      const res = await fetch(`${base()}:${port}/api/providers/probe`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ type: "google", auth: "antigravity", ...more }) });
+      const body = await res.json() as { ok: boolean; models: { id: string }[] };
+      assert.equal(body.ok, true);
+      return body.models.map((m) => m.id);
+    };
+    assert.deepEqual(await probe({ name: "pinned", url: prod }), ["gemini-5-prod-only"]);
+    assert.deepEqual(await probe({ name: "first" }), ["gemini-5-neon"]);
+    assert.deepEqual(asked, ["pinned", "first"]);
+    // A provider not saved yet has no catalogue of its own: it is shown one read from the hosts it
+    // would ask, and the tables' list when no saved provider asks those.
+    assert.deepEqual(await probe({ name: "new one", url: prod }), ["gemini-5-prod-only"]);
+    assert.deepEqual(await probe({}), ["gemini-5-neon"]);
+    assert.deepEqual(asked.slice(2), ["pinned", "first"]);
+    const elsewhere = await probe({ url: "https://daily-cloudcode-pa.googleapis.com" });
+    assert.ok(elsewhere.includes("gemini-3.8-flash") && !elsewhere.some((id) => id.startsWith("gemini-5-")), "the static list");
+    assert.equal(asked.length, 4, "no provider's catalogue was asked for hosts it does not ask");
+    // A name that is another kind of provider is not asked either.
+    assert.deepEqual(await probe({ name: "missing" }), ["gemini-5-neon"]);
+  }, { google });
 });
 
 test("google login: the API returns the terms warning and account endpoints expose no token", async () => {

@@ -1,6 +1,6 @@
 {
   "name": "@clauderipple/app",
-  "version": "0.12.36",
+  "version": "0.12.45",
   "private": true,
   "description": "ClaudeRipple Electron tray for Windows and Linux. Hosts the dashboard even when the router is down and shows chain health.",
   "license": "GPL-3.0-only",

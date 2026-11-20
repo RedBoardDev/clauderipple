@@ -64,6 +64,7 @@
     "hide": [
       "reason"
     ],
+    "idleCompact": true,
     "jevSource": "typesafe",
     "judge": "haiku",
     "judgeModel": "deepseek-v4.1-flash",

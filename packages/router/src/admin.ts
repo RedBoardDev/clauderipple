@@ -38,7 +38,7 @@ import { adminPort, headerValueProblem, homeDir, searchProviderFor, ssidProblem,
 export { adminPort } from "./config.ts";
 import { accountDisplayName, agentRenames, generatedAgents } from "./agents.ts";
 import { isJudgeOnlyModel } from "./model-policy.ts";
-import { ModSettingsInputError, readModSettings, validateSettings, validateSettingsSchema, writeAutoCompactWindow, writeModSettings } from "./mod-settings.ts";
+import { ModSettingsInputError, idleCompactionWanted, readModSettings, validateSettings, validateSettingsSchema, writeAutoCompactWindow, writeIdleCompaction, writeModSettings } from "./mod-settings.ts";
 import { billingOf, claudeChoices, fillLadder, ladderNeedsFill } from "../../mod/hooks/ladder.ts";
 import { latestClaudeIds, normalizeSettings, twoLevelRungs } from "../../mod/hooks/settings.ts";
 import type { Billing, DomainRules, Effort, LadderChoice, Rungs, Settings, Step } from "../../mod/types/index.d.ts";
@@ -75,7 +75,7 @@ import { statusModEnabled, syncModelSlots } from "../../cli/src/settings.ts";
 import { ClaudeOAuthSession, type ClaudeOAuthState } from "./providers/claude-oauth.ts";
 import { readClaudeAuthFile } from "./providers/anthropic-token-file.ts";
 import { isCurrentClaudeAccountPaused, listClaudeAccounts, listClaudeAccountsWithSubject, removeClaudeAccount, updateClaudeAccount, setCurrentClaudeAccountPaused, setPreferredClaudeAccount } from "./providers/anthropic-accounts.ts";
-import { storedAccountsFor } from "./pinned-accounts.ts";
+import { pinnableAccountsFor, storedAccountsFor } from "./pinned-accounts.ts";
 import { CODEX_LOGIN_ID, readChatGptAccounts, removeChatGptAccount, summarize as summarizeChatGptAccount, updateChatGptAccount } from "./providers/chatgpt/accounts.ts";
 import { exhaustedForMs, IMAGE_ASPECTS, IMAGE_BACKGROUNDS, IMAGE_FORMATS, type ChatGptAccountStatus, type ImageRequest, type ImageResult } from "./providers/chatgpt/index.ts";
 import type { GoogleAccountStatus } from "./providers/google/index.ts";
@@ -970,7 +970,7 @@ async function modOptions(deps: AdminDeps, scores: ModelScoreCatalog): Promise<M
   const credentials = deps.credentials?.() ?? {};
   const health = deps.providerHealth?.() ?? {};
   const catalog = effortLevels(cfg).providers;
-  const agents: ModOptions["agents"] = generatedAgents(cfg, deps.agentDir, undefined, deps.log, (provider) => storedAccountsFor(provider, homeDir())).map(a => ({
+  const agents: ModOptions["agents"] = generatedAgents(cfg, deps.agentDir, undefined, deps.log, (provider) => pinnableAccountsFor(provider, homeDir())).map(a => ({
     ...a,
     efforts: modEfforts(catalog[a.provider]?.models?.[a.model] ?? catalog[a.provider]?.default),
     billing: billingOf(cfg.providers[a.provider] as { type: string; auth?: string; preset?: string; url?: string }, a.model),
@@ -1504,11 +1504,19 @@ async function probeGoogle(body: { apiKey?: unknown; url?: unknown }, probeFetch
  * Cloud Code Assist returns for it (falling back to the static list). No network call is made here
  * beyond the catalogue the provider already serves; a signed-out state is the common answer.
  */
-async function probeGoogleAntigravity(deps: AdminDeps): Promise<{ ok: boolean; auth: ProbeAuth; models: ModelEntry[]; error?: string }> {
+async function probeGoogleAntigravity(deps: AdminDeps, probe: { name?: unknown; url?: unknown } = {}): Promise<{ ok: boolean; auth: ProbeAuth; models: ModelEntry[]; error?: string }> {
   const accounts = deps.google?.().accounts?.() ?? {};
   const signedIn = Object.values(accounts).some((list) => list.length > 0) || readGoogleAccounts(homeDir()).length > 0;
   if (!signedIn) return { ok: false, auth: "missing", models: staticAntigravityModels(), error: "no Google account; run `clauderipple google-login`" };
-  const named = Object.keys(accounts)[0];
+  // Whose catalogue to read. Each Antigravity provider learns the models outside the tables from
+  // its own catalogue, on the hosts it asks, so a list read through another provider can offer a
+  // model the one being configured never learns and would then send as an unknown id. The form
+  // names the provider it is editing; one not saved yet is shown the catalogue of a saved provider
+  // that asks the same hosts (the same pinned `url`, or none), and the tables' list when there is
+  // no such provider. It reads its own catalogue once it is saved.
+  const antigravity = Object.entries(deps.config().providers).filter(([, p]) => p.type === "google" && p.auth === "antigravity") as [string, { url?: string }][];
+  const pin = (url: unknown): string => (typeof url === "string" ? url.trim().replace(/\/+$/, "") : "");
+  const named = antigravity.find(([name]) => name === probe.name)?.[0] ?? antigravity.find(([, p]) => pin(p.url) === pin(probe.url))?.[0];
   const models = named ? await deps.google?.().models?.(named).catch(() => null) ?? null : null;
   return { ok: true, auth: "ok", models: models ?? staticAntigravityModels() };
 }
@@ -2305,10 +2313,15 @@ export function startAdmin(deps: AdminDeps): Promise<{ port: number; close(): vo
         if (method !== (isList ? "GET" : "POST")) { sendJson(res, 404, { error: "unknown phone endpoint or method" }); return; }
         let body: string | undefined;
         let session: string | undefined;
+        let caps: string | undefined;
         if (isList) {
           const query = new URL(url, "http://127.0.0.1").searchParams;
           session = query.get("session") ?? undefined;
           if (!session || session.length > 200 || query.getAll("session").length !== 1) { sendJson(res, 400, { error: "invalid session" }); return; }
+          // What the mod can run beyond a prompt (a mod that predates it sends none).
+          const announced = query.getAll("caps");
+          if (announced.length > 1 || announced.length === 1 && !/^[a-z]{1,20}(,[a-z]{1,20}){0,7}$/.test(announced[0]!)) { sendJson(res, 400, { error: "invalid caps" }); return; }
+          caps = announced[0];
         } else {
           try { body = (await readBody(req, 4096, new Error("inbox body too large"))).toString("utf8"); }
           catch { sendJson(res, 400, { error: "invalid inbox request" }); return; }
@@ -2322,7 +2335,7 @@ export function startAdmin(deps: AdminDeps): Promise<{ port: number; close(): vo
           }
         }
         const route = isList ? "inbox" : `inbox/${pathname.endsWith("/claim") ? "claim" : "result"}`;
-        const result = await phoneRequest(route, method, body, deps.phone, session);
+        const result = await phoneRequest(route, method, body, deps.phone, session, undefined, caps);
         sendJson(res, result.status, result.body);
         return;
       }
@@ -2534,7 +2547,12 @@ export function startAdmin(deps: AdminDeps): Promise<{ port: number; close(): vo
         if (body && typeof body === "object" && body.settings && typeof body.settings === "object" && !Array.isArray(body.settings)) {
           // Checked before normalizing, which would drop a credential field the check is there to refuse.
           validateSettings(body.settings);
-          body.settings = await withFilledLadder(deps, scores, normalizeSettings(body.settings));
+          // Normalizing fills a missing `idleCompact` with the default; an older mod's save leaves it
+          // out, and writeModSettings keeps the stored value only while the key stays absent.
+          const idleAbsent = !Object.hasOwn(body.settings, "idleCompact");
+          const normalized: Partial<Settings> = await withFilledLadder(deps, scores, normalizeSettings(body.settings));
+          if (idleAbsent) delete normalized.idleCompact;
+          body.settings = normalized;
         }
         if (!body || typeof body !== "object" || body.settings === undefined) {
           if (body && typeof body === "object" && body.compactAt !== undefined) {
@@ -2546,6 +2564,12 @@ export function startAdmin(deps: AdminDeps): Promise<{ port: number; close(): vo
           throw new ModSettingsInputError("settings must be a JSON object");
         }
         const result = writeModSettings(parsed);
+        if (!result.stale) {
+          // Claude Code's `idleCompaction` follows the saved toggle alone. The save already
+          // happened, so a settings.json that cannot be written is logged, not turned into a failed save.
+          try { writeIdleCompaction(idleCompactionWanted(result.current.settings)); }
+          catch (error) { deps.log.warn(`admin: idleCompaction not synced: ${(error as Error).message}`); }
+        }
         sendJson(res, result.stale ? 409 : 200, result.current);
         return;
       }
@@ -2630,7 +2654,7 @@ export function startAdmin(deps: AdminDeps): Promise<{ port: number; close(): vo
         }
         if (probe.type === "google") {
           if (probe.auth === "antigravity") {
-            sendJson(res, 200, await probeGoogleAntigravity(deps));
+            sendJson(res, 200, await probeGoogleAntigravity(deps, probe));
             return;
           }
           sendJson(res, 200, await probeGoogle({ apiKey: probe.apiKey, url: probe.url }, deps.probeFetch));

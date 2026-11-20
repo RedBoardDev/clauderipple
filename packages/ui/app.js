@@ -3101,7 +3101,8 @@ async function probeProvider(name, provider, onComplete) {
     const body = provider.type === "anthropic"
       ? { type: "anthropic", auth: provider.auth, ...(provider.auth === "api-key" && provider.apiKey ? { apiKey: provider.apiKey } : {}) }
       : provider.type === "google"
-      ? { type: "google", auth: provider.auth, ...(provider.apiKey ? { apiKey: provider.apiKey } : {}), ...(provider.url ? { url: provider.url } : {}) }
+      // The name says whose catalogue to read: an Antigravity provider learns its models from its own.
+      ? { type: "google", auth: provider.auth, name, ...(provider.apiKey ? { apiKey: provider.apiKey } : {}), ...(provider.url ? { url: provider.url } : {}) }
       : provider.type === "grok"
       ? { type: "grok", ...Object.fromEntries(["home", "cli", "url", "clientVersion"].filter((key) => provider[key]).map((key) => [key, provider[key]])) }
       : {
@@ -4899,7 +4900,8 @@ function openGoogleProviderForm(options) {
     probeButton.disabled = true;
     result.textContent = t("providers.checking");
     try {
-      const body = auth.value === "antigravity" ? { type: "google", auth: "antigravity" } : { type: "google", auth: "api-key", apiKey: keyInput.value.trim() || (existing && existing.apiKey) };
+      // The provider being edited and its pinned host, so the list is its own catalogue's and not another Antigravity provider's.
+      const body = auth.value === "antigravity" ? { type: "google", auth: "antigravity", ...(options.name ? { name: options.name } : {}), ...(existing && existing.url ? { url: existing.url } : {}) } : { type: "google", auth: "api-key", apiKey: keyInput.value.trim() || (existing && existing.apiKey) };
       const response = await api("/api/providers/probe", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
       if (!formActive) return;
       const failed = response.auth === "bad-key" ? t("providers.probeBadKey") : response.auth === "missing" && auth.value === "antigravity" ? t("providers.googleSignInFirst") : t("providers.probeFailed");
@@ -5341,6 +5343,7 @@ const MOD_DEFAULTS = {
   allow: [], allowKnown: [], modes: [], delegation: "normal", providers: {},
   fallback: { agent: "general-purpose", model: "sonnet" },
   keepWarm: false, keepWarmHours: 2, keepWarmMinTokens: 30000,
+  idleCompact: true,
   compactModel: "claude-haiku-5-5", compactModels: [],
   swampAlert: false, layout: "dashboard", appearance: "auto", skin: "deep", language: "auto", hide: ["reason"], extras: [], setupDone: false,
 };
@@ -5802,13 +5805,23 @@ function modTicked(choice) {
   const known = modState.settings.allowKnown || [];
   return !allow.length || allow.includes(modTickKey(choice)) || allow.includes(choice.provider) || known.length > 0 && !known.includes(modTickKey(choice));
 }
-/** Ticks one model; every model on again is stored as [], and the last one on cannot go off. */
+/**
+ * Ticks one model; every model on again is stored as [], and the last one on cannot go off. A model
+ * the list knew but does not offer now (its account paused or waiting for a sign-in) keeps its tick
+ * or its untick, so it comes back as it was rather than as a new model ticked on.
+ */
 function modTick(choice, on) {
   const all = modTickable();
-  const known = all.map(modTickKey);
+  const offered = all.map(modTickKey);
   const kept = new Set(all.filter((model) => modTicked(model)).map(modTickKey));
   if (on) kept.add(modTickKey(choice)); else kept.delete(modTickKey(choice));
-  const allow = kept.size === known.length ? [] : known.filter((key) => kept.has(key));
+  const was = modState.settings.allow || [];
+  const away = (modState.settings.allowKnown || []).filter((key) => !offered.includes(key));
+  // With no list written yet (every model on), a model away now was on too.
+  const awayOn = away.filter((key) => !was.length || was.includes(key));
+  const known = [...offered, ...away];
+  const everything = kept.size === offered.length && awayOn.length === away.length;
+  const allow = everything ? [] : [...offered.filter((key) => kept.has(key)), ...awayOn];
   modPatch({ allow, allowKnown: allow.length ? known : [] });
 }
 function modTickRows() {
@@ -6273,6 +6286,11 @@ function modCompactCard() {
     cell(t("mod.compactModel"), modSelect("compact-model", modCompactModelItems(), s.compactModel, t("mod.compactModel"), (compactModel) => modPatch({ compactModel })), null, "wide"),
     modCompactChoices(s),
     cell(t("mod.compactAt"), el("div", { class: "mode-until compact-at" }, [preset, custom]), el("span", { class: outOfRange ? "cell-sub warn-text" : undefined, text: hint }), "wide"),
+    // Claude Code's own `idleCompaction` follows this toggle alone. A chat whose keep-warm will hold its
+    // cache skips the idle summary inside the mod, so the second caption says that, always (not only
+    // while the global keep-warm is on: the flame switches it per chat).
+    cell(t("mod.idleCompact"), modSwitch("idle-compact", s.idleCompact, t("mod.idleCompact"), (idleCompact) => modPatch({ idleCompact })),
+      [modCap(t("mod.idleCompactHint")), modCap(t("mod.idleCompactKeepWarm"))]),
   ])]);
 }
 

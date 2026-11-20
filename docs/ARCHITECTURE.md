@@ -445,6 +445,59 @@ The final word of a field name decides (`apiKey`, `access_token`, `clientSecret`
 `password`, etc.); `keepWarmMinTokens` is a count, not a credential, and is accepted.
 Corrupt storage is an error, never an empty store to overwrite.
 
+**`idleCompaction` is router-derived from the toggle; keep-warm yields per chat in the mod
+(2026-11-17, per-chat 2026-11-18).** Claude Code 2.1.325 compacts a long
+main conversation while it sits idle: with at least 200K context tokens
+(`CLAUDE_CODE_IDLE_COMPACT_MIN_TOKENS`, floor 100K) and a 1-hour prompt cache, its idle timer
+fires at 90% of the cache TTL (about 54 minutes after the last activity) and starts a
+background summary, which it swaps in when the user returns. Which path it takes depends on the
+session: with no host (headless, the Code tab) the timer writes the summary through
+`session.compact` with `trigger: 'precompute'` (armTrigger `idle`) and swaps it in on return
+("Compacted using a summary written while you were away", the notice Code-tab transcripts show);
+an interactive terminal registers a host whose `compact()` runs `compactConversation` at once,
+`trigger: 'auto'` ("Compacted while idle, before the prompt cache expired"). Both fire with no
+`agentId` and outside any main turn; the other precompute arms (`api_response`, `beside_turn`)
+and the threshold's `auto` run inside a turn (2.1.326 binary, read 2026-11-18). A hook that
+answers `{ skip: reason }` leaves the conversation as it is (engine types, `session.compact`,
+whose own example skips `precompute`). Keep-warm pings 4 minutes before expiry
+(about 56), so with both on the idle summary always wins the race and replaces the full cache
+keep-warm exists to keep. Keep-warm is per chat (the band flame's `warmHere` overrides the
+global `keepWarm`), which the router cannot see, so the decision is split. The mod setting
+`idleCompact` (boolean, default true, normalized like `keepWarm`; dashboard "Compact ahead
+while idle" beside `compactAt`) is the user's choice; the router owns settings.json's
+`idleCompaction` and derives it from `idleCompact` alone
+(`mod-settings.ts:idleCompactionWanted`, `writeIdleCompaction`). The mod's `session.compact`
+hook (`register.tsx`) returns `{ skip }`, without calling `next`, when the trigger is
+`precompute` or `auto`, there is no `agentId`, no main turn is running (`currentTurn` null, set
+at `turn.start` before any step, so a built-in command's turn counts; and `busy` unset), and
+`cache.ts:warmWillHold` says keep-warm will hold the cache: effective keep-warm on (per-chat
+switch included), not stopped, a memo that has not expired, a real reply on record, the ping
+that comes (the same lead as `shouldPing`, 4 minutes, 1 minute for a 5-minute TTL) before the
+`keepWarmHours` bound, and the context at least `keepWarmMinTokens`. `shouldPing` and
+`warmWillHold` share one condition list (`warmBlock`). Every other `session.compact` goes to
+core unchanged. A chat without keep-warm still gets its idle summary. False is written as
+`"idleCompaction": false`; true deletes the key (Claude Code's default is true). It writes only
+when the result differs, with `writeAutoCompactWindow`'s lock, backup and atomic replace, keeps
+every other key, and refuses a settings.json that is not a JSON object (409). Every
+`PUT /api/mod-settings` that is not stale applies it, which covers the dashboard and the mod
+panel; a failure there is logged and never fails the save (the store is already saved). The
+router also reconciles once at start (`reconcileIdleCompaction`), so a hand edit or a change
+made while it was down is corrected. A hand-set `idleCompaction: false` is therefore removed
+while the toggle is on, and so is the `false` an earlier release wrote for global
+keep-warm (the next save or start removes it). A save whose
+payload lacks the `idleCompact` key (a mod loaded before it existed) keeps the stored value
+instead of the default, so an old mod cannot undo the user's choice (`writeModSettings`). The
+default home's uninstall removes `idleCompaction` from settings.json when it is `false`
+(`settings.ts:removeProxyEnvLocked`); any other value is left, and a non-default home's
+uninstall never touches it, like the other account-wide state. The 200K minimum is deliberately not a
+setting; the env var is Claude Code's own. Claude Code reads the key live: `idleCompaction` is
+read through `Hi("idleCompaction", true)` each time the idle decision runs, and `Hi` goes
+through the settings store's per-source cache, which a settings file watcher (chokidar on the
+settings directories, `awaitWriteFinish` 1000 ms, 2000 ms polling fallback) clears on any
+change, atomic replacement included. A running session therefore sees a router write within a
+few seconds; no restart is needed. Not checked: whether a headless `-p` session starts that
+watcher (the gate also depends on the launch mode).
+
 The mod reads this endpoint at `session.start` and every 3-second router poll, even
 when its band is hidden. A changed revision replaces the settings atom and redraws
 readers; every read also refreshes `compactAt`, which `/autocompact` changes without
@@ -497,8 +550,8 @@ them available as judge candidates. Tests: `test/admin.test.ts`, `test/model-pol
 
 ### 3c. Native compaction, with only its answering model selected (2026-10-31)
 
-The mod always calls `next(e)` for `session.compact`, including workers and
-`precompute`. Claude Code alone builds the summary prompt, chooses the recent
+The mod calls `next(e)` for `session.compact`, including workers and `precompute`, except
+the idle compaction (a `precompute`, or a terminal host's `auto`) that keep-warm's cache would lose (§3b, `idleCompaction`). Claude Code alone builds the summary prompt, chooses the recent
 messages to keep, and reattaches files. There is no mod-side summarizer or
 transcript serialization. The optional card tidy-up is unchanged; it happens
 before invoking core's compactor, not instead of it.
@@ -536,7 +589,7 @@ Session identity is the same on both sides: the 2.1.309 binary's `session.id`
 handler calls `Rpe(...).id`, whose definition returns `String(V())`; the request
 header builder also sets `X-Claude-Code-Session-Id` from `V()`. The generated API
 types call this the transcript file's name (§3a's captured header measurement).
-Precompute is allowed through unchanged and, when it issues the recognized API
+Precompute is allowed through unchanged (bar the idle one §3b skips) and, when it issues the recognized API
 request, follows the same router selection. A core-reused precomputed summary has
 no new API request to intercept, so the mod clears its pick (`model: null`) once
 core's compaction settles, used or not; otherwise it would wait up to ten minutes
@@ -1756,7 +1809,21 @@ tight, and nothing at 100 or more.
   warning like any other generated-name clash. `storedAccountsFor`
   (`pinned-accounts.ts`) is the one place that maps a provider kind to its store;
   the CLI/Desktop login and the borrowed Codex login are in none of them, so they
-  never get pinned workers. A worker's frontmatter model id is
+  never get pinned workers. Accounts waiting for a sign-in and **paused**
+  accounts get none either (`pinnableAccountsFor`, which the agent files, the
+  dashboard/mod agent options and `storedAccountsSignature` all use): a paused
+  account never serves a pinned turn, so its worker would be listed and picked
+  while the work ran elsewhere (found 2026-11-18: a paused ChatGPT account's
+  workers sat in the max rung). A pause or resume through the dashboard
+  regenerates the files before its request returns (`agentsChanged`); one made
+  elsewhere (the terminal CLI, a hand edit) is caught by the 15-second check,
+  because the signature changes with the list. The dashboard's account numbering
+  keeps using `storedAccountsFor`, which still lists paused accounts. The "models
+  to use" list keeps a worker's tick or untick while it is away
+  (`modTick`, ui/app.js), so a resumed account's worker comes back as it was. A saved rung naming a vanished worker is not
+  rewritten: the dashboard shows it as unavailable
+  (`modPickSelect`, ui/app.js) and the mod skips it as "not installed"
+  (`ladderPick`, mod/hooks/workers.ts). A worker's frontmatter model id is
   `<provider>#<account-pin>:<model>@<effort>`: the pin is the stable local account
   id prefix, never the label, and it rides on the provider half so
   `qualifiedModel` (targets.ts) still selects one declaration while
@@ -2122,7 +2189,8 @@ They were not live-tested during the original implementation. Files are under `s
   served to the CLI family only: its requests carry `antigravity/cli/1.3.4 (…)`
   (`antigravityUserAgentFor`; measured 2026-10-27, one Google AI Pro account: Argon 404s under the IDE UA on
   the daily host and answers 200 under the CLI one; opencodex `antigravityCliUserAgent`). The IDE
-  override env vars do not replace the CLI UA. Response frames nest the standard
+  override env vars do not replace the CLI UA. Gemini 4 Hydrogen is served the same way (measured
+  2026-11-13, one Google AI Pro account, see "Hydrogen" below). Response frames nest the standard
   Gemini payload under `response` (`adapters/google.ts:1281,1591-1596`).
 - **Two hosts, different catalogues and separate quotas (measured 2026-10-20, user's account,
   `fetchAvailableModels` on the same OAuth token).** `daily-cloudcode-pa.googleapis.com` and
@@ -2164,23 +2232,164 @@ They were not live-tested during the original implementation. Files are under `s
     is not a substitute: in the same measurement, production's Argon High quota metadata matched
     the ordinary Gemini five-hour window while the explicit summary reported spent Argon weekly
     quota, and other Argon catalogue entries omitted `remainingFraction`.
+  - **Hydrogen (measured 2026-11-13, one Google AI Pro account).** Under the CLI UA the daily
+    host's `fetchAvailableModels` lists `gemini-4-hydrogen-{low,medium,high,xhigh}` (display names
+    `Gemini 4 Hydrogen (Low|Medium|High|XHigh)`, `maxTokens` 1048576, `maxOutputTokens` 262144) in
+    `agentModelSorts`; the IDE answer on either host and the CLI answer on prod do not. One
+    `generateContent` per tier on daily under the CLI UA answered 200 with
+    `modelVersion: gemini-4-hydrogen`, with no `thinkingLevel` sent, and a `thinkingLevel` beside
+    `-medium` was accepted too. `-medium` under the IDE UA on daily and the bare
+    `gemini-4-hydrogen` 404, and `-medium` on prod under the CLI UA answers a generic 429
+    `RESOURCE_EXHAUSTED` (no ErrorInfo) rather than a 404, which would rest the whole account, so
+    Hydrogen must reach daily: the host map does that, and daily is also the default host.
+    `retrieveUserQuotaSummary` under the CLI UA reports no Hydrogen group on either host (Gemini,
+    Claude/GPT and Argon only). Hydrogen therefore has a pool scope of its own (`hydrogen`) with no
+    summary group behind it: a 429 proving Hydrogen spent rests only Hydrogen, a spent Gemini group
+    does not hide it, and the ordinary Gemini windows are never its positive-quota evidence, so a
+    generic 429 on Hydrogen is never read as the SDK prompt refusal. The limits show no Hydrogen
+    row. A provider whose `url` pins prod is not guarded: Hydrogen saved on it would be sent to
+    prod and take that generic 429 as the whole account's. **Not measured:**
+    which bucket Hydrogen draws on, a spent Hydrogen's refusal, an Ultra account, and long or
+    tool-using turns. The same catalogue lists `gemini-4-carbon-disabled` (`disabled: true`,
+    "available to Ultra plan subscribers"); it is not in the static list and was not called.
+  - **Models outside the tables are learned from the catalogue (2026-11-13).** Argon and Hydrogen
+    each needed their id typed into five tables (`servedToAntigravityCli`, `SUFFIX_TIER_MODELS`,
+    `CONTEXT_WINDOWS`, `EFFORT_LEVELS`, `ANTIGRAVITY_BASE_MODELS`) and a tier regex before they
+    could be listed or called, so a model Google added stayed invisible until a release. Measured
+    2026-11-13 on all four answers (two hosts, IDE and CLI UA, one Google AI Pro account): the CLI
+    answer is the IDE answer plus, on daily, `gemini-4-argon-{low,medium,high}`,
+    `gemini-4-hydrogen-{low,medium,high,xhigh}` and `gemini-4-carbon-disabled`, and on prod the
+    Argon ids alone; no IDE answer lists an agent id its host's CLI answer lacks. Every tier id
+    carries its own numeric `thinkingLevel` in `models{}` (`-low` 1, `-medium` 2, `-high` 3,
+    `-xhigh` 100; Flash 3.8, Argon, Hydrogen and the Claude tier ids alike), and
+    `gemini-4-carbon-disabled` carries `disabled: true`. So each provider keeps what its
+    catalogue listed outside the tables, per host and per client family, exactly as the answers
+    gave it (`LearnedCatalogue` in `antigravity.ts`; one per provider, because two providers may
+    pin different hosts and each keeps only the hosts it asks; the accounts are the home's, so the
+    same host answers every provider alike), and reads three facts off those lists each
+    time they are needed, so nothing derived can outlive the listing it came from:
+    - *Tier family* (`family`): a `gemini-` base with at least two tier suffixes
+      (`minimal|low|medium|high|xhigh|max`) listed, whose bare id no host lists, collapses to
+      one row whose ladder is those tiers. One suffixed id alone stays a row of its own
+      (`gpt-oss-120b-medium` is a whole model name), and Claude tier ids are never collapsed
+      (existing configurations name them). An effort takes its tier, else the nearest tier
+      below, else the nearest above; no effort takes `medium` by the same rule. No `thinkingLevel`
+      is sent beside the suffix. That last point is **inferred** from the three measured families,
+      not measured for a model that does not exist yet. The list asks `family` (`catalogueFrom` is
+      handed it); routing, the client family and the quota scope ask `tiers`, the same rule with
+      one tier enough. So a family that Google cuts to one tier is no longer offered as a ladder
+      (the tier that is left is a row of its own), but the base id a configuration saved while it
+      was a family still resolves onto that tier under the same UA, host and scope. Forwarded as
+      it is, it named an id no host lists (review of PR 165). The same holds for the
+      base of a lone tier id that was never a family: it is not offered, and a request for it
+      reaches the listed tier. Both end on the read that lists the bare id or no tier of it.
+    - *Client family* (`cliOnly`, per wire id): a `gemini-` id that some CLI answer lists and no
+      IDE answer of any host this provider asks lists is sent under the CLI UA; every other id
+      under the IDE UA, and `transport.build` chooses by the wire id alone. One answer for every
+      host is safe because an id that any host's IDE answer lists is only ever offered on, and
+      sent to, such a host (`hostOf` below; `catalogueFrom` is handed this same predicate, so what
+      is offered from a CLI answer is exactly what goes out under the CLI UA). A family the IDE
+      lists in part sends each tier under the UA it was listed for. Gemini only: a `claude-*` or
+      `gpt-oss*` id that only a CLI answer lists is neither offered nor sent under the CLI UA,
+      as before this change (the validated-function-calling and `3p` rules were measured under
+      the IDE UA).
+    - *Quota scope* (`cliScope`): a learned `gemini-` model with at least one wire id that only
+      CLI answers list has a pool scope of its own, named for its family and shared by its base id
+      and every tier, with no summary group, exactly as Hydrogen: proof that it is spent rests
+      only it, and the Gemini windows are never its positive-quota evidence. One scope for the
+      base id and all its wire ids matters: the turn is asked by the base id and Google's 429
+      names the wire id. A learned model whose every wire id some IDE answer lists keeps the
+      `gemini` scope, as any unknown `gemini-*` id did before, and a learned `claude-*`/`gpt-oss*`
+      id keeps the measured `3p` group whatever lists it. The lists are asked by the id as Google
+      wrote it (no lower-casing on the way to the lookup).
+    A turn takes one immutable `view()` of the lists and resolves its wire id, host, UA and quota
+    scope, and reads Google's refusal, against that view: `take` replaces the map and never
+    changes it in place, so a catalogue read that lands mid-turn cannot make the turn's 429 name
+    another scope than the one it was started under.
+    An id outside the tables whose entry says `disabled: true` is not listed (the flag, not the
+    name). A table id is never kept and never looked up there: everything measured by hand stays
+    as written, and the measured answers above give the same rows and host map as before
+    (replayed through both versions; every row and effort resolves to a wire id that the host it
+    goes to lists for the client family whose UA it carries). A read replaces the lists of each
+    host and client family that answered and leaves the others as they were (an ask that did not
+    answer says nothing), so a tier Google withdraws leaves at the next whole read. The lists are
+    kept in `<home>/antigravity-models.json` as `{version: 2, providers: {<name>: {<host>:
+    {ide, cli}}}}`, read at start, so a start that finds the catalogue unreadable still resolves
+    a learned model's wire id, client family and host and still lists it after the static rows.
+    The file is written only when this provider's entry in it differs from what is kept (compared
+    as sorted JSON, other providers' entries written back as they were), a file whose `version`
+    is later than this build's is left untouched, a file of an earlier version is not read as
+    this one, and a save that fails is tried again when the lists change or at a read an hour or
+    more later (a failed replace holds the event loop while the rename is retried). A provider
+    keeps only the hosts it asks (a pinned `url` never borrows a tier another host listed), and
+    a learned host is only ever one of `GOOGLE_OAUTH.hosts`, because that is where the account's
+    token is sent. `hostFor` places a wire id outside the tables by `hostOf` (the first of the
+    two hosts whose IDE answer lists it, else, for a CLI-only id, the first whose CLI answer
+    does): the same lists that choose its UA, so host and UA cannot disagree. A table id is not
+    in the lists and takes the host map's host for its wire id; then the base id's; then the
+    default. The lists come before the host map for three reasons found in review (PR 165): the
+    map is built per host and keeps an unanswered host's earlier catalogue, so after a partial
+    re-read it could name a host that lists an id for the CLI family while the other host's new
+    IDE listing had already moved that id to the IDE UA (a 400); on the first read after a
+    restart that missed the preferred host, the map knew only the other host and moved the
+    model, its quota scope and its prompt cache there although the stored lists named the
+    preferred one; and with no catalogue at all there is no map, so the limits read
+    (`quotaHosts`) asked the default host instead of the one the stored lists send the model
+    to. A read that missed prod's CLI answer used to send a prod-only model to daily, whose
+    generic 429 rested every account. A re-read in which a host did not answer keeps that host's catalogue
+    from the last read that had it (rows and host map are merged from the kept per-host
+    catalogues, `mergeHostCatalogues`), so one failed ask moves no conversation to the other
+    host and back. Such a partial read (a host or a CLI ask did not answer) stands for five
+    minutes instead of the hour, doubling up to the hour while the same asks keep failing, and a
+    cached read past its time is asked again from the turn path without holding the turn. A
+    provider that pins `url` asks nothing on the turn path, as before: it learns when its model
+    list is read (the provider form, the picker) and from the file. The provider form's probe
+    (`POST /api/providers/probe`) therefore reads the catalogue of the provider being edited (the
+    form sends its `name` and `url`), not of the first Antigravity provider: a list read through
+    another provider offered a second, pinned provider a family it never learned and then sent
+    as an unknown id under the IDE UA. A provider not saved yet is shown the catalogue of a
+    saved one that asks the same hosts, else the tables' list. What it was shown is still its own
+    once saved: an adapter with no stored lists under its name starts from the lists another
+    provider of the home stored for the hosts it asks (same accounts, same host, same answer), and
+    an adapter rebuilt because its configuration changed is handed the lists of the one it
+    replaces (`GoogleAdapter`'s `inherit`), so nothing depends on the file having been written
+    between the form's probe and the save. A catalogue answer is
+    untrusted input: at most 500 ids of one answer are read (the bound of a kept list, so a list is never a truncated answer and an id missing from it is one that host does not list), a kept id matches
+    `[A-Za-z0-9][A-Za-z0-9._-]{0,127}` (500 per list, 8 hosts), every table lookup by a client-
+    or catalogue-supplied id is an own-property lookup (`constructor` is not a model), and
+    `fetchAvailableModels` reading never throws into `fetchModels` (it falls back to the static
+    and learned rows).
+    **Accepted, not fixed:** two accounts on different plans answer different catalogues, and
+    the read uses one account, so which account answered decides what is listed until the next
+    read. Not measured with accounts on different plans.
+    Listing is not enabling: a learned model becomes a worker when it is ticked, as any other.
+    **Not measured:** a real model arriving this way (checked instead by renaming Hydrogen's ids
+    in the measured answers: same row, host, tier wire ids and CLI UA as the hand-written entry),
+    an Ultra account's Carbon ids, and the bucket a future CLI-only model draws on. The same
+    catalogue's `quotaInfo` for the Hydrogen ids equalled Flash 3.8's (same fraction and reset)
+    while Argon's was its own weekly figure; `quotaInfo` is not quota evidence (2026-10-28 above),
+    so Hydrogen's scope is unchanged.
 - Model ids. CCA's wire ids carry the tier as a suffix (`gemini-3.8-flash-low`) or a
   `-tiered` rename (`gemini-3.7-flash-tiered`), while the picker shows a collapsed base id.
   Resolution, from `providers/antigravity-models.ts`: `gemini-3.8-flash` → its suffix per
   effort (`…-low/medium/high`, no `thinkingLevel` beside it — the suffix IS the effort);
   `gemini-3.1-pro` → `gemini-3.1-pro-low` / `gemini-pro-agent` with `thinkingLevel`;
   `gemini-3.7-flash` → `gemini-3.7-flash-tiered` with `thinkingLevel`; `gemini-4-argon` → its
-  suffix per effort (`…-low/medium/high`, default medium, no `thinkingLevel`); a `claude-*` id takes a
+  suffix per effort (`…-low/medium/high`, default medium, no `thinkingLevel`); `gemini-4-hydrogen` →
+  its suffix per effort (`…-low/medium/high/xhigh`, default medium by choice, `max`/`ultra` take
+  `-xhigh`, no `thinkingLevel`); a `claude-*` id takes a
   `thinkingLevel` only (`resolveAntigravityThinkingLevel` clamps `xhigh/max/ultra`→`high`).
   CCA's own catalogue is `POST {host}/v1internal:fetchAvailableModels` with `{project}`, per host
   (see "Two hosts" below) and per client family: the IDE answer gives every model, and a second ask
-  under the CLI UA adds only Argon's ids (which the IDE answer omits); an unreadable IDE answer leaves
+  under the CLI UA adds the ids only it lists: Argon's and Hydrogen's, and any id outside the tables
+  (see "Models outside the tables" above); an unreadable IDE answer leaves
   the host unread as before. Body `{models:{<wireId>:{maxTokens,…}}, agentModelSorts:[{groups:[{modelIds:[…]}]}],
   tieredModelIds:{flash:[…]}}` (`providers/quota/antigravity.ts:166-168`,
   `providers/antigravity-models.ts:489-560`); when it cannot be read on any host we fall back to the
-  static collapsed list (`gemini-3.8-flash`, `gemini-4-argon`, `gemini-3.7-flash`, `gemini-3.1-pro`,
+  static collapsed list (`gemini-3.8-flash`, `gemini-4-argon`, `gemini-4-hydrogen`, `gemini-3.7-flash`, `gemini-3.1-pro`,
   `gemini-3.1-flash-image`, `claude-sonnet-4-6`, `claude-opus-4-6-thinking`,
-  `gpt-oss-120b-medium`, context windows from CCA `maxTokens`).
+  `gpt-oss-120b-medium`, context windows from CCA `maxTokens`). A collapsed row's name drops the tier
+  its first wire id was named for (`Gemini 4 Hydrogen (High)` → `Gemini 4 Hydrogen`).
 - Claude models on CCA force `toolConfig.functionCallingConfig.mode = "VALIDATED"`; a client
   asking for no tools gets the declarations dropped instead (`adapters/google.ts:1109-1120`).
 - **thoughtSignature.** The CCA path sends a real signature back on the exact `functionCall`
@@ -2200,8 +2409,9 @@ They were not live-tested during the original implementation. Files are under `s
   and is not retried. The exception is the model-capacity 503 below, which rests nothing.
   **A 429 that proves one quota group spent rests only that group** (`isGroupQuotaExhausted`:
   an ErrorInfo `reason: "QUOTA_EXHAUSTED"` whose `metadata.model` is in the turn's group;
-  `antigravityQuotaScope`: `gemini` for other gemini-*, `3p` for claude-*/gpt-oss*, and `argon`
-  for gemini-4-argon*. The distinct Argon scope preserves the measured Pro quota boundary;
+  `antigravityQuotaScope`: `gemini` for other gemini-*, `3p` for claude-*/gpt-oss*, `argon`
+  for gemini-4-argon*, `hydrogen` for gemini-4-hydrogen*, and its own family id for a learned
+  CLI-only model. The distinct Argon scope preserves the measured Pro quota boundary;
   its positive-quota evidence requires its own explicitly reported weekly bucket, never the
   ordinary Gemini windows (see the 2026-10-28 measurement above). This does not infer a shared
   Ultra quota scope from a missing bucket). Measured 2026-10-23: one such 429 for
@@ -2471,6 +2681,7 @@ plan unless marked otherwise.
 | Three failovers measured on 2026-11-06 each harmed the connection they meant to protect (owner's MacBook, router.log + `log show` of airportd/WiFiAgent/sharingd). On the iPhone hotspot "PBJ" from 18:32: (1) a directed scan said a known Wi-Fi was visible at 18:37/18:39; the router disassociated at 18:39:25, then every `sudo networksetup -setairportnetwork en0 PBJ` failed ("Failed to join network PBJ", then "Could not find network PBJ") because an idle iPhone stops advertising, and each call cancelled macOS's own Instant Hotspot auto-join (`Auto-join COMPLETED … error=(53 'Auto-join disabled'), wasCancelled=1`), leaving the Mac offline until the owner rejoined from Control Center at 18:43:28. airportd's own auto-join right after the scan found `candidateBSSCount=0`, and a CoreWLAN answer measured then is airportd's cache (~25ms, ~8-10s old) whose membership differed from the next real scan's (13 vs 11). (2) At 19:43:45, 37s after the owner joined home Wi-Fi, the 5-probe window still held the hotspot period's and the switch's failures (probes bound to the old address: `EADDRNOTAVAIL`), so the router joined PBJ over a working home Wi-Fi and disassociated it at 19:44:01. | macOS with no address at all leaves the first `HOTSPOT_JOIN_GRACE_MS` (60s) to macOS and then tries at most once a minute — no 10s ladder — because macOS's auto-join can wake the iPhone and ours cannot and cancels it. A return requires a saved non-hotspot SSID at `RETURN_MIN_RSSI_DBM` (-70 dBm; measured in range -36..-40, merely heard -69..-92) seen by a scan that took at least `SCAN_FRESH_MIN_MS` (1s); a cached answer is re-asked after `SCAN_CACHE_TTL_MS` (10s), else the return is refused. Nothing associated within `JOIN_KNOWN_AFTER_MS` (8s) of leaving → rejoin the hotspot at once while the iPhone still advertises. A change of the Wi-Fi address, subnet or class empties the probe window, and one that brought an address also gives the new network `NETWORK_SETTLE_MS` (30s) in which failures do not count — so a network the OS or the person joined is never failed over in that period, while losing the address keeps the old failover timing (the third failed round). The address is read again after the probe and before the join, so a Wi-Fi joined mid-tick is not evicted. Tests: `tether.test.ts`, `tether-win.test.ts`. |
 | Windows auto-update left the router down until logon (#131, 2026-10-29 to 11-07, 8 of 8 updates): the launcher ran `Start-Process -Wait`, which on PowerShell 5.1 also waits for the router's detached update installer, and the installer's `restartWindowsRouter` waits for the task to end, so each side waited on the other | The launcher waits on its own process handle only (`$null = $p.Handle; $p.WaitForExit()`), never `-Wait`; `schtasks-definition.test.ts` asserts the form and the exit-code handling. |
 | Windows: a router that was alive but frozen was never restarted (#159, 2026-11-11, two stalls, 19 min and 3 min until a user killed the process): `/api/status` ran a PowerShell certificate check with `execFileSync` and no timeout on the event loop the proxy shares, and the launcher only waits for the router to exit. The host had the same shape (#162): its process-list PowerShell was `execFileSync` with `timeout: 5000`, and the host did not answer for 7-8 minutes after start. Node's `timeout` kills only the direct child and the call then waits for stdio to close, so a WMI/PowerShell grandchild holding the pipes defeats it, sync or async | No child process on a request path or a timer path of a long-running process. `execBounded` (`cli/src/bounded-exec.ts`) is the one way those run: its own deadline timer, on expiry `taskkill /T /F` (POSIX: the process group), the pipes destroyed and the promise rejected without waiting for `close`; measured in the Windows 11 VM (`Start-Sleep 60`, and a `ping` grandchild holding the pipe, both cut at 3.0 s, nothing left running). The router answers the certificate question from the last background result (`picker-trust.ts`; unknown, not "not trusted", until the first check lands). The host primes its process snapshot asynchronously and waits at most 10 s before it serves; Windows never reads it synchronously. The router's launcher probes the admin port's `/api/ping` every 15 s and ends its own child with `Kill()` after 4 misses in a row (any HTTP answer counts as alive; a router that never answered gets 5 min; an unreadable config switches the probe off), so the existing relaunch loop restarts it; the host's launcher has no watchdog. Measured in the VM with a router whose event loop was blocked: ended 75 s after the freeze, relaunched 2 s later, the relaunched one left alone while it answered. Tests: `bounded-exec.test.ts`, `picker-trust.test.ts`, `picker-async.test.ts`, `bridge-windows.test.ts`, `schtasks-definition.test.ts`, `admin.test.ts`. |
+| Windows 0.12.35 → 0.12.36 (user report, 2026-11-17): the router ran outside its scheduled task (launcher gone, task `Ready`). `restart` and `update` printed "the scheduled task belongs to another ClaudeRipple installation" although the task and the answering router carried this installation's id: with no process under the task `expectedPid` was null, and any responder whose pid differed from `expectedPid` was `"other"`. The refused restart did not fail the update, the probe passed against the old router, and "Done." was printed on 0.12.35 (found by reading `probeRouter`; Windows behaviour not run here) | `probeRouter` has a fourth state, `unsupervised`: this installation's id answers, but not from the pid the caller would act on (or the caller has none). `other` stays for a different id, a missing id or no pid. `restart` and `stop` drain an unsupervised router through `/api/shutdown` with the id header (never a signal), wait for the port to be released, and start the task; an `other` is still refused. launchd/systemd treat `unsupervised` as unverifiable (`identity-unknown`), as before. `install`/`update` check the answering version after every start that did not fail, count only `drained`/`kickstarted`/`direct` as a switch, and end "not applied" (exit 1, no "Done.") when the version answering is not the installed one. A tray-runtime swap refused by a running tray (EPERM) no longer fails the update: the old runtime stays intact and the line says to quit the tray and run `tray --install --refresh`. Tests: `ownership.test.ts`. |
 
 ### Router-owned automatic updates (2026-10-21)
 
@@ -3042,6 +3253,32 @@ no work, which removes the previous process's alarm (and, if an outage was alrea
 carries the `fired` frame above); a process that starts with work already
 running sends `watch` and moves it. A host that is idle and sleeps leaves no alarm at all. A
 restart longer than 3 min does fire (the host really was gone for that long).
+
+**Wake-ups (2026-11-17; the free tier's 13,000 GB-s/day ran out again on 11-16).** Each wake keeps the
+Durable Object resident ~10 s, so what matters is how many separate wakes a day, not frames. Cuts, each
+negotiated so every old/new mix of relay, host and phone keeps today's behavior:
+- *Ping-judged watch.* The relay's `hello` carries `watchPing:true`; a host that sees it sends `watch`
+  with `ping:true` and renews only on a device change or every `WATCH_RENEW_SLOW_MS` (30 min). The room
+  then judges that watch by the newest control socket's pings (stamped by the runtime without waking the
+  object): the alarm looks, finds a ping younger than `WATCH_SILENT_MS` (150 s) and re-arms at
+  `lastPing + 150 s`; once the host is silent that long it fires — so the alert lands 140–150 s after the
+  host vanishes, inside the old rule's 120–180 s, and an outage under ~140 s never alerts, as before. A
+  closed control socket counts the silence from the close (`hostLeft`), so a restart is not alerted. A
+  `watch` without `ping` (older host) and any relay without `watchPing` (the host then renews every 60 s
+  without the flag) behave exactly as before. A hung host loop stops both pings and renewals alike.
+- *Route check.* A walk of the phone's path costs a probe socket, a connect frame, a data socket and
+  their closes. Every 5 min, 24/7 (~370 GB-s/day per host) is now once an hour (`ROUTE_CHECK_MS`), a real
+  phone's handshake counts as the proof, a stalled process (sleep) walks it again at most every 15 min,
+  and `recheckRoute()` walks on demand. It guards against a relay routing to a socket that never reads
+  (§5, 2026-10-15); the relay itself now routes only to the newest socket that pinged, and a socket that
+  broke the route had to reconnect first, which walks it after the hello.
+- *Loops.* A failing route check retries 5…30 s as before for six rounds, then doubles to 5 min; a host
+  replaced by another with its server id keeps its 30 s wait (when the other stops, nothing the phone
+  does can shorten that host's timer).
+- *Phone.* A link waiting to retry while the app/page is hidden (`Link.background()`) waits
+  `HIDDEN_RETRY_MS` (10 min); foreground, a network change and the retry button still reconnect at
+  once. Presence rides the link's end-to-end beat (`Link.onBeat`) so the ping and presence frames leave in
+  the same moment and share one wake instead of two per minute.
 
 **Online notice: expired Claude login.** Two sources feed one host state: `Sessions.noteBridge`
 entering the existing `HostInfo.desktopProblem` state (a `BridgeAuthError`), and a host-run SDK turn

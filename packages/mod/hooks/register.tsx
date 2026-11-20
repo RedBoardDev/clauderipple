@@ -7,13 +7,13 @@ import { MOD_SETTINGS_SCHEMA_VERSION, RUNG_EFFORT, applySettingsChanges, normali
 import { rungOf, workerLadderLine } from './ladder'
 import { debugText, langFrom, t } from './i18n'
 import type { Lang } from './i18n'
-import { EFFORT_JUDGE_SYSTEM, finalEffort, isCacheSafeModel, jevEffortRequest, jevFailure, jevUsage, judgeContext, parseEffortVerdict, parseJevEffort, parseJevKey, shouldJudge } from './judge'
+import { EFFORT_JUDGE_SYSTEM, bounded, choosePick, isCacheSafeModel, jevEffortRequest, jevFailure, jevUsage, judgeContext, parseEffortVerdict, parseJevEffort, parseJevKey, shouldJudge } from './judge'
 import { AUTO_DESCRIPTION, NATIVE_AGENTS, TIER_MARKERS, agentProvider, candidateUsable, chatgptUsable, claudeCandidates, ladderOptionsFrom, ladderFallbackModels, ladderPick, liveProviders, markerDomain, modelReason, readMarker, routerModelOptions, resolveClaudeModel, pinnedAccountName, pinnedAccountNames, ruleReason, spawnModel, spawnTitle, titleName, takesOver, tierOf, userSaid, withoutReason, withoutRouting, workerRule, zenJev } from './workers'
 import { MARKER, agentFilePaths, agentModel, ancestorFolders, definedModel, delegationPin as parseDelegationPin, fixSpawn, humanText, pinInstruction, pinSaid } from './worker'
 import { activeModeOf, chatgptProviders, claudeWindow, eagerNote, gptLimitsFrom, modeKey, modeOver, quotaWindows, resetProvider, routingSettings } from './modes'
 import type { QuotaWindow } from './modes'
 import type { Spawn, WorkerFix } from './worker'
-import { afterPing, cacheMemoryKey, CACHE_MEMORY_PREFIX, laterMemo, liveContextTokens, nextMemo, restoreFromResume, savedMemory, shouldPing, staleMemory } from './cache'
+import { afterPing, cacheMemoryKey, CACHE_MEMORY_PREFIX, laterMemo, liveContextTokens, nextMemo, restoreFromResume, savedMemory, shouldPing, staleMemory, warmWillHold } from './cache'
 import { HEAVY_PERCENT, bandPriority, claudeLimitsFrom, claudeScopedFrom, coldAlert, contextWindow, countsPrecisely, modelCompactWindow, hotAlert, hottest, hotWindowMoved, keptAlert, costFromSummary, localMidnight, routerLimitItems, saveUntil as limitSaveUntil, swampAlert, swamped } from './session'
 import type { ScopedLimit } from './session'
 import { QUICK_PROMPT, wrapForNewChat } from './handoff'
@@ -434,7 +434,7 @@ async function syncSettings($: EngineInterface, admin: string): Promise<void> {
   sync = await read($, settingsSync)
   if (sync.pending.length || sync.migration) await putSettings($, admin, snapshot.stored ? snapshot.settings : sync.migration ?? snapshot.settings)
 }
-async function loadSettings($: EngineInterface): Promise<void> {
+async function loadSettings($: EngineInterface, sessionId?: string): Promise<void> {
   try { await settingsTask(async () => { await syncSettings($, await adminUrl($)) }) }
   catch (error) { await installSettings($, await currentSettings($)); await routerSettingsDown($, error) }
   const hidden = (await $.store.get('bandHidden')) === true
@@ -446,6 +446,11 @@ async function loadSettings($: EngineInterface): Promise<void> {
       carriedPick = true
       await update($, pick, () => ({ effort: level, why: typeof carried.why === 'string' ? carried.why : '', by: carried.by as Pick['by'], at: typeof carried.at === 'number' ? carried.at : 0 }))
     }
+    // This chat's own requested level survives a restart; the shared pick above never carries it to another chat.
+    try {
+      const asked = effortOf(object(await $.store.get(ASKED_PREFIX + (sessionId ?? await $.session.id()))).level)
+      if (asked) await update($, pick, p => ({ why: '', by: 'jev' as const, at: 0, ...p, effort: asked, asked }))
+    } catch (error) { await report($, 'asked effort restore', error) }
   }
 }
 async function saveSettings($: EngineInterface, s: Settings, baseline?: Settings): Promise<boolean> {
@@ -465,7 +470,25 @@ async function saveSettings($: EngineInterface, s: Settings, baseline?: Settings
 async function installPick($: EngineInterface, value: Pick): Promise<void> {
   carriedPick = false
   await update($, pick, () => value)
-  await $.store.set('pick', value)
+  // The shared store carries the last pick into a brand-new chat as a starting effort; a level the
+  // user asked for belongs to this chat only, so it is kept under this chat's own key (askedKey).
+  // Its effort may lie outside floor and ceiling, so the shared record takes the bounded level a new chat may start at.
+  const { asked, askedRead: _read, ...shared } = value
+  if (asked && asked !== 'auto') {
+    const s = await currentSettings($)
+    shared.effort = bounded(shared.effort, s.floor, s.ceiling)
+  }
+  await $.store.set('pick', shared)
+  await rememberAsked($, asked)
+}
+const ASKED_PREFIX = 'askedEffort:'
+/** The level the user asked for in this chat, read back after a reload mid-turn; any other pick (the next prompt's) clears it. */
+async function rememberAsked($: EngineInterface, level: Pick['asked']): Promise<void> {
+  try {
+    const key = ASKED_PREFIX + await $.session.id()
+    if (level && level !== 'auto') await $.store.set(key, { level })
+    else await $.store.delete(key)
+  } catch (error) { await report($, 'asked effort store', error) }
 }
 
 // The engine's pane list is authoritative: a reload can close panes without sending ui.close.
@@ -892,7 +915,7 @@ async function down($: EngineInterface, message: string, network = false): Promi
   await $.ui.toast(t(await read($, lang), 'toasts.judgeDown', { reason: message }))
 }
 
-type Judged = { verdict: Verdict | undefined; by: JudgeKind; ms: number; error?: string }
+type Judged = { verdict: Verdict | undefined; by: JudgeKind; ms: number; at: number; error?: string }
 function judgeFailure(answer: ModelCompleteResult): string | undefined {
   if (answer.isAnswered) return undefined
   return answer.reason === 'api-error' ? `${answer.reason}: ${answer.error} (${answer.status ?? 'no response'})` : answer.reason
@@ -972,14 +995,14 @@ async function judge($: EngineInterface, s: Settings, input: JudgeInput, testing
   await update($, stats, value => ({ ...value, judge: { ...value.judge, ms: value.judge.ms + ms } }))
   if (!testing) {
     // The log pane lists it: a Jev call never reaches the router, so nothing else would show it.
-    const run: JudgeRun = { at: started, for: 'prompt', asked: s.judge, by, ms, ...(verdict?.effort ? { effort: verdict.effort } : {}), ...(verdict?.sure !== undefined ? { sure: verdict.sure } : {}), ...(failure ? { error: failure } : {}) }
+    const run: JudgeRun = { at: started, for: 'prompt', asked: s.judge, by, ms, ...(verdict?.effort ? { effort: verdict.effort } : {}), ...(verdict?.sure !== undefined ? { sure: verdict.sure } : {}), ...(verdict?.asked ? { userAsked: verdict.asked } : {}), ...(failure ? { error: failure } : {}) }
     await update($, judgeRuns, value => [...value, run].slice(-40))
     // A network blip or timeout is said only when it happens twice running; Haiku covers the one prompt.
     jevBlips = blip ? jevBlips + 1 : 0
     if (failure && !(blip && jevBlips < 2)) await down($, failure, blip)
     else if (await read($, judgeDown)) await update($, judgeDown, () => null)
   }
-  return { verdict, by, ms, ...(failure ? { error: failure } : {}) }
+  return { verdict, by, ms, at: started, ...(failure ? { error: failure } : {}) }
 }
 async function testJudge($: EngineInterface): Promise<void> {
   const language = await read($, lang)
@@ -1569,6 +1592,13 @@ async function scheduleCountdown($: EngineInterface): Promise<void> {
   })
   countdownTimer = { at, cancel: () => timer.cancel() }
 }
+/** Whether keep-warm will hold this chat's cache through its coming expiry (the same figures the tick pings by). */
+async function warmHolds($: EngineInterface): Promise<boolean> {
+  const s = { ...await currentSettings($) }
+  s.keepWarm = await keepWarmOn($, s)
+  return warmWillHold({ settings: s, memo: await read($, cache), warm: await read($, warm), now: await $.clock.now(),
+    contextTokens: liveContextTokens((await read($, context))?.tokens, rememberedContext), lastRealReplyAt: await read($, lastRealReplyAt) })
+}
 async function tick($: EngineInterface): Promise<void> {
   const language = await read($, lang)
   if (ticking) return
@@ -1712,6 +1742,33 @@ async function waitForPhone($: EngineInterface, admin: string, ask: string): Pro
   return await forgetAsk($, admin, ask)
 }
 
+/** The inbox kinds this mod runs beyond a prompt, clear and abort (the host's MOD_CAPS). */
+const INBOX_CAPS = 'command'
+/** The command a claimed phone offer is running, until it settles: the inbox poll goes on meanwhile (it is the host's heartbeat). */
+let phoneCommandRunning = false
+
+/**
+ * Runs the slash command the phone sent (name without its slash, arguments as typed), as if the person typed
+ * it, and reports its real outcome once it settles: submitted when it ran, failed when the engine refused it
+ * or it threw. The caller does not wait for it, so a slow command (/compact) never stops the inbox poll; the
+ * host waits for the result much longer than for a prompt's submit.
+ */
+async function runPhoneCommand($: EngineInterface, admin: string, itemId: string, command: string, args: string): Promise<void> {
+  let outcome: 'submitted' | 'failed' = 'failed'
+  try {
+    await $.command.run({ command, args })
+    outcome = 'submitted'
+  } catch { /* the host shows the failed item for a deliberate resend */ }
+  try {
+    const result = await $.http.fetch(`${admin}/api/phone-inbox/result`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ itemId, outcome }) })
+    // 409: the host already gave this offer up (its result window ran out); that is no poll failure, so polling goes on.
+    if (result.status !== 200 && result.status !== 409) throw new Error(`inbox result HTTP ${result.status}`)
+  } catch {
+    inboxRetryAt = await $.clock.now() + 15_000
+    await report($, 'phone inbox', 'request failed')
+  } finally { phoneCommandRunning = false }
+}
+
 /** A claim is never retried or submitted without a 200: a lost reply may already have claimed it. */
 async function pollPhoneInbox($: EngineInterface): Promise<void> {
   if (inboxPolling) return
@@ -1723,7 +1780,9 @@ async function pollPhoneInbox($: EngineInterface): Promise<void> {
     if (await $.clock.now() < inboxRetryAt) return
     const session = await $.session.id()
     const admin = await adminUrl($)
-    const list = await $.http.fetch(`${admin}/api/phone-inbox?session=${encodeURIComponent(session)}`)
+    // `caps` tells the host which kinds beyond a prompt this mod runs: it offers a slash command only to a mod that says so
+    // (an older mod would submit the arguments as a prompt), and an offer no mod takes expires on the host as it always did.
+    const list = await $.http.fetch(`${admin}/api/phone-inbox?session=${encodeURIComponent(session)}&caps=${INBOX_CAPS}`)
     if (list.status !== 200) throw new Error(`inbox HTTP ${list.status}`)
     const offers = object(JSON.parse(list.text)).offers
     if (!Array.isArray(offers)) throw new Error('invalid inbox response')
@@ -1731,10 +1790,14 @@ async function pollPhoneInbox($: EngineInterface): Promise<void> {
       const offer = object(raw)
       if (offer.sessionId !== session || typeof offer.itemId !== 'string' || !/^[\w-]{1,100}$/.test(offer.itemId) || typeof offer.text !== 'string') throw new Error('invalid inbox offer')
       // `kind` is the host's: an offer without one is a phone message to submit, as before.
-      const kind = offer.kind === 'abort' || offer.kind === 'clear' ? offer.kind : 'prompt'
+      const kind = offer.kind === 'abort' || offer.kind === 'clear' || offer.kind === 'command' ? offer.kind : 'prompt'
       if (await $.session.id() !== session) return
+      // A command with no usable name is left unclaimed: the offer expires and the host keeps the message waiting.
+      if (kind === 'command' && (typeof offer.command !== 'string' || !/^[^\s/]{1,100}$/.test(offer.command))) continue
       // A clear the host cannot be told about is left unclaimed: the offer expires and the /clear waits.
       if (kind === 'clear' && !await moveRouteReady($, admin, session, offer.itemId)) continue
+      // While a command runs the app is busy with it: nothing else is taken (the host keeps what follows queued behind it), except a stop.
+      if (phoneCommandRunning && kind !== 'abort') continue
       const claimAt = await $.clock.now()
       const claim = await $.http.fetch(`${admin}/api/phone-inbox/claim`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ itemId: offer.itemId }) })
       if (claim.status === 409) continue
@@ -1744,6 +1807,12 @@ async function pollPhoneInbox($: EngineInterface): Promise<void> {
         const now = await $.clock.now()
         // A claim answered this late is not submitted: the host may be close to giving up on it.
         if (now >= claimAt && now - claimAt < 10_000 && await $.session.id() === session) {
+          if (kind === 'command') {
+            // Run beside the poll, not inside it: the host reads a silent inbox as a mod that left. It gets the result when the command settles.
+            phoneCommandRunning = true
+            void runPhoneCommand($, admin, offer.itemId, offer.command as string, offer.text)
+            continue
+          }
           if (kind === 'abort') { if (await stopTurn($)) outcome = 'submitted' }
           else if (kind === 'clear') { if (await clearInPlace($, admin, session, offer.itemId)) outcome = 'submitted' }
           else {
@@ -1753,7 +1822,8 @@ async function pollPhoneInbox($: EngineInterface): Promise<void> {
         }
       } catch { /* The host shows the failed item for a deliberate resend. */ }
       const result = await $.http.fetch(`${admin}/api/phone-inbox/result`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ itemId: offer.itemId, outcome }) })
-      if (result.status !== 200) throw new Error(`inbox result HTTP ${result.status}`)
+      // 409: the host already gave this offer up; that is no poll failure, so polling goes on.
+      if (result.status !== 200 && result.status !== 409) throw new Error(`inbox result HTTP ${result.status}`)
     }
     inboxRetryAt = 0
   } catch {
@@ -2003,10 +2073,12 @@ async function dashboard($: EngineInterface, working: boolean): Promise<Dashboar
   const l = await read($, limit)
   const w = await read($, warm)
   const pinned = await read($, delegationPin)
+  // A save-mode cap on a requested level lifts when save mode ends; prepareStep then sends the asked level, so show it.
+  const lifted = p?.asked && p.asked !== 'auto' && !saving && s.effortAuto && p.by !== 'manual' && p.asked !== p.effort ? p.asked : undefined
   return {
-    effort: { level: p?.effort ?? effortOf(await read($, appEffort)) ?? null,
+    effort: { level: lifted ?? p?.effort ?? effortOf(await read($, appEffort)) ?? null,
       mode: await read($, deciding) ? 'deciding' : await read($, paused) ? 'paused' : p?.by === 'manual' ? 'manual' : s.effortAuto ? 'auto' : 'off',
-      ...(p?.why ? { why: p.why, by: p.by } : {}), ...(await read($, decidingSince) !== null ? { since: (await read($, decidingSince))! } : {}) },
+      ...(p?.why ? { why: lifted ? t(await read($, lang), 'toasts.effortAsked') : p.why, by: p.by } : {}), ...(await read($, decidingSince) !== null ? { since: (await read($, decidingSince))! } : {}) },
     model: await read($, modelIs) ? modelName((await read($, modelIs))!) : null,
     context: await read($, context), cache: await read($, cache), warm: { ...w, on: await keepWarmOn($, s), ...(await read($, warmHere) !== null ? { here: true } : {}) },
     limit: l ? { ...l, save: saving } : null, route: record ? routeOf(record) : null, notice: await read($, line),
@@ -2226,7 +2298,9 @@ async function prepareStep($: EngineInterface, e: TurnStepInput): Promise<TurnSt
   if (!await read($, busy)) await update($, busy, () => true)
   if (!safe || !p || (!s.effortAuto && p.by !== 'manual')) return e
   const saving = s.effortAuto && (await read($, saveUntil) ?? 0) > await $.clock.now()
-  return { ...e, effort: saving && EFFORTS.indexOf(p.effort) > EFFORTS.indexOf('medium') ? 'medium' : p.effort }
+  // A requested level is applied as asked: a save-mode cap on it lifts when save mode ends.
+  const level = p.asked && p.asked !== 'auto' ? p.asked : p.effort
+  return { ...e, effort: saving && EFFORTS.indexOf(level) > EFFORTS.indexOf('medium') ? 'medium' : level }
 }
 
 async function agentsRenderFailure($: EngineInterface, e: RenderInput, error: unknown, context: { frame?: Frame; records?: readonly AgentRec[]; wasOpen?: boolean } = {}): Promise<RenderElement> {
@@ -2323,12 +2397,25 @@ export const register: Register = on => {
         contextRun += 1
         fullMark = null
         await update($, contextFull, () => null)
-        await loadSettings($)
+        // A resumed or forked chat is another chat: the asked level of the one before it stays in that chat's own key,
+        // and loadSettings restores this chat's own from its session id (the starting pick is the shared, bounded one).
+        // The restored level only covers a turn cut off by the reload: the next prompt is judged and clears it.
+        const switched = e.source !== 'clear'
+        const chatId = switched ? e.session_id || await $.session.id() : undefined
+        if (switched && (await read($, pick))?.asked) await update($, pick, () => null)
+        await loadSettings($, chatId)
+        if (chatId && !(await read($, pick))?.asked) {
+          const own = effortOf(object(await $.store.get(ASKED_PREFIX + chatId)).level)
+          if (own) await update($, pick, p => ({ why: '', by: 'jev' as const, at: 0, ...p, effort: own, asked: own }))
+        }
         await update($, busy, () => false)
         await update($, appEffort, () => null)
         await update($, heldPick, () => null)
         await update($, deciding, () => false)
         if (e.source === 'clear') {
+          // A fresh conversation starts without the level asked for in the old one.
+          const askedPick = await read($, pick)
+          if (askedPick?.asked) { const { asked: _released, ...rest } = askedPick; await update($, pick, () => rest); await rememberAsked($, undefined) }
           await update($, cache, () => null)
           await update($, context, () => null)
           await update($, lastRealReplyAt, () => null)
@@ -2482,12 +2569,19 @@ export const register: Register = on => {
         const c = await read($, context)
         const input: JudgeInput = { messages, next: e.text, attachments: e.attachments, current: { model, effort: current?.effort ?? effortOf(await read($, appEffort)) ?? 'medium' }, contextPercent: c?.percent, midTurn: !!e.turnId }
         const judged = await judge($, s, input)
-        if (sequence === judgeSequence && (await currentSettings($)).effortAuto && judged.verdict) {
-          const final = finalEffort(judged.verdict, s, (await read($, saveUntil) ?? 0) > await $.clock.now(), await read($, lang))
-          const value: Pick = { ...judged.verdict, ...final, by: judged.by, at: await $.clock.now() }
-          if (e.turnId && current && EFFORTS.indexOf(value.effort) < EFFORTS.indexOf(current.effort)) await update($, heldPick, () => value)
-          else { await update($, heldPick, () => null); await installPick($, value) }
-          await update($, stats, old => addPrompt(old, value.effort))
+        // A message that is itself an effort request must not be dropped because the judge failed: the deterministic check still reads it.
+        if (sequence === judgeSequence && (await currentSettings($)).effortAuto) {
+          const value = choosePick({ verdict: judged.verdict, text: e.text, current, settings: s, saving: (await read($, saveUntil) ?? 0) > await $.clock.now(), lang: await read($, lang), by: judged.by, at: await $.clock.now() })
+          // Both the judge's raw read and what was installed, so a wrong pick can be traced in the log pane.
+          await update($, judgeRuns, runs => runs.map(run => run.at === judged.at && run.for === 'prompt' ? { ...run, ...(value ? { final: value.effort } : {}), ...(!run.userAsked && value?.asked ? { userAsked: value.asked } : {}) } : run))
+          if (!value) {
+            // Nothing to change: the judge failed with no asked level to drop. The prompt still runs at the current level.
+            if (current) await update($, stats, old => addPrompt(old, current.effort))
+          } else {
+            if (e.turnId && current && EFFORTS.indexOf(value.effort) < EFFORTS.indexOf(current.effort)) await update($, heldPick, () => value)
+            else { await update($, heldPick, () => null); await installPick($, value) }
+            await update($, stats, old => addPrompt(old, value.effort))
+          }
         }
       } else if (human && !hostCommand && s.effortAuto && current && isCacheSafeModel(model)) {
         await update($, stats, old => addPrompt(old, current.effort))
@@ -2733,6 +2827,21 @@ export const register: Register = on => {
     }
   })
   on('session.compact', async ($, e, next) => {
+    // Claude Code's idle compaction fires about 54 minutes after the last activity, while the main chat
+    // sits idle, and its summary would replace the cache keep-warm keeps (it pings at about 56). A
+    // headless session (the Code tab) writes the summary through a `precompute`; an interactive
+    // terminal compacts at once through its host, an `auto`. When keep-warm will hold this chat's
+    // cache, neither runs. Only outside a main turn: the precomputes armed inside one (`api_response`,
+    // `beside_turn`) and the threshold's own `auto` run while `currentTurn` is set (turn.start, before
+    // any step) or `busy` is, and are left alone.
+    if ((e.trigger === 'precompute' || e.trigger === 'auto') && !e.agentId && currentTurn === null) {
+      try {
+        if (!await read($, busy) && await warmHolds($)) {
+          await $.ui.log('ClaudeRipple: idle compaction skipped, keep warm holds this chat\'s cache', { to: 'debug' })
+          return { skip: 'keep warm holds this chat\'s cache' }
+        }
+      } catch (error) { await report($, 'session.compact warm', error) }
+    }
     // A finished compaction of the main conversation adds one to the Compact icon's count; a skipped
     // one, a subagent's own and the ahead-of-time precompute do not.
     const counted = async (result: SessionCompactResult): Promise<SessionCompactResult> => {
@@ -2768,7 +2877,8 @@ export const register: Register = on => {
       await pick(choice)
     }
     // Core owns the prompt, recent-message preservation and file reattachment, including precompute.
-    // Its ahead-of-time summary uses the same router default; it must never be skipped by this mod.
+    // Its ahead-of-time summary uses the same router default; this mod never skips it, except the
+    // idle one above that keep-warm's cache would lose.
     // A pick core never asked for (it reused that precompute) is forgotten, not left to the next
     // compaction (2026-10-31).
     try { return await next(e).then(counted) }

@@ -1820,6 +1820,42 @@ test('prompt judge rewrites every Opus 5.5 main step, not subagent effort', asyn
   expect(stats.text).toContain('Auto: 1 prompts, 2 requests')
 })
 
+test('a level asked for in one chat runs there, but a new chat starts at the bounded level, and a resumed chat holds only its own', async ($, on) => {
+  const b = boundaries(on, { floor: 'medium', ceiling: 'high' })
+  http(on)
+  judgeStub(on, '{"effort":"medium","asked":"xhigh","sure":0.9,"why":"asked"}')
+  const sent = stepStub(on)
+  await start($)
+  await submit($, '추론 강도 매우 높음으로')
+  await step($)
+  expect(sent[0]?.effort).toBe('xhigh')
+  // The shared record a new chat starts from stays inside the ceiling; the level itself is kept under this chat's key.
+  expect(b.saved.get('pick')).toMatchObject({ effort: 'high' })
+  expect(b.saved.get('pick')).not.toHaveProperty('asked')
+  expect(b.saved.get('askedEffort:session-test')).toEqual({ level: 'xhigh' })
+  // Resuming another chat drops this chat's hold: it starts at the shared, bounded level and the old key stays for its own chat.
+  await $.classic.SessionStart({ source: 'resume', session_id: 'other-chat', seconds_since_last_response: 120, prompt_cache_likely_expired: false, model: 'claude-opus-5-5' })
+  await step($)
+  expect(sent[1]?.effort).toBe('high')
+  expect(b.saved.get('askedEffort:session-test')).toEqual({ level: 'xhigh' })
+  // A resumed chat that had asked for its own level takes that one back.
+  b.saved.set('askedEffort:own-chat', { level: 'max' })
+  await $.classic.SessionStart({ source: 'resume', session_id: 'own-chat', seconds_since_last_response: 120, prompt_cache_likely_expired: false, model: 'claude-opus-5-5' })
+  await step($)
+  expect(sent[2]?.effort).toBe('max')
+})
+
+test('a judge that answered "none" is not overridden by the text check, so a question about the level changes nothing', async ($, on) => {
+  boundaries(on, { floor: 'medium', ceiling: 'high' })
+  http(on)
+  judgeStub(on, '{"effort":"medium","asked":"none","sure":0.9,"why":"question"}')
+  const sent = stepStub(on)
+  await start($)
+  await submit($, 'Why did you use max effort? Set effort to high in the config file')
+  await step($)
+  expect(sent[0]?.effort).toBe('medium')
+})
+
 test('Fable pauses without paying a judge or rewriting effort', async ($, on) => {
   const b = boundaries(on)
   b.setModel('claude-fable-5-1')
@@ -2046,6 +2082,133 @@ test('the flame turns keep-warm off for this chat only; Settings stay as they ar
   await b.clock.advance(3375000)
   expect(forks).toBe(0)
   expect(b.router().settings.keepWarm).toBe(true)
+})
+
+// Claude Code's idle compaction asks `session.compact` for a `precompute` ~54 minutes into the idle,
+// while keep-warm's ping is still two minutes away. The mod answers `{ skip }` for a chat whose
+// cache keep-warm will hold; everything else goes on to core.
+const IDLE = 54 * 60000
+/** A chat with one finished reply (so a warm memo), then `IDLE` of silence; counts what core and the pings saw. */
+async function idleChat($: Engine, on: On, patch: Partial<Settings> = { keepWarm: true }, options: Parameters<typeof boundaries>[2] = { tokens: 220000 }) {
+  const b = boundaries(on, patch, options)
+  http(on)
+  judgeStub(on)
+  stepStub(on)
+  const seen = { core: 0, forks: 0 }
+  on('model.fork', () => { seen.forks++; return { value: { isAnswered: true, text: 'ok', usage: USAGE } } })
+  on('session.compact', () => { seen.core++; return { messages: MESSAGES } })
+  await start($)
+  await step($)
+  await complete($)
+  await b.clock.advance(IDLE)
+  return { b, seen }
+}
+const precompute = ($: Engine, extra: { agentId?: string } = {}) => $.session.compact({ trigger: 'precompute', messages: MESSAGES, ...extra })
+
+test('an idle precompute is skipped, not computed, while keep-warm will hold the chat\'s cache; the ping still comes', async ($, on) => {
+  const { b, seen } = await idleChat($, on)
+  expect(seen.forks).toBe(0)
+  const out = await precompute($)
+  expect('skip' in out && typeof out.skip === 'string' && out.skip.length > 0).toBe(true)
+  expect(seen.core).toBe(0)
+  expect(b.logs.some(log => log.includes('idle compaction skipped'))).toBe(true)
+  expect(b.toasts).toEqual([])
+  await b.clock.advance(3375000 - IDLE)
+  expect(seen.forks).toBe(1)
+})
+
+test('an interactive terminal\'s idle compaction (its host\'s `auto`, outside a turn) is skipped the same way', async ($, on) => {
+  const { seen } = await idleChat($, on)
+  const out = await $.session.compact({ trigger: 'auto', messages: MESSAGES })
+  expect('skip' in out).toBe(true)
+  expect(seen.core).toBe(0)
+})
+
+test('a turn that started but has not stepped yet (a built-in command) keeps its precompute and threshold compaction', async ($, on) => {
+  const { seen } = await idleChat($, on)
+  await $.turn.start({ text: '/init', turnId: 'turn-2' })
+  expect('skip' in await precompute($)).toBe(false)
+  expect('skip' in await $.session.compact({ trigger: 'auto', messages: MESSAGES })).toBe(false)
+  expect(seen.core).toBe(2)
+  await $.turn.complete({ turnId: 'turn-2', answer: 'Done.', reason: 'answer', durationMs: 1000, isAborted: false })
+  expect('skip' in await precompute($)).toBe(true)
+  expect(seen.core).toBe(2)
+})
+
+test('the same precompute reaches core while the turn runs, for a subagent, and under any other trigger', async ($, on) => {
+  const { seen } = await idleChat($, on)
+  expect('skip' in await precompute($, { agentId: 'worker' })).toBe(false)
+  expect('skip' in await $.session.compact({ trigger: 'auto', messages: MESSAGES, agentId: 'worker' })).toBe(false)
+  for (const trigger of ['manual', 'plugin'] as const) expect('skip' in await $.session.compact({ trigger, messages: MESSAGES })).toBe(false)
+  expect(seen.core).toBe(4)
+  // A new prompt starts the main turn: the in-turn precompute arms run, untouched.
+  await submit($)
+  expect('skip' in await precompute($)).toBe(false)
+  expect(seen.core).toBe(5)
+  await complete($)
+  expect('skip' in await precompute($)).toBe(true)
+  expect(seen.core).toBe(5)
+})
+
+for (const [name, patch, options, flame] of [
+  ['keep-warm off', { keepWarm: false }, { tokens: 220000 }, false],
+  ['the chat is too small for keep-warm', { keepWarm: true }, { tokens: 10000 }, false],
+  ['the flame turned keep-warm off for this chat', { keepWarm: true }, { tokens: 220000 }, true],
+] as const) {
+  test(`an idle precompute still runs when ${name}`, async ($, on) => {
+    const b = boundaries(on, patch, options)
+    http(on)
+    judgeStub(on)
+    stepStub(on)
+    let core = 0
+    on('model.fork', () => ({ value: { isAnswered: true, text: 'ok', usage: USAGE } }))
+    on('session.compact', () => { core++; return { messages: MESSAGES } })
+    await start($)
+    await step($)
+    await complete($)
+    if (flame) await command($, 'warm')
+    await b.clock.advance(IDLE)
+    expect('skip' in await precompute($)).toBe(false)
+    expect(core).toBe(1)
+  })
+}
+
+test('the flame turns keep-warm on for one chat while Settings keep it off: its idle precompute is skipped', async ($, on) => {
+  const b = boundaries(on, { keepWarm: false }, { tokens: 220000 })
+  http(on)
+  judgeStub(on)
+  stepStub(on)
+  let core = 0
+  on('model.fork', () => ({ value: { isAnswered: true, text: 'ok', usage: USAGE } }))
+  on('session.compact', () => { core++; return { messages: MESSAGES } })
+  await start($)
+  await step($)
+  await complete($)
+  await command($, 'warm')
+  await b.clock.advance(IDLE)
+  expect('skip' in await precompute($)).toBe(true)
+  expect(core).toBe(0)
+  expect(b.router().settings.keepWarm).toBe(false)
+})
+
+test('an idle precompute runs once keep-warm has stopped itself', async ($, on) => {
+  const b = boundaries(on, { keepWarm: true, keepWarmHours: 1 }, { tokens: 220000 })
+  http(on)
+  judgeStub(on)
+  stepStub(on)
+  let core = 0
+  on('model.fork', () => ({ value: JSON.parse('null') }))
+  on('session.compact', () => { core++; return { messages: MESSAGES } })
+  await start($)
+  await step($)
+  await complete($)
+  // The reply was at 0; the one-hour bound is at 60 minutes and the ping at 56 comes before it.
+  await b.clock.advance(IDLE)
+  expect('skip' in await precompute($)).toBe(true)
+  // The ping's fork fails: keep-warm stops itself, and the chat's cache is no longer kept.
+  await b.clock.advance(3375000 - IDLE)
+  expect('skip' in await precompute($)).toBe(false)
+  expect(core).toBe(1)
 })
 
 test('typed compaction passes core input and output unchanged, with no model call or pick POST', async ($, on) => {
@@ -3840,6 +4003,115 @@ test('phone inbox handles offers in order and refuses a different session', asyn
   wrong = true
   await b.clock.advance(1500)
   expect(events).toHaveLength(6)
+})
+
+// A slash command from the phone: the host offers it as kind "command" (name, arguments in text) only to a mod that announced `caps=command`.
+function commandInbox(on: On, offers: unknown[], events: string[]) {
+  on('http.fetch', { url: /\/api\/phone-inbox/ }, ($, e) => {
+    const url = new URL(e.url)
+    if (url.pathname === '/api/phone-inbox') {
+      events.push(`poll:caps=${url.searchParams.get('caps')}`)
+      return { value: { ok: true, status: 200, headers: {}, text: JSON.stringify({ offers: offers.splice(0) }) } }
+    }
+    const body = JSON.parse(e.init?.body ?? '{}')
+    events.push(url.pathname.endsWith('/claim') ? `claim:${body.itemId}` : `result:${body.itemId}:${body.outcome}`)
+    return { value: { ok: true, status: 200, headers: {}, text: '{}' } }
+  })
+}
+test('a phone slash command runs as that command with its arguments, and is never submitted as a prompt', async ($, on) => {
+  const events: string[] = []
+  const b = boundaries(on, {}, { env: APP_ENV, phoneSubmit: text => { events.push(`submit:${text}`); return 'submitted' } })
+  on('command.run', { command: 'hello' }, ($, e) => { events.push(`run:${e.command}:${JSON.stringify(e.args)}`); return { text: 'hi' } })
+  // One command at a time: the second is offered on a later poll, after the first reported.
+  const offers: unknown[] = [{ sessionId: 'session-test', itemId: 'cmd-1', text: 'two words', command: 'hello', kind: 'command', offeredAt: NOW }]
+  commandInbox(on, offers, events)
+  http(on)
+  await start($)
+  await b.clock.advance(1500)
+  offers.push({ sessionId: 'session-test', itemId: 'cmd-2', text: '', command: 'hello', kind: 'command', offeredAt: NOW })
+  await b.clock.advance(1500)
+  expect(events).toEqual(['poll:caps=command', 'claim:cmd-1', 'run:hello:"two words"', 'result:cmd-1:submitted', 'poll:caps=command', 'claim:cmd-2', 'run:hello:""', 'result:cmd-2:submitted'])
+  expect(b.submitted).toEqual([])
+})
+test('a phone slash command the engine refuses is reported failed after its claim', async ($, on) => {
+  const events: string[] = []
+  const b = boundaries(on, {}, { env: APP_ENV })
+  on('command.run', { command: 'broken' }, () => { throw new Error('Unknown command') })
+  commandInbox(on, [{ sessionId: 'session-test', itemId: 'cmd-1', text: '', command: 'broken', kind: 'command', offeredAt: NOW }], events)
+  http(on)
+  await start($)
+  await b.clock.advance(1500)
+  expect(events).toEqual(['poll:caps=command', 'claim:cmd-1', 'result:cmd-1:failed'])
+  expect(b.submitted).toEqual([])
+})
+test('a slow phone slash command does not stop the inbox poll, holds the next offer, and reports its real result when it settles', async ($, on) => {
+  const events: string[] = []
+  const b = boundaries(on, {}, { env: APP_ENV })
+  let release: (() => void) | undefined
+  on('command.run', { command: 'compact' }, async () => { events.push('run:compact'); await new Promise<void>(resolve => { release = resolve }); return { text: 'done' } })
+  on('command.run', { command: 'hello' }, () => { events.push('run:hello'); return { text: 'hi' } })
+  const offers: unknown[] = [{ sessionId: 'session-test', itemId: 'cmd-1', text: '', command: 'compact', kind: 'command', offeredAt: NOW }]
+  commandInbox(on, offers, events)
+  http(on)
+  await start($)
+  await b.clock.advance(1500)
+  expect(events).toEqual(['poll:caps=command', 'claim:cmd-1', 'run:compact'])
+  // Two minutes of a running command: the mod keeps polling (the host's heartbeat) and takes nothing else, no result is sent early.
+  offers.push({ sessionId: 'session-test', itemId: 'cmd-2', text: '', command: 'hello', kind: 'command', offeredAt: NOW })
+  await b.clock.advance(60_000)
+  expect(events.filter(e => e.startsWith('poll')).length).toBeGreaterThan(10)
+  expect(events.filter(e => e.startsWith('claim') || e.startsWith('result'))).toEqual(['claim:cmd-1'])
+  release!()
+  await b.clock.settle()
+  expect(events.filter(e => e.startsWith('result'))).toEqual(['result:cmd-1:submitted'])
+})
+test('a phone slash command that fails after running a while is reported failed, not submitted', async ($, on) => {
+  const events: string[] = []
+  const b = boundaries(on, {}, { env: APP_ENV })
+  on('command.run', { command: 'compact' }, async () => { await b.clock.sleep(45_000); throw new Error('compaction failed') })
+  commandInbox(on, [{ sessionId: 'session-test', itemId: 'cmd-1', text: '', command: 'compact', kind: 'command', offeredAt: NOW }], events)
+  http(on)
+  await start($)
+  await b.clock.advance(1500)
+  await b.clock.advance(40_000)
+  expect(events.filter(e => e.startsWith('result'))).toEqual([])
+  await b.clock.advance(10_000)
+  expect(events.filter(e => e.startsWith('result'))).toEqual(['result:cmd-1:failed'])
+})
+test('a result post the host answers 409 (offer already expired) does not pause the inbox poll', async ($, on) => {
+  const events: string[] = []
+  const b = boundaries(on, {}, { env: APP_ENV })
+  on('command.run', { command: 'compact' }, async () => { await b.clock.sleep(20_000); return { text: 'done' } })
+  on('command.run', { command: 'hello' }, () => { events.push('run:hello'); return { text: 'hi' } })
+  const offers: unknown[] = [{ sessionId: 'session-test', itemId: 'cmd-1', text: '', command: 'compact', kind: 'command', offeredAt: NOW }]
+  on('http.fetch', { url: /\/api\/phone-inbox/ }, ($, e) => {
+    const url = new URL(e.url)
+    if (url.pathname === '/api/phone-inbox') { events.push('poll'); return { value: { ok: true, status: 200, headers: {}, text: JSON.stringify({ offers: offers.splice(0) }) } } }
+    const body = JSON.parse(e.init?.body ?? '{}')
+    if (url.pathname.endsWith('/claim')) { events.push(`claim:${body.itemId}`); return { value: { ok: true, status: 200, headers: {}, text: '{}' } } }
+    events.push(`result:${body.itemId}`)
+    return { value: { ok: false, status: 409, headers: {}, text: '{}' } }
+  })
+  http(on)
+  await start($)
+  await b.clock.advance(1500)
+  await b.clock.advance(20_000)
+  expect(events).toContain('result:cmd-1')
+  offers.push({ sessionId: 'session-test', itemId: 'cmd-2', text: '', command: 'hello', kind: 'command', offeredAt: NOW })
+  const before = events.length
+  await b.clock.advance(3000)
+  expect(events.slice(before)).toContain('claim:cmd-2')
+  expect(b.logs.join('\n')).not.toContain('phone inbox')
+})
+test('a phone slash command with no usable name is left unclaimed', async ($, on) => {
+  const events: string[] = []
+  const b = boundaries(on, {}, { env: APP_ENV })
+  commandInbox(on, [{ sessionId: 'session-test', itemId: 'cmd-1', text: 'x', kind: 'command', offeredAt: NOW }, { sessionId: 'session-test', itemId: 'cmd-2', text: 'x', command: 'a/b', kind: 'command', offeredAt: NOW }], events)
+  http(on)
+  await start($)
+  await b.clock.advance(1500)
+  expect(events).toEqual(['poll:caps=command'])
+  expect(b.submitted).toEqual([])
 })
 
 test('a claim response delayed past the safe window never submits the message', async ($, on) => {
