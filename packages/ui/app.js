@@ -3627,8 +3627,10 @@ function renderClaudeResets(id) {
   if (state.loading && !state.status) rows.push(el("div", { class: "small", text: t("resets.loading") }));
   if (state.error) rows.push(el("div", { class: "bad-text small", text: state.error }));
   if (state.status) {
-    if (!state.status.grants.length) rows.push(el("div", {}, [el("div", { text: t("resets.none") }), hint(t("resets.noneHint"))]));
-    for (const grant of state.status.grants) rows.push(claudeResetGrantRow(id, state, grant));
+    // A grant with no use left is spent: Anthropic still lists it, but there is nothing to do with it.
+    const grants = state.status.grants.filter((grant) => grant.left > 0);
+    if (!grants.length) rows.push(el("div", {}, [el("div", { text: t("resets.none") }), hint(t("resets.noneHint"))]));
+    for (const grant of grants) rows.push(claudeResetGrantRow(id, state, grant));
     rows.push(el("div", { class: "small", text: t("resets.updated", { time: new Date(state.readAt).toLocaleTimeString(CURRENT_LANG) }) }));
   }
   panel.replaceChildren(...rows);

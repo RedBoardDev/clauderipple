@@ -536,7 +536,7 @@ test('an account\'s limit resets open on demand, and a use needs a click, a conf
   assert.equal(panel.hidden, false);
   assert.deepEqual(calls, [{ url: '/api/claude-accounts/acct/resets', method: 'GET' }], 'the first opening reads the list without forcing it');
   const uses = panel.querySelectorAll('button').filter(node => node.textContent === 'resets.use');
-  assert.deepEqual(uses.map(node => node.disabled), [false, true], 'a spent grant cannot be used');
+  assert.deepEqual(uses.map(node => node.disabled), [false], 'a spent grant is not listed');
 
   confirmAnswer = false;
   uses[0]!.emit('click'); await flush();
@@ -550,7 +550,7 @@ test('an account\'s limit resets open on demand, and a use needs a click, a conf
   assert.deepEqual(posts, [{ url: '/api/claude-accounts/acct/resets', method: 'POST', body: JSON.stringify({ grantId: 'usable', confirm: true }) }]);
   assert.equal(refreshed, 1, 'the account list is read again after a reset');
   assert.deepEqual(toasts, ['resets.result.reset{"left":0}']);
-  assert.deepEqual(panel.querySelectorAll('button').filter(node => node.textContent === 'resets.use').map(node => node.disabled), [true], 'the list shows what is left after the use');
+  assert.deepEqual(panel.querySelectorAll('button').filter(node => node.textContent === 'resets.use').map(node => node.disabled), [], 'the used grant leaves the list');
 
   button.emit('click'); await flush();
   assert.equal(panel.hidden, true, 'the button closes the list again');
