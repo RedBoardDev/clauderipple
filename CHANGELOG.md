@@ -11,6 +11,13 @@
   rotation, use first, pause, rename, remove), model mapping, workers and effort, clients,
   activity, laptop, recovery and updates. Provider editing, Google accounts and phone pairing stay
   on the web dashboard. Build with `apps/macos/build.sh install` (Xcode 26+, XcodeGen).
+- **Limit resets per Claude account, without signing that account in to Claude Desktop.** Each
+  account card in the web dashboard has a "Resets" button that lists the refills of the 5-hour and
+  weekly limits Anthropic granted to that account (what Claude Desktop shows under Settings → Limit
+  resets) with their expiry dates, and a button to use one. It works for stored accounts, paused ones
+  and the current login. Reading uses the account's own login and never starts a limit window; a use
+  asks first, goes to Anthropic once, never retries, and lifts the router's rest on the account.
+  Admin API: `GET`/`POST /api/claude-accounts/<id|current>/resets`. The macOS app does not show it yet.
 
 ### Changed
 

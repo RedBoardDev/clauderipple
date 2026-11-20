@@ -489,7 +489,7 @@ test('the current Claude card uses the pool pause controls without rename, remov
     const buttons = current.querySelectorAll('button');
     const pause = buttons.find(node => node.textContent === (paused ? 'providers.chatgptResume' : 'providers.chatgptPause'))!;
     assert.ok(pause, 'the current login always offers pause or resume');
-    assert.deepEqual(buttons.map(node => node.textContent), paused ? ['providers.chatgptResume'] : ['providers.preferAction', 'providers.chatgptPause']);
+    assert.deepEqual(buttons.map(node => node.textContent), paused ? ['providers.chatgptResume', 'resets.action'] : ['providers.preferAction', 'providers.chatgptPause', 'resets.action']);
     assert.equal(current.descendants().some(node => node.textContent === 'providers.chatgptPaused'), paused);
     assert.equal(current.descendants().some(node => node.textContent === 'providers.preferBadge'), false);
     assert.ok(current.descendants().some(node => node.textContent === 'providers.currentAccountHelp'));
@@ -497,9 +497,64 @@ test('the current Claude card uses the pool pause controls without rename, remov
     assert.deepEqual(writes.at(-1), { url: '/api/claude-accounts/current', method: 'PATCH', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ paused: !paused }) });
     assert.equal(pause.disabled, false);
     const own = target.children.find(node => node !== current)!;
-    assert.deepEqual(own.querySelectorAll('button').map(node => node.textContent), ['providers.preferClear', 'providers.chatgptPause', 'common.edit', 'common.remove']);
+    assert.deepEqual(own.querySelectorAll('button').map(node => node.textContent), ['providers.preferClear', 'providers.chatgptPause', 'resets.action', 'common.edit', 'common.remove']);
   }
   assert.equal(refreshed, 2);
+});
+
+test('an account\'s limit resets open on demand, and a use needs a click, a confirmation and a usable grant', async () => {
+  const calls: { url: string; method: string; body?: string }[] = [];
+  const toasts: string[] = [];
+  let confirmAnswer = false;
+  const confirms: string[] = [];
+  const grant = (id: string, extra: Record<string, unknown> = {}) => ({ id, label: `Reset ${id}`, left: 1, total: 1, endsAt: '2026-12-10T22:00:00+00:00', clears: ['five_hour', 'seven_day'], paused: false, usableNow: true, ...extra });
+  const status = { grants: [grant('usable'), grant('spent', { left: 0, usableNow: false })] };
+  const after = { grants: [grant('usable', { left: 0, usableNow: false })] };
+  const api = async (url: string, options?: { method?: string; body?: string }) => {
+    calls.push({ url, method: options?.method ?? 'GET', ...(options?.body ? { body: options.body } : {}) });
+    return options?.method === 'POST' ? { claim: { result: 'reset', resetsLeft: 0 }, status: after } : { status };
+  };
+  const make = new Function('document', 'Node', 'api', 'refreshClaudeAccountPanel', 'confirm', 'toast', `
+    const t = (key, vars) => vars ? key + JSON.stringify(vars) : key, CURRENT_LANG = 'en';
+    const hint = text => el('span', {text});
+    ${block('function $(', '// Inside the ClaudeRipple app')}
+    ${block('function durationText(', 'async function patchChatgptAccount(')}
+    ${block('const claudeResetsState =', 'function accountPoolActions(')}
+    return { claudeResetsControl, claudeResetsStateOf };
+  `);
+  let refreshed = 0;
+  const { claudeResetsControl } = make(
+    { createElement: (tag: string) => new DomNode(tag.toUpperCase()), querySelector: () => null }, DomNode,
+    api, async () => { refreshed++; }, (message: string) => { confirms.push(message); return confirmAnswer; }, (message: string) => toasts.push(message),
+  ) as { claudeResetsControl: (provider: string, id: string, label: string) => { button: DomNode; panel: DomNode } };
+  const flush = () => new Promise(resolve => setImmediate(resolve));
+  const { button, panel } = claudeResetsControl('claude', 'acct', 'Emilie');
+  assert.equal(panel.hidden, true, 'closed until asked for');
+  assert.equal(calls.length, 0, 'nothing is read before the button is pressed');
+
+  button.emit('click'); await flush();
+  assert.equal(panel.hidden, false);
+  assert.deepEqual(calls, [{ url: '/api/claude-accounts/acct/resets', method: 'GET' }], 'the first opening reads the list without forcing it');
+  const uses = panel.querySelectorAll('button').filter(node => node.textContent === 'resets.use');
+  assert.deepEqual(uses.map(node => node.disabled), [false, true], 'a spent grant cannot be used');
+
+  confirmAnswer = false;
+  uses[0]!.emit('click'); await flush();
+  assert.equal(confirms.length, 1);
+  assert.ok(confirms[0]!.includes('Emilie') && confirms[0]!.includes('Reset usable'));
+  assert.equal(calls.filter(call => call.method === 'POST').length, 0, 'a declined confirmation sends nothing');
+
+  confirmAnswer = true;
+  uses[0]!.emit('click'); await flush();
+  const posts = calls.filter(call => call.method === 'POST');
+  assert.deepEqual(posts, [{ url: '/api/claude-accounts/acct/resets', method: 'POST', body: JSON.stringify({ grantId: 'usable', confirm: true }) }]);
+  assert.equal(refreshed, 1, 'the account list is read again after a reset');
+  assert.deepEqual(toasts, ['resets.result.reset{"left":0}']);
+  assert.deepEqual(panel.querySelectorAll('button').filter(node => node.textContent === 'resets.use').map(node => node.disabled), [true], 'the list shows what is left after the use');
+
+  button.emit('click'); await flush();
+  assert.equal(panel.hidden, true, 'the button closes the list again');
+  assert.equal(calls.filter(call => call.method === 'GET').length, 1, 'closing the list does not read again');
 });
 
 test('the dashboard recognises Ollama so an empty ladder there is measured, not a decision', () => {
