@@ -520,21 +520,26 @@ test('an account\'s limit resets open on demand, and a use needs a click, a conf
     ${block('function $(', '// Inside the ClaudeRipple app')}
     ${block('function durationText(', 'async function patchChatgptAccount(')}
     ${block('const claudeResetsState =', 'function accountPoolActions(')}
-    return { claudeResetsControl, claudeResetsStateOf };
+    return { claudeResetsControl, claudeResetsStateOf, refreshClaudeResetsControls };
   `);
   let refreshed = 0;
-  const { claudeResetsControl } = make(
+  const { claudeResetsControl, refreshClaudeResetsControls } = make(
     { createElement: (tag: string) => new DomNode(tag.toUpperCase()), querySelector: () => null }, DomNode,
     api, async () => { refreshed++; }, (message: string) => { confirms.push(message); return confirmAnswer; }, (message: string) => toasts.push(message),
-  ) as { claudeResetsControl: (provider: string, id: string, label: string) => { button: DomNode; panel: DomNode } };
+  ) as {
+    claudeResetsControl: (provider: string, id: string, label: string, needsLogin?: boolean) => { button: DomNode; panel: DomNode };
+    refreshClaudeResetsControls: (target: DomNode) => void;
+  };
   const flush = () => new Promise(resolve => setImmediate(resolve));
   const { button, panel } = claudeResetsControl('claude', 'acct', 'Emilie');
+  const target = new DomNode('DIV'); target.append(button, panel);
   assert.equal(panel.hidden, true, 'closed until asked for');
-  assert.equal(calls.length, 0, 'nothing is read before the button is pressed');
-
-  button.emit('click'); await flush();
+  assert.equal(button.disabled, true, 'availability is unknown');
+  refreshClaudeResetsControls(target); refreshClaudeResetsControls(target); await flush();
+  assert.equal(button.disabled, false);
+  assert.deepEqual(calls, [{ url: '/api/claude-accounts/acct/resets', method: 'GET' }], 'polling performs one cached lookup');
+  button.click();
   assert.equal(panel.hidden, false);
-  assert.deepEqual(calls, [{ url: '/api/claude-accounts/acct/resets', method: 'GET' }], 'the first opening reads the list without forcing it');
   const uses = panel.querySelectorAll('button').filter(node => node.textContent === 'resets.use');
   assert.deepEqual(uses.map(node => node.disabled), [false], 'a spent grant is not listed');
 
@@ -552,9 +557,10 @@ test('an account\'s limit resets open on demand, and a use needs a click, a conf
   assert.deepEqual(toasts, ['resets.result.reset{"left":0}']);
   assert.deepEqual(panel.querySelectorAll('button').filter(node => node.textContent === 'resets.use').map(node => node.disabled), [], 'the used grant leaves the list');
 
-  button.emit('click'); await flush();
-  assert.equal(panel.hidden, true, 'the button closes the list again');
-  assert.equal(calls.filter(call => call.method === 'GET').length, 1, 'closing the list does not read again');
+  assert.equal(button.disabled, true, 'a spent reset disables the button');
+  assert.equal(panel.hidden, true, 'the empty list closes');
+  refreshClaudeResetsControls(target);
+  assert.equal(calls.filter(call => call.method === 'GET').length, 1, 'polling reuses recent availability');
 });
 
 test('the dashboard recognises Ollama so an empty ladder there is measured, not a decision', () => {

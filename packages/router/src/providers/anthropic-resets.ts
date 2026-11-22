@@ -121,18 +121,25 @@ function percentMap(value: unknown): Record<string, number> {
   if (!source) return out;
   for (const name of WINDOWS) {
     const percent = source[name];
-    if (typeof percent === "number" && Number.isInteger(percent) && percent >= 0 && percent <= 100) out[name] = percent;
+    if (typeof percent === "number" && Number.isFinite(percent) && percent >= 0 && percent <= 100) out[name] = percent;
   }
   return out;
 }
 
-function grantFrom(value: unknown): ClaudeResetGrant | null {
+function grantFrom(value: unknown, usage: Record<string, unknown>): ClaudeResetGrant | null {
   const grant = object(value);
   if (!grant) return null;
   const id = grant.id;
   const left = count(grant.resets_left, null);
   if (typeof id !== "string" || !GRANT_ID.test(id) || left === null) return null;
   const type = grant.type === "session" || grant.type === "weekly" || grant.type === "full" ? grant.type : null;
+  const clears = windowList(grant.clears);
+  const givesBackWeekly = grant.gives_back_weekly === true;
+  const percentUsed = percentMap(grant.percent_used);
+  for (const window of givesBackWeekly ? [...clears, "seven_day"] : clears) {
+    const used = object(usage[window])?.utilization;
+    if (percentUsed[window] === undefined && typeof used === "number" && Number.isFinite(used) && used >= 0 && used <= 100) percentUsed[window] = used;
+  }
   return {
     id,
     label: typeof grant.label === "string" ? grant.label.replace(/[\x00-\x1f\x7f]/g, "").slice(0, 200) : "",
@@ -141,14 +148,14 @@ function grantFrom(value: unknown): ClaudeResetGrant | null {
     total: count(grant.resets_total, 0) ?? 0,
     startsAt: text(grant.starts_at),
     endsAt: text(grant.ends_at),
-    clears: windowList(grant.clears),
-    percentUsed: percentMap(grant.percent_used),
+    clears,
+    percentUsed,
     blocking: windowList(grant.blocking),
     paused: grant.paused === true,
     usableNow: grant.usable_now === true,
     // Anthropic's own client assumes a use needs a limit until the grant says otherwise.
     requiresLimit: grant.use_requires_limit !== false,
-    givesBackWeekly: grant.gives_back_weekly === true,
+    givesBackWeekly,
     unavailableReason: text(grant.unavailable_reason),
   };
 }
@@ -167,7 +174,7 @@ export function claudeResetsFromBody(body: unknown): ClaudeResetStatus | null {
   }
   const status = object(block);
   if (!status) return null;
-  const grants = (Array.isArray(status.grants) ? status.grants : []).map(grantFrom).filter((grant): grant is ClaudeResetGrant => grant !== null);
+  const grants = (Array.isArray(status.grants) ? status.grants : []).map((grant) => grantFrom(grant, root)).filter((grant): grant is ClaudeResetGrant => grant !== null);
   const next = typeof status.next_grant_id === "string" && grants.some((grant) => grant.id === status.next_grant_id) ? status.next_grant_id : null;
   return {
     eligible: status.eligible === true,
