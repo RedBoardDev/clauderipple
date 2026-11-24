@@ -8,8 +8,10 @@ import path from "node:path";
 
 import { ClaudeAccountAuthPool } from "../src/providers/anthropic-account-pool.ts";
 import { CredentialPool } from "../src/pool.ts";
+import { ClaudeUsage } from "../src/providers/anthropic-usage.ts";
 import {
   listClaudeAccounts,
+  markClaudeAccountNeedsReauth,
   readClaudeAccountsFile,
   replaceClaudeOAuthAccount,
   saveClaudeOAuthAccount,
@@ -110,6 +112,46 @@ test("resuming the current login does not bypass a paused stored copy of the sam
     assert.deepEqual(pool.peekCredentials(), [], "the stored pause still drops the current login");
     updateClaudeAccount(dir, stored.id, { paused: false });
     assert.deepEqual(pool.peekCredentials().map((c) => c.ownerId), ["current"]);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a paused account keeps its usage readable: the pause only keeps it out of routing", async () => {
+  const dir = home();
+  try {
+    const now = () => 1_000_000;
+    const resting = saveClaudeOAuthAccount(dir, { accessToken: "rest-access", refreshToken: "rest-refresh", expiresAt: 9_000_000, accountId: "rest" });
+    const active = saveClaudeOAuthAccount(dir, { accessToken: "live-access", refreshToken: "live-refresh", expiresAt: 9_000_000, accountId: "live" });
+    const signedOut = saveClaudeOAuthAccount(dir, { accessToken: "gone-access", refreshToken: "gone-refresh", expiresAt: 9_000_000, accountId: "gone" });
+    updateClaudeAccount(dir, resting.id, { paused: true });
+    updateClaudeAccount(dir, signedOut.id, { paused: true });
+    markClaudeAccountNeedsReauth(dir, signedOut.id, "gone-refresh");
+    setCurrentClaudeAccountPaused(dir, true);
+    const current = new ClaudeCodeAuthStore(
+      new ClaudeCodeCredentialStore(() => JSON.stringify({ claudeAiOauth: { accessToken: "current-access", expiresAt: 9_000_000 } }), now),
+      { home: dir, env: {}, now },
+    );
+    const pool = new ClaudeAccountAuthPool({ home: dir, now, current, log: log().logger });
+
+    assert.deepEqual(pool.peekCredentials().map((c) => c.ownerId), [active.id], "routing still leaves paused accounts out");
+    assert.deepEqual((await pool.usageCredentials()).map((c) => c.ownerId), [active.id, "current", resting.id], "usage also reads the paused ones; one signed out has no login to read");
+
+    const asked: string[] = [];
+    const usage = new ClaudeUsage(pool, {
+      upstream: () => "api.anthropic.com",
+      now,
+      fetch: async (_url, init) => {
+        asked.push((init.headers as Record<string, string>).authorization!);
+        return Response.json({ five_hour: { utilization: 93, resets_at: "2026-11-24T08:30:00+00:00" }, seven_day: { utilization: 62, resets_at: "2026-11-27T11:00:00+00:00" } });
+      },
+    });
+    const snapshot = await usage.snapshot();
+    assert.deepEqual(Object.keys(snapshot).sort(), ["current", active.id, resting.id].sort());
+    assert.deepEqual(asked.sort(), ["Bearer current-access", "Bearer live-access", "Bearer rest-access"]);
+    const paused = snapshot[resting.id] as { rate_limits: { primary: { used_percent: number }; secondary: { used_percent: number } } };
+    assert.equal(paused.rate_limits.primary.used_percent, 93);
+    assert.equal(paused.rate_limits.secondary.used_percent, 62);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }

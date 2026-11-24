@@ -164,6 +164,26 @@ export class ClaudeAccountAuthPool {
     return this.peekCredentials();
   }
 
+  /**
+   * Credentials for reading how much of each account's limits is used: the routing ones, plus the paused
+   * accounts a pause keeps out of routing. Pausing an account only stops it taking turns, so its usage
+   * stays readable (the dashboard keeps showing it). A paused account whose login is gone is left out.
+   */
+  async usageCredentials(): Promise<Credential[]> {
+    const routed = await this.credentials();
+    const seen = new Set(routed.map((credential) => credential.ownerId ?? credential.id));
+    const owners = ["current", ...readClaudeOAuthAccounts(this.home).filter((account) => account.paused).map((account) => account.id)];
+    const paused = await Promise.all(owners.filter((owner) => !seen.has(owner)).map(async (owner) => {
+      try {
+        const credential = await this.accountCredential(owner);
+        return credential === null || credential === "needs-login" ? null : credential;
+      } catch {
+        return null;
+      }
+    }));
+    return [...routed, ...paused.filter((credential): credential is Credential => credential !== null)];
+  }
+
   /** The client's own Bearer is the current login, so a caller falling back on it asks this first. */
   currentPaused(): boolean {
     return isCurrentClaudeAccountPaused(this.home);

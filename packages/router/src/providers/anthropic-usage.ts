@@ -146,7 +146,11 @@ function durableAccount(credential: Credential): string {
   return credential.healthKey ?? credential.ownerId ?? credential.id;
 }
 
-type UsageSource = { credentials(): Promise<Credential[]> };
+/**
+ * `usageCredentials`, when the source has it, also lists the accounts routing leaves out (paused ones):
+ * their usage is still worth reading, since a pause only stops them taking turns.
+ */
+type UsageSource = { credentials(): Promise<Credential[]>; usageCredentials?(): Promise<Credential[]> };
 type FetchLike = (url: string, init: RequestInit) => Promise<Response>;
 type UsageOptions = {
   /** The Anthropic API host (`config.upstream`). */
@@ -243,7 +247,7 @@ export class ClaudeUsage {
     const ttl = this.opts.ttlMs ?? 5 * 60_000;
     let credentials: Credential[];
     try {
-      credentials = await this.source.credentials();
+      credentials = this.source.usageCredentials ? await this.source.usageCredentials() : await this.source.credentials();
       this.sourceRetrying = false;
     } catch (e) {
       this.opts.warn?.(`claude usage: no credentials: ${(e as Error).message}`);
